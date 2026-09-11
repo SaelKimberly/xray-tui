@@ -210,6 +210,12 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     // a writer that never noticed shutdown would hang the process at exit.
     state.shutdown_token.store(true, Ordering::Relaxed);
 
+    // Persist anything still staged (ping results, scheduler transitions)
+    // before the runtime goes away.
+    if let Err(e) = state.link_writer.flush().await {
+        tracing::warn!(target: "tui::ui", "final link flush failed: {e}");
+    }
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture)?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;

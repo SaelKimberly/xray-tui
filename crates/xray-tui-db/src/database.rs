@@ -730,7 +730,26 @@ impl Database {
             .exec(&mut tx)
             .await?
             else {
-                continue; // row deleted mid-batch
+                // No row: insert it, keeping the previous `upsert_link`
+                // contract for a link that has never been persisted. Every
+                // group comes from the caller's snapshot because there is
+                // nothing to clobber on a fresh row.
+                ProfileStats::upsert_by_protocol_id_and_endpoint_id(
+                    patch.link.protocol_id,
+                    patch.link.endpoint_id,
+                )
+                .core_type(patch.link.core_type)
+                .config_type(patch.link.config_type)
+                .last_seen_at(patch.link.last_seen_at)
+                .latency(patch.link.latency.clone())
+                .speed_bps(patch.link.speed_bps)
+                .error(patch.link.error.clone())
+                .traffic(patch.link.traffic)
+                .on_create(|create| create.task_queue(Vec::<u16>::new()))
+                .exec(&mut tx)
+                .await?;
+                applied += 1;
+                continue;
             };
 
             if patch.groups.contains(LinkGroups::RESULT) {

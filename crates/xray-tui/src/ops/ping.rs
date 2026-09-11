@@ -554,6 +554,8 @@ impl BatchProbeRunner for EngineProbeRunner {
 struct BatchShared {
     sched: Arc<TaskScheduler>,
     db: Arc<Database>,
+    /// Gate persistence seam: staged transitions, never a commit per call.
+    writer: Arc<crate::ops::link_writer::LinkWriter>,
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -597,6 +599,8 @@ struct FastDedupInner {
 pub(crate) struct BatchParams {
     scheduler: Arc<TaskScheduler>,
     db: Arc<Database>,
+    /// Gate persistence seam (staged transitions).
+    writer: Arc<crate::ops::link_writer::LinkWriter>,
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -634,7 +638,8 @@ impl From<BatchParams> for BatchShared {
             .collect();
         Self {
             sched: p.scheduler,
-            db: p.db,
+            db: p.db.clone(),
+            writer: p.writer,
             tx: p.tx,
             runner: p.runner,
             stop: p.stop,
@@ -687,7 +692,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
         }
         match shared
             .sched
-            .schedule(&plan.link, TaskKind::FastPing, shared.db.as_ref())
+            .schedule(&plan.link, TaskKind::FastPing, shared.writer.as_ref())
             .await
         {
             ScheduleOutcome::Started(id) => {
@@ -744,7 +749,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
         }
         match shared
             .sched
-            .schedule(&plan.link, TaskKind::RealPing, shared.db.as_ref())
+            .schedule(&plan.link, TaskKind::RealPing, shared.writer.as_ref())
             .await
         {
             ScheduleOutcome::Started(id) => {
@@ -839,6 +844,18 @@ pub(crate) async fn run_batch(params: BatchParams) {
 /// whose stale markers this clears.
 async fn finish_batch(shared: &BatchShared) {
     shared.progress.0.store(0, Ordering::Relaxed);
+    // Make the batch durable before the sweeps look at the rows: the staged
+    // result/task writes land in one transaction here instead of one commit
+    // per result on the UI task.
+    if let Err(e) = shared.writer.flush().await {
+        tracing::warn!(target: "tui::ops::ping", "batch flush failed: {e}");
+    }
+    // Bound WAL growth: one checkpoint after the write burst, not per commit.
+    if let Ok(mut conn) = shared.db.connection().await {
+        let _ = toasty::sql::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .exec(&mut conn)
+            .await;
+    }
     crate::ops::profiles::clear_expired_errors(&shared.db, shared.error_ttl_hours).await;
     let _ = shared.tx.try_send(CoreEvent::BatchProgress {
         total: 0,
@@ -855,7 +872,7 @@ async fn retry_deferred_fast(shared: Arc<BatchShared>, plan: PlanLink) {
         }
         match shared
             .sched
-            .schedule(&plan.link, TaskKind::FastPing, shared.db.as_ref())
+            .schedule(&plan.link, TaskKind::FastPing, shared.writer.as_ref())
             .await
         {
             ScheduleOutcome::Started(id) => {
@@ -889,7 +906,7 @@ async fn retry_deferred_real(shared: Arc<BatchShared>, plan: PlanLink) {
         }
         match shared
             .sched
-            .schedule(&plan.link, TaskKind::RealPing, shared.db.as_ref())
+            .schedule(&plan.link, TaskKind::RealPing, shared.writer.as_ref())
             .await
         {
             ScheduleOutcome::Started(id) => {
@@ -935,14 +952,20 @@ async fn run_task_chain(
         if shared.stop.load(Ordering::Relaxed) {
             // Stop pressed at a dispatch boundary: retire this task silently —
             // no result event, no error marker.
-            shared.sched.complete(&link, kind, shared.db.as_ref()).await;
+            shared
+                .sched
+                .complete(&link, kind, shared.writer.as_ref())
+                .await;
             shared.note_settled(kind);
         } else {
             match kind {
                 TaskKind::FastPing => {
                     let outcome = shared.fast_probe(&link).await;
                     shared.emit_result(&link, TestType::TcpPing, &outcome);
-                    shared.sched.complete(&link, kind, shared.db.as_ref()).await;
+                    shared
+                        .sched
+                        .complete(&link, kind, shared.writer.as_ref())
+                        .await;
                     shared.note_settled(kind);
                 }
                 TaskKind::RealPing => {
@@ -956,7 +979,10 @@ async fn run_task_chain(
                             .insert(link.endpoint_id.get());
                     }
                     shared.emit_result(&link, TestType::RealPing, &outcome);
-                    shared.sched.complete(&link, kind, shared.db.as_ref()).await;
+                    shared
+                        .sched
+                        .complete(&link, kind, shared.writer.as_ref())
+                        .await;
                     shared.note_settled(kind);
                 }
                 _ => return, // SpeedTest/UdpTest tasks are not part of the batch
@@ -1121,11 +1147,11 @@ impl BatchShared {
     /// Never writes a result event, so no error marker is persisted.
     async fn retire_real(&self, fresh: &ProfileStats, id: u16) {
         self.sched
-            .cancel_queued(fresh, TaskKind::RealPing, self.db.as_ref())
+            .cancel_queued(fresh, TaskKind::RealPing, self.writer.as_ref())
             .await;
         if self.sched.kind_of(id) == Some(TaskKind::RealPing) {
             self.sched
-                .complete(fresh, TaskKind::RealPing, self.db.as_ref())
+                .complete(fresh, TaskKind::RealPing, self.writer.as_ref())
                 .await;
         }
         self.note_settled(TaskKind::RealPing);
@@ -1253,6 +1279,7 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
     let pool = get_or_create_pool(state);
     let runner: Arc<dyn BatchProbeRunner> = Arc::new(EngineProbeRunner::new(pool));
     let db = state.db.clone();
+    let writer = state.link_writer.clone();
     let scheduler = state.scheduler.clone();
     let stop = state.speed_test_stop.clone();
     let total = u16::try_from(plan.len()).unwrap_or(u16::MAX);
@@ -1273,6 +1300,7 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
     tokio::spawn(run_batch(BatchParams {
         scheduler,
         db,
+        writer,
         tx,
         runner,
         stop,
@@ -1419,6 +1447,7 @@ mod tests {
         BatchParams {
             scheduler: h.state.scheduler.clone(),
             db: h.state.db.clone(),
+            writer: h.state.link_writer.clone(),
             tx: h.tx.clone(),
             runner: h.runner.clone(),
             stop: h.state.speed_test_stop.clone(),

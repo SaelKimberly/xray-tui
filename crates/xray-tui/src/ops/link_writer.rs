@@ -18,6 +18,8 @@ use dashmap::DashMap;
 use xray_tui_db::models::{EndpointId, ProfileStats, ProtocolId};
 use xray_tui_db::{Database, LinkGroups, LinkPatch};
 
+use crate::ops::scheduler::SchedulerDb;
+
 /// One staged row identity: the link plus the column group it carries.
 type StageKey = ((ProtocolId, EndpointId), LinkGroups);
 
@@ -220,6 +222,32 @@ impl LinkWriter {
     pub fn spawn_flush_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let writer = Arc::clone(self);
         tokio::spawn(writer.run())
+    }
+}
+
+/// The scheduler gate's persistence seam while a batch is running: reads see
+/// staged transitions (read-through) and writes are staged, never committed on
+/// the caller's task.
+impl SchedulerDb for LinkWriter {
+    async fn read_link(
+        &self,
+        protocol_id: ProtocolId,
+        endpoint_id: EndpointId,
+    ) -> xray_tui_db::Result<Option<ProfileStats>> {
+        self.read((protocol_id, endpoint_id)).await
+    }
+
+    fn write_task_state(
+        &self,
+        link: &ProfileStats,
+        task_id: Option<u16>,
+        queue: &[u16],
+    ) -> impl std::future::Future<Output = xray_tui_db::Result<()>> + Send {
+        let mut row = link.clone();
+        row.task_id = task_id;
+        row.task_queue = queue.to_vec();
+        self.stage(&row, LinkGroups::TASK);
+        std::future::ready(Ok(()))
     }
 }
 

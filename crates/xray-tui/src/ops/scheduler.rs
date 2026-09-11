@@ -76,12 +76,14 @@ pub trait SchedulerDb {
         endpoint_id: EndpointId,
     ) -> impl std::future::Future<Output = xray_tui_db::Result<Option<ProfileStats>>> + Send;
 
-    /// Atomically replace a link's `task_id` + `task_queue` (OCC-guarded in
-    /// the real backend).
+    /// Replace a link's `task_id` + `task_queue` (OCC-guarded in the real
+    /// backend; staged in memory by the write-behind writer).
+    ///
+    /// Takes the caller's row — the gate has just re-read it, so a
+    /// non-database implementation needs no extra lookup.
     fn write_task_state(
         &self,
-        protocol_id: ProtocolId,
-        endpoint_id: EndpointId,
+        link: &ProfileStats,
         task_id: Option<u16>,
         queue: &[u16],
     ) -> impl std::future::Future<Output = xray_tui_db::Result<()>> + Send;
@@ -104,12 +106,11 @@ impl SchedulerDb for Database {
 
     async fn write_task_state(
         &self,
-        protocol_id: ProtocolId,
-        endpoint_id: EndpointId,
+        link: &ProfileStats,
         task_id: Option<u16>,
         queue: &[u16],
     ) -> xray_tui_db::Result<()> {
-        self.update_scheduler_state(protocol_id, endpoint_id, task_id, queue)
+        self.update_scheduler_state(link.protocol_id, link.endpoint_id, task_id, queue)
             .await
     }
 }
@@ -443,10 +444,7 @@ impl TaskScheduler {
         queue: &[u16],
         action: &str,
     ) {
-        if let Err(e) = db
-            .write_task_state(link.protocol_id, link.endpoint_id, task_id, queue)
-            .await
-        {
+        if let Err(e) = db.write_task_state(link, task_id, queue).await {
             error!(
                 target: "tui::scheduler",
                 "{action} on xray-tui://{:x}: persist failed: {e}",
@@ -590,13 +588,12 @@ mod tests {
 
         fn write_task_state(
             &self,
-            protocol_id: ProtocolId,
-            endpoint_id: EndpointId,
+            link: &ProfileStats,
             task_id: Option<u16>,
             queue: &[u16],
         ) -> impl Future<Output = xray_tui_db::Result<()>> + Send {
             self.state.lock().insert(
-                (protocol_id.get(), endpoint_id.get()),
+                (link.protocol_id.get(), link.endpoint_id.get()),
                 (task_id, queue.to_vec()),
             );
             std::future::ready(Ok(()))
@@ -1033,7 +1030,7 @@ mod tests {
         db.upsert_link(&l).await.unwrap();
 
         // SchedulerDb::write_task_state -> update_scheduler_state.
-        SchedulerDb::write_task_state(db.as_ref(), l.protocol_id, l.endpoint_id, Some(7), &[8, 9])
+        SchedulerDb::write_task_state(db.as_ref(), &l, Some(7), &[8, 9])
             .await
             .unwrap();
 
@@ -1045,7 +1042,7 @@ mod tests {
         assert_eq!(stored.task_queue, vec![8, 9]);
 
         // Full replace (Turso cannot pop scalars) — the queue is overwritten.
-        SchedulerDb::write_task_state(db.as_ref(), l.protocol_id, l.endpoint_id, Some(9), &[])
+        SchedulerDb::write_task_state(db.as_ref(), &l, Some(9), &[])
             .await
             .unwrap();
         let stored = SchedulerDb::read_link(db.as_ref(), l.protocol_id, l.endpoint_id)

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
+use xray_tui_db::LinkGroups;
 use xray_tui_db::models::{
     EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, ProfileStats, TrafficStats,
 };
@@ -252,8 +253,9 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 }
                 // protocol_id is a Protocol row id — match the row whose links
                 // own it (never the endpoint id). Patch the link's traffic
-                // in-memory and persist via `upsert_link` (the gRPC stats
-                // poller writes these).
+                // in-memory and stage the traffic group (the gRPC stats poller
+                // writes only these columns).
+                let stats_writer = Arc::clone(&state.link_writer);
                 if apply_stats_delta(
                     &mut state.endpoints,
                     protocol_id,
@@ -266,13 +268,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .links
                         .iter_mut()
                         .find(|l| l.protocol_id.get() == protocol_id)
-                    && let Err(e) = state.db.upsert_link(link).await
                 {
-                    state.log_trace(
-                        "error",
-                        "tui::ops::events",
-                        &format!("Failed to save stats: {e}"),
-                    );
+                    // Only the traffic group: the stats poller must never
+                    // rewrite latency/error from its snapshot.
+                    stats_writer.stage(link, LinkGroups::TRAFFIC);
                 }
                 state.current_traffic_up = total_up;
                 state.current_traffic_down = total_down;
@@ -432,6 +431,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         (r.endpoint.id.get(), r.endpoint.host_type == HostType::Dns)
                     });
                 let ip_info_clone = ip_info.clone();
+                let writer = Arc::clone(&state.link_writer);
 
                 let name = {
                     let row = state
@@ -459,13 +459,9 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                         kind: err_kind_for(test_type),
                                         text: error.clone().unwrap_or_default(),
                                     });
-                                    if let Err(e) = state.db.upsert_link(link).await {
-                                        state.log_trace(
-                                            "error",
-                                            "tui::ops::events",
-                                            &format!("Failed to save ping error: {e}"),
-                                        );
-                                    }
+                                    // Staged, not committed: the flush task
+                                    // batches it off the UI task.
+                                    writer.stage(link, LinkGroups::RESULT);
                                 } else if error.is_none() {
                                     // Success: record the measurement and clear
                                     // any previous failure marker.
@@ -490,13 +486,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                         }
                                     }
                                     link.error = None;
-                                    if let Err(e) = state.db.upsert_link(link).await {
-                                        state.log_trace(
-                                            "error",
-                                            "tui::ops::events",
-                                            &format!("Failed to save ping result: {e}"),
-                                        );
-                                    }
+                                    writer.stage(link, LinkGroups::RESULT);
                                 }
                             }
                             fmt_profile_id(protocol_id)
@@ -1307,7 +1297,9 @@ mod tests {
         assert_eq!(link.traffic.total_up, 1_008);
         assert_eq!(link.traffic.total_down, 2_014);
 
-        // The accumulated row was persisted (upsert_link) — re-read it.
+        // The accumulated row is STAGED, not committed on the UI task: flush
+        // the write-behind writer, then re-read.
+        state.link_writer.flush().await.expect("flush");
         let mut conn = state.db.connection().await.unwrap();
         let stored = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
             xray_tui_db::models::ProtocolId::new(7),

@@ -639,12 +639,19 @@ pub fn disconnect(state: &mut AppState) {
     // every processed tick, so the row is current as of the last tick.
     let flushed = crate::ops::events::drain_pending_stats_updates(state);
     if !flushed.is_empty() {
-        let db = state.db.clone();
+        // Stage, don't commit: the traffic group is written by the flush task
+        // (one transaction per window), and the UI task never waits on it.
+        for link in &flushed {
+            state
+                .link_writer
+                .stage(link, xray_tui_db::LinkGroups::TRAFFIC);
+        }
+        // `disconnect` is synchronous, so the flush is spawned (as the old
+        // per-row writes were) — but it is now one transaction, not N.
+        let writer = std::sync::Arc::clone(&state.link_writer);
         tokio::spawn(async move {
-            for link in flushed {
-                if let Err(e) = db.upsert_link(&link).await {
-                    tracing::warn!(target: "tui::ops::connect", "final stats flush failed: {e}");
-                }
+            if let Err(e) = writer.flush().await {
+                tracing::warn!(target: "tui::ops::connect", "final stats flush failed: {e}");
             }
         });
     }
