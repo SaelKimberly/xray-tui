@@ -111,6 +111,9 @@ Rules for this module (enforced by review, asserted by tests):
   `endpoint_groups.group_id`. All model hydration stays on the typed path
   (`load_page_rows` → `load_endpoint_rows`), so no `Value`-level decoding of
   JSON columns, timestamps, or embed structs exists anywhere.
+- The module is **read-only**: it never writes `profile_stats`. (A raw writer
+  that sets `error = 1` without `error_text` breaks every typed read, because
+  `ErrorInfo.text` is a non-`Option` `String` — found while probing.)
 - Every returned row is converted into a typed model at the boundary; no
   `Value` escapes the module.
 
@@ -282,10 +285,19 @@ fixed direction so paging stays total and deterministic.
 | `Traffic` | `<active total up + down> ASC, e.id ASC` |
 | `ConfigType` | `<active config_type rank> ASC, e.id ASC` |
 
-- `<dns_flag>` = `CASE WHEN e.host_type = 'dns' AND e.resolved_as = '[]' THEN 1
-  ELSE 0 END` — unresolved endpoints sort last, matching the decision-16 tier-5
-  band, and this matches the current comparator which folds the flag into every
-  link's key.
+- `<dns_flag>` is defined over the **persisted column**:
+  `CASE WHEN e.host_type = 'dns' AND e.resolved_as = '[]' THEN 1 ELSE 0 END`.
+  The runtime comparator today receives a *different* predicate:
+  `endpoint_dns_unresolved` (`crates/xray-tui/src/ops/profiles.rs:277`) reads
+  the in-memory `endpoint_info` map (`resolved_ips.is_empty()`). The two
+  disagree for as long as a resolution takes to reach the database — the
+  resolve write is spawned (`ops/events.rs:867`) while the map is updated
+  synchronously — so the divergence window opens on **every** successful
+  resolution, not only on a failed persist. The runtime predicate MUST be
+  re-expressed over the persisted column (same expression, one owner), and
+  `endpoint_info` stays the source of the resolved *IP list* only. The
+  in-memory DNS-flip re-sort in `poll_core_events` (which re-sorts the row with
+  `dns_unresolved = false`) is retired with it; a flip re-runs the page query.
 - **The `Test` sort's second, third, and fourth terms come from the
   representative link `r`, not from the display-preference `active` link.**
   Decision 16's endpoint key is `min` over links of
@@ -379,14 +391,22 @@ written when the implementation lands, not before.
 
 1. **Ordering golden** — for a seeded fixture covering every tier and tiebreak
    (real/fast success, `real`/`name`/`fast` errors, untested, DNS-unresolved,
-   equal weights with different `last_seen_at`), assert the SQL page order
-   equals the order produced by the existing `EndpointRow` comparator. Run it
-   for **every** `PageSort` column, ascending and descending. The fixture MUST
-   include the cases where the representative link and the display link
-   diverge: an endpoint whose minimum-weight link is an error (or untested)
-   while a sibling carries a measurement, and an endpoint with
-   `manual_protocol_override` set to a non-minimum link. This is the contract
-   that keeps the SQL expressions and the decision-16 law from drifting.
+   DNS-resolved, equal weights with different `last_seen_at`), assert the SQL
+   page order equals the order produced by the existing `EndpointRow`
+   comparator. Run it for **every** `PageSort` column, ascending and
+   descending. The fixture MUST include the cases where the representative link
+   and the display link diverge: an endpoint whose minimum-weight link is an
+   error or untested row while a sibling carries a measurement, and an endpoint
+   with `manual_protocol_override` set to a non-minimum link. It MUST also seed
+   an `endpoint_info` entry so the in-memory branch of the DNS predicate is
+   exercised rather than assumed equal.
+   **Expectations are computed from the oracle (`best_test_priority_key`), never
+   written by hand** — a hand-written array can be tuned to whatever the SQL
+   returns, which is exactly the drift this test exists to catch. This contract
+   was pre-validated by a throwaway probe on 2026-09-11: oracle and SQL both
+   produced `[7, 2, 1, 4, 5, 3, 6]` for the fixture above (DNS-resolved real 7,
+   real 10, real 30, real 90 with a diverging override, two untested endpoints
+   by `last_seen_at` descending, DNS-unresolved last).
 2. **Filter equivalence** — same fixture: SQL `page`/`count` results equal the
    current in-memory filter for each view, search term, and group.
 3. **Drift guard** — every statement in the module executes against a pushed
@@ -413,6 +433,8 @@ written when the implementation lands, not before.
 | Planner change alters the query plan | The page query is a bounded scan plus a link-group sort and an endpoint sort; a regression shows up as page latency, timed in §11.5; no criterion target is added by this spec |
 | Per-page cost grows with total links, not page size | Accepted and measured: 8.3–9.3 ms across offsets 0 → 7,472 (7,672 endpoints / 9,048 links), 14.3 ms with the tiebreak term. The win delivered is memory and per-frame work, not an asymptotic scan. Named escalation if that stops being acceptable: add an `endpoints.weight` column with an index on `(weight, id)`, maintained by SQL triggers over `profile_stats` — raw DDL plus a column the typed model does not know, added idempotently in `open()`. That reintroduces a second owner of the ordering law (now in triggers) and is explicitly deferred. Any index added later must be created with `CREATE INDEX IF NOT EXISTS` in `open()` on every open — `push_schema` is skipped whenever the `user_version` tag matches, so a one-shot DDL would never run against existing files |
 | The endpoint-grouped page keeps a sorter | Accepted: the GROUP BY sorter runs over links, the ORDER BY sorter over the grouped endpoint set |
+| Two DNS-unresolved predicates diverge (map vs persisted column) | Removed by unification: the runtime predicate is re-expressed over `resolved_as`, and the SQL flag uses the same expression (§7.5) |
+| The module never writes | It is read-only over `profile_stats`; a raw writer that sets `error = 1` without `error_text` breaks every typed read, because `ErrorInfo.text` is a non-`Option` `String` (found while probing) |
 | `resolved_as` is a JSON text column | The DNS flag predicate compares it to `'[]'`, which is how the typed `Vec<String>` renders when empty (verified against the live database); the drift test covers it |
 
 ## Appendix A — Aegis working drafts
