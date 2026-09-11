@@ -22,6 +22,38 @@ pub struct Database {
     db: toasty::Db,
 }
 
+/// Which mutable column groups a [`LinkPatch`] writes.
+///
+/// The groups exist so the two independent writers of a `profile_stats` row —
+/// ping results and the scheduler gate — cannot clobber each other's columns
+/// when their patches coalesce in the same flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkGroups(u8);
+
+impl LinkGroups {
+    /// `latency` + `speed_bps` + `error` (ping results, error TTL sweeps).
+    pub const RESULT: Self = Self(0b01);
+    /// `task_id` + `task_queue` (the scheduler gate).
+    pub const TASK: Self = Self(0b10);
+    /// Both groups.
+    pub const ALL: Self = Self(0b11);
+
+    /// OR of two groups.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// One row's pending write: the mutable state plus the groups that changed.
+#[derive(Debug, Clone)]
+pub struct LinkPatch {
+    /// Row identity and the new values of the patched groups.
+    pub link: ProfileStats,
+    /// Groups to write; unset groups keep their persisted values.
+    pub groups: LinkGroups,
+}
+
 // ── Constructors ────────────────────────────────────────────────────────
 
 impl Database {
@@ -661,6 +693,84 @@ impl Database {
             .exec(&mut conn)
             .await?;
         Ok(())
+    }
+
+    /// Apply one narrow `UPDATE` per row inside a single transaction.
+    ///
+    /// Each patch carries only the column *groups* that changed (see
+    /// [`LinkGroups`]): a result patch never rewrites scheduler state and vice
+    /// versa, so the two writers cannot clobber each other's columns. One
+    /// transaction per batch replaces one commit per row — the write-behind
+    /// link writer calls this from its flush task, never from the UI task.
+    ///
+    /// The optimistic `version` is honoured when the caller's snapshot is
+    /// current; a stale snapshot costs one re-read of that row instead of
+    /// failing the batch. A row deleted mid-batch is skipped.
+    pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize> {
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn().await?;
+        let mut tx = conn.transaction().await?;
+        let mut applied = 0usize;
+        for patch in patches {
+            let mut model = patch.link.clone();
+            loop {
+                let mut target = model.clone();
+                let result = match patch.groups {
+                    g if g == LinkGroups::RESULT => {
+                        toasty::update!(target {
+                            latency: patch.link.latency.clone(),
+                            speed_bps: patch.link.speed_bps,
+                            error: patch.link.error.clone(),
+                        })
+                        .exec(&mut tx)
+                        .await
+                    }
+                    g if g == LinkGroups::TASK => {
+                        toasty::update!(target {
+                            task_id: patch.link.task_id,
+                            task_queue: patch.link.task_queue.clone(),
+                        })
+                        .exec(&mut tx)
+                        .await
+                    }
+                    _ => {
+                        toasty::update!(target {
+                            latency: patch.link.latency.clone(),
+                            speed_bps: patch.link.speed_bps,
+                            error: patch.link.error.clone(),
+                            task_id: patch.link.task_id,
+                            task_queue: patch.link.task_queue.clone(),
+                        })
+                        .exec(&mut tx)
+                        .await
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        applied += 1;
+                        break;
+                    }
+                    Err(err) if err.is_condition_failed() => {
+                        let Some(fresh) = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+                            patch.link.protocol_id,
+                            patch.link.endpoint_id,
+                        )
+                        .first()
+                        .exec(&mut tx)
+                        .await?
+                        else {
+                            break; // row deleted mid-batch
+                        };
+                        model = fresh;
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(applied)
     }
 
     /// Insert or update one endpoint↔group link by its composite key

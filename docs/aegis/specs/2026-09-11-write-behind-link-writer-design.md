@@ -95,10 +95,25 @@ impl LinkWriter {
 `Database` gains one narrow batch primitive:
 
 ```rust
+/// Which mutable column groups a patch writes.
+pub struct LinkGroups;              // RESULT (latency, speed_bps, error)
+                                    // TASK   (task_id, task_queue)
+                                    // ALL
+
+/// One row's pending write: the row snapshot plus the groups that changed.
+pub struct LinkPatch { pub link: ProfileStats, pub groups: LinkGroups }
+
 /// One `UPDATE` per row inside a single transaction, covering only the
-/// mutable columns (latency*, speed_bps, error*, task_id, task_queue).
-pub async fn apply_link_patches(&self, patches: &[ProfileStats]) -> Result<usize>;
+/// patched column groups.
+pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize>;
 ```
+
+The groups are load-bearing, not cosmetic: the first implementation wrote the
+whole mutable column set, and the `apply_link_patches_survives_a_stale_snapshot`
+test caught a result patch wiping a concurrent scheduler write
+(`task_queue` → `[]`). A result patch must never touch scheduler columns and
+vice versa, so the two writers of one row cannot clobber each other when their
+patches coalesce into the same flush.
 
 `upsert_link` stays for the subscription/import path (whole-row semantic);
 the batch path no longer uses it.
@@ -156,8 +171,8 @@ never written twice.
 
 | Site | Today | After |
 | --- | --- | --- |
-| `SpeedTestResult` handler | `db.upsert_link(link).await` in the UI task | mutate the in-memory link, `writer.stage(link)` |
-| `TaskScheduler::schedule` / `complete` | `read_link` + `update_scheduler_state` (2 commits) | read through the writer; `writer.stage(row)` |
+| `SpeedTestResult` handler | `db.upsert_link(link).await` in the UI task | mutate the in-memory link, `writer.stage(link, LinkGroups::RESULT)` |
+| `TaskScheduler::schedule` / `complete` | `read_link` + `update_scheduler_state` (2 commits) | read through the writer; `writer.stage(row, LinkGroups::TASK)` |
 | `SchedulerDb` impl | database reads/writes | `LinkWriter::read` + `stage` |
 | Batch end (`ops/ping.rs`) | — | `writer.flush()` + checkpoint |
 | `clear_expired_errors` | bulk UPDATE | unchanged (rare, runs on reload) |

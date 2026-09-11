@@ -8,12 +8,12 @@
 
 use jiff::Timestamp;
 use toasty::{Deferred, Json};
-use xray_tui_db::Database;
 use xray_tui_db::models::{
     ConfigType, DnsSetting, Endpoint, EndpointGroup, EndpointId, ErrorInfo, Group, HostType,
     Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, RoutingRule, Security, TrafficStats,
     Transport,
 };
+use xray_tui_db::{Database, LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
     CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
@@ -1520,4 +1520,164 @@ async fn pooled_connections_use_synchronous_normal() {
         _ => None,
     });
     assert_eq!(level, Some(1), "NORMAL (1) expected, got {level:?}");
+}
+
+// ── Write-behind batch patching ─────────────────────────────────────────
+
+/// `apply_link_patches` writes the patched column groups for every row in one
+/// transaction — the batch primitive the write-behind link writer flushes.
+#[tokio::test]
+async fn apply_link_patches_writes_patched_groups_for_every_row() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("conn");
+    seed_endpoint(&mut conn, 1, 101, "a.example", HostType::Ipv4, 443, 100).await;
+    seed_link(&mut conn, 1, 102, 100).await;
+
+    let mut result_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(101),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("load")
+    .expect("row");
+    result_row.latency = Some(Latency::Real {
+        delay: 42,
+        ip: Some("203.0.113.5".to_string()),
+    });
+    result_row.speed_bps = Some(9_000_000);
+    result_row.error = Some(ErrorInfo {
+        kind: ProfileErr::Fast,
+        text: "boom".to_string(),
+    });
+
+    let mut task_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(102),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("load")
+    .expect("row");
+    task_row.task_id = Some(7);
+    task_row.task_queue = vec![7, 9];
+
+    let applied = db
+        .apply_link_patches(&[
+            LinkPatch {
+                link: result_row,
+                groups: LinkGroups::RESULT,
+            },
+            LinkPatch {
+                link: task_row,
+                groups: LinkGroups::TASK,
+            },
+        ])
+        .await
+        .expect("apply");
+    assert_eq!(applied, 2);
+
+    let result_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(101),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(
+        result_row.latency,
+        Some(Latency::Real {
+            delay: 42,
+            ip: Some("203.0.113.5".to_string())
+        })
+    );
+    assert_eq!(result_row.speed_bps, Some(9_000_000));
+    assert_eq!(
+        result_row.error.as_ref().map(|e| e.kind),
+        Some(ProfileErr::Fast)
+    );
+    assert_eq!(
+        result_row.task_id, None,
+        "result group leaves scheduler state alone"
+    );
+
+    let task_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(102),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(task_row.task_id, Some(7));
+    assert_eq!(task_row.task_queue, vec![7, 9]);
+    assert_eq!(
+        task_row.core_type,
+        CoreType::Xray,
+        "untouched columns keep their values"
+    );
+}
+
+#[tokio::test]
+async fn apply_link_patches_empty_is_a_noop() {
+    let db = test_db().await;
+    assert_eq!(db.apply_link_patches(&[]).await.expect("apply"), 0);
+}
+
+/// A result patch taken before another writer bumped the row must land, and
+/// must not clobber the scheduler columns that writer changed.
+#[tokio::test]
+async fn apply_link_patches_survives_a_stale_snapshot_without_clobbering() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("conn");
+    seed_endpoint(&mut conn, 2, 201, "b.example", HostType::Ipv4, 443, 100).await;
+
+    let mut stale = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(201),
+        EndpointId::new(2),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("load")
+    .expect("row");
+
+    // Another writer moves the scheduler state (bumps `version`).
+    db.update_scheduler_state(ProtocolId::new(201), EndpointId::new(2), Some(3), &[3])
+        .await
+        .expect("scheduler write");
+
+    stale.latency = Some(Latency::Fast { delay: 55 });
+    stale.task_queue = Vec::new(); // the stale snapshot's view of the queue
+    assert_eq!(
+        db.apply_link_patches(&[LinkPatch {
+            link: stale,
+            groups: LinkGroups::RESULT
+        }])
+        .await
+        .expect("apply"),
+        1
+    );
+
+    let row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(201),
+        EndpointId::new(2),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(row.latency, Some(Latency::Fast { delay: 55 }));
+    assert_eq!(
+        row.task_queue,
+        vec![3],
+        "the concurrent scheduler write survives"
+    );
+    assert_eq!(row.task_id, Some(3));
 }

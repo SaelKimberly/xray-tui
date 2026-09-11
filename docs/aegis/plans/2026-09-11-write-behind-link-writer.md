@@ -161,7 +161,9 @@ async fn apply_link_patches_empty_is_a_noop() { /* returns Ok(0) */ }
 //! the durable mirror (see docs/aegis/specs/2026-09-11-write-behind-link-writer-design.md).
 
 pub struct LinkWriter {
-    pending: DashMap<(ProtocolId, EndpointId), ProfileStats>,
+    /// One staged snapshot per (link, column group): the result group and the
+    /// task group are staged independently and never overwrite each other.
+    pending: DashMap<((ProtocolId, EndpointId), LinkGroups), ProfileStats>,
     flush_rows: usize,
     flush_interval: Duration,
     db: Arc<Database>,
@@ -173,7 +175,7 @@ pub struct LinkWriter {
 impl LinkWriter {
     pub fn new(db: Arc<Database>, flush_rows: usize, flush_interval: Duration) -> Arc<Self>;
     pub fn spawn_flush_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()>;
-    pub fn stage(&self, link: &ProfileStats);                        // sync, never awaits
+    pub fn stage(&self, link: &ProfileStats, groups: LinkGroups);     // sync, never awaits
     pub async fn read(&self, key: (ProtocolId, EndpointId)) -> Result<Option<ProfileStats>>;
     pub async fn flush(&self) -> Result<usize>;                      // drain + one transaction
     pub fn staged_len(&self) -> usize;
@@ -181,12 +183,15 @@ impl LinkWriter {
 }
 ```
 
-2. `stage` inserts/overwrites `pending[key]` with the row's mutable fields and
-   notifies the flush task when `pending.len() >= flush_rows`.
+2. `stage` inserts/overwrites `pending[(key, groups)]` with the row snapshot
+   and notifies the flush task when `pending.len() >= flush_rows`. Staging both
+   groups for one link keeps the result and task snapshots separate, so the
+   flush can patch each group with its own OCC version.
 3. `read` returns `pending[key]` when present (read-through), else the typed
    PK read.
-4. `flush` takes the mutex, drains `pending` into a `Vec`, calls
-   `db.apply_link_patches(&rows)`, and returns the count. On error, the drained
+4. `flush` takes the mutex, drains `pending` into a `Vec<LinkPatch>` (one per
+   staged group), calls `db.apply_link_patches(&patches)`, and returns the
+   count. On error, the drained
    rows are merged back so a failed flush retries.
 5. The flush task loops on `tokio::select! { _ = wake.notified() => {}, _ =
    sleep(flush_interval) => {} }` while `staged_len() > 0`.
