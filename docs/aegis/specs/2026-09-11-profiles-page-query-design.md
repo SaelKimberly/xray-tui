@@ -201,18 +201,41 @@ resolution never rewrites link rows.
 ### 7.2 Page query shape
 
 ```sql
-SELECT e.id
-FROM endpoints e JOIN profile_stats ps ON ps.endpoint_id = e.id
-WHERE <view / search / group predicates>
-GROUP BY e.id
+SELECT r.endpoint_id
+FROM (
+    SELECT ps.endpoint_id, ps.protocol_id, ps.last_seen_at,
+           <dns_flag over e2>                    AS dns_flag,
+           <eff_weight over e2, ps>              AS eff_weight,
+           ROW_NUMBER() OVER (
+               PARTITION BY ps.endpoint_id
+               ORDER BY <eff_weight> ASC, ps.last_seen_at DESC, ps.protocol_id ASC
+           ) AS rn
+    FROM profile_stats ps JOIN endpoints e2 ON e2.id = ps.endpoint_id
+) r
+WHERE r.rn = 1
+  AND <view / search / group predicates, as EXISTS subqueries>
 ORDER BY <sort terms>        -- see 7.5
 LIMIT ?limit OFFSET ?offset
 ```
 
-Verified through the driver on 2026-09-11: `GROUP BY`, `MIN`, the `CASE`
-ordering expression, `LIMIT`/`OFFSET`, and the correlated tiebreak subquery all
-execute with bound parameters. The count query is the same `FROM`/`WHERE`
-without `GROUP BY`/`ORDER BY`/`LIMIT`, wrapped in `COUNT(*)`.
+`endpoints` is joined *inside* the window subquery (as `e2`), because the DNS
+term and `eff_weight` read endpoint columns; a links-only subquery cannot see
+them (the first probe attempt failed with `no such table: e`). The outer query
+therefore filters through the self-contained `EXISTS` predicates of §7.3, and
+the `rn = 1` row carries the representative-link tuple the `Test` sort orders by
+— no per-row correlated subquery and no aggregate are needed for that sort.
+
+Executed as a whole on 2026-09-11 against the real schema with bound
+parameters, over a fixture that includes both divergence cases (an endpoint
+whose manual override points away from its minimum-weight link, and one whose
+measured link carries an error marker next to an untested sibling): the page
+came back in representative-link order `[2, 1, 4, 5, 3, 6]` — real 10, real 30,
+real 90, then the two untested endpoints by `last_seen_at` descending, then the
+DNS-unresolved endpoint last. `GROUP BY`, `MIN`, the `CASE` ordering
+expression, `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)`,
+`LIMIT`/`OFFSET`, and correlated subqueries were each verified separately
+through the same driver. The count query is the same `FROM`/`WHERE` without
+`ORDER BY`/`LIMIT`, wrapped in `COUNT(*)`.
 
 Paging is by offset, not by cursor. A keyset cursor would only pay off if the
 planner could reach the ordered rows through an index; with the ordering
@@ -251,7 +274,7 @@ fixed direction so paging stays total and deterministic.
 
 | `PageSort` | ORDER BY terms (ascending case) |
 | --- | --- |
-| `Test` | `<dns_flag> ASC, MIN(<weight>) ASC, <active last_seen> DESC, <active protocol_id> ASC, e.id ASC` |
+| `Test` | `<dns_flag> ASC, r.eff_weight ASC, r.last_seen_at DESC, r.protocol_id ASC, e.id ASC` — `r` is the *representative* link (below) |
 | `Address` | `e.host ASC, e.id ASC` |
 | `Port` | `e.port ASC, e.id ASC` |
 | `LastSeen` | `<active last_seen_at> ASC, e.id ASC` |
@@ -263,16 +286,32 @@ fixed direction so paging stays total and deterministic.
   ELSE 0 END` — unresolved endpoints sort last, matching the decision-16 tier-5
   band, and this matches the current comparator which folds the flag into every
   link's key.
-- `<active …>` selects the display-preference link: the manual override if set,
-  else the best measured link (real before fast, lowest delay). It is computed
-  with a correlated subquery ordered by
-  `(CASE WHEN error = 1 THEN 1 ELSE 0 END), COALESCE(latency_delay, 999999),
-  last_seen_at DESC` and `LIMIT 1`; the corresponding value is projected in the
-  same subquery for the ordering term.
+- **The `Test` sort's second, third, and fourth terms come from the
+  representative link `r`, not from the display-preference `active` link.**
+  Decision 16's endpoint key is `min` over links of
+  `(tier, latency, -last_seen_at, protocol_id)` — the link attaining that
+  minimum, which is a different link from `active_link()` whenever the
+  minimum-weight link is an error or untested row while a sibling carries a
+  measurement, and whenever `manual_protocol_override` is set. `r` is selected
+  by
+  `ORDER BY <dns_flag> ASC, eff_weight ASC, last_seen_at DESC, protocol_id ASC
+  LIMIT 1`, where `eff_weight = CASE WHEN <dns_flag> THEN 0 ELSE <weight> END`
+  (a constant inside the DNS band, so unresolved endpoints order among
+  themselves by newest `last_seen_at` then `protocol_id`, exactly as
+  `link_test_key` does with `tier = 5, latency = i32::MAX`). It is realised
+  either as
+  `ROW_NUMBER() OVER (PARTITION BY ps.endpoint_id ORDER BY …) = 1` over a
+  derived table or as a correlated subquery per key column; both were verified
+  through the driver.
+- `<active …>` (all non-`Test` rows) selects the **display** link: the manual
+  override if set, else the best measured link (real before fast, lowest
+  delay), ordered by `(CASE WHEN error = 1 THEN 1 ELSE 0 END),
+  COALESCE(latency_delay, 999999), last_seen_at DESC` with `LIMIT 1`. This is
+  the same link the single-row display reads, so those sorts keep their current
+  meaning.
 - Nullable columns are wrapped in `COALESCE` with a sentinel so ordering and
   paging never depend on NULL placement.
-- `Test`'s third and fourth terms mirror the Rust comparator's `-last_seen_at`
-  then `protocol_id` tiebreak; `e.id` is appended as the unique final term.
+- `e.id` is appended as the unique final term to every sort.
 - `SortColumn::Core` has no entry: it is removed from the cycle (§4).
 
 Sort semantics for non-`Test` columns ignore the DNS flag, exactly like the
@@ -342,9 +381,12 @@ written when the implementation lands, not before.
    (real/fast success, `real`/`name`/`fast` errors, untested, DNS-unresolved,
    equal weights with different `last_seen_at`), assert the SQL page order
    equals the order produced by the existing `EndpointRow` comparator. Run it
-   for **every** `PageSort` column, ascending and descending. This is the
-   contract that keeps the SQL expressions and the decision-16 law from
-   drifting.
+   for **every** `PageSort` column, ascending and descending. The fixture MUST
+   include the cases where the representative link and the display link
+   diverge: an endpoint whose minimum-weight link is an error (or untested)
+   while a sibling carries a measurement, and an endpoint with
+   `manual_protocol_override` set to a non-minimum link. This is the contract
+   that keeps the SQL expressions and the decision-16 law from drifting.
 2. **Filter equivalence** — same fixture: SQL `page`/`count` results equal the
    current in-memory filter for each view, search term, and group.
 3. **Drift guard** — every statement in the module executes against a pushed
