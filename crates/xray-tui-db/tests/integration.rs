@@ -1631,6 +1631,132 @@ async fn apply_link_patches_empty_is_a_noop() {
 
 /// A result patch taken before another writer bumped the row must land, and
 /// must not clobber the scheduler columns that writer changed.
+/// Every group is isolated: a patch writes its own group and leaves the others
+/// exactly as persisted, even when the caller's snapshot is stale for them.
+#[tokio::test]
+async fn apply_link_patches_isolates_column_groups() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("conn");
+    seed_endpoint(&mut conn, 3, 301, "c.example", HostType::Ipv4, 443, 100).await;
+
+    let mut row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(301),
+        EndpointId::new(3),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("load")
+    .expect("row");
+    // Known values in every group.
+    row.latency = Some(Latency::Real { delay: 7, ip: None });
+    row.speed_bps = Some(1_000);
+    row.error = Some(ErrorInfo {
+        kind: ProfileErr::Real,
+        text: "old".to_string(),
+    });
+    row.task_id = Some(5);
+    row.task_queue = vec![5, 6];
+    row.traffic = TrafficStats {
+        today_up: 1,
+        today_down: 2,
+        total_up: 3,
+        total_down: 4,
+    };
+    db.apply_link_patches(&[LinkPatch {
+        link: row.clone(),
+        groups: LinkGroups::ALL,
+    }])
+    .await
+    .expect("seed");
+
+    // A stale snapshot: every group differs from what is persisted.
+    let mut stale = row.clone();
+    stale.latency = Some(Latency::Fast { delay: 99 });
+    stale.error = None;
+    stale.task_id = None;
+    stale.task_queue = Vec::new();
+    stale.traffic = TrafficStats {
+        today_up: 0,
+        today_down: 0,
+        total_up: 0,
+        total_down: 0,
+    };
+
+    // TRAFFIC-only patch: results and task state must survive untouched.
+    let mut traffic = stale.clone();
+    traffic.traffic = TrafficStats {
+        today_up: 10,
+        today_down: 20,
+        total_up: 30,
+        total_down: 40,
+    };
+    db.apply_link_patches(&[LinkPatch {
+        link: traffic,
+        groups: LinkGroups::TRAFFIC,
+    }])
+    .await
+    .expect("traffic patch");
+
+    let after = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(301),
+        EndpointId::new(3),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(
+        after.traffic,
+        TrafficStats {
+            today_up: 10,
+            today_down: 20,
+            total_up: 30,
+            total_down: 40
+        }
+    );
+    assert_eq!(
+        after.latency,
+        Some(Latency::Real { delay: 7, ip: None }),
+        "stale result snapshot ignored"
+    );
+    assert_eq!(after.error.as_ref().map(|e| e.kind), Some(ProfileErr::Real));
+    assert_eq!(after.task_id, Some(5), "stale task snapshot ignored");
+    assert_eq!(after.task_queue, vec![5, 6]);
+
+    // RESULT-only patch: traffic and task state must survive untouched.
+    db.apply_link_patches(&[LinkPatch {
+        link: stale,
+        groups: LinkGroups::RESULT,
+    }])
+    .await
+    .expect("result patch");
+    let after = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(301),
+        EndpointId::new(3),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(after.latency, Some(Latency::Fast { delay: 99 }));
+    assert_eq!(after.error, None);
+    assert_eq!(
+        after.traffic,
+        TrafficStats {
+            today_up: 10,
+            today_down: 20,
+            total_up: 30,
+            total_down: 40
+        },
+        "traffic survives a result patch"
+    );
+    assert_eq!(after.task_id, Some(5));
+    assert_eq!(after.task_queue, vec![5, 6]);
+}
+
 #[tokio::test]
 async fn apply_link_patches_survives_a_stale_snapshot_without_clobbering() {
     let db = test_db().await;

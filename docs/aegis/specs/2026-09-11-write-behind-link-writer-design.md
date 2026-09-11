@@ -96,17 +96,41 @@ impl LinkWriter {
 
 ```rust
 /// Which mutable column groups a patch writes.
-pub struct LinkGroups;              // RESULT (latency, speed_bps, error)
-                                    // TASK   (task_id, task_queue)
-                                    // ALL
+pub struct LinkGroups;              // bitflags: RESULT | TASK | TRAFFIC
 
 /// One row's pending write: the row snapshot plus the groups that changed.
 pub struct LinkPatch { pub link: ProfileStats, pub groups: LinkGroups }
 
-/// One `UPDATE` per row inside a single transaction, covering only the
-/// patched column groups.
+/// One row per iteration inside a single transaction: read the row fresh,
+/// overlay ONLY the patched groups from the caller's snapshot, write it back.
 pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize>;
 ```
+
+The fresh read is not an optimisation detail — it is what makes the
+non-patched groups safe. A caller's snapshot is authoritative for its own
+group and stale for every other, so overlaying onto the current row means a
+result patch can never write traffic or scheduler state, and no version
+bookkeeping is needed (the loaded model is always current).
+
+**All writers of `profile_stats`, and the group each one owns**:
+
+| Group | Columns | Writers |
+| --- | --- | --- |
+| `RESULT` | `latency`, `latency_delay`, `latency_ip`, `speed_bps`, `error`, `error_kind`, `error_text` | ping/real-ping results (via `LinkWriter`), `clear_expired_errors` (error columns only) |
+| `TASK` | `task_id`, `task_queue` | the scheduler gate (via `LinkWriter`) |
+| `TRAFFIC` | `traffic_today_up/down`, `traffic_total_up/down` | `CoreEvent::StatsUpdate` (`ops/events.rs:269`) and `drain_pending_stats_updates` (`ops/connect.rs:645`) — routed through `LinkWriter` |
+| `ACTIVITY` | `last_used_at`, `last_seen_at` | `Database::update_last_used` (`ops/connect.rs:193`) — narrow typed write, moved off `upsert_link` |
+| `SOURCE` | `core_type`, `config_type`, `last_seen_at`, insert | subscription/import (`upsert_links_bulk`) — restricted to these columns so an import refresh can no longer overwrite test results |
+
+No writer may write a group it does not own. `Settings`/`clear_expired_errors`
+is the one bulk UPDATE left outside the writer: it touches error columns only,
+runs on reload and batch finish, and the batch-finish flush (§4.3) runs before
+it, so it cannot clear a marker the same batch just wrote.
+
+The three writers that today use whole-row `upsert_link` for non-source state —
+the result handler, the stats poller, and the connect-time stats flush — all
+move to `LinkWriter`; `upsert_link`'s remaining callers are limited to the
+`SOURCE` group.
 
 The groups are load-bearing, not cosmetic: the first implementation wrote the
 whole mutable column set, and the `apply_link_patches_survives_a_stale_snapshot`
@@ -156,8 +180,14 @@ A single background task owns flushing (one writer, so no OCC contention):
 
 - flush when `pending.len() >= flush_rows` (512) or every `flush_interval`
   (200 ms) while non-empty;
-- `stage` never awaits; if a flush is in flight, staging keeps filling the map
-  (the flush drains a snapshot and re-checks);
+- `stage` never awaits; if a flush is in flight, staging keeps filling the map.
+  The drain is a **remove**, not a snapshot copy: each drained entry is owned by
+  the flush, and a `stage` landing for the same `(link, group)` during the write
+  inserts a *new* entry that the next window picks up. A snapshot-copy drain
+  followed by an unconditional key removal would silently drop that newer state
+  — that is the race this rule closes;
+- a failed flush merges the drained entries back with `or_insert` semantics, so
+  a newer staged entry always wins over the failed snapshot;
 - batch end calls `flush()` explicitly, so a finished batch is fully durable;
 - on `Database` close/quit, `flush()` runs once;
 - after a batch's final flush, one `PRAGMA wal_checkpoint(TRUNCATE)` bounds WAL
@@ -221,6 +251,14 @@ awaits a flush.
    a `complete` with a mismatched id → stale no-op.
 2. **Flush batching** — stage 1000 mutations; assert one transaction and 1000
    narrow updates, and that a fresh read sees them only after `flush()`.
+2b. **Stage during an in-flight flush** — hold the flush mid-write (a test
+   writer that blocks), stage a newer value for the same `(link, group)`,
+   release: the newer value must survive and be written by the next window
+   (the remove-at-drain rule of §4.3).
+2c. **Group isolation** — a `RESULT` patch must leave `TASK` and `TRAFFIC`
+   columns untouched, and a `TRAFFIC` patch must leave `RESULT` untouched;
+   seeded via `apply_link_patches` on a row whose other groups hold known
+   values.
 3. **Final-state equality** — after `flush()`, every staged row equals the
    persisted row (all mutable columns).
 4. **No UI-task commit** — a poll pass that drains `EVENT_DRAIN_BUDGET` result

@@ -32,11 +32,19 @@ pub struct LinkGroups(u8);
 
 impl LinkGroups {
     /// `latency` + `speed_bps` + `error` (ping results, error TTL sweeps).
-    pub const RESULT: Self = Self(0b01);
+    pub const RESULT: Self = Self(0b001);
     /// `task_id` + `task_queue` (the scheduler gate).
-    pub const TASK: Self = Self(0b10);
-    /// Both groups.
-    pub const ALL: Self = Self(0b11);
+    pub const TASK: Self = Self(0b010);
+    /// `traffic_*` (the gRPC stats poller).
+    pub const TRAFFIC: Self = Self(0b100);
+    /// Every group.
+    pub const ALL: Self = Self(0b111);
+
+    /// Whether `other`'s groups are all present in `self`.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 
     /// OR of two groups.
     #[must_use]
@@ -695,17 +703,17 @@ impl Database {
         Ok(())
     }
 
-    /// Apply one narrow `UPDATE` per row inside a single transaction.
+    /// Apply one patch per row inside a single transaction.
     ///
     /// Each patch carries only the column *groups* that changed (see
-    /// [`LinkGroups`]): a result patch never rewrites scheduler state and vice
-    /// versa, so the two writers cannot clobber each other's columns. One
-    /// transaction per batch replaces one commit per row — the write-behind
-    /// link writer calls this from its flush task, never from the UI task.
+    /// [`LinkGroups`]). The row is read fresh inside the transaction and only
+    /// the patched groups are overlaid from the caller's snapshot, so a result
+    /// patch can never write traffic or scheduler state and vice versa: the
+    /// groups make the writers disjoint instead of merely sequential.
     ///
-    /// The optimistic `version` is honoured when the caller's snapshot is
-    /// current; a stale snapshot costs one re-read of that row instead of
-    /// failing the batch. A row deleted mid-batch is skipped.
+    /// One transaction per batch replaces one commit per row — the write-behind
+    /// link writer calls this from its flush task, never from the UI task.
+    /// A row deleted mid-batch is skipped.
     pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize> {
         if patches.is_empty() {
             return Ok(0);
@@ -714,60 +722,44 @@ impl Database {
         let mut tx = conn.transaction().await?;
         let mut applied = 0usize;
         for patch in patches {
-            let mut model = patch.link.clone();
-            loop {
-                let mut target = model.clone();
-                let result = match patch.groups {
-                    g if g == LinkGroups::RESULT => {
-                        toasty::update!(target {
-                            latency: patch.link.latency.clone(),
-                            speed_bps: patch.link.speed_bps,
-                            error: patch.link.error.clone(),
-                        })
-                        .exec(&mut tx)
-                        .await
-                    }
-                    g if g == LinkGroups::TASK => {
-                        toasty::update!(target {
-                            task_id: patch.link.task_id,
-                            task_queue: patch.link.task_queue.clone(),
-                        })
-                        .exec(&mut tx)
-                        .await
-                    }
-                    _ => {
-                        toasty::update!(target {
-                            latency: patch.link.latency.clone(),
-                            speed_bps: patch.link.speed_bps,
-                            error: patch.link.error.clone(),
-                            task_id: patch.link.task_id,
-                            task_queue: patch.link.task_queue.clone(),
-                        })
-                        .exec(&mut tx)
-                        .await
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        applied += 1;
-                        break;
-                    }
-                    Err(err) if err.is_condition_failed() => {
-                        let Some(fresh) = ProfileStats::filter_by_protocol_id_and_endpoint_id(
-                            patch.link.protocol_id,
-                            patch.link.endpoint_id,
-                        )
-                        .first()
-                        .exec(&mut tx)
-                        .await?
-                        else {
-                            break; // row deleted mid-batch
-                        };
-                        model = fresh;
-                    }
-                    Err(err) => return Err(err.into()),
-                }
+            let Some(mut model) = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+                patch.link.protocol_id,
+                patch.link.endpoint_id,
+            )
+            .first()
+            .exec(&mut tx)
+            .await?
+            else {
+                continue; // row deleted mid-batch
+            };
+
+            if patch.groups.contains(LinkGroups::RESULT) {
+                model.latency.clone_from(&patch.link.latency);
+                model.speed_bps = patch.link.speed_bps;
+                model.error.clone_from(&patch.link.error);
             }
+            if patch.groups.contains(LinkGroups::TASK) {
+                model.task_id = patch.link.task_id;
+                model.task_queue.clone_from(&patch.link.task_queue);
+            }
+            if patch.groups.contains(LinkGroups::TRAFFIC) {
+                model.traffic = patch.link.traffic;
+            }
+
+            // Write the whole mutable set back: the unpatched groups hold the
+            // values just read inside this transaction, so writing them is a
+            // no-op for those columns and keeps the OCC version coherent.
+            toasty::update!(model {
+                latency: model.latency.clone(),
+                speed_bps: model.speed_bps,
+                error: model.error.clone(),
+                task_id: model.task_id,
+                task_queue: model.task_queue.clone(),
+                traffic: model.traffic,
+            })
+            .exec(&mut tx)
+            .await?;
+            applied += 1;
         }
         tx.commit().await?;
         Ok(applied)

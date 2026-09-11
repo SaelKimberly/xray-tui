@@ -68,83 +68,31 @@ TDD Route:
 | `crates/xray-tui/src/ops/ping.rs` | flush at batch end |
 | `crates/xray-tui/src/main.rs`, `ui/mod.rs` | construct the writer; flush on quit |
 
-## W1 — `Database::apply_link_patches`
+## W1 — `Database::apply_link_patches` ✓ (commit `0574310`, revised)
 
-**Why**: the batch primitive; the UI path must not call it directly (the writer
+**Why**: the batch primitive; the UI path never calls it directly (the writer
 does).
 
-**Steps**
-
-1. Add to `crates/xray-tui-db/src/database.rs`:
+**Final shape** (the module on disk is authoritative):
 
 ```rust
-/// Apply one narrow `UPDATE` per row inside a single transaction.
-///
-/// Covers only the mutable columns (`latency`, `speed_bps`, `error`,
-/// `task_id`, `task_queue`); every other column is owned by its own writer.
-/// The OCC `version` is honoured when the caller's snapshot is current; a
-/// stale snapshot costs one re-read for that row instead of failing the batch.
-pub async fn apply_link_patches(&self, patches: &[ProfileStats]) -> Result<usize> {
-    if patches.is_empty() {
-        return Ok(0);
-    }
-    let mut conn = self.conn().await?;
-    let mut tx = conn.transaction().await?;
-    let mut applied = 0usize;
-    for patch in patches {
-        let mut model = patch.clone();
-        loop {
-            match toasty::update!(model.clone() {
-                latency: patch.latency.clone(),
-                speed_bps: patch.speed_bps,
-                error: patch.error.clone(),
-                task_id: patch.task_id,
-                task_queue: patch.task_queue.clone(),
-            })
-            .exec(&mut tx)
-            .await
-            {
-                Ok(()) => {
-                    applied += 1;
-                    break;
-                }
-                Err(err) if err.is_condition_failed() => {
-                    // Stale snapshot: refresh and retry this row once.
-                    let Some(fresh) = ProfileStats::filter_by_protocol_id_and_endpoint_id(
-                        patch.protocol_id,
-                        patch.endpoint_id,
-                    )
-                    .first()
-                    .exec(&mut tx)
-                    .await?
-                    else {
-                        break; // row deleted mid-batch
-                    };
-                    model = fresh;
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-    tx.commit().await?;
-    Ok(applied)
-}
+pub struct LinkGroups(u8);   // RESULT | TASK | TRAFFIC | ALL, with contains()
+pub struct LinkPatch { pub link: ProfileStats, pub groups: LinkGroups }
+
+/// One row per iteration inside ONE transaction: read the row fresh, overlay
+/// only the patched groups from the caller's snapshot, write it back.
+pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize>;
 ```
 
-2. Test in `tests/integration.rs`:
+The fresh read inside the transaction is what makes the unpatched groups safe:
+a caller's snapshot is authoritative for its own group and stale for the rest,
+so a result patch can never write traffic or scheduler state.
 
-```rust
-#[tokio::test]
-async fn apply_link_patches_writes_all_mutable_columns_in_one_transaction() {
-    // seed 3 links, patch latency/error/task state, assert every column landed
-    // and that a stale-version patch still applies (re-read path).
-}
-
-#[tokio::test]
-async fn apply_link_patches_empty_is_a_noop() { /* returns Ok(0) */ }
-```
-
-**Verification**: `cargo nextest run -p xray-tui-db`.
+**Tests** (`tests/integration.rs`, all green): group-scoped writes for every
+row; empty input is a no-op; stale snapshot lands without clobbering a
+concurrent `update_scheduler_state`; and `..._isolates_column_groups` — a
+TRAFFIC patch leaves result/task columns exactly as persisted, and a RESULT
+patch with a deliberately stale snapshot leaves traffic/task intact.
 
 ## W2 — `ops/link_writer.rs`
 
@@ -189,9 +137,12 @@ impl LinkWriter {
    flush can patch each group with its own OCC version.
 3. `read` returns `pending[key]` when present (read-through), else the typed
    PK read.
-4. `flush` takes the mutex, drains `pending` into a `Vec<LinkPatch>` (one per
-   staged group), calls `db.apply_link_patches(&patches)`, and returns the
-   count. On error, the drained
+4. `flush` takes the mutex and **removes** the pending entries into a
+   `Vec<LinkPatch>` (one per staged group; a remove, never a snapshot copy —
+   a `stage` landing during the write must survive as a new entry for the next
+   window), calls `db.apply_link_patches(&patches)`, and returns the count. On
+   error the drained rows merge back with `or_insert` semantics so a newer
+   staged entry wins over the failed snapshot. On error, the drained
    rows are merged back so a failed flush retries.
 5. The flush task loops on `tokio::select! { _ = wake.notified() => {}, _ =
    sleep(flush_interval) => {} }` while `staged_len() > 0`.
@@ -201,7 +152,10 @@ impl LinkWriter {
    - `stage_never_awaits` — 1000 stages complete without any flush call
      (`flush_count() == 0`);
    - `flush_is_one_transaction` — `flush_count()` increments once for 1000
-     staged rows.
+     staged rows;
+   - `stage_during_in_flight_flush_survives` — with the flush blocked mid-write
+     (a test writer), stage a newer value for the same `(link, group)`; after
+     release the newer value is what lands (spec §4.3 drain rule).
 
 ## W3 — Wire the call sites
 
@@ -214,7 +168,18 @@ impl LinkWriter {
    `read_link` → `LinkWriter::read`; `write_task_state` → build the row's new
    state and `stage` it (no await). Keep the existing `Database` impl for
    non-batch callers.
-3. `state.rs`: add `link_writer: Arc<LinkWriter>`; construct it in
+3. **Every other `profile_stats` writer moves to its owned group** (spec §4.1
+   table):
+   - `CoreEvent::StatsUpdate` (`ops/events.rs:269`) → `stage(link, TRAFFIC)`
+     instead of `db.upsert_link(link).await`;
+   - `drain_pending_stats_updates` flush (`ops/connect.rs:645`) → stage +
+     flush through the writer;
+   - `Database::update_last_used` (`ops/connect.rs:193`) stays a narrow typed
+     write, but must stop passing through `upsert_link`;
+   - `upsert_links_bulk` (subscription/import) is restricted to the `SOURCE`
+     group (`core_type`, `config_type`, `last_seen_at` on update; full row on
+     insert) so an import refresh can no longer overwrite ping results.
+4. `state.rs`: add `link_writer: Arc<LinkWriter>`; construct it in
    `AppState::new` and in the test helpers.
 4. Update `ops/scheduler.rs` unit tests to use a writer-backed fake (the
    existing `FakeDb` gains the read-through behaviour, or the tests move to
