@@ -35,6 +35,7 @@ lru = "0.18"
 # (zero-copy slices); `ConnMeta.payload_prefix` shares that buffer instead
 # of owning a `Vec` copy.
 bytes = "1"
+xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [features]
 default = []

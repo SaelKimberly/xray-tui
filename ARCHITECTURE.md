@@ -30,6 +30,10 @@ generated core config and no share link ever names it. Design brief:
 	generated feature-unification crate — every workspace member depends on it,
 	its dependencies exist only to unify feature flags and are never referenced
 	from code. Regenerate after any Cargo.lock change (`cargo hakari generate`).
+	The `hakari-check` gate runs `cargo hakari generate --diff`,
+	`cargo hakari manage-deps --dry-run` and `cargo hakari verify`;
+	`--dry-run` is what catches a member missing the workspace-hack dependency,
+	and `verify` alone does not.
 
 ## Crate Responsibilities
 

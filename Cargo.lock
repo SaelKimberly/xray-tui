@@ -8428,6 +8428,7 @@ dependencies = [
  "tokio",
  "xray-tui-dns",
  "xray-tui-geoip",
+ "xray-tui-hakari",
  "xray-tui-tls",
 ]
 

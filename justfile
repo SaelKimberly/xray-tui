@@ -22,8 +22,15 @@ quality-gate-ci target='all':
 fmt-check mode='report':
     @cargo fmt --all --check
 
-# cargo-hakari workspace-hack verification (.config/hakari.toml)
+# cargo-hakari workspace-hack verification (.config/hakari.toml).
+# Three distinct checks; `verify` alone does NOT catch staleness or a member
+# missing the workspace-hack dep (why xray-tui-route drifted):
+#   generate --diff        workspace-hack Cargo.toml is up-to-date
+#   manage-deps --dry-run  every workspace crate depends on the workspace-hack
+#   verify                 each crate resolves to a single feature set
 hakari-check mode='report':
+    @cargo hakari generate --diff
+    @cargo hakari manage-deps --dry-run
     @cargo hakari verify
 
 # Clippy, all workspace targets and features, warnings denied
