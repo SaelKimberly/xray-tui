@@ -63,11 +63,6 @@ fn eff_weight() -> String {
 
 /// Projection of the page query.
 const PROJ_ID: &str = "r.endpoint_id";
-/// Projection of the anchor fetch: the full ordering key.
-const PROJ_KEYS: &str = "r.dns_flag, r.eff_weight, r.last_seen_at, r.protocol_id, r.endpoint_id";
-/// The same key, aliased for the anchor count's derived table.
-const PROJ_KEYS_ALIASED: &str = "r.dns_flag AS k0, r.eff_weight AS k1, r.last_seen_at AS k2, \
-     r.protocol_id AS k3, r.endpoint_id AS k4";
 
 // ── Request / response ──────────────────────────────────────────────────
 
@@ -178,6 +173,13 @@ fn escape_like(s: &str) -> String {
 fn base_select(sql: &mut Sql, req: &PageRequest, projection: &str) {
     sql.push("SELECT ");
     sql.push(projection);
+    base_from_where(sql, req);
+}
+
+/// The shared `FROM`/`WHERE` of every profiles query: the representative-link
+/// window joined to its endpoint row, plus the view / group / search
+/// predicates.
+fn base_from_where(sql: &mut Sql, req: &PageRequest) {
     sql.push(" FROM (SELECT ps.endpoint_id, ps.protocol_id, ps.last_seen_at, ");
     let dns = dns_flag("e2");
     sql.push(&dns);
@@ -249,45 +251,64 @@ fn display_link(expr: &str) -> String {
     )
 }
 
-/// ORDER BY terms for a sort column. The primary term takes the UI direction;
-/// the tiebreaks keep their own direction so paging stays total.
-fn order_by(sql: &mut Sql, sort: PageSort, ascending: bool) {
-    let dir = if ascending { "ASC" } else { "DESC" };
+/// The full ORDER BY term list for a sort column and direction.
+///
+/// Every term flips with the direction, mirroring the oracle's
+/// `if asc { cmp } else { cmp.reverse() }`: a descending sort is the exact
+/// reverse of the ascending one, tiebreaks included.
+fn order_terms(sort: PageSort, ascending: bool) -> String {
+    // `natural_asc` is the term's direction in the ascending case.
+    let dir = |natural_asc: bool| {
+        if ascending == natural_asc {
+            "ASC"
+        } else {
+            "DESC"
+        }
+    };
     match sort {
-        PageSort::Test => sql.push(&format!(
-            " ORDER BY r.dns_flag {dir}, r.eff_weight {dir}, r.last_seen_at DESC, \
-             r.protocol_id ASC, r.endpoint_id ASC"
-        )),
-        PageSort::Address => sql.push(&format!(" ORDER BY e.host {dir}, e.id ASC")),
-        PageSort::Port => sql.push(&format!(" ORDER BY e.port {dir}, e.id ASC")),
-        PageSort::LastSeen => {
-            let expr = format!("COALESCE({}, '')", display_link("{t}.last_seen_at"));
-            sql.push(&format!(" ORDER BY {expr} {dir}, e.id ASC"));
-        }
-        PageSort::Speed => {
-            let expr = format!(
-                "COALESCE({}, -1)",
-                display_link("COALESCE({t}.speed_bps, -1)")
-            );
-            sql.push(&format!(" ORDER BY {expr} {dir}, e.id ASC"));
-        }
-        PageSort::Traffic => {
-            let expr = format!(
-                "COALESCE({}, 0)",
-                display_link("({t}.traffic_total_up + {t}.traffic_total_down)")
-            );
-            sql.push(&format!(" ORDER BY {expr} {dir}, e.id ASC"));
-        }
-        PageSort::ConfigType => {
-            let expr = format!(
-                "COALESCE({}, 2)",
-                display_link(
-                    "CASE {t}.config_type WHEN 'form' THEN 0 WHEN 'share_url' THEN 1 ELSE 2 END"
-                )
-            );
-            sql.push(&format!(" ORDER BY {expr} {dir}, e.id ASC"));
-        }
+        PageSort::Test => format!(
+            "r.dns_flag {}, r.eff_weight {}, r.last_seen_at {}, r.protocol_id {}, r.endpoint_id {}",
+            dir(true),
+            dir(true),
+            dir(false),
+            dir(true),
+            dir(true)
+        ),
+        PageSort::Address => format!("e.host {}, e.id {}", dir(true), dir(true)),
+        PageSort::Port => format!("e.port {}, e.id {}", dir(true), dir(true)),
+        PageSort::LastSeen => format!(
+            "COALESCE({}, '') {}, e.id {}",
+            display_link("{t}.last_seen_at"),
+            dir(true),
+            dir(true)
+        ),
+        PageSort::Speed => format!(
+            "COALESCE({}, -1) {}, e.id {}",
+            display_link("COALESCE({t}.speed_bps, -1)"),
+            dir(true),
+            dir(true)
+        ),
+        PageSort::Traffic => format!(
+            "COALESCE({}, 0) {}, e.id {}",
+            display_link("({t}.traffic_total_up + {t}.traffic_total_down)"),
+            dir(true),
+            dir(true)
+        ),
+        PageSort::ConfigType => format!(
+            "COALESCE({}, 2) {}, e.id {}",
+            display_link(
+                "CASE {t}.config_type WHEN 'form' THEN 0 WHEN 'share_url' THEN 1 ELSE 2 END"
+            ),
+            dir(true),
+            dir(true)
+        ),
     }
+}
+
+/// Append `ORDER BY <terms>`.
+fn order_by(sql: &mut Sql, sort: PageSort, ascending: bool) {
+    sql.push(" ORDER BY ");
+    sql.push(&order_terms(sort, ascending));
 }
 
 fn decode_id(row: &Value) -> Result<EndpointId> {
@@ -296,6 +317,20 @@ fn decode_id(row: &Value) -> Result<EndpointId> {
             Some(Value::I64(id)) => Ok(EndpointId::new(*id)),
             other => Err(DatabaseError::Generic(format!(
                 "profiles_query: unexpected id column: {other:?}"
+            ))),
+        },
+        other => Err(DatabaseError::Generic(format!(
+            "profiles_query: unexpected row: {other:?}"
+        ))),
+    }
+}
+
+fn decode_i64(row: &Value) -> Result<i64> {
+    match row {
+        Value::Record(record) => match record.fields.first() {
+            Some(Value::I64(n)) => Ok(*n),
+            other => Err(DatabaseError::Generic(format!(
+                "profiles_query: unexpected integer column: {other:?}"
             ))),
         },
         other => Err(DatabaseError::Generic(format!(
@@ -314,32 +349,6 @@ fn decode_count(row: &Value) -> Result<u64> {
         },
         other => Err(DatabaseError::Generic(format!(
             "profiles_query: unexpected row: {other:?}"
-        ))),
-    }
-}
-
-/// Decode the anchor query's key row:
-/// `(dns_flag, eff_weight, last_seen, protocol_id)`.
-fn decode_keys(row: &Value) -> Result<(i64, i64, String, i64)> {
-    let Value::Record(record) = row else {
-        return Err(DatabaseError::Generic(format!(
-            "profiles_query: unexpected row: {row:?}"
-        )));
-    };
-    match (
-        record.fields.first(),
-        record.fields.get(1),
-        record.fields.get(2),
-        record.fields.get(3),
-    ) {
-        (
-            Some(Value::I64(dns)),
-            Some(Value::I64(weight)),
-            Some(Value::String(seen)),
-            Some(Value::I64(pid)),
-        ) => Ok((*dns, *weight, seen.clone(), *pid)),
-        other => Err(DatabaseError::Generic(format!(
-            "profiles_query: unexpected key row: {other:?}"
         ))),
     }
 }
@@ -444,49 +453,43 @@ impl Database {
         let mut conn = self.connection().await?;
         let mut sql = Sql::new();
         base_select(&mut sql, req, PROJ_ID);
-        sql.push(" AND e.host_type <> 'undefined'");
+        // Mirrors `ops/enrich.rs`: IP hosts, plus DNS hosts that already carry
+        // a cached resolution. An unresolved DNS host must NOT be seeded — an
+        // empty `endpoint_info` entry blocks the startup seeding pass and
+        // makes `should_resolve` treat the endpoint as a never-retried IP host.
+        sql.push(" AND (e.host_type IN ('ipv4','ipv6') OR e.resolved_as <> '[]')");
         let rows = sql.exec(&mut conn).await?;
         rows.iter().map(decode_id).collect()
     }
 
     /// Offset the endpoint currently occupies in the ordered view — used to
     /// re-anchor the window when a re-sort moves the selected row out of it.
+    ///
+    /// One query: the request's ordering is applied by `ROW_NUMBER()` over the
+    /// same source the page uses, so it is correct for every sort and
+    /// direction (a hard-coded key comparison would only hold for
+    /// `Test`/ascending).
     pub async fn profiles_anchor(
         &self,
         req: &PageRequest,
         endpoint_id: EndpointId,
     ) -> Result<Option<usize>> {
         let mut conn = self.connection().await?;
-        let mut keys = Sql::new();
-        base_select(&mut keys, req, PROJ_KEYS);
-        keys.push(" AND r.endpoint_id = ");
-        let target = keys.bind(endpoint_id.get());
-        keys.push(&target);
-        let rows = keys.exec(&mut conn).await?;
+        let mut sql = Sql::new();
+        sql.push("SELECT t.rn - 1 FROM (SELECT r.endpoint_id AS eid, ROW_NUMBER() OVER (ORDER BY ");
+        sql.push(&order_terms(req.sort, req.ascending));
+        sql.push(") AS rn");
+        base_from_where(&mut sql, req);
+        sql.push(") t WHERE t.eid = ");
+        let bind = sql.bind(endpoint_id.get());
+        sql.push(&bind);
+
+        let rows = sql.exec(&mut conn).await?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let (d0, w1, seen2, pid3) = decode_keys(row)?;
-
-        let mut count = Sql::new();
-        count.push("SELECT COUNT(*) FROM (");
-        base_select(&mut count, req, PROJ_KEYS_ALIASED);
-        count.push(") q WHERE ");
-        let b0 = count.bind(d0);
-        let b1 = count.bind(w1);
-        let b2 = count.bind(seen2);
-        let b3 = count.bind(pid3);
-        let b4 = count.bind(endpoint_id.get());
-        count.push(&format!(
-            "q.k0 < {b0} OR (q.k0 = {b0} AND q.k1 < {b1}) \
-             OR (q.k0 = {b0} AND q.k1 = {b1} AND q.k2 > {b2}) \
-             OR (q.k0 = {b0} AND q.k1 = {b1} AND q.k2 = {b2} AND q.k3 < {b3}) \
-             OR (q.k0 = {b0} AND q.k1 = {b1} AND q.k2 = {b2} AND q.k3 = {b3} AND q.k4 < {b4})"
-        ));
-        let rows = count.exec(&mut conn).await?;
-        Ok(Some(
-            usize::try_from(rows.first().map_or(Ok(0), decode_count)?).unwrap_or(0),
-        ))
+        let offset = decode_i64(row)?;
+        Ok(Some(usize::try_from(offset.max(0)).unwrap_or(0)))
     }
 
     /// Per-endpoint link order for a page's endpoints: the decision-16 order

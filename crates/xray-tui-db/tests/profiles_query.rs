@@ -24,6 +24,16 @@ fn ts(secs: i64) -> Timestamp {
 
 const ALL_ENDPOINTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
 
+const ALL_SORTS: [PageSort; 7] = [
+    PageSort::Test,
+    PageSort::Address,
+    PageSort::Port,
+    PageSort::LastSeen,
+    PageSort::Speed,
+    PageSort::Traffic,
+    PageSort::ConfigType,
+];
+
 fn request(sort: PageSort, ascending: bool, offset: usize, limit: usize) -> PageRequest {
     PageRequest {
         view: PurgatoryView::All,
@@ -257,26 +267,70 @@ async fn count_narrows_with_search_and_group_filters() {
 }
 
 #[tokio::test]
-async fn anchor_returns_each_rows_position_in_the_ordered_view() {
+async fn anchor_returns_each_rows_position_for_every_sort_and_direction() {
     let db = seed_fixture().await;
-    let page = db
-        .profiles_page(&request(PageSort::Test, true, 0, 100))
-        .await
-        .expect("page");
-    assert_eq!(page.ids.len(), 7);
-
-    for (position, id) in page.ids.iter().enumerate() {
-        let anchored = db
-            .profiles_anchor(&request(PageSort::Test, true, 0, 10), *id)
-            .await
-            .expect("anchor");
-        assert_eq!(anchored, Some(position), "anchor for {}", id.get());
+    for sort in ALL_SORTS {
+        for ascending in [true, false] {
+            let page = db
+                .profiles_page(&request(sort, ascending, 0, 100))
+                .await
+                .expect("page");
+            assert_eq!(page.ids.len(), 7, "{sort:?} {ascending}");
+            for (position, id) in page.ids.iter().enumerate() {
+                let anchored = db
+                    .profiles_anchor(&request(sort, ascending, 0, 10), *id)
+                    .await
+                    .expect("anchor");
+                assert_eq!(
+                    anchored,
+                    Some(position),
+                    "anchor {sort:?} {ascending} {id:?}"
+                );
+            }
+        }
     }
     let missing = db
         .profiles_anchor(&request(PageSort::Test, true, 0, 10), EndpointId::new(999))
         .await
         .expect("anchor missing");
     assert_eq!(missing, None);
+}
+
+#[tokio::test]
+async fn descending_order_is_the_reverse_of_ascending_for_every_sort() {
+    // The UI reverses the whole comparator (`cmp.reverse()`), so a descending
+    // page must be the exact reverse of the ascending one, tiebreaks included.
+    let db = seed_fixture().await;
+    for sort in ALL_SORTS {
+        let asc = db
+            .profiles_page(&request(sort, true, 0, 100))
+            .await
+            .expect("asc");
+        let desc = db
+            .profiles_page(&request(sort, false, 0, 100))
+            .await
+            .expect("desc");
+        let mut expected = asc.ids.clone();
+        expected.reverse();
+        assert_eq!(desc.ids, expected, "{sort:?}");
+    }
+}
+
+#[tokio::test]
+async fn enrich_seed_covers_ip_hosts_and_resolved_dns_hosts_only() {
+    let db = seed_fixture().await;
+    let mut seeded: Vec<i64> = db
+        .profiles_enrich_seed_ids(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("seed")
+        .iter()
+        .map(|id| id.get())
+        .collect();
+    seeded.sort_unstable();
+    // e1-e5 are IP hosts; e7 is a DNS host with a cached resolution.
+    // e6 is a DNS host with no resolution and must NOT be seeded: an empty
+    // `endpoint_info` entry would block the startup seeding pass.
+    assert_eq!(seeded, vec![1, 2, 3, 4, 5, 7]);
 }
 
 #[tokio::test]
@@ -379,14 +433,7 @@ async fn every_statement_runs_against_a_pushed_schema() {
         .await
         .expect("order");
 
-    for sort in [
-        PageSort::Address,
-        PageSort::Port,
-        PageSort::LastSeen,
-        PageSort::Speed,
-        PageSort::Traffic,
-        PageSort::ConfigType,
-    ] {
+    for sort in ALL_SORTS {
         for ascending in [true, false] {
             let req = PageRequest {
                 sort,

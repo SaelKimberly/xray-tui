@@ -667,6 +667,14 @@ fn decode_keys(row: &Value) -> Result<(i64, i64, String, i64)> {
 }
 ```
 
+> T1 status: **executed** (commit `4471384`), then hardened in a follow-up
+> (`order_terms` flips every term with the direction to mirror the oracle's
+> `cmp.reverse()`; `profiles_anchor` is a single `ROW_NUMBER() OVER (ORDER BY
+> <terms>)` query that is correct for every sort and direction;
+> `profiles_enrich_seed_ids` mirrors the `ops/enrich.rs` predicate). The code
+> block above is the planning sketch — the module on disk is authoritative.
+> Tests on disk: 9 green.
+
 **Verification**: `cargo nextest run -p xray-tui-db --test profiles_query`.
 The db-crate test file covers the **mechanics** (the ordering *parity* golden
 lives in the TUI crate, where the comparators are — see T4):
@@ -792,11 +800,13 @@ pub async fn profiles_link_pairs(&self, req: &PageRequest) -> Result<Vec<(Endpoi
 pub async fn profiles_failed_ids(&self) -> Result<Vec<EndpointId>>;
 // SQL: SELECT DISTINCT ps.endpoint_id FROM profile_stats ps WHERE ps.error = 1
 
-/// Endpoints eligible for enrichment seeding (IP hosts and resolved DNS
-/// hosts) across the whole view.
-pub async fn profiles_enrich_seed(&self, req: &PageRequest) -> Result<Vec<Endpoint>>;
-// SQL: SELECT r.endpoint_id FROM (…) r JOIN endpoints e … WHERE e.host_type <> 'undefined'
-//      (typed hydration afterwards)
+/// Endpoint ids eligible for enrichment seeding across the whole view.
+pub async fn profiles_enrich_seed_ids(&self, req: &PageRequest) -> Result<Vec<EndpointId>>;
+// Predicate MUST mirror `ops/enrich.rs`: e.host_type IN ('ipv4','ipv6')
+// OR e.resolved_as <> '[]'. An unresolved DNS host must NOT be seeded — an
+// empty `endpoint_info` entry blocks the startup seeding pass and makes
+// `should_resolve` treat the endpoint as a never-retried IP host.
+// (typed hydration afterwards)
 
 /// The display link of every filtered endpoint (active protocol per
 /// endpoint), used to resolve the enrichment SNI.
@@ -996,6 +1006,12 @@ if !persist_batch.is_empty() {
 
 4. Delete the DNS-flip in-memory re-sort (`events.rs` ~line 551) and its
    `endpoint_dns_unresolved` import.
+5. **Cross-crate predicate test** (TUI crate): assert
+   `endpoint_dns_unresolved(&state, row) == (row.endpoint.host_type == HostType::Dns
+   && row.endpoint.resolved_as.is_empty())` for a DNS row with and without a
+   cached resolution. The SQL flag cannot be bound to a TUI helper by the
+   db-crate suite, so without this test the two definitions can drift with both
+   suites green.
 
 **Verification**: `cargo nextest run -p xray-tui` including the new merge-sync
 test.
