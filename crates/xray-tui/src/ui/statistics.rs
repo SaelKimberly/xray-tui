@@ -167,16 +167,28 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut state = AppState::new(db, AppConfig::default()).await;
-        state.endpoints = vec![
+        // The search filter is SQL now, and the tab holds one page of what the
+        // query returned: seed the rows, set the search, and load the page
+        // through the real path. Assigning `state.endpoints` by hand would
+        // build a page the query never produced (a stale, unfiltered one).
+        for row in [
             endpoint_row(1, "alpha.example", 443),
             endpoint_row(2, "beta.example", 8443),
             endpoint_row(3, "gamma.example", 443),
-        ];
+        ] {
+            db.upsert_endpoint(&row.endpoint).await.unwrap();
+            for link in &row.links {
+                db.upsert_link(link).await.unwrap();
+                if let Some(proto) = row.protocols.get(&link.protocol_id) {
+                    db.upsert_protocol(proto).await.unwrap();
+                }
+            }
+        }
+        let mut state = AppState::new(db, AppConfig::default()).await;
         state.search_query = search.to_string();
-        state.filter_cache_valid.set(false);
-        state.selected_index = 0;
+        state.purgatory_view = xray_tui_db::models::PurgatoryView::All; // rows carry ts(0)
         state.connected_core = Some(CoreType::Xray);
+        crate::ops::profiles::reload_profiles(&mut state).await;
         state
     }
 
@@ -198,8 +210,8 @@ mod tests {
 
     #[tokio::test]
     async fn render_shows_filtered_profile_not_endpoints_index() {
-        // Filtered index 0 is the "beta" row (endpoints[1]); the old code
-        // rendered alpha.example:443 — the wrong profile's stats.
+        // The page holds only the match, so index 0 is beta — the old code
+        // rendered alpha.example:443 (the unfiltered first row).
         let state = filtered_state("beta").await;
         let rendered = render_to_string(&state);
         assert!(rendered.contains("beta.example:8443"), "got: {rendered}");
@@ -269,8 +281,8 @@ mod tests {
 
     #[tokio::test]
     async fn render_placeholders_when_filter_matches_nothing() {
-        // `selected_index` (0) is past the end of the FILTERED list even
-        // though `endpoints.len()` is 3; the old code rendered alpha's stats.
+        // The search matches nothing, so the page is empty even though the
+        // database holds three endpoints; the old code rendered alpha's stats.
         let state = filtered_state("nomatch").await;
         let rendered = render_to_string(&state);
         assert!(

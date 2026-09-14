@@ -116,13 +116,16 @@ fn page_request(load: &ProfilesLoad) -> PageRequest {
         now.checked_sub(jiff::Span::new().seconds(ttl_secs))
             .unwrap_or(now)
     };
+    // Active and Stale share both bounds; the view decides which of them the
+    // query uses — Active: `last_seen_at >= active`; Stale: `>= stale` and NOT
+    // `>= active`. Passing `now` for Active made the window `last_seen_at >=
+    // now`, i.e. an empty tab (a sync only ever stamps the past).
     let (active_threshold, stale_threshold) = match load.view {
-        PurgatoryView::Active => (now, now),
-        PurgatoryView::Stale => (
+        PurgatoryView::Active | PurgatoryView::Stale => (
             threshold(load.purgatory_ttl_secs),
             threshold(load.purgatory_retention_secs),
         ),
-        // `All`: everything is "active" as of the epoch.
+        // `All`: no predicate is emitted, so the bounds are unused.
         PurgatoryView::All => (
             Timestamp::from_second(0).unwrap_or(now),
             Timestamp::from_second(0).unwrap_or(now),
@@ -1760,6 +1763,71 @@ mod page_nav_tests {
         goto_first(&mut state).await;
         assert_eq!(state.page_offset, 0);
         assert_eq!(state.selected_index, 0);
+    }
+}
+
+#[cfg(test)]
+mod view_window_tests {
+    use std::sync::Arc;
+
+    use super::test_support::{fake_row, test_state};
+    use super::*;
+    use crate::ops::profiles::ttl_tests::persist_rows;
+
+    const DAY: i64 = 86_400;
+
+    /// Three endpoints whose only link was last seen 1, 10 and 40 days ago —
+    /// inside the 7d active window, inside the 30d retention but past the 7d
+    /// TTL, and past both. Ages are stamped relative to *now* because the
+    /// request computes its thresholds from now.
+    async fn state_with_ages() -> AppState {
+        let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
+        let now = now_ts();
+        let aged = |id: i64, days: i64| {
+            let mut row = fake_row(id, &format!("h{id}.example"), 1);
+            row.links[0].last_seen_at = now
+                .checked_sub(jiff::Span::new().seconds(days * DAY))
+                .expect("ts");
+            row
+        };
+        persist_rows(&db, &[aged(1, 1), aged(2, 10), aged(3, 40)]).await;
+
+        let mut state = test_state(Vec::new()).await;
+        state.db = db;
+        state.purgatory_ttl_secs = 7 * DAY;
+        state.purgatory_retention_secs = 30 * DAY;
+        state
+    }
+
+    /// Endpoint ids the tab shows for `view`, through the real load path
+    /// (`load_profiles_rows` → the request `page_request` derives from the
+    /// state), not through hand-built thresholds.
+    async fn ids_for(view: PurgatoryView) -> Vec<i64> {
+        let mut state = state_with_ages().await;
+        state.purgatory_view = view;
+        reload_profiles(&mut state).await;
+        let mut ids: Vec<i64> = state
+            .endpoints
+            .iter()
+            .map(|r| r.endpoint.id.get())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn active_shows_the_recently_seen_window() {
+        assert_eq!(ids_for(PurgatoryView::Active).await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn stale_shows_the_aging_band_only() {
+        assert_eq!(ids_for(PurgatoryView::Stale).await, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn all_shows_every_age() {
+        assert_eq!(ids_for(PurgatoryView::All).await, vec![1, 2, 3]);
     }
 }
 
