@@ -629,7 +629,9 @@ fn build_display_rows(
 
         let is_multi = state.multi_select.contains(&row.endpoint.id.get());
 
-        let idx_str = index_cell(i + 1, is_multi);
+        // The number is the row's position in the FEED, not in the loaded page:
+        // the page is a window, so its first row is `page_offset + 1`.
+        let idx_str = index_cell(state.page_offset + i + 1, is_multi);
 
         let info = state.endpoint_info.get(&row.endpoint.id.get());
         let resolved = info.is_some_and(|i| !i.resolved_ips.is_empty());
@@ -1134,6 +1136,112 @@ fn render_confirmation_overlays(
             );
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod page_window_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::ops::profiles::{PROFILES_PAGE_SIZE, move_selection, reload_profiles, test_support};
+
+    /// Two full pages of endpoints, loaded through the real query path.
+    async fn two_page_state() -> AppState {
+        let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
+        let count = PROFILES_PAGE_SIZE + 5;
+        for i in 1..=count as i64 {
+            let row = test_support::fake_row(i, &format!("h{i:05}.example"), 1);
+            db.upsert_endpoint(&row.endpoint).await.unwrap();
+            for link in &row.links {
+                db.upsert_link(link).await.unwrap();
+                if let Some(proto) = row.protocols.get(&link.protocol_id) {
+                    db.upsert_protocol(proto).await.unwrap();
+                }
+            }
+        }
+        let mut state = test_support::test_state(Vec::new()).await;
+        state.db = db;
+        state.purgatory_view = xray_tui_db::models::PurgatoryView::All;
+        reload_profiles(&mut state).await;
+        state
+    }
+
+    fn display(state: &AppState) -> Vec<DisplayRowData> {
+        let rows: Vec<&EndpointRow> = state.endpoints.iter().collect();
+        let palette = state.current_palette();
+        build_display_rows(&rows, state.selected_index, state, &palette)
+    }
+
+    /// The `#` column carries the row's position in the FEED, not in the
+    /// loaded page: page 2 starts at 201.
+    #[tokio::test]
+    async fn numbering_is_absolute_across_pages() {
+        let mut state = two_page_state().await;
+        let first = display(&state);
+        assert_eq!(first[0].idx_str.trim(), "1");
+        assert_eq!(
+            first[PROFILES_PAGE_SIZE - 1].idx_str.trim(),
+            PROFILES_PAGE_SIZE.to_string()
+        );
+
+        state.selected_index = PROFILES_PAGE_SIZE - 1;
+        move_selection(&mut state, 1).await;
+        assert_eq!(state.page_offset, PROFILES_PAGE_SIZE, "page 2 loaded");
+
+        let second = display(&state);
+        assert_eq!(
+            second[0].idx_str.trim(),
+            (PROFILES_PAGE_SIZE + 1).to_string(),
+            "page 2 numbers continue the feed"
+        );
+    }
+
+    /// Paging back onto a page whose rows are all already enriched (so the
+    /// enrichment seeding marks nothing dirty) must still render that page.
+    #[tokio::test]
+    async fn returning_to_an_enriched_page_renders_it() {
+        let mut state = two_page_state().await;
+        let first_address = display(&state)[0].address_port_str.trim().to_string();
+
+        state.selected_index = PROFILES_PAGE_SIZE - 1;
+        move_selection(&mut state, 1).await; // page 2
+        let second_address = display(&state)[0].address_port_str.trim().to_string();
+        assert_ne!(first_address, second_address);
+
+        state.selected_index = 0;
+        move_selection(&mut state, -1).await; // back to page 1
+        assert_eq!(state.page_offset, 0);
+        assert_eq!(
+            display(&state)[0].address_port_str.trim(),
+            first_address,
+            "page 1 must render again"
+        );
+    }
+
+    /// A page change must show the new page's rows: the display cache key has
+    /// to see the page, not just the loaded row count.
+    #[tokio::test]
+    async fn page_change_refreshes_the_display_rows() {
+        let mut state = two_page_state().await;
+        let before = display(&state);
+        let before_addr = before[0].address_port_str.clone();
+
+        state.selected_index = PROFILES_PAGE_SIZE - 1;
+        move_selection(&mut state, 1).await;
+
+        let after = display(&state);
+        assert_ne!(
+            after[0].address_port_str, before_addr,
+            "page 2's first row must not be page 1's cached row"
+        );
+        assert_eq!(
+            after[0].address_port_str.trim(),
+            format!(
+                "{}:{}",
+                state.endpoints[0].endpoint.host, state.endpoints[0].endpoint.port
+            )
+        );
     }
 }
 

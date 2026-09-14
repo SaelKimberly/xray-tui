@@ -401,10 +401,60 @@ impl Database {
         conn: &mut toasty::Connection,
         req: &PageRequest,
     ) -> Result<u64> {
+        // Count endpoints, not representative links: the window core exists to
+        // pick one link per endpoint, which a count does not need — running it
+        // here doubled every page fetch (~0.86 s of the ~1.8 s boundary stall
+        // at 7.7k endpoints). The predicates are the same endpoint-level
+        // EXISTS terms the page filter uses, so the two cannot disagree.
         let mut sql = Sql::new();
-        sql.push("SELECT COUNT(*) FROM (");
-        base_select(&mut sql, req, PROJ_ID);
-        sql.push(")");
+        sql.push("SELECT COUNT(*) FROM endpoints e WHERE ");
+        let has_link = |sql: &mut Sql, alias: &str, predicate: Option<String>| match predicate {
+            Some(pred) => {
+                sql.push(&format!(
+                        "EXISTS (SELECT 1 FROM profile_stats {alias} WHERE {alias}.endpoint_id = e.id AND {pred})"
+                    ));
+            }
+            None => {
+                sql.push(&format!(
+                    "EXISTS (SELECT 1 FROM profile_stats {alias} WHERE {alias}.endpoint_id = e.id)"
+                ));
+            }
+        };
+        match req.view {
+            PurgatoryView::All => has_link(&mut sql, "p", None),
+            PurgatoryView::Active => {
+                let ts = sql.bind(sql_ts(req.active_threshold));
+                has_link(&mut sql, "p", Some(format!("p.last_seen_at >= {ts}")));
+            }
+            PurgatoryView::Stale => {
+                let stale = sql.bind(sql_ts(req.stale_threshold));
+                let active = sql.bind(sql_ts(req.active_threshold));
+                has_link(
+                    &mut sql,
+                    "p",
+                    Some(format!(
+                        "p.last_seen_at >= {stale} AND NOT EXISTS (SELECT 1 FROM profile_stats p3 \
+                         WHERE p3.endpoint_id = e.id AND p3.last_seen_at >= {active})"
+                    )),
+                );
+            }
+        }
+        if let Some(group_id) = &req.group_id {
+            let gid = sql.bind(group_id.clone());
+            sql.push(&format!(
+                " AND EXISTS (SELECT 1 FROM endpoint_groups eg WHERE eg.endpoint_id = e.id \
+                 AND eg.group_id = {gid})"
+            ));
+        }
+        if let Some(search) = &req.search
+            && !search.is_empty()
+        {
+            let pattern = sql.bind(format!("%{}%", escape_like(&search.to_lowercase())));
+            sql.push(&format!(
+                " AND (lower(e.host) LIKE {pattern} ESCAPE '\\' \
+                 OR CAST(e.port AS TEXT) LIKE {pattern} ESCAPE '\\')"
+            ));
+        }
         let rows = sql.exec(conn).await?;
         rows.first().map_or(Ok(0), decode_count)
     }

@@ -441,10 +441,20 @@ impl Database {
         ))
         .exec(conn)
         .await?;
-        // Plain table scan: no include -> no EXISTS(VALUES …) monster query.
-        // ~6k distinct configs is the whole protocol table; a fresh in-memory
-        // join is cheaper than any per-page relation resolution.
-        let protocols: Vec<Protocol> = Protocol::all().exec(conn).await?;
+        // Only the protocols THIS page's links reference. The whole-table read
+        // (6,111 rows here) decoded every `Protocol` model per page load —
+        // ~0.47 s of the ~2.2 s a page-boundary move cost at 7.7k endpoints —
+        // and the page only ever looks up the few ids its own links carry.
+        let mut protocol_ids: Vec<ProtocolId> = links.iter().map(|l| l.protocol_id).collect();
+        protocol_ids.sort_unstable();
+        protocol_ids.dedup();
+        let protocols: Vec<Protocol> = if protocol_ids.is_empty() {
+            Vec::new()
+        } else {
+            Protocol::filter(toasty::stmt::in_list(Protocol::fields().id(), protocol_ids))
+                .exec(conn)
+                .await?
+        };
         let protocol_by_id: HashMap<ProtocolId, Protocol> =
             protocols.into_iter().map(|p| (p.id, p)).collect();
 
