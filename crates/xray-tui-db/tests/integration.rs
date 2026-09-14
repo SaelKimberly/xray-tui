@@ -1461,7 +1461,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     let db = Database::open(&path).await.expect("fresh open");
     let mut conn = db.connection().await.expect("connection");
 
-    // Fresh open writes the 8-table schema AND tags it user_version=7 so a
+    // Fresh open writes the 9-table schema AND tags it `user_version=8` so a
     // reopen can skip push_schema.
     let rows = toasty::sql::query("PRAGMA user_version")
         .exec(&mut conn)
@@ -1469,19 +1469,19 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .expect("read version");
     assert_eq!(
         first_i64(&rows),
-        Some(7),
-        "fresh open must tag the schema user_version=7"
+        Some(8),
+        "fresh open must tag the schema user_version=8"
     );
     let rows = toasty::sql::query(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
          AND name IN ('endpoints', 'protocols', 'profile_stats', \
                        'endpoint_groups', 'groups', 'routing_rules', 'dns_settings', \
-                       'route_probes')",
+                       'route_probes', 'endpoint_rank')",
     )
     .exec(&mut conn)
     .await
     .expect("count tables");
-    assert_eq!(first_i64(&rows), Some(8), "8-table schema created");
+    assert_eq!(first_i64(&rows), Some(9), "9-table schema created");
 
     // Seed data, then reopen: the tag preserves both schema and data.
     toasty::create!(Endpoint {
@@ -1504,7 +1504,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .exec(&mut conn)
         .await
         .expect("read version");
-    assert_eq!(first_i64(&rows), Some(7), "reopen keeps the schema tag");
+    assert_eq!(first_i64(&rows), Some(8), "reopen keeps the schema tag");
     assert!(
         Endpoint::filter_by_id(EndpointId::new(9))
             .first()

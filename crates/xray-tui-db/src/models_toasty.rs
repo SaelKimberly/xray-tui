@@ -355,6 +355,56 @@ pub struct RouteProbes {
     pub hosts: Vec<String>,
 }
 
+/// Materialized per-endpoint ordering keys (ADR 0003).
+///
+/// Derived state of the decision-16 law, computed in Rust by
+/// [`crate::endpoint_rank`] — never re-derived in SQL — and read by the page
+/// query through the covering index `endpoint_rank_test`. The page drives from
+/// this table, so every write that changes a link refreshes the endpoint's row
+/// (the write methods in [`crate::database`] own that).
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "endpoint_rank"]
+pub struct EndpointRank {
+    /// The endpoint these keys describe.
+    #[key]
+    #[column("endpoint_id")]
+    pub endpoint_id: EndpointId,
+    /// DNS-unresolved flag (1 = collapsed into the bottom band).
+    #[column("rank_dns")]
+    pub dns: i64,
+    /// Representative link's decision-16 tier (0 real-ok … 5 dns).
+    #[column("rank_tier")]
+    pub tier: i64,
+    /// Representative link's latency (`i32::MAX` outside the success tiers).
+    #[column("rank_latency")]
+    pub latency: i64,
+    /// Representative link's `last_seen_at` (epoch nanoseconds); ordered
+    /// descending, so newer links lead.
+    #[column("rank_seen")]
+    pub seen: i64,
+    /// Representative link's protocol id (the order's tiebreak).
+    #[column("rank_protocol")]
+    pub protocol: i64,
+    /// Display link's `last_seen_at` (epoch nanos), [`crate::endpoint_rank::NO_SEEN`] when none.
+    #[column("rank_display_seen")]
+    pub display_seen: i64,
+    /// Display link's speed (bps), [`crate::endpoint_rank::NO_SPEED`] when none.
+    #[column("rank_speed")]
+    pub speed: i64,
+    /// Display link's total traffic (up + down), 0 when none.
+    #[column("rank_traffic")]
+    pub traffic: i64,
+    /// Display link's config-type rank (`form` 0, `share_url` 1, other 2).
+    #[column("rank_config")]
+    pub config: i64,
+    /// Newest `last_seen_at` across the endpoint's links (epoch nanos): the
+    /// view windows ask whether any link falls in the band, which is the same
+    /// question as whether the newest one does — and reading it here keeps the
+    /// predicate single-table, so the page is an index scan.
+    #[column("rank_newest_seen")]
+    pub newest_seen: i64,
+}
+
 // ── Data-transfer types ──────────────────────────────────────────────────
 
 /// An endpoint with its per-pair links and their protocols, as loaded by the

@@ -35,11 +35,20 @@ an index.
   rank_latency, rank_seen, rank_protocol, rank_display_seen, rank_speed,
   rank_traffic, rank_config, rank_newest_seen)` with two indexes: the Test
   order (the scroll path) and the view window.
-- **Created additively** at `Database::open` (`CREATE TABLE IF NOT EXISTS` +
-  indexes) — NOT via a schema-tag bump, because decision 4 makes a bump a full
-  wipe. An older shape of the table is dropped and rebuilt: it is derived
-  state, so the backfill is the only cost, and it needs no migration
-  machinery.
+- A first-class `toasty` model (`models_toasty::EndpointRank`, table
+  `endpoint_rank`), so `push_schema` creates it with the rest of the schema.
+  This project is pre-alpha, so the table arrived with **schema tag 8** — the
+  tag bump WIPES the database (decision 4), which is the accepted way to add a
+  table here; the keys rebuild from the re-imported feed. (The first cut
+  created the table additively with raw DDL to avoid the wipe; the model is the
+  better shape and the wipe was authorised.)
+- Two statements stay raw, both performance-critical and inexpressible in the
+  ORM: the covering index (`#[index]` is single-column and cannot express a
+  composite whose last-but-one term is DESC) and the `refresh`/`repair_missing`
+  reads of `endpoints`/`profile_stats`, which inline their integer ids because
+  the engine charges ~0.8 ms per bound parameter. Rows are written with the
+  typed `upsert_by_endpoint_id`; writes are per-row inside the caller's
+  transaction, matching the existing `upsert_*_bulk` pattern.
 - **The keys are computed in Rust**, by the same function that is the
   ordering law (`endpoint_rank::RankLink::key`, which
   `EndpointRow::link_test_key` now delegates to). SQL stores the numbers and
@@ -79,8 +88,15 @@ an index.
   LastSeen/Speed/Traffic/ConfigType ≈ 39 ms (ordered column not indexed);
   Address/Port ≈ 166 ms (sorts the joined rows). The anchor query ≈ 65 ms.
 - One-time cost per database: the backfill (typed reads of every endpoint and
-  link, then chunked inserts) + index build ≈ 4.6 s at 7.7k endpoints, at the
-  first open after the upgrade; the table persists afterwards.
+  link, then the key writes) + index build, at the first open; the table
+  persists afterwards.
+- Measured after the model switch (7,672 endpoints / 15,344 links, synthetic):
+  page query 9.6–14.3 ms at offsets 0/2400/7400 (unchanged — the covering index
+  still serves it), hydration ~470 ms; a full import through `upsert_links_bulk`
+  now costs ~39 s (endpoints 6.7 s, links + key maintenance 32.5 s), of which
+  ~8 s is the per-row key upserts; one flush window's key refresh (400
+  endpoints) is ~470 ms, so the batch writer stays ahead at the observed result
+  rate but has less headroom than the raw bulk write gave it.
 - **Membership now depends on the rank row.** The page drives from the rank
   table, so a write path that changed links without refreshing would hide its
   endpoint. The freshness test pins the three write paths, the parity and

@@ -133,9 +133,10 @@ Implementation notes that differ from the draft above:
 
 - The keys are computed **in Rust** (the oracle), not in SQL; SQL stores and
   reads them.
-- The table is created **additively** at `open` (`CREATE TABLE IF NOT EXISTS`),
-  so no schema-tag bump and no wipe; an older shape is dropped and rebuilt
-  (derived state).
+- The table is a first-class `toasty` model, created by `push_schema` under
+  **schema tag 8** — a tag bump, which wipes the database (accepted: pre-alpha,
+  and the keys rebuild from a re-import). The earlier additive raw-DDL shape is
+  superseded.
 - The view windows read a stored `rank_newest_seen` instead of an `EXISTS` over
   `profile_stats`: with the latter the planner sorted every row (221 ms) rather
   than walking the index (1 ms).

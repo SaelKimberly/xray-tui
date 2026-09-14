@@ -11,8 +11,8 @@ use toasty_core::stmt::Value;
 use crate::error::{DatabaseError, Result};
 use crate::hash::stable_hash;
 use crate::models_toasty::{
-    DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRow, Group, HostType, ProfileStats,
-    Protocol, ProtocolId, RouteProbes, RoutingRule, TrafficStats,
+    DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRank, EndpointRow, Group, HostType,
+    ProfileStats, Protocol, ProtocolId, RouteProbes, RoutingRule, TrafficStats,
 };
 use crate::retry_on_busy;
 
@@ -82,7 +82,13 @@ impl Database {
         // from canonical JSON, which are unrelated to the new values, so
         // reusing a v6 file would re-key every protocol into a duplicate row
         // and orphan its links. The bump WIPES the file by design.
-        const SCHEMA_VERSION: i64 = 7;
+        //
+        // 8 = `endpoint_rank` (ADR 0003) as a first-class table. This project
+        // is pre-alpha, so a new table arrives by the same wipe rather than by
+        // migration machinery: a v7 file is discarded and rebuilt with the
+        // table present. The stored keys are derived state — a feed is
+        // re-imported, and the keys rebuild from its links.
+        const SCHEMA_VERSION: i64 = 8;
 
         let path_str = path
             .as_ref()
@@ -187,7 +193,8 @@ impl Database {
                 Group,
                 RoutingRule,
                 DnsSetting,
-                RouteProbes
+                RouteProbes,
+                EndpointRank
             ))
             .build(driver)
             .await?;
@@ -230,7 +237,8 @@ impl Database {
                 Group,
                 RoutingRule,
                 DnsSetting,
-                RouteProbes
+                RouteProbes,
+                EndpointRank
             ))
             .build(driver)
             .await?;
@@ -897,14 +905,14 @@ impl Database {
             .delete()
             .exec(&mut tx)
             .await?;
-            Endpoint::filter(toasty::stmt::in_list(Endpoint::fields().id(), ids))
+            Endpoint::filter(toasty::stmt::in_list(Endpoint::fields().id(), ids.clone()))
                 .delete()
                 .exec(&mut tx)
                 .await?;
             Self::purge_orphan_protocols(&mut tx).await?;
             // The page drives from `endpoint_rank`: drop the keys of the rows
             // whose links just went away, or the tab would list them again.
-            crate::endpoint_rank::prune(&mut tx).await?;
+            crate::endpoint_rank::prune(&mut tx, &ids).await?;
         }
 
         tx.commit().await?;
@@ -933,7 +941,7 @@ impl Database {
         Self::purge_orphan_protocols(&mut tx).await?;
         // The page drives from `endpoint_rank`: a deleted endpoint must not
         // leave its key behind.
-        crate::endpoint_rank::prune(&mut tx).await?;
+        crate::endpoint_rank::prune(&mut tx, &[endpoint_id]).await?;
 
         tx.commit().await?;
         Ok(())

@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use toasty_core::stmt::Value;
 
 use crate::models_toasty::{
-    ConfigType, Endpoint, EndpointId, EndpointRow, HostType, Latency, ProfileErr, ProfileStats,
-    ProtocolId,
+    ConfigType, Endpoint, EndpointId, EndpointRank, EndpointRow, HostType, Latency, ProfileErr,
+    ProfileStats, ProtocolId,
 };
 
 /// Sentinel for "no display link": sorts before any real timestamp, matching
@@ -114,57 +114,6 @@ fn nanos(ts: jiff::Timestamp) -> i64 {
     i64::try_from(ts.as_nanosecond()).unwrap_or(i64::MAX)
 }
 
-/// One endpoint's ordering keys, as stored in `endpoint_rank`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EndpointRank {
-    pub endpoint_id: i64,
-    /// DNS-unresolved flag (1 = collapse to the bottom band).
-    pub dns: i64,
-    /// Representative link's tier (0 real-ok … 5 dns).
-    pub tier: i64,
-    /// Representative link's latency (`i32::MAX` outside the success tiers).
-    pub latency: i64,
-    /// Representative link's `last_seen_at` (epoch nanoseconds) — ordered
-    /// descending, so newer links lead.
-    pub seen: i64,
-    /// Representative link's protocol id (the order's tiebreak).
-    pub protocol: i64,
-    /// Display link's `last_seen_at` (epoch nanos), [`NO_SEEN`] when none.
-    pub display_seen: i64,
-    /// Display link's speed (bps), [`NO_SPEED`] when none.
-    pub speed: i64,
-    /// Display link's total traffic (up + down), 0 when none.
-    pub traffic: i64,
-    /// Display link's config-type rank (`form` 0, `share_url` 1, other 2).
-    pub config: i64,
-    /// Newest `last_seen_at` across the endpoint's links (epoch nanos). The
-    /// Active/Stale windows ask "does any link fall in the band", which is the
-    /// same question as "does the newest" — and answering it from this column
-    /// keeps the view predicate off `profile_stats`, where it forced the
-    /// planner to sort every row instead of walking the index.
-    pub newest_seen: i64,
-}
-
-impl EndpointRank {
-    /// Terse constructor for tests.
-    #[must_use]
-    pub const fn new(endpoint_id: i64) -> Self {
-        Self {
-            endpoint_id,
-            dns: 0,
-            tier: 2,
-            latency: i32::MAX as i64,
-            seen: 0,
-            protocol: 0,
-            display_seen: NO_SEEN,
-            speed: NO_SPEED,
-            traffic: 0,
-            config: CONFIG_OTHER,
-            newest_seen: 0,
-        }
-    }
-}
-
 /// True when the endpoint is a DNS host whose resolution has not landed —
 /// the flag that collapses its links into one band (decision 16, tier 5).
 #[must_use]
@@ -215,7 +164,7 @@ const fn config_rank(config: ConfigType) -> i64 {
 /// page only ever lists endpoints that have at least one.
 #[must_use]
 pub fn compute_rank(
-    endpoint_id: i64,
+    endpoint_id: EndpointId,
     dns_unresolved: bool,
     override_protocol: Option<i64>,
     links: &[RankLink],
@@ -243,7 +192,7 @@ pub fn compute_rank(
 pub fn rank_of_row(row: &EndpointRow) -> Option<EndpointRank> {
     let links: Vec<RankLink> = row.links.iter().map(RankLink::from).collect();
     compute_rank(
-        row.endpoint.id.get(),
+        row.endpoint.id,
         dns_unresolved(row),
         row.endpoint.manual_protocol_override.map(ProtocolId::get),
         &links,
@@ -262,41 +211,29 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<EndpointRank> {
 // engine parses ~0.8 ms per bound parameter (200 ids = 174 ms; the same
 // statement with literals = 9.7 ms), which would dominate every refresh.
 
-const RANK_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS endpoint_rank (\
-        endpoint_id INTEGER PRIMARY KEY, \
-        rank_dns INTEGER NOT NULL, \
-        rank_tier INTEGER NOT NULL, \
-        rank_latency INTEGER NOT NULL, \
-        rank_seen INTEGER NOT NULL, \
-        rank_protocol INTEGER NOT NULL, \
-        rank_display_seen INTEGER NOT NULL, \
-        rank_speed INTEGER NOT NULL, \
-        rank_traffic INTEGER NOT NULL, \
-        rank_config INTEGER NOT NULL, \
-        rank_newest_seen INTEGER NOT NULL)"];
+/// The Test order (decision 16): the default sort, and the one the tab
+/// scrolls under.
+///
+/// It stays a raw statement because toasty's `#[index]` is single-column and
+/// cannot express a composite whose last-but-one term is DESCENDING — and this
+/// index is what makes a page an index scan (~1 ms) instead of a sort over
+/// every endpoint (~240 ms). Additive (`IF NOT EXISTS`), no data of its own.
+const COVERING_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_test ON endpoint_rank(\
+     rank_dns, rank_tier, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)";
 
-/// Indexes, created AFTER the fill: maintaining them across the backfill's
-/// inserts costs more than building them once at the end.
-const RANK_INDEXES: &[&str] = &[
-    // The Test order (decision 16): the default sort, and the one the tab
-    // scrolls under.
-    "CREATE INDEX IF NOT EXISTS endpoint_rank_test ON endpoint_rank(\
-        rank_dns, rank_tier, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)",
-    // The view windows read this one.
-    "CREATE INDEX IF NOT EXISTS endpoint_rank_window ON endpoint_rank(rank_newest_seen)",
-];
-
-/// Rows per statement for a rank write.
-const RANK_CHUNK: usize = 400;
+/// The view windows read this column.
+const WINDOW_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS endpoint_rank_window ON endpoint_rank(rank_newest_seen)";
 
 /// Create the rank table and, on a database that has none yet, fill it from
 /// the current link state. Runs once per database: an upgraded one pays the
 /// backfill here, at open, instead of on its first page.
 pub(crate) async fn ensure(conn: &mut toasty::Connection) -> crate::Result<()> {
-    // One transaction around the DDL and the fill: the table appears with its
-    // rows atomically, and no implicit write lock outlives this call (leaving
-    // one behind made the next writer on the pool time out with
-    // "database is locked").
+    // The table itself comes from the schema (tag 8) — this only creates the
+    // indexes and, on a database whose keys are not materialized yet, fills
+    // them. One transaction: the indexes and the fill land together, and no
+    // implicit write lock outlives the call (leaving one behind made the next
+    // writer on the pool time out with "database is locked").
     let mut tx = conn.transaction().await?;
     let result = ensure_in(&mut tx).await;
     match result {
@@ -307,45 +244,14 @@ pub(crate) async fn ensure(conn: &mut toasty::Connection) -> crate::Result<()> {
 }
 
 async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
-    // The table is DERIVED state: if an older shape of it is present, drop
-    // and rebuild it (the backfill is the only cost) rather than carrying
-    // migration machinery for a cache.
-    let columns = toasty::sql::query("SELECT name FROM pragma_table_info('endpoint_rank')")
-        .exec(conn)
-        .await
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| match row {
-                    Value::Record(record) => record.fields.first().cloned(),
-                    _ => None,
-                })
-                .filter_map(|v| match v {
-                    Value::String(name) => Some(name),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if !columns.is_empty() && !columns.iter().any(|name| name == "rank_newest_seen") {
-        tracing::warn!(target: "xray_tui_db", "endpoint_rank: rebuilding (shape changed)");
-        toasty::sql::query("DROP TABLE IF EXISTS endpoint_rank")
-            .exec(conn)
-            .await?;
+    for ddl in [COVERING_INDEX, WINDOW_INDEX] {
+        toasty::sql::query(ddl).exec(conn).await?;
     }
-    for ddl in RANK_DDL {
-        toasty::sql::query(*ddl).exec(conn).await?;
-    }
-    for ddl in RANK_INDEXES {
-        toasty::sql::query(*ddl).exec(conn).await?;
-    }
-    let existing = scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank").await?;
-    if existing > 0 {
-        // A database written before a refresh path existed (or by a path that
-        // bypassed it) heals here rather than hiding rows from the page.
+    if scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank").await? > 0 {
+        // A database whose keys are absent or stale (written before a refresh
+        // path existed, or by a path that bypassed one) heals here rather than
+        // hiding rows from the page.
         repair_missing(conn).await?;
-        for ddl in RANK_INDEXES {
-            toasty::sql::query(*ddl).exec(conn).await?;
-        }
         return Ok(());
     }
     let endpoints: Vec<Endpoint> = Endpoint::all().exec(conn).await?;
@@ -362,7 +268,7 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         .filter_map(|endpoint| {
             let links = by_endpoint.remove(&endpoint.id)?;
             compute_rank(
-                endpoint.id.get(),
+                endpoint.id,
                 dns_unresolved_endpoint(endpoint.host_type, &endpoint.resolved_as),
                 endpoint.manual_protocol_override.map(ProtocolId::get),
                 &links,
@@ -370,9 +276,6 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         })
         .collect();
     let written = write(conn, &ranks).await?;
-    for ddl in RANK_INDEXES {
-        toasty::sql::query(*ddl).exec(conn).await?;
-    }
     tracing::info!(target: "xray_tui_db", "endpoint_rank: backfilled {written} rows");
     Ok(())
 }
@@ -393,41 +296,28 @@ async fn scalar_i64(conn: &mut impl toasty::Executor, sql: &str) -> crate::Resul
         .unwrap_or(0))
 }
 
-/// `INSERT OR REPLACE` the rank rows, [`RANK_CHUNK`] per statement.
+/// Upsert the rank rows on the caller's executor (one statement per row, inside
+/// the caller's transaction — `ensure`, a flush window, or an import batch).
 pub(crate) async fn write(
     conn: &mut impl toasty::Executor,
     ranks: &[EndpointRank],
 ) -> crate::Result<usize> {
-    let mut written = 0usize;
-    for chunk in ranks.chunks(RANK_CHUNK) {
-        let values = chunk
-            .iter()
-            .map(|r| {
-                format!(
-                    "({},{},{},{},{},{},{},{},{},{},{})",
-                    r.endpoint_id,
-                    r.dns,
-                    r.tier,
-                    r.latency,
-                    r.seen,
-                    r.protocol,
-                    r.display_seen,
-                    r.speed,
-                    r.traffic,
-                    r.config,
-                    r.newest_seen
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        toasty::sql::query(format!(
-            "INSERT OR REPLACE INTO endpoint_rank VALUES {values}"
-        ))
-        .exec(conn)
-        .await?;
-        written += chunk.len();
+    for rank in ranks {
+        EndpointRank::upsert_by_endpoint_id(rank.endpoint_id)
+            .dns(rank.dns)
+            .tier(rank.tier)
+            .latency(rank.latency)
+            .seen(rank.seen)
+            .protocol(rank.protocol)
+            .display_seen(rank.display_seen)
+            .speed(rank.speed)
+            .traffic(rank.traffic)
+            .config(rank.config)
+            .newest_seen(rank.newest_seen)
+            .exec(conn)
+            .await?;
     }
-    Ok(written)
+    Ok(ranks.len())
 }
 
 /// The raw facts the rank law needs, straight from the stored columns.
@@ -467,14 +357,17 @@ impl crate::Database {
 /// The page drives from this table, so a lingering row would list a linkless
 /// endpoint. Called by the deletion owners (`purge_expired`) rather than on a
 /// timer: they are the only writers that remove links.
-pub(crate) async fn prune(conn: &mut impl toasty::Executor) -> crate::Result<usize> {
-    let rows = toasty::sql::query(
-        "DELETE FROM endpoint_rank WHERE endpoint_id NOT IN \
-         (SELECT endpoint_id FROM profile_stats)",
-    )
-    .exec(conn)
-    .await?;
-    Ok(rows.len())
+pub(crate) async fn prune(
+    conn: &mut impl toasty::Executor,
+    endpoint_ids: &[EndpointId],
+) -> crate::Result<usize> {
+    for id in endpoint_ids {
+        EndpointRank::filter_by_endpoint_id(*id)
+            .delete()
+            .exec(conn)
+            .await?;
+    }
+    Ok(endpoint_ids.len())
 }
 
 /// Backfill rank rows for endpoints that have links but no row yet.
@@ -574,7 +467,7 @@ pub(crate) async fn refresh(
             let empty: Vec<RankLink> = Vec::new();
             let endpoint_links = links.get(id).unwrap_or(&empty);
             compute_rank(
-                *id,
+                EndpointId::new(*id),
                 endpoint.dns_unresolved,
                 endpoint.override_protocol,
                 endpoint_links,
