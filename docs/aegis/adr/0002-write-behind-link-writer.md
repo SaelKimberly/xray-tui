@@ -124,9 +124,21 @@ Measured on a 20k-link table, 400 pairs per statement (this engine, debug build)
 | --- | --- | --- |
 | `OR` chain, 90 pairs × 5 statements | 18 ms | index-driven; unscalable (dies at 99 pairs/statement) |
 | row-value `(p, e) IN ((..), ..)` | 757 ms | parses at any width, but scans — not index-driven |
+| `… IN (VALUES (p, e), ..)` | 30 s | the same scan, an order of magnitude worse |
 | `UNION ALL` of 400 per-pair `SELECT`s | — | overflows turso's parser stack |
-| `VALUES`-CTE join (chosen) | 9 ms | flat at 5,000 pairs, exact pairs only, composite-key index |
+| cross-product `pid IN (…) AND eid IN (…)` | 40 ms | verdict stays exact (the set is built from returned rows), but it over-fetches |
+| `VALUES`-CTE join (chosen) | 8 ms | flat at 5,000 pairs, exact pairs only, composite-key index |
 
-Pinned by
-`tests/integration.rs::apply_link_patches_applies_a_window_wider_than_the_expression_depth_limit`
-(a 500-row window: the class guard, whatever the predicate's shape).
+The chosen shape's cost tracks the pair count, not the table: 400 pairs cost
+8.5 ms at 20k rows and 7.7 ms at 50k rows, and 7.3 ms when the chunk's pairs are
+all ABSENT (the fresh-import shape) — index probes in both directions, no
+materialize-and-scan cliff. `endpoint_rank::write`'s bulk
+`INSERT OR REPLACE … VALUES (…),(…)` was audited for the same class: it parses at
+400 / 512 / 1,000 / 5,000 / 20,000 rows, so a `VALUES` list is depth-flat and
+needs no chunking constraint either.
+
+Pinned by two tests: `apply_link_patches_applies_a_window_wider_than_the_expression_depth_limit`
+(a 500-row window — the class guard for any future predicate shape) and
+`apply_link_patches_probe_is_exact_for_absent_and_near_miss_pairs` (the UPDATE vs
+INSERT verdict at 140 rows, absent pairs included — the failure mode that is
+silent, since an `UPDATE` matching zero rows drops the link without an error).

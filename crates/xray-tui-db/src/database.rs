@@ -838,8 +838,8 @@ impl Database {
                     upsert_link_row(&mut tx, &patch.link).await?;
                     // An INSERT writes the whole snapshot whatever the patch's
                     // groups are, so it can move the endpoint's key even for a
-                    // TASK-only patch — the endpoint may not have had this link
-                    // at all a moment ago.
+                    // groups-narrow patch — the endpoint may not have had this
+                    // link at all a moment ago.
                     touched.push(patch.link.endpoint_id);
                 }
             }

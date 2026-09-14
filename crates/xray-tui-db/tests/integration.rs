@@ -1730,6 +1730,99 @@ async fn apply_link_patches_applies_a_window_wider_than_the_expression_depth_lim
     );
 }
 
+/// The probe's verdict decides UPDATE vs INSERT per row, so at batch scale it
+/// must be right in BOTH directions: a pair that exists is updated in place, and
+/// a pair that does not is inserted through the typed upsert. Treating a missing
+/// pair as existing runs an `UPDATE` that matches zero rows, and the link is
+/// silently dropped (no result, no error).
+///
+/// The absent pairs are **near-misses** — both of their ids are elsewhere in the
+/// window, only the pair is not (protocol 10 belongs to endpoint 1, endpoint 2
+/// holds protocol 20). Note the exactness here is structural, not
+/// predicate-dependent: the probe's set is built from the ROWS the statement
+/// returned, so an over-fetching predicate (a cross-product superset) still
+/// yields an exact verdict — it only costs more (measured: 40 ms vs 8 ms per
+/// 400 pairs). What this test pins is the verdict split at batch scale, which no
+/// other test crosses the 99-pair mark to reach.
+#[tokio::test]
+async fn apply_link_patches_probe_is_exact_for_absent_and_near_miss_pairs() {
+    const EXISTING: i64 = 120;
+    const ABSENT: i64 = 20;
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("conn");
+    for id in 1..=EXISTING {
+        seed_endpoint(
+            &mut conn,
+            id,
+            id * 10,
+            "h.example",
+            HostType::Ipv4,
+            443,
+            100,
+        )
+        .await;
+    }
+    let base = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(10),
+        EndpointId::new(1),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("load")
+    .expect("row");
+
+    let patch = |protocol_id: i64, endpoint_id: i64, delay: i32| {
+        let mut link = base.clone();
+        link.protocol_id = ProtocolId::new(protocol_id);
+        link.endpoint_id = EndpointId::new(endpoint_id);
+        link.latency = Some(Latency::Fast { delay });
+        LinkPatch {
+            link,
+            groups: LinkGroups::RESULT,
+        }
+    };
+    let mut patches: Vec<LinkPatch> = (1..=EXISTING).map(|id| patch(id * 10, id, 7)).collect();
+    patches.extend((0..ABSENT).map(|k| patch((k + 1) * 10, k + 2, 9)));
+
+    assert_eq!(
+        db.apply_link_patches(&patches).await.expect("apply"),
+        patches.len()
+    );
+
+    let persisted: Vec<ProfileStats> = ProfileStats::all().exec(&mut conn).await.expect("links");
+    assert_eq!(
+        persisted.len(),
+        patches.len(),
+        "the absent pairs were inserted, not skipped as already-present"
+    );
+    let by_key: std::collections::HashMap<(i64, i64), Option<Latency>> = persisted
+        .iter()
+        .map(|l| {
+            (
+                (l.protocol_id.get(), l.endpoint_id.get()),
+                l.latency.clone(),
+            )
+        })
+        .collect();
+    for k in 0..ABSENT {
+        let key = ((k + 1) * 10, k + 2);
+        assert_eq!(
+            by_key.get(&key),
+            Some(&Some(Latency::Fast { delay: 9 })),
+            "the absent pair {key:?} was inserted with its patched result"
+        );
+    }
+    for id in 1..=EXISTING {
+        assert_eq!(
+            by_key.get(&(id * 10, id)),
+            Some(&Some(Latency::Fast { delay: 7 })),
+            "the existing pair ({}, {id}) took the patched result",
+            id * 10
+        );
+    }
+}
+
 /// A result patch taken before another writer bumped the row must land, and
 /// must not clobber the scheduler columns that writer changed.
 /// Every group is isolated: a patch writes its own group and leaves the others
