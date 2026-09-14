@@ -39,11 +39,26 @@ impl LinkGroups {
     pub const TRAFFIC: Self = Self(0b100);
     /// Every group.
     pub const ALL: Self = Self(0b111);
+    /// The groups that can change a STORED ORDERING KEY.
+    ///
+    /// The rank columns derive from a link's `error`/`latency`/`last_seen_at`/
+    /// `speed_bps`/`traffic`/`config_type` (and the endpoint's `host_type`/
+    /// `resolved_as`/`manual_protocol_override`) — never from `task_id` or
+    /// `task_queue`. A TASK-only patch therefore leaves every key untouched,
+    /// which matters because the scheduler's transitions are the bulk of a
+    /// batch's writes: refreshing them cost ~0.7 ms per row for no change.
+    pub const KEY_AFFECTING: Self = Self(0b101);
 
     /// Whether `other`'s groups are all present in `self`.
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// Whether any group is shared.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
     }
 
     /// OR of two groups.
@@ -628,7 +643,9 @@ impl Database {
         let mut tx = conn.transaction().await?;
         let mut applied = 0usize;
         for patch in patches {
-            touched.push(patch.link.endpoint_id);
+            if patch.groups.intersects(LinkGroups::KEY_AFFECTING) {
+                touched.push(patch.link.endpoint_id);
+            }
             let Some(mut model) = ProfileStats::filter_by_protocol_id_and_endpoint_id(
                 patch.link.protocol_id,
                 patch.link.endpoint_id,

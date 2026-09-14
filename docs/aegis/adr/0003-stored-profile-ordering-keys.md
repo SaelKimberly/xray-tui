@@ -99,6 +99,12 @@ an index.
   per 400 rows: 136 ms for the statement alone, +60 ms for the covering index,
   +87 ms for the window index. The batch writer stays ahead at observed result
   rates; the write cost is what the derived-state cache buys.
+- A patch window refreshes a key only when it could have changed it:
+  `LinkGroups::KEY_AFFECTING` (RESULT | TRAFFIC) skips the scheduler's TASK-only
+  transitions, which carry `task_id`/`task_queue` — columns no rank field
+  derives from. Measured on 400 patches: TASK-only 450 ms, RESULT 792 ms, so
+  the skip is worth ~340 ms per scheduler window, and those windows are the
+  bulk of a batch.
 - **Membership now depends on the rank row.** The page drives from the rank
   table, so a write path that changed links without refreshing would hide its
   endpoint. The freshness test pins the three write paths, the parity and
