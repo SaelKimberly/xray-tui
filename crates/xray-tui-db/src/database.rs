@@ -165,6 +165,14 @@ impl Database {
             .await?;
 
         Self::init_default_groups(&mut conn).await?;
+        // Materialized per-endpoint ordering keys (decision 21): additive
+        // side table, created here and backfilled when empty. A database that
+        // predates it pays the fill once, at open.
+        if std::env::var("XRAY_TUI_SKIP_RANK_ENSURE").is_err()
+            && let Err(e) = crate::endpoint_rank::ensure(&mut conn).await
+        {
+            tracing::warn!(target: "xray_tui_db", "endpoint_rank: {e}");
+        }
         Ok(Self { db })
     }
 
@@ -247,6 +255,14 @@ impl Database {
             .await?;
 
         Self::init_default_groups(&mut conn).await?;
+        // Materialized per-endpoint ordering keys (decision 21): additive
+        // side table, created here and backfilled when empty. A database that
+        // predates it pays the fill once, at open.
+        if std::env::var("XRAY_TUI_SKIP_RANK_ENSURE").is_err()
+            && let Err(e) = crate::endpoint_rank::ensure(&mut conn).await
+        {
+            tracing::warn!(target: "xray_tui_db", "endpoint_rank: {e}");
+        }
         Ok(Self { db })
     }
 
@@ -566,6 +582,7 @@ impl Database {
     /// preserved on update; new rows start with an empty queue.
     pub async fn upsert_link(&self, s: &ProfileStats) -> Result<()> {
         let mut conn = self.conn().await?;
+        let endpoint_id = s.endpoint_id;
         ProfileStats::upsert_by_protocol_id_and_endpoint_id(s.protocol_id, s.endpoint_id)
             .core_type(s.core_type)
             .config_type(s.config_type)
@@ -577,6 +594,9 @@ impl Database {
             .on_create(|create| create.task_queue(Vec::<u16>::new()))
             .exec(&mut conn)
             .await?;
+        // The stored ordering key is derived state: refresh it for the write
+        // that just invalidated it (the page reads the key, not the link).
+        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
         Ok(())
     }
 
@@ -596,9 +616,11 @@ impl Database {
             return Ok(0);
         }
         let mut conn = self.conn().await?;
+        let mut touched: Vec<EndpointId> = Vec::with_capacity(patches.len());
         let mut tx = conn.transaction().await?;
         let mut applied = 0usize;
         for patch in patches {
+            touched.push(patch.link.endpoint_id);
             let Some(mut model) = ProfileStats::filter_by_protocol_id_and_endpoint_id(
                 patch.link.protocol_id,
                 patch.link.endpoint_id,
@@ -658,6 +680,11 @@ impl Database {
             applied += 1;
         }
         tx.commit().await?;
+        // Derived state: the patched endpoints' ordering keys follow their
+        // links. Done after the commit (the page is read later, never here).
+        if let Err(e) = crate::endpoint_rank::refresh(&mut conn, &touched).await {
+            tracing::warn!(target: "xray_tui_db", "endpoint_rank refresh: {e}");
+        }
         Ok(applied)
     }
 
@@ -1171,6 +1198,13 @@ pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -
             .exec(tx)
             .await?;
     }
+    // Derived state: the stored ordering keys follow the links, so every
+    // link writer refreshes the endpoints it touched — here, inside the
+    // caller's transaction, which makes the key update atomic with the write.
+    let mut touched: Vec<EndpointId> = links.iter().map(|l| l.endpoint_id).collect();
+    touched.sort_unstable_by_key(|id| id.get());
+    touched.dedup();
+    crate::endpoint_rank::refresh(tx, &touched).await?;
     Ok(())
 }
 
@@ -1361,6 +1395,9 @@ mod tests {
         )
         .await;
 
+        // The fixture seeded with raw writes: make the stored keys follow.
+        db.repair_endpoint_ranks().await.expect("ranks");
+
         // Active: only the recent endpoint.
         let active = req(PurgatoryView::Active, ts(now - 3_600), ts(now - 7_200));
         assert_eq!(ids(&db, &active).await, vec![1]);
@@ -1379,6 +1416,9 @@ mod tests {
         let mut conn = db.connection().await.expect("connection");
         seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
         seed_link(&mut conn, 1, 1002, 20).await;
+
+        // The fixture seeded with raw writes: make the stored keys follow.
+        db.repair_endpoint_ranks().await.expect("ranks");
 
         let rows = rows_of(&db, &req(PurgatoryView::All, ts(0), ts(0))).await;
         assert_eq!(rows.len(), 1);
@@ -1432,6 +1472,8 @@ mod tests {
             group_id: Some(id.to_string()),
             ..req(PurgatoryView::All, ts(0), ts(0))
         };
+        // The fixture seeded with raw writes: make the stored keys follow.
+        db.repair_endpoint_ranks().await.expect("ranks");
         assert_eq!(ids(&db, &group("source-a")).await, vec![1]);
         assert_eq!(ids(&db, &group("source-b")).await, vec![1]);
         assert!(
@@ -1562,6 +1604,9 @@ mod tests {
             .await
             .expect("link");
         }
+
+        // The fixture seeded with raw writes: make the stored keys follow.
+        db.repair_endpoint_ranks().await.expect("ranks");
 
         let rows = rows_of(&db, &req(PurgatoryView::All, ts(0), ts(0))).await;
         let row = &rows[0];

@@ -9,3 +9,5 @@
 | 2026-09-11 | plan | `plans/2026-09-11-write-behind-link-writer.md` | Write-behind link writer — implementation | executed (W1-W4 + W5.2; W5.4 throughput harness deliberately not built — per-statement cost measured directly) |
 | 2026-09-11 | adr | `adr/0001-raw-sql-profiles-page-query.md` | Raw SQL for the Profiles page query | accepted |
 | 2026-09-11 | adr | `adr/0002-write-behind-link-writer.md` | Write-behind profile_stats persistence | accepted |
+| 2026-09-14 | spec | `specs/2026-09-14-profiles-stored-sort-key-design.md` | Profiles sort keys: materialize the per-endpoint ordering | implemented |
+| 2026-09-14 | adr | `adr/0003-stored-profile-ordering-keys.md` | Materialized per-endpoint ordering keys | accepted |

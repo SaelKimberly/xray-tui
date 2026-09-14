@@ -65,6 +65,13 @@ async fn test_db() -> Database {
     Database::in_memory().await.expect("open in-memory db")
 }
 
+/// The fixtures seed with raw statements, bypassing the write paths that keep
+/// `endpoint_rank` current — the same invariant, established explicitly: the
+/// page lists endpoints through their stored keys.
+async fn seed_ranks(db: &Database) {
+    db.repair_endpoint_ranks().await.expect("seed ranks");
+}
+
 fn ts(secs: i64) -> Timestamp {
     Timestamp::from_second(secs).expect("valid ts")
 }
@@ -178,6 +185,8 @@ async fn page_rows_assemble_links_and_protocols() {
     seed_link(&mut conn, 1, 1002, 20).await;
 
     let all = page_req(PurgatoryView::All, ts(0), ts(0), None);
+    // The fixture seeded with raw writes: make the stored keys follow.
+    seed_ranks(&db).await;
     let rows = page_rows(&db, &all).await;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
@@ -222,6 +231,10 @@ async fn large_page_loads_via_batched_in_list() {
         .await;
     }
 
+    // The fixture seeded with raw writes: make the stored keys follow.
+
+    seed_ranks(&db).await;
+
     let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
     assert_eq!(rows.len(), 1000, "every endpoint on the page");
     assert!(
@@ -261,6 +274,10 @@ async fn rows_are_sorted_by_test_priority() {
     )
     .await;
 
+    // The fixture seeded with raw writes: make the stored keys follow.
+
+    seed_ranks(&db).await;
+
     let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
     let row = &rows[0];
     let order: Vec<i64> = row.links.iter().map(|l| l.protocol_id.get()).collect();
@@ -290,6 +307,10 @@ async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
         Some(Latency::Real { delay: 5, ip: None }),
     )
     .await;
+
+    // The fixture seeded with raw writes: make the stored keys follow.
+
+    seed_ranks(&db).await;
 
     let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
     let row = &rows[0];
@@ -363,6 +384,7 @@ async fn active_and_stale_windows() {
         ts(now - 7_200),
         None,
     );
+    seed_ranks(&db).await;
     assert_eq!(page_ids(&db, &active).await, vec![1]);
 
     let stale = page_req(PurgatoryView::Stale, ts(now - 3_600), ts(now - 7_200), None);
@@ -441,6 +463,8 @@ async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
     seed_endpoint(&mut conn, 7, 7001, "7.7.7.7", HostType::Ipv4, 443, active).await;
 
     let stale_req = page_req(PurgatoryView::Stale, ts(active), ts(stale), None);
+    // The fixture seeded with raw writes: make the stored keys follow.
+    seed_ranks(&db).await;
     let stale_ids = page_ids(&db, &stale_req).await;
     let count = db.profiles_count(&stale_req).await.expect("count");
     let rows = page_rows(&db, &stale_req).await;
@@ -489,6 +513,7 @@ async fn group_filter_selects_by_group_membership() {
     .expect("link group b");
 
     let group = |id: &str| page_req(PurgatoryView::All, ts(0), ts(0), Some(id));
+    seed_ranks(&db).await;
     assert_eq!(page_ids(&db, &group("source-a")).await, vec![1]);
     assert_eq!(page_ids(&db, &group("source-b")).await, vec![1]);
     assert!(

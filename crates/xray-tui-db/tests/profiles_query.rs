@@ -8,10 +8,11 @@ use jiff::Timestamp;
 use toasty::{Deferred, Json};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    ConfigType, Endpoint, EndpointId, HostType, ProfileStats, Protocol, ProtocolId, PurgatoryView,
-    Security, TrafficStats, Transport,
+    ConfigType, Endpoint, EndpointId, ErrorInfo, HostType, Latency, ProfileStats, Protocol,
+    ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, sql_ts};
+use xray_tui_db::{LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
     CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
@@ -158,6 +159,48 @@ async fn seed_link(
     }
 }
 
+/// A `ProfileStats` value for the value-taking write paths (`upsert_link`,
+/// `apply_link_patches`) — the seeded equivalent of a ping result.
+fn link_value(
+    endpoint_id: i64,
+    protocol_id: i64,
+    delay: Option<i32>,
+    error_kind: Option<&str>,
+    last_seen: i64,
+) -> ProfileStats {
+    ProfileStats {
+        protocol_id: ProtocolId::new(protocol_id),
+        endpoint_id: EndpointId::new(endpoint_id),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_used_at: None,
+        last_seen_at: ts(last_seen),
+        task_id: None,
+        task_queue: Vec::<u16>::new(),
+        latency: delay.map(|delay| Latency::Real { delay, ip: None }),
+        speed_bps: None,
+        error: error_kind.map(|kind| ErrorInfo {
+            kind: match kind {
+                "real" => xray_tui_db::models::ProfileErr::Real,
+                "fast" => xray_tui_db::models::ProfileErr::Fast,
+                _ => xray_tui_db::models::ProfileErr::Name,
+            },
+            text: format!("{kind} probe"),
+        }),
+        traffic: TrafficStats {
+            today_up: 0,
+            today_down: 0,
+            total_up: 0,
+            total_down: 0,
+        },
+        created_at: ts(last_seen),
+        updated_at: ts(last_seen),
+        version: 1,
+        protocol: Deferred::default(),
+        endpoint: Deferred::default(),
+    }
+}
+
 /// Fixture: measured successes, both error bands, untested, DNS unresolved and
 /// resolved, a manual override pointing away from the minimum-weight link, and
 /// a measured link with an error marker beside an untested sibling.
@@ -196,7 +239,13 @@ async fn seed_fixture() -> Database {
     seed_endpoint(&mut conn, 7, HostType::Dns, &["203.0.113.7"]).await;
     seed_link(&mut conn, 7, 110, Some(7), None, 180).await;
     seed_link(&mut conn, 7, 111, None, Some("name"), 190).await;
+    drop(conn);
 
+    // These fixtures write links with raw statements, bypassing the write
+    // paths that keep `endpoint_rank` current (see the freshness test below).
+    // Establish the same invariant they do, explicitly.
+    let ids: Vec<EndpointId> = (1..=7).map(EndpointId::new).collect();
+    db.refresh_endpoint_ranks(&ids).await.expect("seed ranks");
     db
 }
 
@@ -333,6 +382,51 @@ async fn enrich_seed_covers_ip_hosts_and_resolved_dns_hosts_only() {
     assert_eq!(seeded, vec![1, 2, 3, 4, 5, 7]);
 }
 
+/// The stored keys are derived state: every write path that can change a link
+/// must leave them current, or the page order silently ignores the write.
+#[tokio::test]
+async fn link_writes_keep_the_stored_keys_current() {
+    let db = Database::in_memory().await.expect("db");
+    let mut conn = db.connection().await.expect("conn");
+    seed_endpoint(&mut conn, 1, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 2, HostType::Ipv4, &[]).await;
+    drop(conn);
+
+    let page = || async {
+        db.profiles_page(&request(PageSort::Test, true, 0, 100))
+            .await
+            .expect("page")
+            .ids
+    };
+
+    // `upsert_link` (the import / single-row path).
+    db.upsert_link(&link_value(1, 101, None, None, 100))
+        .await
+        .expect("upsert a");
+    db.upsert_link(&link_value(2, 102, None, None, 100))
+        .await
+        .expect("upsert b");
+    assert_eq!(page().await, vec![EndpointId::new(1), EndpointId::new(2)]);
+
+    // `apply_link_patches` (the batch-result path): a real result leads.
+    db.apply_link_patches(&[LinkPatch {
+        link: link_value(2, 102, Some(20), None, 100),
+        groups: LinkGroups::RESULT,
+    }])
+    .await
+    .expect("patch");
+    assert_eq!(page().await, vec![EndpointId::new(2), EndpointId::new(1)]);
+
+    // And the failure band follows the same route.
+    db.apply_link_patches(&[LinkPatch {
+        link: link_value(2, 102, None, Some("real"), 100),
+        groups: LinkGroups::RESULT,
+    }])
+    .await
+    .expect("patch");
+    assert_eq!(page().await, vec![EndpointId::new(1), EndpointId::new(2)]);
+}
+
 #[tokio::test]
 async fn anchor_and_page_agree_after_a_weight_change() {
     let db = seed_fixture().await;
@@ -351,6 +445,8 @@ async fn anchor_and_page_agree_after_a_weight_change() {
     .exec(&mut db.connection().await.expect("conn"))
     .await
     .expect("mutate");
+    // The raw statement bypassed the write paths, so refresh like they do.
+    db.refresh_endpoint_ranks(&[moved]).await.expect("ranks");
 
     let after = db
         .profiles_page(&request(PageSort::Test, true, 0, 100))

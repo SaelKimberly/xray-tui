@@ -390,46 +390,17 @@ impl EndpointRow {
         Some((link, protocol))
     }
 
-    /// Tier for one link under the test-priority model (lower = better):
-    /// 0 real-ok, 1 fast-ok, 2 untested, 3 real-err, 4 fast-err,
-    /// 5 dns-unresolved. `dns_unresolved` is endpoint-level: one flag for
-    /// all links (`host_type == Dns` and no cached `resolved_as`).
-    const fn link_test_tier(link: &ProfileStats, dns_unresolved: bool) -> u8 {
-        if dns_unresolved {
-            5
-        } else if let Some(err) = &link.error {
-            match err.kind {
-                // A name-resolution failure surfaces on a real attempt, so it
-                // shares the real-err bucket.
-                ProfileErr::Real | ProfileErr::Name => 3,
-                ProfileErr::Fast => 4,
-            }
-        } else {
-            match link.latency {
-                Some(Latency::Real { .. }) => 0,
-                Some(Latency::Fast { .. }) => 1,
-                None => 2,
-            }
-        }
-    }
-
-    /// Ascending sort key: `(tier, latency, recency, protocol_id)`. `recency`
+    /// Ascending sort key `(tier, latency, recency, protocol_id)`. `recency`
     /// is the negated `last_seen_at` epoch so newer links sort first on ties.
     /// Only success tiers (0/1) rank by latency; untested and error/dns tiers
     /// use `i32::MAX` so they order by recency then protocol id.
+    ///
+    /// Delegates to [`crate::endpoint_rank::RankLink::key`], the single
+    /// implementation of the decision-16 law: the stored `endpoint_rank` keys,
+    /// this comparator, and the parity golden all read it, so none of them can
+    /// drift from the others.
     fn link_test_key(link: &ProfileStats, dns_unresolved: bool) -> (u8, i32, i64, i64) {
-        let tier = Self::link_test_tier(link, dns_unresolved);
-        let delay = match link.latency {
-            Some(Latency::Real { delay, .. } | Latency::Fast { delay }) => delay,
-            None => i32::MAX,
-        };
-        let latency = if tier <= 1 { delay } else { i32::MAX };
-        (
-            tier,
-            latency,
-            -link.last_seen_at.as_second(),
-            link.protocol_id.get(),
-        )
+        crate::endpoint_rank::RankLink::from(link).key(dns_unresolved)
     }
 
     /// Re-sort `links` by test priority: real-ping success first, then fast
@@ -688,8 +659,14 @@ mod tests {
             (20, 2, Some(fast(10)), None),
             (30, 3, None, None),
         ]);
-        // Best = real-ok (tier 0), latency 200
-        assert_eq!(r.best_test_priority_key(false), Some((0, 200, -1, 10)));
+        // Best = real-ok (tier 0), latency 200. Recency is epoch NANOSECONDS:
+        // the key orders by the same instant the stored `endpoint_rank.seen`
+        // and the retired SQL `last_seen_at DESC` compare, so sub-second
+        // differences participate instead of collapsing to a tie.
+        assert_eq!(
+            r.best_test_priority_key(false),
+            Some((0, 200, -1_000_000_000, 10))
+        );
         // Empty links -> None
         let empty = row(&[]);
         assert_eq!(empty.best_test_priority_key(false), None);
