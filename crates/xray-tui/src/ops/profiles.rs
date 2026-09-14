@@ -168,27 +168,58 @@ pub async fn reload_profiles(state: &mut AppState) {
     if let Err(e) = state.link_writer.flush().await {
         tracing::warn!(target: "tui::ops::profiles", "flush before reload: {e}");
     }
-    // The selection is an endpoint id, not a row index: after a reorder the row
-    // may sit on another page, and the window follows it.
+    let load = ProfilesLoad::from(&*state);
+    match load_profiles_rows(&state.db, &load).await {
+        Ok((rows, meta)) => apply_profiles_rows(state, rows, &meta),
+        Err(e) => {
+            state.log_trace(
+                "error",
+                "tui::ops::profiles",
+                &format!("Failed to load profiles: {e}"),
+            );
+            state.endpoints.clear();
+            state.filter_cache_valid.set(true);
+            clamp_selection(state);
+        }
+    }
+}
+
+/// Reload the page for an EXTERNAL invalidation (a ping result moved a row, a
+/// search/sort/view change landed), keeping the user where they were.
+///
+/// The selection is an endpoint id, not an index: after a reorder the row may
+/// sit on another page, so the window is re-anchored on the row's new offset
+/// when it left the loaded page. Deliberate navigation uses [`reload_profiles`]
+/// instead — it sets the offset on purpose and must not be pulled back.
+pub async fn reload_profiles_preserving_selection(state: &mut AppState) {
     let selected = state
         .selected_profile_id()
         .map(xray_tui_db::models::EndpointId::new);
-    let mut load = ProfilesLoad::from(&*state);
-    let mut outcome = load_profiles_rows(&state.db, &load).await;
-    if let (Ok((rows, _meta)), Some(id)) = (&outcome, selected)
-        && !rows.iter().any(|row| row.endpoint.id == id)
-        && let Ok(Some(offset)) = state.db.profiles_anchor(&page_request(&load), id).await
-    {
-        load.offset = offset;
-        outcome = load_profiles_rows(&state.db, &load).await;
-    }
-    match outcome {
+    let load = ProfilesLoad::from(&*state);
+    match load_profiles_rows(&state.db, &load).await {
         Ok((rows, meta)) => {
+            let moved_away =
+                selected.is_some_and(|id| !rows.iter().any(|row| row.endpoint.id == id));
             apply_profiles_rows(state, rows, &meta);
             if let Some(id) = selected
                 && let Some(index) = state.endpoints.iter().position(|row| row.endpoint.id == id)
             {
                 state.selected_index = index;
+            } else if moved_away
+                && let Some(id) = selected
+                && let Ok(Some(offset)) = state.db.profiles_anchor(&page_request(&load), id).await
+            {
+                // Re-anchor once on the row's new position, then follow it.
+                state.page_offset = offset;
+                let load = ProfilesLoad::from(&*state);
+                if let Ok((rows, meta)) = load_profiles_rows(&state.db, &load).await {
+                    apply_profiles_rows(state, rows, &meta);
+                    if let Some(index) =
+                        state.endpoints.iter().position(|row| row.endpoint.id == id)
+                    {
+                        state.selected_index = index;
+                    }
+                }
             }
         }
         Err(e) => {
@@ -197,9 +228,6 @@ pub async fn reload_profiles(state: &mut AppState) {
                 "tui::ops::profiles",
                 &format!("Failed to load profiles: {e}"),
             );
-            state.endpoints.clear();
-            state.filter_cache_valid.set(false);
-            clamp_selection(state);
         }
     }
 }
@@ -213,6 +241,75 @@ pub(crate) const fn clamp_index(selected: usize, len: usize) -> usize {
     } else {
         selected
     }
+}
+
+/// Move the selection by `delta` rows, crossing page boundaries.
+///
+/// Down past the last row of the window loads the next page and lands on its
+/// first row; Up before the first row loads the previous page and lands on its
+/// last row. At the very start/end of the feed the index clamps and nothing is
+/// fetched.
+pub async fn move_selection(state: &mut AppState, delta: isize) {
+    let len = filtered_len(state);
+    if len == 0 {
+        return;
+    }
+    let total = state.page_total;
+    let target = state.selected_index as isize + delta;
+
+    if target < 0 {
+        if state.page_offset == 0 {
+            state.selected_index = 0;
+            return;
+        }
+        state.page_offset = state.page_offset.saturating_sub(PROFILES_PAGE_SIZE);
+        reload_profiles(state).await;
+        state.selected_index = filtered_len(state).saturating_sub(1);
+        return;
+    }
+
+    if target as usize >= len {
+        let next_offset = state.page_offset + len;
+        if next_offset as u64 >= total {
+            state.selected_index = len.saturating_sub(1);
+            return;
+        }
+        let overshoot = target as usize - len;
+        state.page_offset = next_offset;
+        reload_profiles(state).await;
+        state.selected_index = overshoot.min(filtered_len(state).saturating_sub(1));
+        return;
+    }
+
+    state.selected_index = target as usize;
+}
+
+/// Jump to the first row of the feed.
+pub async fn goto_first(state: &mut AppState) {
+    state.selected_sub = None;
+    if state.page_offset == 0 {
+        state.selected_index = 0;
+        return;
+    }
+    state.page_offset = 0;
+    reload_profiles(state).await;
+    state.selected_index = 0;
+}
+
+/// Jump to the last row of the feed, loading the page that holds it.
+pub async fn goto_last(state: &mut AppState) {
+    state.selected_sub = None;
+    let total = state.page_total;
+    if total == 0 {
+        state.selected_index = 0;
+        return;
+    }
+    let last_offset = (((total - 1) as usize) / PROFILES_PAGE_SIZE) * PROFILES_PAGE_SIZE;
+    if state.page_offset != last_offset {
+        state.page_offset = last_offset;
+        reload_profiles(state).await;
+    }
+    state.selected_index = filtered_len(state).saturating_sub(1);
 }
 
 /// Re-clamp the selection into the loaded page.
@@ -1586,8 +1683,89 @@ mod clamp_tests {
 }
 
 #[cfg(test)]
-mod sort_tests {
+mod page_nav_tests {
+    use std::sync::Arc;
+
+    use super::test_support::{fake_row, test_state};
     use super::*;
+    use crate::ops::profiles::ttl_tests::persist_rows;
+
+    /// One more row than a page, so both boundary directions are real.
+    async fn state_with_two_pages() -> AppState {
+        let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
+        let rows: Vec<EndpointRow> = (1..=(PROFILES_PAGE_SIZE as i64 + 2))
+            .map(|i| fake_row(i, &format!("h{i:05}.example"), 1))
+            .collect();
+        persist_rows(&db, &rows).await;
+        let mut state = test_state(Vec::new()).await;
+        state.db = db;
+        state.purgatory_view = PurgatoryView::All;
+        reload_profiles(&mut state).await;
+        state
+    }
+
+    #[tokio::test]
+    async fn down_past_the_last_row_loads_the_next_page() {
+        let mut state = state_with_two_pages().await;
+        assert_eq!(filtered_len(&state), PROFILES_PAGE_SIZE);
+        assert_eq!(state.page_total, PROFILES_PAGE_SIZE as u64 + 2);
+
+        state.selected_index = PROFILES_PAGE_SIZE - 1;
+        let last_of_page = state.selected_profile_id().expect("selection");
+        move_selection(&mut state, 1).await;
+
+        assert_eq!(state.page_offset, PROFILES_PAGE_SIZE, "next page");
+        assert_eq!(state.selected_index, 0, "lands on its first row");
+        assert_ne!(state.selected_profile_id(), Some(last_of_page));
+        assert_eq!(state.profiles_total(), PROFILES_PAGE_SIZE as u64 + 2);
+    }
+
+    #[tokio::test]
+    async fn up_before_the_first_row_loads_the_previous_page() {
+        let mut state = state_with_two_pages().await;
+        state.page_offset = PROFILES_PAGE_SIZE;
+        reload_profiles(&mut state).await;
+        assert_eq!(state.selected_index, 0);
+
+        move_selection(&mut state, -1).await;
+        assert_eq!(state.page_offset, 0, "previous page");
+        assert_eq!(state.selected_index, PROFILES_PAGE_SIZE - 1, "its last row");
+
+        // One more Up is an ordinary row move inside the page...
+        move_selection(&mut state, -1).await;
+        assert_eq!(state.page_offset, 0);
+        assert_eq!(state.selected_index, PROFILES_PAGE_SIZE - 2);
+
+        // ...and only at the feed's first row does it clamp.
+        state.selected_index = 0;
+        move_selection(&mut state, -1).await;
+        assert_eq!(state.page_offset, 0);
+        assert_eq!(state.selected_index, 0);
+    }
+
+    #[tokio::test]
+    async fn home_and_end_reach_the_feeds_edges() {
+        let mut state = state_with_two_pages().await;
+
+        goto_last(&mut state).await;
+        assert_eq!(state.selected_index, filtered_len(&state) - 1);
+        assert_eq!(state.page_offset, PROFILES_PAGE_SIZE, "last page");
+        assert_eq!(filtered_len(&state), 2, "the tail page holds the remainder");
+        let last_id = state.selected_profile_id().expect("selection");
+
+        // Down at the feed's end clamps instead of wrapping.
+        move_selection(&mut state, 1).await;
+        assert_eq!(state.selected_profile_id(), Some(last_id));
+
+        goto_first(&mut state).await;
+        assert_eq!(state.page_offset, 0);
+        assert_eq!(state.selected_index, 0);
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::{AppState, PageSort, SortColumn, page_sort};
 
     /// The tab no longer sorts in memory: it asks the query for the order. What
     /// the UI owns is the mapping from its column enum to the query's sort enum,
@@ -1645,7 +1823,7 @@ mod ttl_tests {
     }
 
     /// Persist the rows (endpoint + links + protocols) via the typed writes.
-    async fn persist_rows(db: &Database, rows: &[EndpointRow]) {
+    pub(super) async fn persist_rows(db: &Database, rows: &[EndpointRow]) {
         for row in rows {
             db.upsert_endpoint(&row.endpoint).await.unwrap();
             for link in &row.links {

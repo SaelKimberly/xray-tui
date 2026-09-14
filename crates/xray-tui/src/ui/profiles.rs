@@ -1050,6 +1050,19 @@ fn render_footer(
             ])
         },
     );
+    // Page position: a 200-row window must not look like a 200-entry feed.
+    let line = line.patch_style(ThemeStyles::status_footer(palette));
+    let mut spans = line.spans;
+    if state.profiles_total() > 0 {
+        let first = state.page_offset as u64 + 1;
+        let last = state.page_offset as u64 + state.endpoints.len() as u64;
+        spans.push(Span::styled(" ", ThemeStyles::footer_label(palette)));
+        spans.push(Span::styled(
+            format!("rows {first}-{last} of {}", state.profiles_total()),
+            ThemeStyles::footer_label(palette),
+        ));
+    }
+    let line = Line::from(spans);
     let footer = Paragraph::new(line).style(ThemeStyles::status_footer(palette));
     frame.render_widget(footer, area);
 }

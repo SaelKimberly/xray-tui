@@ -164,7 +164,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         // scrolls the user away. One reload per tick, at most.
         if !state.filter_cache_valid.get() {
             state.filter_cache_valid.set(true);
-            crate::ops::profiles::reload_profiles(state).await;
+            crate::ops::profiles::reload_profiles_preserving_selection(state).await;
             events_seen = true;
         }
 
@@ -588,35 +588,29 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         }
         KeyCode::Up if state.current_tab == Tab::Profiles => {
             if !state.nav_protocol_up() {
-                state.selected_index = state.selected_index.saturating_sub(1);
+                crate::ops::profiles::move_selection(state, -1).await;
             }
         }
         KeyCode::Down if state.current_tab == Tab::Profiles => {
             if !state.nav_protocol_down() {
-                let max = state.filtered_len().saturating_sub(1);
-                if state.selected_index < max {
-                    state.selected_index += 1;
-                }
+                crate::ops::profiles::move_selection(state, 1).await;
             }
         }
         KeyCode::Home if state.current_tab == Tab::Profiles => {
-            state.selected_index = 0;
-            state.selected_sub = None;
+            crate::ops::profiles::goto_first(state).await;
         }
         KeyCode::End if state.current_tab == Tab::Profiles => {
-            state.selected_index = state.filtered_len().saturating_sub(1);
-            state.selected_sub = None;
+            crate::ops::profiles::goto_last(state).await;
         }
         KeyCode::PageUp if state.current_tab == Tab::Profiles => {
-            let page = state.term_height.get().saturating_sub(5) as usize;
-            state.selected_index = state.selected_index.saturating_sub(page);
+            let page = state.term_height.get().saturating_sub(5) as isize;
             state.selected_sub = None;
+            crate::ops::profiles::move_selection(state, -page).await;
         }
         KeyCode::PageDown if state.current_tab == Tab::Profiles => {
-            let page = state.term_height.get().saturating_sub(5) as usize;
-            let max = state.filtered_len().saturating_sub(1);
-            state.selected_index = (state.selected_index + page).min(max);
+            let page = state.term_height.get().saturating_sub(5) as isize;
             state.selected_sub = None;
+            crate::ops::profiles::move_selection(state, page).await;
         }
         KeyCode::Up
             if key.modifiers.contains(KeyModifiers::CONTROL)
