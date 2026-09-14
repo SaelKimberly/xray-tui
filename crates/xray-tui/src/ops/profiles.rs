@@ -99,11 +99,19 @@ pub(crate) async fn load_profiles_rows(
     db: &Database,
     load: &ProfilesLoad,
 ) -> Result<(Vec<EndpointRow>, PageMeta), DatabaseError> {
-    let now = now_ts();
     // Error-TTL sweep (design §6.4): clear failure markers older than the
     // configured TTL before rows are (re)loaded, so a swept error never
     // renders. `None` (default) = no-op.
     clear_expired_errors(db, load.error_ttl_hours).await;
+    let req = page_request(load);
+    let meta = db.profiles_page(&req).await?;
+    let rows = db.load_page_rows(&meta.ids).await?;
+    Ok((rows, meta))
+}
+
+/// Build the query request a [`ProfilesLoad`] describes.
+fn page_request(load: &ProfilesLoad) -> PageRequest {
+    let now = now_ts();
     let threshold = |ttl_secs: i64| -> Timestamp {
         now.checked_sub(jiff::Span::new().seconds(ttl_secs))
             .unwrap_or(now)
@@ -120,7 +128,7 @@ pub(crate) async fn load_profiles_rows(
             Timestamp::from_second(0).unwrap_or(now),
         ),
     };
-    let req = PageRequest {
+    PageRequest {
         view: load.view,
         active_threshold,
         stale_threshold,
@@ -130,10 +138,7 @@ pub(crate) async fn load_profiles_rows(
         ascending: load.ascending,
         offset: load.offset,
         limit: load.limit,
-    };
-    let meta = db.profiles_page(&req).await?;
-    let rows = db.load_page_rows(&meta.ids).await?;
-    Ok((rows, meta))
+    }
 }
 
 /// The UI half of a profile reload: swap in fresh rows, invalidate filters,
@@ -143,7 +148,8 @@ pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>, 
     state.endpoints = rows;
     state.page_total = meta.total;
     state.page_offset = meta.offset;
-    state.filter_cache_valid.set(false);
+    // The page was just read: nothing pending.
+    state.filter_cache_valid.set(true);
     clamp_selection(state);
     // Enrich new endpoints in the background (IP hosts + persisted DNS cache;
     // no network for fresh entries).
@@ -162,9 +168,29 @@ pub async fn reload_profiles(state: &mut AppState) {
     if let Err(e) = state.link_writer.flush().await {
         tracing::warn!(target: "tui::ops::profiles", "flush before reload: {e}");
     }
-    let load = ProfilesLoad::from(&*state);
-    match load_profiles_rows(&state.db, &load).await {
-        Ok((rows, meta)) => apply_profiles_rows(state, rows, &meta),
+    // The selection is an endpoint id, not a row index: after a reorder the row
+    // may sit on another page, and the window follows it.
+    let selected = state
+        .selected_profile_id()
+        .map(xray_tui_db::models::EndpointId::new);
+    let mut load = ProfilesLoad::from(&*state);
+    let mut outcome = load_profiles_rows(&state.db, &load).await;
+    if let (Ok((rows, _meta)), Some(id)) = (&outcome, selected)
+        && !rows.iter().any(|row| row.endpoint.id == id)
+        && let Ok(Some(offset)) = state.db.profiles_anchor(&page_request(&load), id).await
+    {
+        load.offset = offset;
+        outcome = load_profiles_rows(&state.db, &load).await;
+    }
+    match outcome {
+        Ok((rows, meta)) => {
+            apply_profiles_rows(state, rows, &meta);
+            if let Some(id) = selected
+                && let Some(index) = state.endpoints.iter().position(|row| row.endpoint.id == id)
+            {
+                state.selected_index = index;
+            }
+        }
         Err(e) => {
             state.log_trace(
                 "error",

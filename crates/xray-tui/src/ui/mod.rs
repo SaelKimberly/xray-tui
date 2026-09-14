@@ -157,6 +157,17 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             events_seen = true;
         }
 
+        // Refetch the Profiles page when something invalidated it: a ping
+        // result (the row must move to its new place), a search keystroke, a
+        // sort or view change, a delete. The reload preserves the selection by
+        // endpoint id and re-anchors the window on it, so a reorder never
+        // scrolls the user away. One reload per tick, at most.
+        if !state.filter_cache_valid.get() {
+            state.filter_cache_valid.set(true);
+            crate::ops::profiles::reload_profiles(state).await;
+            events_seen = true;
+        }
+
         // Lazy-load initial logs on first Logs tab access
         if !state.logs_loaded && state.current_tab == Tab::Logs {
             state.load_initial_logs().await;

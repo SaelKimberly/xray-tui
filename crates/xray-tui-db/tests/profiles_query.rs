@@ -482,3 +482,143 @@ async fn load_page_rows_preserves_page_and_link_order() {
     // Empty page: no query, no rows.
     assert!(db.load_page_rows(&[]).await.expect("empty").is_empty());
 }
+
+// ── Ordering parity: the SQL vs the Rust oracle ─────────────────────────
+//
+// The oracle is the production comparator (`EndpointRow::best_test_priority_key`
+// and the display-link accessors), i.e. the decision-16 law and the
+// display-preference rule as the rest of the codebase defines them. A mismatch
+// means the SQL is wrong — the oracle is never adjusted to match it.
+
+fn dns_unresolved(row: &xray_tui_db::models::EndpointRow) -> bool {
+    row.endpoint.host_type == HostType::Dns && row.endpoint.resolved_as.is_empty()
+}
+
+/// The DISPLAY link as the spec defines it: the manual override when it names
+/// an existing link, else the best measured link (real before fast, lowest
+/// delay, then protocol id), else none.
+///
+/// Not `EndpointRow::active_link()`: that falls back to `links[selected_protocol]`
+/// — the untested link when nothing is measured — while the ordering rule is
+/// "no measured link, no value" (the SQL's `COALESCE(..., sentinel)`).
+fn display_link<'a>(
+    row: &'a xray_tui_db::models::EndpointRow,
+) -> Option<&'a xray_tui_db::models::ProfileStats> {
+    if let Some(pid) = row.endpoint.manual_protocol_override
+        && let Some(link) = row.links.iter().find(|l| l.protocol_id == pid)
+    {
+        return Some(link);
+    }
+    row.links
+        .iter()
+        .filter(|l| l.latency.is_some())
+        .min_by_key(|l| {
+            let (rank, delay) = match l.latency {
+                Some(xray_tui_db::models::Latency::Real { delay, .. }) => (0i32, delay),
+                Some(xray_tui_db::models::Latency::Fast { delay }) => (1, delay),
+                None => (2, i32::MAX),
+            };
+            (rank, delay, l.protocol_id.get())
+        })
+}
+
+fn config_type_rank(link: &xray_tui_db::models::ProfileStats) -> i32 {
+    match link.config_type {
+        ConfigType::Form => 0,
+        ConfigType::ShareUrl => 1,
+    }
+}
+
+/// Ascending sort key per endpoint, mirroring `order_terms`.
+///
+/// A tuple, not a packed integer: the Test key is the FULL decision-16 tuple
+/// `(tier, latency, -last_seen, protocol_id)` — dropping the recency term makes
+/// the oracle disagree with the law on ties, which is how this test first
+/// failed.
+fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> (i64, i64, i64, i64) {
+    match sort {
+        PageSort::Test => {
+            let (tier, latency, neg_seen, pid) = row
+                .best_test_priority_key(dns_unresolved(row))
+                .unwrap_or((u8::MAX, i32::MAX, i64::MAX, i64::MAX));
+            (
+                i64::from(tier) + i64::from(dns_unresolved(row)) * 8,
+                i64::from(latency),
+                neg_seen,
+                pid,
+            )
+        }
+        PageSort::Address => (0, 0, 0, 0),
+        PageSort::Port => (i64::from(row.endpoint.port), 0, 0, 0),
+        PageSort::LastSeen => (
+            display_link(row).map_or(i64::MIN, |l| l.last_seen_at.as_second()),
+            0,
+            0,
+            0,
+        ),
+        PageSort::Speed => (
+            display_link(row).and_then(|l| l.speed_bps).unwrap_or(-1),
+            0,
+            0,
+            0,
+        ),
+        PageSort::Traffic => (
+            display_link(row).map_or(0, |l| l.traffic.total_up + l.traffic.total_down),
+            0,
+            0,
+            0,
+        ),
+        PageSort::ConfigType => (
+            i64::from(display_link(row).map_or(2, config_type_rank)),
+            0,
+            0,
+            0,
+        ),
+    }
+}
+
+#[tokio::test]
+async fn page_order_matches_the_rust_oracle_for_every_sort() {
+    let db = seed_fixture().await;
+    let all = db
+        .profiles_page(&request(PageSort::Test, true, 0, 1000))
+        .await
+        .expect("all ids");
+    let rows = db.load_page_rows(&all.ids).await.expect("rows");
+    assert_eq!(rows.len(), 7, "fixture rows");
+
+    for sort in ALL_SORTS {
+        for ascending in [true, false] {
+            let mut expected: Vec<i64> = match sort {
+                // Address compares host text, which the i64 key above cannot
+                // carry; sort by the column itself.
+                PageSort::Address => {
+                    let mut v: Vec<(String, i64)> = rows
+                        .iter()
+                        .map(|r| (r.endpoint.host.clone(), r.endpoint.id.get()))
+                        .collect();
+                    v.sort();
+                    v.into_iter().map(|(_, id)| id).collect()
+                }
+                _ => {
+                    let mut v: Vec<((i64, i64, i64, i64), i64)> = rows
+                        .iter()
+                        .map(|r| (oracle_key(r, sort), r.endpoint.id.get()))
+                        .collect();
+                    v.sort();
+                    v.into_iter().map(|(_, id)| id).collect()
+                }
+            };
+            if !ascending {
+                expected.reverse();
+            }
+
+            let page = db
+                .profiles_page(&request(sort, ascending, 0, 1000))
+                .await
+                .expect("page");
+            let got: Vec<i64> = page.ids.iter().map(|id| id.get()).collect();
+            assert_eq!(got, expected, "{sort:?} ascending={ascending}");
+        }
+    }
+}
