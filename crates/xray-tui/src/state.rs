@@ -637,7 +637,7 @@ impl AppState {
         profiles::filtered_profiles(self)
     }
 
-    pub fn filtered_len(&self) -> usize {
+    pub const fn filtered_len(&self) -> usize {
         profiles::filtered_len(self)
     }
 

@@ -388,7 +388,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 meta,
             } => {
                 if generation == state.reload_gen {
-                    crate::ops::profiles::apply_profiles_rows(state, rows, meta);
+                    crate::ops::profiles::apply_profiles_rows(state, rows, &meta);
                 }
                 // A newer reload superseded this one — drop the stale rows.
             }

@@ -139,7 +139,7 @@ pub(crate) async fn load_profiles_rows(
 /// The UI half of a profile reload: swap in fresh rows, invalidate filters,
 /// re-clamp the selection, and seed background enrichment for rows that lack
 /// cached `endpoint_info`.
-pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>, meta: PageMeta) {
+pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>, meta: &PageMeta) {
     state.endpoints = rows;
     state.page_total = meta.total;
     state.page_offset = meta.offset;
@@ -164,7 +164,7 @@ pub async fn reload_profiles(state: &mut AppState) {
     }
     let load = ProfilesLoad::from(&*state);
     match load_profiles_rows(&state.db, &load).await {
-        Ok((rows, meta)) => apply_profiles_rows(state, rows, meta),
+        Ok((rows, meta)) => apply_profiles_rows(state, rows, &meta),
         Err(e) => {
             state.log_trace(
                 "error",
@@ -189,12 +189,13 @@ pub(crate) const fn clamp_index(selected: usize, len: usize) -> usize {
     }
 }
 
-/// Re-clamp the selection after a reload/filter change so the highlighted row
-/// stays inside the (possibly shrunk) filtered list. The `DataTable` clamps its
-/// own selection visually to row 0, but `AppState` keeps the stale index —
-/// which makes `selected_profile_id()` return `None` and Enter/e/d/x/Space
-/// silent no-ops. Drop a `selected_sub` that no longer points at a real row.
-pub(crate) fn clamp_selection(state: &mut AppState) {
+/// Re-clamp the selection into the loaded page.
+///
+/// The `DataTable` clamps its own selection visually to row 0, but `AppState`
+/// keeps the stale index — which makes `selected_profile_id()` return `None`
+/// and Enter/e/d/x/Space silent no-ops. Drop a `selected_sub` that no longer
+/// points at a real row.
+pub const fn clamp_selection(state: &mut AppState) {
     let len = filtered_len(state);
     state.selected_index = clamp_index(state.selected_index, len);
     if state.selected_index >= len || len == 0 {
@@ -229,7 +230,7 @@ pub fn filtered_profiles(state: &AppState) -> impl Iterator<Item = &EndpointRow>
 
 /// Length of the indexed space (the page), used by selection clamping and
 /// navigation. The feed-wide count is [`AppState::profiles_total`].
-pub fn filtered_len(state: &AppState) -> usize {
+pub const fn filtered_len(state: &AppState) -> usize {
     state.endpoints.len()
 }
 
@@ -249,19 +250,11 @@ pub(crate) const fn page_sort(column: SortColumn) -> PageSort {
     }
 }
 
-/// Sort rank for the config-type column: Form before `ShareUrl` (hand-made
-/// profiles first, deterministic for the sort).
-fn config_type_rank(row: &EndpointRow) -> u8 {
-    use xray_tui_db::models::ConfigType;
-    match row.active_link().map(|l| l.config_type) {
-        Some(ConfigType::Form) => 0,
-        Some(ConfigType::ShareUrl) => 1,
-        None => 2,
-    }
-}
-
 /// Whether the endpoint's DNS host is currently unresolved (no known IPs).
-/// Endpoints without an `endpoint_info` entry count as unresolved.
+///
+/// Reads the persisted column — the same fact the ordering SQL reads — so the
+/// comparator and the query cannot disagree. `endpoint_info` supplies only the
+/// resolved IP list.
 pub(crate) fn endpoint_dns_unresolved(state: &AppState, row: &EndpointRow) -> bool {
     use xray_tui_db::models::HostType;
     row.endpoint.host_type == HostType::Dns
