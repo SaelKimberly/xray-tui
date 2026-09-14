@@ -292,7 +292,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                 r.endpoint.id.get(),
                 r.endpoint.clone(),
                 r.endpoint.resolved_as.clone(),
-                r.endpoint.resolved_at.map(jiff::Timestamp::as_second),
+                r.endpoint.resolved_at,
                 r.active_protocol().and_then(|(_, p)| extract_sni(p)),
             )
         })

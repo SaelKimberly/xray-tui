@@ -132,8 +132,9 @@ pub fn get_field(fields: &[(String, String)], key: &str) -> Option<String> {
 /// `Timestamp` → "YYYY-MM-DD HH:MM:SS" in the system local time zone.
 /// Callers render "—" for `None`.
 #[must_use]
-pub fn format_ts(ts: &jiff::Timestamp) -> String {
-    ts.to_zoned(jiff::tz::TimeZone::system())
+pub fn format_ts(secs: i64) -> String {
+    xray_tui_db::models::from_epoch(secs)
+        .to_zoned(jiff::tz::TimeZone::system())
         .strftime("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
@@ -142,8 +143,10 @@ pub fn format_ts(ts: &jiff::Timestamp) -> String {
 /// ago", "3m ago", "now" for under a minute. Callers render "never" for
 /// `None`.
 #[must_use]
-pub fn format_relative_ts(ts: &jiff::Timestamp) -> String {
-    let span = jiff::Timestamp::now().since(*ts).unwrap_or_default();
+pub fn format_relative_ts(secs: i64) -> String {
+    let span = jiff::Timestamp::now()
+        .since(xray_tui_db::models::from_epoch(secs))
+        .unwrap_or_default();
     let (n, unit) = if span.get_weeks() > 0 {
         (span.get_weeks() as u64, "w")
     } else if span.get_days() > 0 {
@@ -308,7 +311,7 @@ mod tests {
         // local civil time in the system zone must recover the exact instant
         // (a UTC-only formatter would fail this whenever TZ != UTC).
         let ts = jiff::Timestamp::from_second(1_752_595_200).expect("valid ts");
-        let s = format_ts(&ts);
+        let s = format_ts(xray_tui_db::models::to_epoch(ts));
         assert_eq!(s.len(), 19, "YYYY-MM-DD HH:MM:SS is 19 chars");
         assert_eq!(&s[4..5], "-");
         assert_eq!(&s[7..8], "-");

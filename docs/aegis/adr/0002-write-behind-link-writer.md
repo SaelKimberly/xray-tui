@@ -70,3 +70,28 @@ cost was still ~95 s of UI-task blocking per batch.
 
 None planned. Revisit if a future writer needs cross-process visibility of
 `profile_stats` mutations, or if `flush_interval` proves too coarse.
+
+## Amendment — 2026-09-14: the gate left the writer, and the groups narrowed
+
+Invariants 3 and 4 changed; the rest stand.
+
+- **The scheduler gate no longer reads through the writer** (invariant 3). Task
+  state is runtime-only: `TaskScheduler.states` owns it, `profile_stats` lost
+  `task_id`/`task_queue`, and the `SchedulerDb` trait — the seam invariant 3
+  names — is deleted along with its Database/LinkWriter impls, its test mock,
+  `update_scheduler_state` and `sweep_orphans`. The gate now holds no database
+  handle, which is the stronger form of what invariant 3 was protecting: the
+  ~60k per-batch reads (a connection + SELECT per transition) are impossible, not
+  merely cheap, and an id the process does not know cannot be read back.
+- **Column groups are RESULT and TRAFFIC** (invariant 4); TASK is gone with the
+  columns. Both remaining groups can move a stored ordering key, so every patch
+  refreshes its endpoint's keys (there is no TASK-only fast path left).
+  `drain()` coalesces the staged groups into ONE patch per link, and
+  `apply_link_patches` writes an existing row with a single literal `UPDATE`
+  covering only that patch's groups (no per-row SELECT, no bound parameters; one
+  existence probe per 400-row chunk) — the "reads the row fresh inside the
+  transaction and overlays only the patched groups" behaviour is preserved by
+  construction, and `tests/profiles_query.rs::link_patches_leave_columns_outside_their_groups_alone`
+  pins it.
+- `LinkWriter::read`/`overlay_pending`/`db_read_count` were deleted with their
+  only caller: nothing reads a link through the writer any more.

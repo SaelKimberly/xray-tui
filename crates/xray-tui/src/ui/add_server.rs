@@ -419,13 +419,7 @@ async fn handle_form_key(state: &mut AppState, key: &KeyEvent) {
         AppMode::AddServer {
             protocol: Some(p), ..
         } => Some(*p),
-        AppMode::EditServer { protocol_id, .. } => state
-            .db
-            .get_endpoint(crate::ops::profiles::endpoint_id_from_raw(*protocol_id))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|p| p.active_protocol().map(|(_, proto)| proto.proto_kind)),
+        AppMode::EditServer { proto_kind, .. } => Some(*proto_kind),
         _ => None,
     };
 

@@ -24,8 +24,8 @@ use xray_tui_proto::proto_spec::{
 /// A one-shot page request: the view predicates plus a group filter, all rows.
 fn page_req(
     view: PurgatoryView,
-    active: Timestamp,
-    stale: Timestamp,
+    active: i64,
+    stale: i64,
     group: Option<&str>,
 ) -> xray_tui_db::profiles_query::PageRequest {
     xray_tui_db::profiles_query::PageRequest {
@@ -72,8 +72,9 @@ async fn seed_ranks(db: &Database) {
     db.repair_endpoint_ranks().await.expect("seed ranks");
 }
 
-fn ts(secs: i64) -> Timestamp {
-    Timestamp::from_second(secs).expect("valid ts")
+/// Epoch seconds — the storage unit of every timestamp column.
+const fn ts(secs: i64) -> i64 {
+    secs
 }
 
 fn tcp_transport() -> Transport {
@@ -127,6 +128,7 @@ async fn seed_endpoint(
     last_seen: i64,
 ) {
     toasty::create!(Endpoint {
+        created_at: 0,
         id: EndpointId::new(endpoint_id),
         host: host.to_string(),
         host_type,
@@ -148,9 +150,9 @@ async fn seed_link(
     last_seen: i64,
 ) {
     toasty::create!(Protocol {
+        created_at: 0,
         id: ProtocolId::new(protocol_id),
         sig: protocol_id,
-        cred_hash: 0,
         proto_kind: ProtocolKind::Vless,
         transport: tcp_transport(),
         security: no_security(),
@@ -161,12 +163,13 @@ async fn seed_link(
     .expect("create protocol");
 
     toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
         core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(last_seen),
-        task_queue: Vec::<u16>::new(),
         traffic: zero_traffic(),
     })
     .exec(conn)
@@ -390,7 +393,7 @@ async fn active_and_stale_windows() {
     let stale = page_req(PurgatoryView::Stale, ts(now - 3_600), ts(now - 7_200), None);
     assert_eq!(page_ids(&db, &stale).await, vec![2]);
     assert_eq!(
-        db.profiles_count(&stale).await.expect("count"),
+        db.profiles_page(&stale).await.expect("count").total,
         1,
         "the footer count matches the stale window"
     );
@@ -435,6 +438,7 @@ async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
     seed_link(&mut conn, 3, 3002, now - 12_000).await;
     // 4: linkless — vacuously outside both windows (never stale).
     toasty::create!(Endpoint {
+        created_at: 0,
         id: EndpointId::new(4),
         host: "4.4.4.4".to_string(),
         host_type: HostType::Ipv4,
@@ -466,7 +470,7 @@ async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
     // The fixture seeded with raw writes: make the stored keys follow.
     seed_ranks(&db).await;
     let stale_ids = page_ids(&db, &stale_req).await;
-    let count = db.profiles_count(&stale_req).await.expect("count");
+    let count = db.profiles_page(&stale_req).await.expect("count").total;
     let rows = page_rows(&db, &stale_req).await;
 
     let expected: Vec<i64> = vec![2, 6];
@@ -563,6 +567,7 @@ async fn get_endpoint_returns_linkless_row_with_empty_links() {
     // Endpoint with NO profile_stats rows. Pre-T8+9 this was an INNER JOIN
     // that returned None; the typed path must return Some with empty links.
     toasty::create!(Endpoint {
+        created_at: 0,
         id: EndpointId::new(41),
         host: "linkless.example".to_string(),
         host_type: HostType::Dns,
@@ -595,47 +600,6 @@ async fn get_endpoint_returns_linkless_row_with_empty_links() {
         "nonexistent id -> None"
     );
 }
-
-#[tokio::test]
-async fn endpoints_by_parent_orders_by_id() {
-    let db = test_db().await;
-    let mut conn = db.connection().await.expect("connection");
-
-    toasty::create!(Endpoint {
-        id: EndpointId::new(50),
-        host: "dns.example".to_string(),
-        host_type: HostType::Dns,
-        port: 443,
-        ports: Vec::<u16>::new(),
-        resolved_as: Vec::<String>::new(),
-    })
-    .exec(&mut conn)
-    .await
-    .expect("parent");
-    for (id, ip) in [(51, "1.1.1.1"), (52, "2.2.2.2")] {
-        toasty::create!(Endpoint {
-            id: EndpointId::new(id),
-            host: ip.to_string(),
-            host_type: HostType::Ipv4,
-            port: 443,
-            ports: Vec::<u16>::new(),
-            parent_id: Some(EndpointId::new(50)),
-            resolved_as: Vec::<String>::new(),
-        })
-        .exec(&mut conn)
-        .await
-        .expect("child");
-    }
-
-    let children = db
-        .endpoints_by_parent(EndpointId::new(50))
-        .await
-        .expect("children");
-    let ids: Vec<i64> = children.iter().map(|e| e.id.get()).collect();
-    assert_eq!(ids, vec![51, 52]);
-}
-
-// ── Newtype columns ─────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn newtype_ids_roundtrip_through_reads() {
@@ -713,7 +677,7 @@ async fn groups_due_update_respects_refresh_interval() {
         url: Some("https://example.com/sub2".to_string()),
         enabled: true,
         refresh_interval: Some(30),
-        last_refreshed: Some(hour_ago),
+        last_refreshed: Some(hour_ago.as_second()),
     })
     .exec(&mut conn)
     .await
@@ -725,7 +689,7 @@ async fn groups_due_update_respects_refresh_interval() {
         name: Some("fresh".to_string()),
         url: Some("https://example.com/sub3".to_string()),
         enabled: true,
-        last_refreshed: Some(now),
+        last_refreshed: Some(now.as_second()),
     })
     .exec(&mut conn)
     .await
@@ -814,9 +778,9 @@ async fn seed_link_latency(
     latency: Option<Latency>,
 ) {
     toasty::create!(Protocol {
+        created_at: 0,
         id: ProtocolId::new(protocol_id),
         sig: protocol_id,
-        cred_hash: 0,
         proto_kind: ProtocolKind::Vless,
         transport: tcp_transport(),
         security: no_security(),
@@ -827,13 +791,14 @@ async fn seed_link_latency(
     .expect("create protocol");
 
     toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
         core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(last_seen),
         latency,
-        task_queue: Vec::<u16>::new(),
         traffic: zero_traffic(),
     })
     .exec(conn)
@@ -862,6 +827,7 @@ async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
 
     // Endpoint 2: linkless — vacuously expired (old COALESCE(MAX,0) < cutoff).
     toasty::create!(Endpoint {
+        created_at: 0,
         id: EndpointId::new(2),
         host: "2.2.2.2".to_string(),
         host_type: HostType::Ipv4,
@@ -876,12 +842,13 @@ async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
     // Endpoint 3: shares protocol 1002 with endpoint 1, but has a fresh link.
     seed_endpoint(&mut conn, 3, 3001, "3.3.3.3", HostType::Ipv4, 443, 1500).await;
     toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
         protocol_id: ProtocolId::new(1002),
         endpoint_id: EndpointId::new(3),
         core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(1600),
-        task_queue: Vec::<u16>::new(),
         traffic: zero_traffic(),
     })
     .exec(&mut conn)
@@ -973,6 +940,7 @@ async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
     // Endpoint 2: shares protocol 1002 (survives while its link remains) and
     // owns protocol 3001.
     toasty::create!(Endpoint {
+        created_at: 0,
         id: EndpointId::new(2),
         host: "2.2.2.2".to_string(),
         host_type: HostType::Ipv4,
@@ -984,12 +952,13 @@ async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
     .await
     .expect("endpoint 2");
     toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
         protocol_id: ProtocolId::new(1002),
         endpoint_id: EndpointId::new(2),
         core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(30),
-        task_queue: Vec::<u16>::new(),
         traffic: zero_traffic(),
     })
     .exec(&mut conn)
@@ -1117,13 +1086,15 @@ async fn clear_all_stats_zeroes_traffic_and_clears_results() {
     }
 }
 
+/// The optimistic-concurrency guard still protects a link row: a writer
+/// working from a stale snapshot is rejected, and the winner's value stands.
+/// (The scheduler used to be the OCC client that retried; its state is
+/// runtime-only now, so this pins the guard itself.)
 #[tokio::test]
-async fn scheduler_state_occ_rejects_stale_and_retries_after_reload() {
+async fn occ_rejects_a_stale_link_writer() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
-    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 10).await;
-
-    // Two handles loaded at the same version.
+    seed_endpoint(&mut conn, 1, 1001, "a.example", HostType::Ipv4, 443, 100).await;
     let mut h1 = ProfileStats::filter_by_protocol_id_and_endpoint_id(
         ProtocolId::new(1001),
         EndpointId::new(1),
@@ -1149,8 +1120,7 @@ async fn scheduler_state_occ_rejects_stale_and_retries_after_reload() {
 
     // Writer A wins via an instance update.
     toasty::update!(h1 {
-        task_id: Some(1),
-        task_queue: vec![10, 11],
+        core_type: CoreType::SingBox,
     })
     .exec(&mut conn)
     .await
@@ -1158,25 +1128,13 @@ async fn scheduler_state_occ_rejects_stale_and_retries_after_reload() {
 
     // Writer B from the same stale snapshot is rejected by the #[version] guard.
     let err = toasty::update!(h2 {
-        task_id: Some(2),
-        task_queue: vec![20, 21],
+        core_type: CoreType::Xray,
     })
     .exec(&mut conn)
     .await
     .expect_err("stale writer must fail the version check");
     assert!(err.is_condition_failed(), "OCC must reject the stale write");
 
-    // The scheduler write reloads (fresh version) and succeeds; the final
-    // state is the last writer's.
-    db.update_scheduler_state(
-        ProtocolId::new(1001),
-        EndpointId::new(1),
-        Some(3),
-        &[30, 31],
-    )
-    .await
-    .expect("scheduler update");
-
     let link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
         ProtocolId::new(1001),
         EndpointId::new(1),
@@ -1186,24 +1144,7 @@ async fn scheduler_state_occ_rejects_stale_and_retries_after_reload() {
     .await
     .expect("read")
     .expect("link");
-    assert_eq!(link.task_id, Some(3));
-    assert_eq!(link.task_queue, vec![30, 31], "whole vector replaced");
-
-    // Whole-vector replace + clearing task_id.
-    db.update_scheduler_state(ProtocolId::new(1001), EndpointId::new(1), None, &[40])
-        .await
-        .expect("scheduler replace");
-    let link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
-        ProtocolId::new(1001),
-        EndpointId::new(1),
-    )
-    .first()
-    .exec(&mut conn)
-    .await
-    .expect("read")
-    .expect("link");
-    assert_eq!(link.task_id, None);
-    assert_eq!(link.task_queue, vec![40]);
+    assert_eq!(link.core_type, CoreType::SingBox, "writer A's value stands");
 }
 
 #[tokio::test]
@@ -1216,7 +1157,6 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         host_type: HostType::Dns,
         port,
         ports: Vec::<u16>::new(),
-        parent_id: None,
         last_source: Some("g1".to_string()),
         manual_protocol_override: None,
         resolved_as: Vec::<String>::new(),
@@ -1228,7 +1168,6 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
     let protocol = Protocol {
         id: ProtocolId::new(1001),
         sig: 1001,
-        cred_hash: 0,
         proto_kind: ProtocolKind::Vless,
         transport: tcp_transport(),
         security: no_security(),
@@ -1243,8 +1182,6 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         config_type: ConfigType::ShareUrl,
         last_used_at: Some(ts(10)),
         last_seen_at: ts(last_seen),
-        task_id: Some(7),
-        task_queue: vec![8, 9],
         latency,
         speed_bps: None,
         error: None,
@@ -1297,17 +1234,15 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         tx.commit().await.expect("commit");
     }
 
-    // Simulate the scheduler owning its fields (as it does between two
-    // subscription refreshes): the bulk link upsert must not touch them.
-    db.update_scheduler_state(ProtocolId::new(1001), EndpointId::new(1), Some(7), &[8, 9])
-        .await
-        .expect("seed scheduler state");
+    // Simulate the activity clock being owned by its own writer (as it is
+    // between two subscription refreshes): the bulk link upsert must not touch
+    // it.
     db.update_last_used(ProtocolId::new(1001), EndpointId::new(1), ts(10))
         .await
         .expect("seed last_used_at");
 
-    // Re-upsert: port and latency update; scheduler state (task_id,
-    // task_queue) and last_used_at must survive (owned by their own writers).
+    // Re-upsert: port and latency update; last_used_at survives (owned by its
+    // own writer).
     {
         let mut conn = db.connection().await.expect("connection 2");
         let mut tx = conn.transaction().await.expect("txn 2");
@@ -1336,8 +1271,6 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         Some(Latency::Fast { delay: 123 }),
         "latency updated"
     );
-    assert_eq!(row[0].links[0].task_id, Some(7), "task_id preserved");
-    assert_eq!(row[0].links[0].task_queue, vec![8, 9], "queue preserved");
     assert_eq!(
         row[0].links[0].last_used_at,
         Some(ts(10)),
@@ -1357,7 +1290,6 @@ async fn subscription_upsert_flow_assembles_group_rows() {
         host_type: HostType::Dns,
         port: 443,
         ports: Vec::<u16>::new(),
-        parent_id: None,
         last_source: Some("g1".to_string()),
         manual_protocol_override: None,
         resolved_as: Vec::<String>::new(),
@@ -1372,7 +1304,6 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     db.upsert_protocol(&Protocol {
         id: ProtocolId::new(1001),
         sig: 1001,
-        cred_hash: 0,
         proto_kind: ProtocolKind::Vless,
         transport: tcp_transport(),
         security: no_security(),
@@ -1390,8 +1321,6 @@ async fn subscription_upsert_flow_assembles_group_rows() {
         config_type: ConfigType::ShareUrl,
         last_used_at: None,
         last_seen_at: ts(50),
-        task_id: None,
-        task_queue: Vec::<u16>::new(),
         latency: None,
         speed_bps: None,
         error: None,
@@ -1461,7 +1390,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     let db = Database::open(&path).await.expect("fresh open");
     let mut conn = db.connection().await.expect("connection");
 
-    // Fresh open writes the 9-table schema AND tags it `user_version=8` so a
+    // Fresh open writes the 9-table schema AND tags it `user_version=9` so a
     // reopen can skip push_schema.
     let rows = toasty::sql::query("PRAGMA user_version")
         .exec(&mut conn)
@@ -1469,8 +1398,8 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .expect("read version");
     assert_eq!(
         first_i64(&rows),
-        Some(8),
-        "fresh open must tag the schema user_version=8"
+        Some(9),
+        "fresh open must tag the schema user_version=9"
     );
     let rows = toasty::sql::query(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
@@ -1485,6 +1414,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
 
     // Seed data, then reopen: the tag preserves both schema and data.
     toasty::create!(Endpoint {
+        created_at: 0,
         id: EndpointId::new(9),
         host: "9.9.9.9".to_string(),
         host_type: HostType::Ipv4,
@@ -1504,7 +1434,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .exec(&mut conn)
         .await
         .expect("read version");
-    assert_eq!(first_i64(&rows), Some(8), "reopen keeps the schema tag");
+    assert_eq!(first_i64(&rows), Some(9), "reopen keeps the schema tag");
     assert!(
         Endpoint::filter_by_id(EndpointId::new(9))
             .first()
@@ -1529,6 +1459,7 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         let db = Database::open(&path).await.expect("fresh open");
         let mut conn = db.connection().await.expect("connection");
         toasty::create!(Endpoint {
+            created_at: 0,
             id: EndpointId::new(7),
             host: "seeded.example".to_string(),
             host_type: HostType::Ipv4,
@@ -1540,7 +1471,7 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         .await
         .expect("seed");
         // Pretend the file was written by the previous schema generation.
-        toasty::sql::query("PRAGMA user_version = 7")
+        toasty::sql::query("PRAGMA user_version = 8")
             .exec(&mut conn)
             .await
             .expect("tag");
@@ -1554,7 +1485,7 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         .expect("version");
     assert_eq!(
         first_i64(&rows),
-        Some(8),
+        Some(9),
         "the file is rebuilt at the new tag"
     );
     let rows = toasty::sql::query(
@@ -1638,6 +1569,7 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("conn");
     seed_endpoint(&mut conn, 1, 101, "a.example", HostType::Ipv4, 443, 100).await;
+    // A second link for the SAME endpoint: one patch per row, two rows.
     seed_link(&mut conn, 1, 102, 100).await;
 
     let mut result_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
@@ -1659,7 +1591,7 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
         text: "boom".to_string(),
     });
 
-    let mut task_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+    let mut traffic_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
         ProtocolId::new(102),
         EndpointId::new(1),
     )
@@ -1668,8 +1600,12 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     .await
     .expect("load")
     .expect("row");
-    task_row.task_id = Some(7);
-    task_row.task_queue = vec![7, 9];
+    traffic_row.traffic = TrafficStats {
+        today_up: 11,
+        today_down: 22,
+        total_up: 33,
+        total_down: 44,
+    };
 
     let applied = db
         .apply_link_patches(&[
@@ -1678,8 +1614,8 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
                 groups: LinkGroups::RESULT,
             },
             LinkPatch {
-                link: task_row,
-                groups: LinkGroups::TASK,
+                link: traffic_row,
+                groups: LinkGroups::TRAFFIC,
             },
         ])
         .await
@@ -1707,12 +1643,8 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
         result_row.error.as_ref().map(|e| e.kind),
         Some(ProfileErr::Fast)
     );
-    assert_eq!(
-        result_row.task_id, None,
-        "result group leaves scheduler state alone"
-    );
 
-    let task_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+    let traffic_row = ProfileStats::filter_by_protocol_id_and_endpoint_id(
         ProtocolId::new(102),
         EndpointId::new(1),
     )
@@ -1721,10 +1653,10 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     .await
     .expect("reload")
     .expect("row");
-    assert_eq!(task_row.task_id, Some(7));
-    assert_eq!(task_row.task_queue, vec![7, 9]);
+    assert_eq!(traffic_row.traffic.total_up, 33);
+    assert_eq!(traffic_row.traffic.total_down, 44);
     assert_eq!(
-        task_row.core_type,
+        traffic_row.core_type,
         CoreType::Xray,
         "untouched columns keep their values"
     );
@@ -1762,8 +1694,6 @@ async fn apply_link_patches_isolates_column_groups() {
         kind: ProfileErr::Real,
         text: "old".to_string(),
     });
-    row.task_id = Some(5);
-    row.task_queue = vec![5, 6];
     row.traffic = TrafficStats {
         today_up: 1,
         today_down: 2,
@@ -1781,8 +1711,6 @@ async fn apply_link_patches_isolates_column_groups() {
     let mut stale = row.clone();
     stale.latency = Some(Latency::Fast { delay: 99 });
     stale.error = None;
-    stale.task_id = None;
-    stale.task_queue = Vec::new();
     stale.traffic = TrafficStats {
         today_up: 0,
         today_down: 0,
@@ -1829,8 +1757,6 @@ async fn apply_link_patches_isolates_column_groups() {
         "stale result snapshot ignored"
     );
     assert_eq!(after.error.as_ref().map(|e| e.kind), Some(ProfileErr::Real));
-    assert_eq!(after.task_id, Some(5), "stale task snapshot ignored");
-    assert_eq!(after.task_queue, vec![5, 6]);
 
     // RESULT-only patch: traffic and task state must survive untouched.
     db.apply_link_patches(&[LinkPatch {
@@ -1860,8 +1786,6 @@ async fn apply_link_patches_isolates_column_groups() {
         },
         "traffic survives a result patch"
     );
-    assert_eq!(after.task_id, Some(5));
-    assert_eq!(after.task_queue, vec![5, 6]);
 }
 
 #[tokio::test]
@@ -1880,13 +1804,13 @@ async fn apply_link_patches_survives_a_stale_snapshot_without_clobbering() {
     .expect("load")
     .expect("row");
 
-    // Another writer moves the scheduler state (bumps `version`).
-    db.update_scheduler_state(ProtocolId::new(201), EndpointId::new(2), Some(3), &[3])
+    // Another writer moves the activity clock (bumps `version`).
+    db.update_last_used(ProtocolId::new(201), EndpointId::new(2), ts(777))
         .await
-        .expect("scheduler write");
+        .expect("activity write");
 
     stale.latency = Some(Latency::Fast { delay: 55 });
-    stale.task_queue = Vec::new(); // the stale snapshot's view of the queue
+    stale.last_used_at = None; // the stale snapshot's view of the clock
     assert_eq!(
         db.apply_link_patches(&[LinkPatch {
             link: stale,
@@ -1908,9 +1832,8 @@ async fn apply_link_patches_survives_a_stale_snapshot_without_clobbering() {
     .expect("row");
     assert_eq!(row.latency, Some(Latency::Fast { delay: 55 }));
     assert_eq!(
-        row.task_queue,
-        vec![3],
-        "the concurrent scheduler write survives"
+        row.last_used_at,
+        Some(ts(777)),
+        "the concurrent activity write survives"
     );
-    assert_eq!(row.task_id, Some(3));
 }

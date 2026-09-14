@@ -185,7 +185,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
     // "Last Used" = connect initiation: DB write + in-memory row so the
     // sub-table refreshes without a reload. `update_last_used` sets both
     // `last_used_at` and `last_seen_at` to the same ts (old semantics).
-    let now = jiff::Timestamp::now();
+    let now = xray_tui_db::models::now_epoch();
     let lu_endpoint_id = EndpointId::new(endpoint.id.get());
     let lu_db = state.db.clone();
     tokio::spawn(async move {
@@ -715,7 +715,6 @@ mod tests {
     /// connect attempt fails deterministically at config build — before any
     /// binary lookup or core start.
     fn placeholder_protocol(id: i64) -> xray_tui_db::models::Protocol {
-        use crate::ops::profiles::test_support::ts;
         let settings = serde_json::json!({
             "protocol_settings": {"password": "sekrit"},
             "stream_settings": {},
@@ -723,7 +722,6 @@ mod tests {
         xray_tui_db::models::Protocol {
             id: ProtocolId::new(id),
             sig: id,
-            cred_hash: 0,
             proto_kind: ProtocolKind::Redirect,
             transport: Transport {
                 r#type: TransportType::Tcp,
@@ -740,7 +738,7 @@ mod tests {
                 "redirect".to_string(),
                 serde_json::to_vec(&settings).unwrap(),
             )))),
-            created_at: ts(0),
+            created_at: 0,
             links: Deferred::default(),
         }
     }

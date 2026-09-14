@@ -12,6 +12,7 @@ use xray_tui_native::telemetry::{TraceEvent, TraceKind, TraceSecurity};
 
 /// Re-export `EndpointRow` as `EndpointRow` for backward compatibility.
 pub use xray_tui_db::models::EndpointRow;
+use xray_tui_proto::proto_spec::ProtocolKind;
 
 /// Clash API /traffic response struct.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -391,6 +392,10 @@ pub enum AppMode {
     },
     EditServer {
         protocol_id: i64,
+        /// The edited profile's protocol kind, captured when the form opened.
+        /// The form re-derives its layout from this on every key; re-reading it
+        /// from the database per keystroke was a round trip per key press.
+        proto_kind: ProtocolKind,
         fields: Vec<(String, String)>,
         focus_index: usize,
         /// Per-field validation errors
@@ -475,6 +480,13 @@ pub enum CoreEvent {
         rows: Vec<EndpointRow>,
         /// Page position/count the rows belong to (footer + navigation).
         meta: xray_tui_db::profiles_query::PageMeta,
+    },
+    /// The background retention pass reclaimed endpoints whose newest link
+    /// aged past the retention window. The page the user is looking at may
+    /// have lost rows, so it must be re-read (nothing else invalidates it:
+    /// the purge runs off the event loop).
+    RetentionPurged {
+        count: usize,
     },
     /// Result from a speed test operation. `endpoint_id` + `protocol_id`
     /// together address exactly one `ProfileStats` row: protocol rows are

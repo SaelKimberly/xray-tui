@@ -51,7 +51,12 @@ pub struct DisplayRowsCache {
     pub expanded: Vec<bool>,
     /// Pending rebuild reasons (see `ROWS_DIRTY_*`).
     pub dirty: u8,
-    pub rows: Vec<DisplayRowData>,
+    /// The built rows. Behind an `Rc` so the per-frame hand-off to the
+    /// renderer is a refcount bump, not a deep clone of every row's strings
+    /// and sub-rows (`Rc::make_mut` still gives the selection patch its
+    /// in-place path — it only copies when a previous frame's handle is
+    /// somehow still alive).
+    pub rows: std::rc::Rc<Vec<DisplayRowData>>,
 }
 
 impl Default for DisplayRowsCache {
@@ -64,7 +69,7 @@ impl Default for DisplayRowsCache {
             multi_select: Vec::new(),
             expanded: Vec::new(),
             dirty: 0,
-            rows: Vec::new(),
+            rows: std::rc::Rc::new(Vec::new()),
         }
     }
 }
@@ -543,7 +548,7 @@ fn build_display_rows(
     selected: usize,
     state: &AppState,
     palette: &ratatui_cheese::theme::Palette,
-) -> Vec<DisplayRowData> {
+) -> std::rc::Rc<Vec<DisplayRowData>> {
     // Cache check (part-2 runtime bounds): reuse the previous frame's rows
     // when every input is unchanged — structural gen, the selection,
     // connection, multi-select membership, per-row expansion, and the async
@@ -574,9 +579,10 @@ fn build_display_rows(
             cache.selected_index != selected || cache.selected_sub != state.selected_sub;
         if selection_changed {
             let previous = cache.selected_index;
+            let cached_rows = std::rc::Rc::make_mut(&mut cache.rows);
             for index in [previous, selected] {
-                if let Some(row) = cache.rows.get_mut(index)
-                    && index < rows.len()
+                if index < rows.len()
+                    && let Some(row) = cached_rows.get_mut(index)
                 {
                     restyle_row(row, index, selected, state, palette, rows[index]);
                 }
@@ -770,10 +776,10 @@ fn build_display_rows(
                             "○".to_string()
                         },
                         proto_id_hex: format!("{:08x}", link.protocol_id.get() as u32),
-                        last_seen: format_ts(&link.last_seen_at),
+                        last_seen: format_ts(link.last_seen_at),
                         last_used: link
                             .last_used_at
-                            .map_or_else(|| "never".to_string(), |ts| format_relative_ts(&ts)),
+                            .map_or_else(|| "never".to_string(), format_relative_ts),
                         protocol_type,
                         config_type,
                         delay,
@@ -826,8 +832,8 @@ fn build_display_rows(
     cache.multi_select.sort_unstable();
     cache.expanded = rows.iter().map(|r| r.expanded).collect();
     cache.dirty = 0;
-    cache.rows = result;
-    cache.rows.clone()
+    cache.rows = std::rc::Rc::new(result);
+    std::rc::Rc::clone(&cache.rows)
 }
 
 fn render_data_grid(
@@ -1172,7 +1178,7 @@ mod page_window_tests {
     fn display(state: &AppState) -> Vec<DisplayRowData> {
         let rows: Vec<&EndpointRow> = state.endpoints.iter().collect();
         let palette = state.current_palette();
-        build_display_rows(&rows, state.selected_index, state, &palette)
+        (*build_display_rows(&rows, state.selected_index, state, &palette)).clone()
     }
 
     /// The `#` column carries the row's position in the FEED, not in the
@@ -1698,7 +1704,6 @@ mod tests {
                 host_type: xray_tui_db::models::HostType::Ipv4,
                 port: port as u16,
                 ports: Vec::new(),
-                parent_id: None,
                 last_source: None,
                 manual_protocol_override: None,
                 resolved_as: Vec::new(),

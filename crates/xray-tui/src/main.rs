@@ -5,7 +5,7 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use xray_tui::AppState;
+use xray_tui::{AppState, CoreEvent};
 use xray_tui_config::AppConfig;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_db::Database;
@@ -360,6 +360,44 @@ async fn main() -> Result<()> {
             .ok();
         }
     });
+    // 5b. Retention maintenance: endpoints whose NEWEST link has aged past the
+    //     purgatory retention window are reclaimed. `purge_expired` had no
+    //     production caller before this — the Stale view showed rows that were
+    //     never reclaimed. Best-effort: a failed pass logs and the next one
+    //     retries.
+    {
+        let purge_db = Arc::clone(&state.db);
+        let purge_tx = state.core_event_tx.clone();
+        let purge_retention_secs = state.purgatory_retention_secs;
+        let purge_shutdown = state.shutdown_token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_mins(10));
+            interval.tick().await; // skip first tick
+            loop {
+                interval.tick().await;
+                if purge_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                if purge_retention_secs <= 0 {
+                    continue; // 0 or negative = keep forever
+                }
+                // Stored timestamps are epoch seconds, so is the cutoff.
+                let cutoff = xray_tui_db::models::now_epoch() - purge_retention_secs;
+                match purge_db.purge_expired(cutoff).await {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        if let Some(tx) = &purge_tx {
+                            let _ = tx.try_send(CoreEvent::RetentionPurged { count });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "tui::main", "retention purge failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     // Panic hook to restore terminal on unexpected crashes
     let prev_hook = std::panic::take_hook();
     // A panic unwinds past the store below (the workspace has no

@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,9 +33,16 @@ pub(crate) fn endpoint_row_for_protocol(
 
 /// True when `a` and `b` fall on the same civil day in the system local
 /// time zone — the "today" boundary for the daily traffic reset.
-fn same_local_day(a: jiff::Timestamp, b: jiff::Timestamp) -> bool {
+/// Whether two epoch-second stamps fall on the same local day (the traffic
+/// counters' daily reset).
+fn same_local_day(a: i64, b: i64) -> bool {
     let tz = jiff::tz::TimeZone::system();
-    a.to_zoned(tz.clone()).date() == b.to_zoned(tz).date()
+    let date = |secs: i64| {
+        xray_tui_db::models::from_epoch(secs)
+            .to_zoned(tz.clone())
+            .date()
+    };
+    date(a) == date(b)
 }
 
 /// True when `protocol_id` belongs to the currently connected endpoint — the
@@ -174,8 +180,8 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
     let mut budget = EVENT_DRAIN_BUDGET;
     // DNS resolutions changed this pass, flushed as ONE spawned task after
     // the drain (see the `persist_batch.push` in the EndpointInfoUpdated arm).
-    let mut persist_batch: Vec<(EndpointId, Vec<String>, jiff::Timestamp, Vec<IpAddr>)> =
-        Vec::new();
+    // `(endpoint, resolved IPs, epoch seconds of the lookup)`.
+    let mut persist_batch: Vec<(EndpointId, Vec<String>, i64)> = Vec::new();
     while let Some(rx) = state.core_event_rx.as_mut() {
         let event = match rx.try_recv() {
             Ok(event) => event,
@@ -391,6 +397,16 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     crate::ops::profiles::apply_profiles_rows(state, rows, &meta);
                 }
                 // A newer reload superseded this one — drop the stale rows.
+            }
+            CoreEvent::RetentionPurged { count } => {
+                state.log_trace(
+                    "info",
+                    "tui::ops::events",
+                    &format!("Retention reclaimed {count} profile(s)"),
+                );
+                // The loaded page may have lost rows: re-read it on this tick.
+                state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
+                state.filter_cache_valid.set(false);
             }
             CoreEvent::TestTypeUpdate {
                 endpoint_id,
@@ -764,7 +780,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // would block the startup seeding pass and make
                 // `should_resolve` treat the endpoint as a never-retried IP
                 // host.
-                let mut persist: Option<(Vec<String>, jiff::Timestamp)> = None;
+                let mut persist: Option<(Vec<String>, i64)> = None;
                 if !info.resolved_ips.is_empty()
                     || info.sni_whitelisted.is_some()
                     || info.outbound_ip.is_some()
@@ -795,8 +811,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                     .iter()
                                     .map(std::string::ToString::to_string)
                                     .collect::<Vec<_>>(),
-                                jiff::Timestamp::from_second(entry.resolved_at_secs.unwrap_or(0))
-                                    .unwrap_or_else(|_| jiff::Timestamp::now()),
+                                entry.resolved_at_secs.unwrap_or(0),
                             ));
                         }
                     } else if info.resolved_at_secs.is_some() {
@@ -814,21 +829,12 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     }
                 }
                 // Persist DNS resolutions (DNS hosts only) so launches don't
-                // re-resolve; the TTL gate applies across restarts. The typed
-                // write also refreshes the resolved-IP child endpoints (port
-                // 443, per the T10 decision).
+                // re-resolve; the TTL gate applies across restarts.
                 if let Some((resolved_as, resolved_at)) = persist {
                     // Batched: one spawned flush per poll instead of one
                     // task per event — an enrichment flood must not create
                     // thousands of concurrent DB write tasks.
-                    let ip_addrs: Vec<IpAddr> =
-                        resolved_as.iter().filter_map(|s| s.parse().ok()).collect();
-                    persist_batch.push((
-                        EndpointId::new(endpoint_id),
-                        resolved_as,
-                        resolved_at,
-                        ip_addrs,
-                    ));
+                    persist_batch.push((EndpointId::new(endpoint_id), resolved_as, resolved_at));
                 }
 
                 // DNS flip (unresolved -> resolved): lift the endpoint's
@@ -862,7 +868,9 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
     if !persist_batch.is_empty() {
         let db = state.db.clone();
         tokio::spawn(async move {
-            for (eid, resolved_as, resolved_at, ip_addrs) in persist_batch {
+            for (eid, resolved_as, resolved_at) in persist_batch {
+                // `resolved_as` + `resolved_at` are the ONLY owner of a DNS
+                // endpoint's resolutions (the resolved-IP child rows are gone).
                 if let Err(e) = db
                     .update_endpoint_resolution(eid, resolved_as, resolved_at)
                     .await
@@ -870,12 +878,6 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     tracing::warn!(
                         target: "tui::ops::events",
                         "update_endpoint_resolution failed: {e}"
-                    );
-                }
-                if let Err(e) = db.upsert_resolved_ip_children(eid, &ip_addrs).await {
-                    tracing::warn!(
-                        target: "tui::ops::events",
-                        "upsert_resolved_ip_children failed: {e}"
                     );
                 }
             }
@@ -931,7 +933,7 @@ fn apply_stats_delta(
     else {
         return false;
     };
-    let now = jiff::Timestamp::now();
+    let now = xray_tui_db::models::now_epoch();
     let (base_up, base_down) = if same_local_day(link.updated_at, now) {
         (link.traffic.today_up, link.traffic.today_down)
     } else {
@@ -1234,6 +1236,37 @@ mod tests {
         assert!(!state.poll_core_events().await);
     }
 
+    /// The retention pass runs off the event loop, so its result has to come
+    /// back through the channel: the handler must invalidate the loaded page
+    /// (it may just have lost rows) and say so in the log.
+    #[tokio::test]
+    async fn retention_purge_invalidates_the_loaded_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, AppConfig::default()).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        state.core_event_rx = Some(rx);
+        state.filter_cache_valid.set(true);
+        let gen_before = state.endpoints_gen;
+
+        tx.send(CoreEvent::RetentionPurged { count: 2 })
+            .await
+            .unwrap();
+        assert!(state.poll_core_events().await);
+        assert!(
+            !state.filter_cache_valid.get(),
+            "the next tick must re-read the page"
+        );
+        assert_ne!(
+            state.endpoints_gen, gen_before,
+            "the display cache's key must move with the dataset"
+        );
+    }
+
     #[test]
     fn endpoint_row_for_protocol_matches_protocol_id_not_endpoint_id() {
         // endpoint id 100 has link protocol 7; endpoint id 101 has link 9
@@ -1311,8 +1344,7 @@ mod tests {
         };
         // Last write 48h ago — a different civil day in any time zone.
         let now = jiff::Timestamp::now();
-        link.updated_at =
-            jiff::Timestamp::from_second(now.as_second() - 48 * 3600).expect("valid ts");
+        link.updated_at = now.as_second() - 48 * 3600;
         state.endpoints = vec![row];
         // The events handler only accepts traffic from the connected session
         // (T22 stale-event guard): the connected endpoint owns protocol 7.
@@ -2149,10 +2181,6 @@ mod tests {
         assert!(!state.speed_test_stop.load(Ordering::Relaxed));
     }
 
-    fn ts(secs: i64) -> jiff::Timestamp {
-        jiff::Timestamp::from_second(secs).unwrap()
-    }
-
     #[test]
     fn render_route_event_covers_all_five_variants() {
         use xray_tui_route::events::RouteEvent as Re;
@@ -2161,7 +2189,7 @@ mod tests {
             rule_name: Some("ads".into()),
             tag: Some("proxy".into()),
             sni: Some("example.com".into()),
-            at: ts(1_700_000_000),
+            at: jiff::Timestamp::from_second(1_700_000_000).expect("ts"),
         });
         assert_eq!(line.target, "route");
         assert_eq!(line.level, "info");
@@ -2176,7 +2204,7 @@ mod tests {
             rule_name: None,
             tag: None,
             sni: None,
-            at: ts(1),
+            at: jiff::Timestamp::from_second(1).expect("ts"),
         });
         assert_eq!(
             line.message,
@@ -2189,7 +2217,7 @@ mod tests {
                 "1.2.3.4".parse::<std::net::IpAddr>().unwrap(),
                 "::1".parse::<std::net::IpAddr>().unwrap(),
             ],
-            at: ts(2),
+            at: jiff::Timestamp::from_second(2).expect("ts"),
         });
         assert_eq!(line.target, "route");
         assert_eq!(
@@ -2199,7 +2227,7 @@ mod tests {
 
         let line = render_route_event(&Re::NetworkBreakdown {
             failed_probe: "gstatic".into(),
-            at: ts(3),
+            at: jiff::Timestamp::from_second(3).expect("ts"),
         });
         assert_eq!(
             line.message,
@@ -2208,7 +2236,7 @@ mod tests {
 
         let line = render_route_event(&Re::ProbeRecovered {
             probe: "gstatic".into(),
-            at: ts(4),
+            at: jiff::Timestamp::from_second(4).expect("ts"),
         });
         assert_eq!(
             line.message,
@@ -2229,7 +2257,7 @@ mod tests {
         tx.send(CoreEvent::Route(
             xray_tui_route::events::RouteEvent::ProbeRecovered {
                 probe: "gstatic".into(),
-                at: ts(5),
+                at: jiff::Timestamp::from_second(5).expect("ts"),
             },
         ))
         .await
@@ -2251,7 +2279,7 @@ mod tests {
         super::spawn_route_event_forwarder(rx, core_tx);
         tx.send(xray_tui_route::events::RouteEvent::NetworkBreakdown {
             failed_probe: "gstatic".into(),
-            at: ts(6),
+            at: jiff::Timestamp::from_second(6).expect("ts"),
         })
         .unwrap();
         drop(tx); // close the route stream so the forwarder can exit later
@@ -2262,7 +2290,7 @@ mod tests {
                 at,
             }) => {
                 assert_eq!(&*failed_probe, "gstatic");
-                assert_eq!(at, ts(6));
+                assert_eq!(at, jiff::Timestamp::from_second(6).expect("ts"));
             }
             other => panic!("unexpected event: {other:?}"),
         }

@@ -272,12 +272,11 @@ pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
         },
         port: ep.port,
         ports: ep.ports.clone(),
-        parent_id: None,
         last_source: None,
         manual_protocol_override: None,
         resolved_as: Vec::new(),
         resolved_at: None,
-        created_at: jiff::Timestamp::now(),
+        created_at: xray_tui_db::models::now_epoch(),
         links: Deferred::default(),
         group_links: Deferred::default(),
     }
@@ -292,16 +291,15 @@ pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
 /// would serialize 3×.
 #[must_use]
 pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
-    let (sig, cred_hash, uid) = parsed.identity_once();
+    let (sig, _cred_hash, uid) = parsed.identity_once();
     Protocol {
         id: ProtocolId::new(uid),
         sig,
-        cred_hash,
         proto_kind: parsed.protocol.proto_kind,
         transport: transport_embed(&parsed.protocol.config),
         security: security_embed(&parsed.protocol.config),
         config: Deferred::from(Json(parsed.protocol.config.clone())),
-        created_at: jiff::Timestamp::now(),
+        created_at: xray_tui_db::models::now_epoch(),
         links: Deferred::default(),
     }
 }
@@ -314,7 +312,7 @@ pub fn link_from_parsed_with_id(
     protocol_id: ProtocolId,
     endpoint_id: EndpointId,
 ) -> ProfileStats {
-    let now = jiff::Timestamp::now();
+    let now = xray_tui_db::models::now_epoch();
     ProfileStats {
         protocol_id,
         endpoint_id,
@@ -325,8 +323,6 @@ pub fn link_from_parsed_with_id(
         },
         last_used_at: None,
         last_seen_at: now,
-        task_id: None,
-        task_queue: Vec::new(),
         latency: None,
         speed_bps: None,
         error: None,
@@ -363,37 +359,50 @@ pub async fn persist_parsed(
     group_id: Option<&str>,
     core_override: Option<xray_tui_proto::proto_spec::CoreType>,
 ) -> Result<usize, xray_tui_db::DatabaseError> {
-    // Stream rows instead of materializing `parsed_to_rows`: the shared
-    // `Protocol` row upserts ONCE (not once per endpoint), and endpoints /
-    // links build inline per endpoint. Orphan protocols (zero endpoints)
-    // persist nothing — same as the old collect-then-loop shape.
+    // Build the whole batch, then write it in ONE transaction — the shape
+    // `ops::stream_import` already uses for a subscription body. Per-row
+    // autocommit upserts cost a commit each; a batch shares one, so a crash
+    // mid-import can no longer leave half a subscription stored.
     if parsed.endpoints.is_empty() {
         return Ok(0);
     }
     let protocol = protocol_from_parsed(parsed);
-    db.upsert_protocol(&protocol).await?;
-    let mut count = 0usize;
+    let mut endpoints = Vec::with_capacity(parsed.endpoints.len());
+    let mut links = Vec::with_capacity(parsed.endpoints.len());
+    let mut group_links = Vec::with_capacity(parsed.endpoints.len());
     for ep in &parsed.endpoints {
         let endpoint = endpoint_from_essentials(ep);
         let mut link = link_from_parsed_with_id(parsed, protocol.id, endpoint.id);
         if let Some(core) = core_override {
             link.core_type = core;
         }
-        db.upsert_endpoint(&endpoint).await?;
-        db.upsert_link(&link).await?;
         if let Some(gid) = group_id {
-            db.upsert_endpoint_group_link(&EndpointGroup {
+            group_links.push(EndpointGroup {
                 endpoint_id: endpoint.id,
                 group_id: gid.to_owned(),
                 last_seen_at: link.last_seen_at,
                 sort_order: None,
                 endpoint: Deferred::default(),
                 group: Deferred::default(),
-            })
-            .await?;
+            });
         }
-        count += 1;
+        endpoints.push(endpoint);
+        links.push(link);
     }
+
+    let protocols = [protocol];
+    let count = endpoints.len();
+    let persist = || async {
+        let mut conn = db.connection().await?;
+        let mut tx = conn.transaction().await?;
+        xray_tui_db::upsert_endpoints_bulk(&mut tx, &endpoints).await?;
+        xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await?;
+        xray_tui_db::upsert_links_bulk(&mut tx, &links).await?;
+        xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &group_links).await?;
+        tx.commit().await?;
+        Ok(())
+    };
+    xray_tui_db::retry_on_busy(persist, 5).await?;
     Ok(count)
 }
 

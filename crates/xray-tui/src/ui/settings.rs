@@ -951,8 +951,10 @@ fn handle_update_form_key(state: &mut AppState, key: &KeyEvent) {
 // ── Routing list ────────────────────────────────────────────────────────
 
 /// Persist a full sort-order pass: each rule's `sort_order` is the index in
-/// `ids`. The typed model has no bulk reorder write, so each rule is updated
-/// through the pooled connection (best-effort — failures log via tracing).
+/// `ids`. One transaction for the whole pass — the typed model has no bulk
+/// reorder, and per-rule autocommit meant one commit per keystroke-visible
+/// move (a partial pass could also leave two rules sharing a sort order).
+/// Best-effort: failures log via tracing and roll the pass back.
 async fn reorder_routing_rules(state: &AppState, ids: &[(String, i32)]) {
     let mut conn = match state.db.connection().await {
         Ok(c) => c,
@@ -961,16 +963,27 @@ async fn reorder_routing_rules(state: &AppState, ids: &[(String, i32)]) {
             return;
         }
     };
+    let mut tx = match conn.transaction().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(target: "tui::ui::settings", "Failed to open reorder transaction: {e}");
+            return;
+        }
+    };
     for (id, order) in ids {
         if let Err(e) = xray_tui_db::models::RoutingRule::filter_by_id(id.clone())
             .update()
             .sort_order(Some(*order))
-            .exec(&mut conn)
+            .exec(&mut tx)
             .await
         {
+            // Dropping the transaction rolls the pass back.
             tracing::warn!(target: "tui::ui::settings", "Failed to reorder rule {id}: {e}");
             return;
         }
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(target: "tui::ui::settings", "Failed to commit reorder: {e}");
     }
 }
 

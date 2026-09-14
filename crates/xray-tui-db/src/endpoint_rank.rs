@@ -43,7 +43,8 @@ pub struct RankLink {
     pub measured: Option<bool>,
     pub delay: i32,
     pub error_kind: Option<ProfileErr>,
-    pub seen_nanos: i64,
+    /// Epoch seconds of the link's `last_seen_at` (the recency tiebreak).
+    pub seen_secs: i64,
     pub speed: Option<i64>,
     pub traffic: i64,
     pub config: ConfigType,
@@ -73,7 +74,7 @@ impl RankLink {
             }
         };
         let latency = if tier <= 1 { self.delay } else { i32::MAX };
-        (tier, latency, -self.seen_nanos, self.protocol_id)
+        (tier, latency, -self.seen_secs, self.protocol_id)
     }
 
     /// "Measured" rank of the display preference: real (0) before fast (1).
@@ -98,7 +99,7 @@ impl From<&ProfileStats> for RankLink {
             measured,
             delay,
             error_kind: link.error.as_ref().map(|e| e.kind),
-            seen_nanos: nanos(link.last_seen_at),
+            seen_secs: link.last_seen_at,
             speed: link.speed_bps,
             traffic: link
                 .traffic
@@ -107,11 +108,6 @@ impl From<&ProfileStats> for RankLink {
             config: link.config_type,
         }
     }
-}
-
-/// Epoch nanoseconds of a `jiff` timestamp.
-fn nanos(ts: jiff::Timestamp) -> i64 {
-    i64::try_from(ts.as_nanosecond()).unwrap_or(i64::MAX)
 }
 
 /// True when the endpoint is a DNS host whose resolution has not landed —
@@ -171,7 +167,7 @@ pub fn compute_rank(
 ) -> Option<EndpointRank> {
     let (tier, latency, neg_seen, protocol) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
     let display = display_link_index(links, override_protocol).map(|i| links[i]);
-    let newest_seen = links.iter().map(|l| l.seen_nanos).max().unwrap_or(0);
+    let newest_seen = links.iter().map(|l| l.seen_secs).max().unwrap_or(0);
     Some(EndpointRank {
         endpoint_id,
         dns: i64::from(dns_unresolved),
@@ -179,7 +175,7 @@ pub fn compute_rank(
         latency: i64::from(latency),
         seen: -neg_seen,
         protocol,
-        display_seen: display.map_or(NO_SEEN, |l| l.seen_nanos),
+        display_seen: display.map_or(NO_SEEN, |l| l.seen_secs),
         speed: display.map_or(NO_SPEED, |l| l.speed.unwrap_or(NO_SPEED)),
         traffic: display.map_or(0, |l| l.traffic),
         config: display.map_or(CONFIG_OTHER, |l| config_rank(l.config)),
@@ -482,10 +478,7 @@ pub(crate) async fn refresh(
                 .and_then(as_i64)
                 .and_then(|d| i32::try_from(d).ok())
                 .unwrap_or(0),
-            seen_nanos: field(5)
-                .and_then(as_text)
-                .and_then(|t| parse_nanos(&t))
-                .unwrap_or(0),
+            seen_secs: field(5).and_then(as_i64).unwrap_or(0),
             speed: field(6).and_then(as_i64),
             traffic: field(7).and_then(as_i64).unwrap_or(0)
                 + field(8).and_then(as_i64).unwrap_or(0),
@@ -567,12 +560,4 @@ fn parse_error_kind(text: &str) -> Option<ProfileErr> {
         "name" => Some(ProfileErr::Name),
         _ => None,
     }
-}
-
-/// `2026-09-11T07:38:50.858130960Z` → epoch nanoseconds. The stored text is
-/// fixed-width UTC with nine fractional digits, so it parses directly.
-fn parse_nanos(text: &str) -> Option<i64> {
-    text.parse::<jiff::Timestamp>()
-        .ok()
-        .map(|ts| i64::try_from(ts.as_nanosecond()).unwrap_or(i64::MAX))
 }

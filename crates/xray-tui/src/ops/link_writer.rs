@@ -10,6 +10,7 @@
 //! fix, ~1.06 ms after, and ~95 s of UI-task blocking per batch. `stage` never
 //! awaits; one flush task turns a window of staged rows into one transaction.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -18,10 +19,22 @@ use dashmap::DashMap;
 use xray_tui_db::models::{EndpointId, ProfileStats, ProtocolId};
 use xray_tui_db::{Database, LinkGroups, LinkPatch};
 
-use crate::ops::scheduler::SchedulerDb;
-
 /// One staged row identity: the link plus the column group it carries.
 type StageKey = ((ProtocolId, EndpointId), LinkGroups);
+
+/// Fold one staged column group onto `base`.
+///
+/// The groups are disjoint by construction, so the order they are applied in
+/// never matters: RESULT owns latency/speed/error, TRAFFIC the four counters.
+fn merge_group(base: &mut ProfileStats, flag: LinkGroups, staged: &ProfileStats) {
+    if flag == LinkGroups::RESULT {
+        base.latency.clone_from(&staged.latency);
+        base.speed_bps = staged.speed_bps;
+        base.error.clone_from(&staged.error);
+    } else {
+        base.traffic = staged.traffic;
+    }
+}
 
 /// Default flush trigger: rows.
 pub const DEFAULT_FLUSH_ROWS: usize = 512;
@@ -77,7 +90,7 @@ impl LinkWriter {
     /// `groups` is normalised to one entry per flag, so a stage of `ALL` and a
     /// later stage of `RESULT` do not shadow each other.
     pub fn stage(&self, link: &ProfileStats, groups: LinkGroups) {
-        for flag in [LinkGroups::RESULT, LinkGroups::TASK, LinkGroups::TRAFFIC] {
+        for flag in [LinkGroups::RESULT, LinkGroups::TRAFFIC] {
             if groups.contains(flag) {
                 self.pending
                     .insert(((link.protocol_id, link.endpoint_id), flag), link.clone());
@@ -88,67 +101,48 @@ impl LinkWriter {
         }
     }
 
-    /// Read-through: the staged state when present, otherwise the persisted
-    /// row.
+    /// Take every staged entry out of the map, COALESCED to one patch per link.
     ///
-    /// The scheduler gate calls this from inside its critical section, so a
-    /// task transition that has been staged but not yet flushed is still
-    /// visible — the guarantee that stops a second `schedule` from starting the
-    /// same link twice.
-    pub async fn read(
-        &self,
-        key: (ProtocolId, EndpointId),
-    ) -> xray_tui_db::Result<Option<ProfileStats>> {
-        let mut conn = self.db.connection().await?;
-        let persisted = ProfileStats::filter_by_protocol_id_and_endpoint_id(key.0, key.1)
-            .first()
-            .exec(&mut conn)
-            .await?;
-        Ok(self.overlay_pending(key, persisted))
-    }
-
-    /// Overlay every staged group for `key` onto `base`.
-    fn overlay_pending(
-        &self,
-        key: (ProtocolId, EndpointId),
-        base: Option<ProfileStats>,
-    ) -> Option<ProfileStats> {
-        let mut merged = base;
-        for flag in [LinkGroups::RESULT, LinkGroups::TASK, LinkGroups::TRAFFIC] {
-            let Some(staged) = self.pending.get(&(key, flag)) else {
-                continue;
-            };
-            let Some(row) = merged.as_mut() else {
-                merged = Some(staged.clone());
-                break;
-            };
-            if flag == LinkGroups::RESULT {
-                row.latency.clone_from(&staged.latency);
-                row.speed_bps = staged.speed_bps;
-                row.error.clone_from(&staged.error);
-            } else if flag == LinkGroups::TASK {
-                row.task_id = staged.task_id;
-                row.task_queue.clone_from(&staged.task_queue);
-            } else {
-                row.traffic = staged.traffic;
-            }
-        }
-        merged
-    }
-
-    /// Take every staged entry out of the map, keyed by its own snapshot.
+    /// The map holds one entry per `(link, group)`, so a link touched by a
+    /// result, its traffic poll and the gate's transition would otherwise be
+    /// written three times. One patch per link with the union of its groups
+    /// writes it once, and the group overlay is the same one the gate reads.
     ///
     /// The drain is a **remove**, never a snapshot copy: a `stage` that lands
     /// while the flush is writing inserts a fresh entry that the next window
     /// picks up. Removing the key again after the write would drop that state.
     fn drain(&self) -> Vec<LinkPatch> {
         let keys: Vec<StageKey> = self.pending.iter().map(|entry| *entry.key()).collect();
-        let mut patches = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some((_, link)) = self.pending.remove(&key) {
+        let mut order: Vec<(ProtocolId, EndpointId)> = Vec::new();
+        let mut groups: HashMap<(ProtocolId, EndpointId), LinkGroups> = HashMap::new();
+        for (link_key, flag) in keys {
+            match groups.entry(link_key) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    *e.get_mut() = e.get().union(flag);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    order.push(link_key);
+                    slot.insert(flag);
+                }
+            }
+        }
+
+        let mut patches = Vec::with_capacity(order.len());
+        for link_key in order {
+            let mut merged: Option<ProfileStats> = None;
+            for flag in [LinkGroups::RESULT, LinkGroups::TRAFFIC] {
+                let Some((_, staged)) = self.pending.remove(&(link_key, flag)) else {
+                    continue;
+                };
+                match merged.as_mut() {
+                    Some(row) => merge_group(row, flag, &staged),
+                    None => merged = Some(staged),
+                }
+            }
+            if let Some(link) = merged {
                 patches.push(LinkPatch {
                     link,
-                    groups: key.1,
+                    groups: groups.get(&link_key).copied().unwrap_or(LinkGroups::ALL),
                 });
             }
         }
@@ -225,32 +219,6 @@ impl LinkWriter {
     }
 }
 
-/// The scheduler gate's persistence seam while a batch is running: reads see
-/// staged transitions (read-through) and writes are staged, never committed on
-/// the caller's task.
-impl SchedulerDb for LinkWriter {
-    async fn read_link(
-        &self,
-        protocol_id: ProtocolId,
-        endpoint_id: EndpointId,
-    ) -> xray_tui_db::Result<Option<ProfileStats>> {
-        self.read((protocol_id, endpoint_id)).await
-    }
-
-    fn write_task_state(
-        &self,
-        link: &ProfileStats,
-        task_id: Option<u16>,
-        queue: &[u16],
-    ) -> impl std::future::Future<Output = xray_tui_db::Result<()>> + Send {
-        let mut row = link.clone();
-        row.task_id = task_id;
-        row.task_queue = queue.to_vec();
-        self.stage(&row, LinkGroups::TASK);
-        std::future::ready(Ok(()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,12 +240,11 @@ mod tests {
             host_type: HostType::Ipv4,
             port: 443,
             ports: Vec::new(),
-            parent_id: None,
             last_source: None,
             manual_protocol_override: None,
             resolved_as: Vec::new(),
             resolved_at: None,
-            created_at: jiff::Timestamp::from_second(1).expect("ts"),
+            created_at: 1,
             links: toasty::Deferred::default(),
             group_links: toasty::Deferred::default(),
         })
@@ -286,7 +253,6 @@ mod tests {
         db.upsert_protocol(&Protocol {
             id: ProtocolId::new(101),
             sig: 101,
-            cred_hash: 0,
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,
@@ -310,7 +276,7 @@ mod tests {
                 splice: None,
                 remarks: None,
             }))),
-            created_at: jiff::Timestamp::from_second(1).expect("ts"),
+            created_at: 1,
             links: toasty::Deferred::default(),
         })
         .await
@@ -321,9 +287,7 @@ mod tests {
             core_type: CoreType::Xray,
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
-            last_seen_at: jiff::Timestamp::from_second(1).expect("ts"),
-            task_id: None,
-            task_queue: Vec::new(),
+            last_seen_at: 1,
             latency: None,
             speed_bps: None,
             error: None,
@@ -333,8 +297,8 @@ mod tests {
                 total_up: 0,
                 total_down: 0,
             },
-            created_at: jiff::Timestamp::from_second(1).expect("ts"),
-            updated_at: jiff::Timestamp::from_second(1).expect("ts"),
+            created_at: 1,
+            updated_at: 1,
             version: 0,
             protocol: toasty::Deferred::default(),
             endpoint: toasty::Deferred::default(),
@@ -370,41 +334,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_is_read_through_before_any_flush() {
-        let (db, writer) = seeded().await;
-        let base = persisted(&db).await;
-        writer.stage(&with_latency(&base, 33), LinkGroups::RESULT);
-
-        assert_eq!(writer.flush_count(), 0, "staging must not write");
-        let seen = writer.read(key()).await.expect("read").expect("row");
-        assert_eq!(seen.latency, Some(Latency::Fast { delay: 33 }));
-        // The database still holds the old value.
-        assert_eq!(persisted(&db).await.latency, None);
-    }
-
-    #[tokio::test]
     async fn flush_writes_every_staged_row_and_final_state_matches() {
         let (db, writer) = seeded().await;
         let base = persisted(&db).await;
         let mut result = with_latency(&base, 44);
         result.speed_bps = Some(1_000_000);
-        let mut task = base.clone();
-        task.task_id = Some(9);
-        task.task_queue = vec![9];
+        let mut traffic = base.clone();
+        traffic.traffic.total_up = 5;
 
         writer.stage(&result, LinkGroups::RESULT);
-        writer.stage(&task, LinkGroups::TASK);
-        assert_eq!(writer.staged_len(), 2);
+        writer.stage(&traffic, LinkGroups::TRAFFIC);
+        assert_eq!(writer.staged_len(), 2, "one entry per (link, group)");
 
-        assert_eq!(writer.flush().await.expect("flush"), 2);
+        // Both groups belong to the same link: they coalesce into ONE write,
+        // and the merged row carries both the result and the counters.
+        assert_eq!(writer.flush().await.expect("flush"), 1);
         assert_eq!(writer.staged_len(), 0);
         assert_eq!(writer.flush_count(), 1, "one transaction per window");
 
         let row = persisted(&db).await;
         assert_eq!(row.latency, Some(Latency::Fast { delay: 44 }));
         assert_eq!(row.speed_bps, Some(1_000_000));
-        assert_eq!(row.task_id, Some(9));
-        assert_eq!(row.task_queue, vec![9]);
+        assert_eq!(row.traffic.total_up, 5);
     }
 
     #[tokio::test]
@@ -421,16 +372,26 @@ mod tests {
     #[tokio::test]
     async fn flush_chunks_at_flush_rows() {
         let (db, _) = seeded().await;
-        // flush_rows = 1: three staged groups become three transactions.
+        // flush_rows = 1: three staged LINKS become three transactions (three
+        // column groups of ONE link would coalesce into a single write).
         let writer = LinkWriter::new(Arc::clone(&db), 1, DEFAULT_FLUSH_INTERVAL);
         let base = persisted(&db).await;
-        writer.stage(&with_latency(&base, 1), LinkGroups::ALL);
+        for idx in 0..3 {
+            let mut link = with_latency(&base, idx);
+            link.endpoint_id = EndpointId::new(i64::from(idx) + 2);
+            link.protocol_id = ProtocolId::new(i64::from(idx) + 202);
+            writer.stage(&link, LinkGroups::ALL);
+        }
         assert_eq!(
             writer.staged_len(),
-            3,
-            "ALL normalises to one entry per group"
+            6,
+            "ALL normalises to one entry per group (2), per link"
         );
-        assert_eq!(writer.flush().await.expect("flush"), 3);
+        assert_eq!(
+            writer.flush().await.expect("flush"),
+            3,
+            "one patch per link"
+        );
         assert_eq!(writer.flush_count(), 3, "one transaction per chunk");
     }
 
@@ -458,21 +419,5 @@ mod tests {
             Some(Latency::Fast { delay: 20 }),
             "the newer value wins"
         );
-    }
-
-    #[tokio::test]
-    async fn a_staged_task_transition_is_visible_to_a_read_before_flush() {
-        // The gate's read-through guarantee: schedule() must see a staged
-        // transition, not the pre-flush database row.
-        let (db, writer) = seeded().await;
-        let base = persisted(&db).await;
-        let mut task = base.clone();
-        task.task_id = Some(5);
-        task.task_queue = vec![5];
-        writer.stage(&task, LinkGroups::TASK);
-
-        let seen = writer.read(key()).await.expect("read").expect("row");
-        assert_eq!(seen.task_id, Some(5));
-        assert_eq!(seen.task_queue, vec![5]);
     }
 }

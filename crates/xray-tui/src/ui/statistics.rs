@@ -235,7 +235,7 @@ mod tests {
             total_up: 10_000,
             total_down: 20_000,
         };
-        link.updated_at = jiff::Timestamp::now();
+        link.updated_at = xray_tui_db::models::now_epoch();
         state.connected_protocol_id = Some(1);
         state.selected_index = 2; // gamma selected
         // Session delta via the T21 handler: the same path the pollers use.

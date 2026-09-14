@@ -644,8 +644,8 @@ mod tests {
 
     // ── M7 lock regression (restored in T16) ───────────────────────────────
 
-    fn ts(secs: i64) -> jiff::Timestamp {
-        jiff::Timestamp::from_second(secs).expect("valid ts")
+    fn ts(secs: i64) -> i64 {
+        secs
     }
 
     /// A buildable vless profile for the pool reuse path: the real `inject_to`
@@ -665,7 +665,6 @@ mod tests {
             host_type: HostType::Dns,
             port: 443,
             ports: Vec::new(),
-            parent_id: None,
             last_source: None,
             manual_protocol_override: None,
             resolved_as: Vec::new(),
@@ -681,8 +680,6 @@ mod tests {
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(0),
-            task_id: None,
-            task_queue: Vec::new(),
             latency: None,
             speed_bps: None,
             error: None,
@@ -701,7 +698,6 @@ mod tests {
         let protocol = DbProtocol {
             id: xray_tui_db::models::ProtocolId::new(1),
             sig: 0,
-            cred_hash: 0,
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,

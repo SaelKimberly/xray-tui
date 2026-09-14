@@ -701,18 +701,17 @@ pool-created conns (deadpool default max_size 10), so concurrent writers now
 queue at the SQLite level instead of failing instantly; all write paths use
 `conn()`.
 
-**Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`):
-- `Endpoint` — server config; dedup key `stable_hash(host, port)`; `resolved_as`/`resolved_at` DNS persistence
-- `ProtocolRow` — per-protocol variant rows (many per endpoint); `last_used_at`/`last_seen_at`, `endpoint_id` index
+**Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`, 9 tables):
+- `Endpoint` — server config; dedup key `stable_hash(host, port)` or `stable_hash("undefined", config_uid)`; `resolved_as`/`resolved_at` are the ONLY owner of a DNS host's resolutions
+- `Protocol` — `#key id` = the identity uid (host/port excluded), plus `sig` for the grouping key; transport/security embeds; `config: Deferred<Json<ProtocolConfig>>`
+- `ProfileStats` — per `(protocol_id, endpoint_id)` pair: latency/speed/error/traffic; `last_seen_at` indexed (retention + staleness windows)
+- `EndpointRank` — the materialized ordering keys the Profiles page is ordered by (ADR 0003)
 - `EndpointGroup` — many-to-many Endpoint↔Group membership
-- `Group` — subscription group with name, URL, sort order, is_system flag
-- `ProfileExtension` — per-protocol test results (delay, speed, ip_info)
-- `ServerStat` — traffic counters (today/total up/down as i64)
-- `RoutingRule` — domain/IP/port matchers with outbound tag; sort-ordered
-- `DnsSetting` — DNS resolver config
-- `PingSession` — ping batch tracking (batch_id, status, ping_type, latency)
+- `Group`, `RoutingRule`, `DnsSetting`, `RouteProbes`
 
-**Schema management**: no migration machinery. `db.push_schema()` runs only when the `PRAGMA user_version` tag differs from `SCHEMA_VERSION = 7`; toasty emits `CREATE TABLE` without `IF NOT EXISTS`, so on an existing DB the push fails and `Database::open` **deletes the file** and recreates the 8-table schema — a tag bump is a data reset, never a migration (v7 is the per-kind binary identity re-key; v6 files cannot be reused). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
+All timestamps are epoch-SECOND integers (`to_epoch`/`from_epoch`/`now_epoch` are the conversion points); `#[auto]` is deliberately absent from them, because on an integer column toasty's auto strategy is `Increment`, not "now". Scheduler task state is NOT a column: it is runtime-only (see "Task gate" below).
+
+**Schema management**: no migration machinery. `db.push_schema()` runs only when the `PRAGMA user_version` tag differs from `SCHEMA_VERSION = 9`; toasty emits `CREATE TABLE` without `IF NOT EXISTS`, so on an existing DB the push fails and `Database::open` **deletes the file** and recreates the schema — a tag bump is a data reset, never a migration (7 = per-kind binary identity re-key, 8 = `endpoint_rank`, 9 = the durable-facts pass: task columns / `cred_hash` / `parent_id` dropped, timestamps to epoch seconds, `last_seen_at` index). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
 **Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage` via a non-blocking `std::sync::mpsc` channel. The `HeedLogStorage` (in `xray-tui-core::log_heed`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp with postcard-encoded `LogMessage` values. A separate `targets` database tracks seen target strings. Batched writer (up to 100 msgs) runs in `spawn_blocking`; async read wrappers wrap LMDB reads in `spawn_blocking`. MapFull triggers auto-resize (1 GB default, doubles up to 8 GB) with backoff retry (50ms*(attempt+1), max 5) — the batch is retried after a successful resize, never dropped. Initial log loading is lazy (deferred to first Logs tab access).
 
 ### xray-tui-config (library crate)

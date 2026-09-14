@@ -65,6 +65,32 @@ impl ProtocolId {
     }
 }
 
+/// Epoch SECONDS of a `jiff` timestamp — the storage form of every timestamp
+/// column.
+///
+/// Timestamps are integers, not RFC3339 text: a column that is only ever
+/// compared (windows, cutoffs, recency ordering) stores what the comparison
+/// needs, and the TUI formats the integer on the way to the screen. Second
+/// precision is the ordering law's original granularity (a link seen twice in
+/// the same second ties, and the protocol id breaks the tie).
+#[must_use]
+pub fn to_epoch(ts: Timestamp) -> i64 {
+    ts.as_second()
+}
+
+/// A `jiff` timestamp from an epoch-seconds column. A value outside jiff's
+/// range (impossible for rows this crate writes) reads as the epoch.
+#[must_use]
+pub fn from_epoch(secs: i64) -> Timestamp {
+    Timestamp::from_second(secs).unwrap_or_else(|_| Timestamp::from_second(0).expect("epoch"))
+}
+
+/// Now, as a stored timestamp value.
+#[must_use]
+pub fn now_epoch() -> i64 {
+    to_epoch(Timestamp::now())
+}
+
 /// Endpoint host kind (replaces the legacy `host_type` string).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum HostType {
@@ -189,10 +215,9 @@ pub struct Endpoint {
     pub id: EndpointId, // stable_hash(host, port) for known types; stable_hash("undefined", config_uid) for exotic
     pub host: String, // canonical host string; empty for undefined
     pub host_type: HostType,
-    pub port: u16,                     // primary port; 0 for undefined
-    pub ports: Vec<u16>,               // full port spec; empty when single-port
-    pub parent_id: Option<EndpointId>, // resolved IP -> DnsName parent
-    pub last_source: Option<String>,   // hash of source subscription
+    pub port: u16,                   // primary port; 0 for undefined
+    pub ports: Vec<u16>,             // full port spec; empty when single-port
+    pub last_source: Option<String>, // hash of source subscription
     /// Manual protocol override (FK -> protocols.id); NULL = auto-select best.
     pub manual_protocol_override: Option<ProtocolId>,
     /// Cached DNS resolution of `host` for `host_type == Dns`: the resolved
@@ -200,9 +225,9 @@ pub struct Endpoint {
     /// launches do not re-resolve.
     pub resolved_as: Vec<String>,
     /// Timestamp of the `resolved_as` lookup; NULL = never / IP host.
-    pub resolved_at: Option<Timestamp>,
-    #[auto]
-    pub created_at: Timestamp,
+    pub resolved_at: Option<i64>, // epoch seconds
+    pub created_at: i64, // epoch seconds; writers stamp it (no `#[auto]`: on an
+    // integer column toasty's auto strategy is Increment, not "now")
     #[has_many]
     pub links: Deferred<Vec<ProfileStats>>,
     #[has_many]
@@ -211,24 +236,24 @@ pub struct Endpoint {
 
 /// `Protocol`: a protocol configuration.
 ///
-/// PK = uid = sig ^ `cred_hash`, all three computed by the crate-private
-/// per-kind `identity` writer in `xray-tui-proto` (non-credential, non-default
-/// fields -> `sig`; credentials -> `cred_hash`, 0 when there are none).
+/// PK = uid = `sig ^ cred_hash`, computed by the crate-private per-kind
+/// `identity` writer in `xray-tui-proto` (non-credential, non-default fields ->
+/// `sig`; credentials -> the second, domain-separated hash). Only the uid is
+/// stored: the two inputs are recomputed from the config when a row is written,
+/// and nothing reads them back.
 #[derive(Debug, Clone, toasty::Model)]
 #[table = "protocols"]
 pub struct Protocol {
     #[key]
-    pub id: ProtocolId, // = uid = sig ^ cred_hash (protocol essentials only)
-    pub sig: i64,
-    pub cred_hash: i64,
+    pub id: ProtocolId, // = uid (protocol essentials only)
+    pub sig: i64, // the non-credential half of the uid (grouping key)
     pub proto_kind: ProtocolKind,
     pub transport: Transport, // embed (T7): type + Deferred<Json<TransportConfig>>
     pub security: Security,   // embed (T7): type/sni/fp/insecure + Deferred<Json<SecurityConfig>>
     /// Full exact definition, sans host/port.
     #[column(type = text)]
     pub config: Deferred<Json<ProtocolConfig>>,
-    #[auto]
-    pub created_at: Timestamp,
+    pub created_at: i64, // epoch seconds (stamped by the writer)
     #[has_many]
     pub links: Deferred<Vec<ProfileStats>>,
 }
@@ -246,18 +271,23 @@ pub struct ProfileStats {
     pub endpoint_id: EndpointId,
     pub core_type: CoreType, // per-pair override (resolved at parse, overridable)
     pub config_type: ConfigType,
-    pub last_used_at: Option<Timestamp>,
-    pub last_seen_at: Timestamp,  // per-link staleness tracking
-    pub task_id: Option<u16>,     // current task slot; 0 never valid
-    pub task_queue: Vec<u16>,     // FIFO of queued task ids
+    pub last_used_at: Option<i64>, // epoch seconds
+    /// Per-link staleness tracking (epoch seconds). Indexed: the retention
+    /// purge's cutoff and the staleness windows scan on it.
+    #[index]
+    pub last_seen_at: i64,
     pub latency: Option<Latency>, // embed enum, shared delay column
     pub speed_bps: Option<i64>,
-    pub error: Option<ErrorInfo>, // persisted failure marker
-    pub traffic: TrafficStats,    // today/total up/down
-    #[auto]
-    pub created_at: Timestamp,
-    #[auto]
-    pub updated_at: Timestamp,
+    /// Persisted failure marker (`error` + `error_kind` + `error_text`).
+    ///
+    /// Not indexed on purpose: it is an embed, and `#[index]` has no
+    /// `IndexableField` for one. The error-TTL sweep scans on it (~7 ms over
+    /// 15k rows, on a reload only), which does not pay for a third raw DDL
+    /// statement next to the schema tag.
+    pub error: Option<ErrorInfo>,
+    pub traffic: TrafficStats, // today/total up/down
+    pub created_at: i64,       // epoch seconds (stamped by the writer)
+    pub updated_at: i64,       // epoch seconds (stamped by the writer)
     #[version]
     pub version: u64, // optimistic concurrency
     #[belongs_to(key = protocol_id, references = id)]
@@ -278,7 +308,7 @@ pub struct EndpointGroup {
     pub endpoint_id: EndpointId,
     #[index]
     pub group_id: String,
-    pub last_seen_at: Timestamp, // per-source last confirmation
+    pub last_seen_at: i64, // per-source last confirmation (epoch seconds)
     pub sort_order: Option<i32>,
     #[belongs_to(key = endpoint_id, references = id)]
     pub endpoint: Deferred<Option<Endpoint>>,
@@ -299,7 +329,7 @@ pub struct Group {
     pub convert_target: Option<ConvertTarget>,
     pub core_type: Option<GroupCoreType>, // form allows "auto"
     pub sort_order: Option<i32>,
-    pub last_refreshed: Option<Timestamp>,
+    pub last_refreshed: Option<i64>, // epoch seconds
     pub status: Option<GroupStatus>,
     pub error_message: Option<String>,
     pub refresh_interval: Option<i64>, // minutes; None = default 1440 (24h)
@@ -378,14 +408,14 @@ pub struct EndpointRank {
     /// Representative link's latency (`i32::MAX` outside the success tiers).
     #[column("rank_latency")]
     pub latency: i64,
-    /// Representative link's `last_seen_at` (epoch nanoseconds); ordered
+    /// Representative link's `last_seen_at` (epoch seconds); ordered
     /// descending, so newer links lead.
     #[column("rank_seen")]
     pub seen: i64,
     /// Representative link's protocol id (the order's tiebreak).
     #[column("rank_protocol")]
     pub protocol: i64,
-    /// Display link's `last_seen_at` (epoch nanos), [`crate::endpoint_rank::NO_SEEN`] when none.
+    /// Display link's `last_seen_at` (epoch seconds), [`crate::endpoint_rank::NO_SEEN`] when none.
     #[column("rank_display_seen")]
     pub display_seen: i64,
     /// Display link's speed (bps), [`crate::endpoint_rank::NO_SPEED`] when none.
@@ -397,7 +427,7 @@ pub struct EndpointRank {
     /// Display link's config-type rank (`form` 0, `share_url` 1, other 2).
     #[column("rank_config")]
     pub config: i64,
-    /// Newest `last_seen_at` across the endpoint's links (epoch nanos): the
+    /// Newest `last_seen_at` across the endpoint's links (epoch seconds): the
     /// view windows ask whether any link falls in the band, which is the same
     /// question as whether the newest one does — and reading it here keeps the
     /// predicate single-table, so the page is an index scan.
@@ -527,12 +557,11 @@ mod tests {
                 host_type: HostType::Ipv4,
                 port: 443,
                 ports: Vec::new(),
-                parent_id: None,
                 last_source: None,
                 manual_protocol_override: None,
                 resolved_as: Vec::new(),
                 resolved_at: None,
-                created_at: Timestamp::from_second(0).expect("ts"),
+                created_at: 0,
                 links: Deferred::default(),
                 group_links: Deferred::default(),
             },
@@ -548,9 +577,7 @@ mod tests {
                 core_type: CoreType::Xray,
                 config_type: ConfigType::ShareUrl,
                 last_used_at: None,
-                last_seen_at: Timestamp::from_second(*last_seen).expect("ts"),
-                task_id: None,
-                task_queue: Vec::new(),
+                last_seen_at: *last_seen,
                 latency: latency.clone(),
                 speed_bps: None,
                 error: error.clone(),
@@ -560,8 +587,8 @@ mod tests {
                     total_up: 0,
                     total_down: 0,
                 },
-                created_at: Timestamp::from_second(0).expect("ts"),
-                updated_at: Timestamp::from_second(0).expect("ts"),
+                created_at: 0,
+                updated_at: 0,
                 version: 1,
                 protocol: Deferred::default(),
                 endpoint: Deferred::default(),
@@ -709,14 +736,12 @@ mod tests {
             (20, 2, Some(fast(10)), None),
             (30, 3, None, None),
         ]);
-        // Best = real-ok (tier 0), latency 200. Recency is epoch NANOSECONDS:
-        // the key orders by the same instant the stored `endpoint_rank.seen`
-        // and the retired SQL `last_seen_at DESC` compare, so sub-second
-        // differences participate instead of collapsing to a tie.
-        assert_eq!(
-            r.best_test_priority_key(false),
-            Some((0, 200, -1_000_000_000, 10))
-        );
+        // Best = real-ok (tier 0), latency 200. Recency is epoch SECONDS —
+        // the stored unit, so the key compares exactly what
+        // `endpoint_rank.seen` and the retiring SQL's `last_seen_at DESC`
+        // compare. Two links seen inside one second tie here, and the
+        // protocol id breaks it.
+        assert_eq!(r.best_test_priority_key(false), Some((0, 200, -1, 10)));
         // Empty links -> None
         let empty = row(&[]);
         assert_eq!(empty.best_test_priority_key(false), None);
@@ -741,7 +766,6 @@ mod tests {
         let protocol = Protocol {
             id: ProtocolId::new(10),
             sig: 10,
-            cred_hash: 0,
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,
@@ -755,7 +779,7 @@ mod tests {
                 data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(vless_config())),
-            created_at: Timestamp::from_second(0).expect("ts"),
+            created_at: 0,
             links: Deferred::default(),
         };
         r.protocols.insert(protocol.id, protocol);
@@ -1037,6 +1061,7 @@ mod tests {
         db.push_schema().await.expect("push schema");
 
         let created = toasty::create!(Endpoint {
+            created_at: 0,
             id: EndpointId::new(42),
             host: "1.2.3.4".to_string(),
             host_type: HostType::Ipv4,

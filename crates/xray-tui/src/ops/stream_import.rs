@@ -396,8 +396,8 @@ mod tests {
     fn group_page_request(group: &str) -> xray_tui_db::profiles_query::PageRequest {
         xray_tui_db::profiles_query::PageRequest {
             view: xray_tui_db::models::PurgatoryView::All,
-            active_threshold: jiff::Timestamp::from_second(0).expect("ts"),
-            stale_threshold: jiff::Timestamp::from_second(0).expect("ts"),
+            active_threshold: 0,
+            stale_threshold: 0,
             search: None,
             group_id: Some(group.to_string()),
             sort: xray_tui_db::profiles_query::PageSort::Test,

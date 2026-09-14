@@ -14,7 +14,7 @@ use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{Endpoint, EndpointId, EndpointRow, ProfileStats, ProtocolId, TaskKind};
 
 use crate::AppState;
-use crate::ops::scheduler::{ScheduleOutcome, SchedulerDb, TaskScheduler};
+use crate::ops::scheduler::{ScheduleOutcome, TaskScheduler};
 use crate::state::{link_is_failed, load_protocol_with_config};
 use crate::try_send_or_warn;
 use crate::types::CoreEvent;
@@ -398,22 +398,37 @@ pub fn stop_speed_test(state: &mut AppState) {
 /// Remove endpoints whose links carry a persisted failure marker (the old
 /// `extension.delay == Some(-1)` sweep, now driven by `ProfileStats.error`).
 pub async fn remove_failed_servers(state: &mut AppState) {
-    let to_remove: Vec<i64> = state
+    let to_remove: Vec<xray_tui_db::models::EndpointId> = state
         .endpoints
         .iter()
         .filter(|r| r.links.iter().any(link_is_failed))
-        .map(|r| r.endpoint.id.get())
+        .map(|r| r.endpoint.id)
         .collect();
     let count = to_remove.len();
-    for id in to_remove {
-        crate::ops::profiles::delete_profile(state, id).await;
+    if count > 0 {
+        // ONE transaction for the whole sweep: the per-endpoint path opens a
+        // transaction, re-scans for orphan protocols and prunes rank keys
+        // every time, which is the wrong shape for "remove everything failed
+        // on this page".
+        match state.db.delete_endpoints(&to_remove).await {
+            Ok(_) => state.log_trace(
+                "info",
+                "tui::ops::ping",
+                &format!("Removed {count} failed server(s)"),
+            ),
+            Err(e) => state.log_trace(
+                "error",
+                "tui::ops::ping",
+                &format!("Failed to remove failed servers: {e}"),
+            ),
+        }
+        for id in &to_remove {
+            state.multi_select.remove(&id.get());
+        }
     }
     state.multi_select.clear();
-    state.log_trace(
-        "info",
-        "tui::ops::ping",
-        &format!("Removed {count} failed server(s)"),
-    );
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
+    state.filter_cache_valid.set(false);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -690,17 +705,10 @@ pub(crate) async fn run_batch(params: BatchParams) {
             // scheduled, so they never write anything.
             break;
         }
-        match shared
-            .sched
-            .schedule(&plan.link, TaskKind::FastPing, shared.writer.as_ref())
-            .await
-        {
+        match shared.sched.schedule(&plan.link, TaskKind::FastPing).await {
             ScheduleOutcome::Started(id) => {
                 shared.pending_fast.fetch_add(1, Ordering::Relaxed);
-                let fresh = shared
-                    .read_link(&plan.link)
-                    .await
-                    .unwrap_or_else(|| plan.link.clone());
+                let fresh = plan.link.clone();
                 let shared = shared.clone();
                 handles.push(tokio::spawn(run_task_chain(
                     shared,
@@ -753,17 +761,10 @@ pub(crate) async fn run_batch(params: BatchParams) {
         if shared.stop.load(Ordering::Relaxed) {
             break;
         }
-        match shared
-            .sched
-            .schedule(&plan.link, TaskKind::RealPing, shared.writer.as_ref())
-            .await
-        {
+        match shared.sched.schedule(&plan.link, TaskKind::RealPing).await {
             ScheduleOutcome::Started(id) => {
                 shared.pending_real.fetch_add(1, Ordering::Relaxed);
-                let fresh = shared
-                    .read_link(&plan.link)
-                    .await
-                    .unwrap_or_else(|| plan.link.clone());
+                let fresh = plan.link.clone();
                 per_endpoint
                     .entry(plan.endpoint.id.get())
                     .or_default()
@@ -890,17 +891,10 @@ async fn retry_deferred_fast(shared: Arc<BatchShared>, plan: PlanLink) {
         if shared.stop.load(Ordering::Relaxed) {
             return;
         }
-        match shared
-            .sched
-            .schedule(&plan.link, TaskKind::FastPing, shared.writer.as_ref())
-            .await
-        {
+        match shared.sched.schedule(&plan.link, TaskKind::FastPing).await {
             ScheduleOutcome::Started(id) => {
                 shared.pending_fast.fetch_add(1, Ordering::Relaxed);
-                let fresh = shared
-                    .read_link(&plan.link)
-                    .await
-                    .unwrap_or_else(|| plan.link.clone());
+                let fresh = plan.link.clone();
                 run_task_chain(shared, fresh, id, TaskKind::FastPing).await;
                 return;
             }
@@ -924,17 +918,10 @@ async fn retry_deferred_real(shared: Arc<BatchShared>, plan: PlanLink) {
         if shared.stop.load(Ordering::Relaxed) {
             return;
         }
-        match shared
-            .sched
-            .schedule(&plan.link, TaskKind::RealPing, shared.writer.as_ref())
-            .await
-        {
+        match shared.sched.schedule(&plan.link, TaskKind::RealPing).await {
             ScheduleOutcome::Started(id) => {
                 shared.pending_real.fetch_add(1, Ordering::Relaxed);
-                let fresh = shared
-                    .read_link(&plan.link)
-                    .await
-                    .unwrap_or_else(|| plan.link.clone());
+                let fresh = plan.link.clone();
                 if shared.dedup_endpoints
                     && shared
                         .completed_endpoints
@@ -964,7 +951,7 @@ async fn retry_deferred_real(shared: Arc<BatchShared>, plan: PlanLink) {
 /// promotes — repeating until the link's gate is clear.
 async fn run_task_chain(
     shared: Arc<BatchShared>,
-    mut link: ProfileStats,
+    link: ProfileStats,
     mut id: u16,
     mut kind: TaskKind,
 ) {
@@ -972,20 +959,14 @@ async fn run_task_chain(
         if shared.stop.load(Ordering::Relaxed) {
             // Stop pressed at a dispatch boundary: retire this task silently —
             // no result event, no error marker.
-            shared
-                .sched
-                .complete(&link, kind, shared.writer.as_ref())
-                .await;
+            shared.sched.complete(&link, id, kind).await;
             shared.note_settled(kind);
         } else {
             match kind {
                 TaskKind::FastPing => {
                     let outcome = shared.fast_probe(&link).await;
                     shared.emit_result(&link, TestType::TcpPing, &outcome);
-                    shared
-                        .sched
-                        .complete(&link, kind, shared.writer.as_ref())
-                        .await;
+                    shared.sched.complete(&link, id, kind).await;
                     shared.note_settled(kind);
                 }
                 TaskKind::RealPing => {
@@ -999,21 +980,16 @@ async fn run_task_chain(
                             .insert(link.endpoint_id.get());
                     }
                     shared.emit_result(&link, TestType::RealPing, &outcome);
-                    shared
-                        .sched
-                        .complete(&link, kind, shared.writer.as_ref())
-                        .await;
+                    shared.sched.complete(&link, id, kind).await;
                     shared.note_settled(kind);
                 }
                 _ => return, // SpeedTest/UdpTest tasks are not part of the batch
             }
         }
-        // Fire the promoted task, if any. The link snapshot is stale after
-        // `complete`, so re-read it (the scheduler rejects stale completions).
-        let Some(fresh) = shared.read_link(&link).await else {
-            return;
-        };
-        let Some(next_id) = fresh.task_id else {
+        // Fire the promoted task, if any. The gate owns task state, so ask it
+        // for the link's new current id (an id the registry does not know
+        // cannot come back: the gate and the registry advance together).
+        let Some(next_id) = shared.sched.task_of(&link) else {
             return;
         };
         if next_id == id {
@@ -1021,28 +997,14 @@ async fn run_task_chain(
             return;
         }
         let Some(next_kind) = shared.sched.kind_of(next_id) else {
-            // Unregistered/orphan id: the next `schedule` pass reconciles it;
-            // nothing to fire.
             return;
         };
-        link = fresh;
         id = next_id;
         kind = next_kind;
     }
 }
 
 impl BatchShared {
-    /// Re-read a link's persisted row (the fire-handshake's fresh snapshot).
-    /// Read-through, exactly like the scheduler gate: task state written by
-    /// this batch is staged in the writer, so the database alone would report
-    /// the link as free and the chain would return early.
-    async fn read_link(&self, link: &ProfileStats) -> Option<ProfileStats> {
-        SchedulerDb::read_link(self.writer.as_ref(), link.protocol_id, link.endpoint_id)
-            .await
-            .ok()
-            .flatten()
-    }
-
     /// Fast probe with batch-level dedup: one TCP ping per unique
     /// (address, port); followers await the owner's result and reuse it.
     async fn fast_probe(&self, link: &ProfileStats) -> ProbeOutcome {
@@ -1168,13 +1130,9 @@ impl BatchShared {
     /// queued real ids, then complete the live task if it is a real task.
     /// Never writes a result event, so no error marker is persisted.
     async fn retire_real(&self, fresh: &ProfileStats, id: u16) {
-        self.sched
-            .cancel_queued(fresh, TaskKind::RealPing, self.writer.as_ref())
-            .await;
+        self.sched.cancel_queued(fresh, TaskKind::RealPing).await;
         if self.sched.kind_of(id) == Some(TaskKind::RealPing) {
-            self.sched
-                .complete(fresh, TaskKind::RealPing, self.writer.as_ref())
-                .await;
+            self.sched.complete(fresh, id, TaskKind::RealPing).await;
         }
         self.note_settled(TaskKind::RealPing);
     }
@@ -1293,8 +1251,11 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
         state.log_trace("warn", "tui::ops::ping", "A batch is already running");
         return;
     }
-    // A fresh user gesture always starts with a clear stop flag.
+    // A fresh user gesture always starts with a clear stop flag AND a clear
+    // gate: task ids are process-local and nothing from the previous batch is
+    // live any more.
     state.speed_test_stop.store(false, Ordering::Relaxed);
+    state.scheduler.reset();
     let Some(tx) = state.core_event_tx.clone() else {
         return;
     };
@@ -1349,7 +1310,7 @@ mod tests {
     use tokio::sync::mpsc;
     use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
 
-    use crate::ops::profiles::test_support::{fake_row, test_state, ts};
+    use crate::ops::profiles::test_support::{fake_row, test_state};
     use crate::ops::scheduler::TaskScheduler;
 
     use super::*;
@@ -1512,12 +1473,14 @@ mod tests {
         panic!("batch did not finish within the deadline");
     }
 
-    async fn assert_gate_clear(writer: &crate::ops::link_writer::LinkWriter, link: &ProfileStats) {
-        let stored = SchedulerDb::read_link(writer, link.protocol_id, link.endpoint_id)
-            .await
-            .expect("read link")
-            .expect("link persisted");
-        assert_eq!(stored.task_id, None, "gate must be clear after the batch");
+    /// The gate is the batch's only task-state authority, so "clear" means the
+    /// scheduler no longer knows the link.
+    fn assert_gate_clear(sched: &crate::ops::scheduler::TaskScheduler, link: &ProfileStats) {
+        assert_eq!(
+            sched.task_of(link),
+            None,
+            "gate must be clear after the batch"
+        );
     }
 
     // ── phase 1 + phase 2 on a 3-link batch ─────────────────────────────
@@ -1550,7 +1513,7 @@ mod tests {
                     "unexpected latency {link:?}"
                 );
                 assert!(link.error.is_none(), "no marker expected: {link:?}");
-                assert_gate_clear(h.state.link_writer.as_ref(), link).await;
+                assert_gate_clear(h.state.scheduler.as_ref(), link);
             }
         }
     }
@@ -1577,7 +1540,7 @@ mod tests {
             link.endpoint_id,
         )
         .update()
-        .updated_at(ts(jiff::Timestamp::now().as_second() - 48 * 3600))
+        .updated_at(jiff::Timestamp::now().as_second() - 48 * 3600)
         .exec(&mut conn)
         .await
         .unwrap();
@@ -1590,16 +1553,16 @@ mod tests {
         tokio::spawn(run_batch(params)).await.unwrap();
         await_batch_done(&mut h.state).await;
 
-        let db: &Database = &h.state.db;
-        let _ = db;
-        let stored = SchedulerDb::read_link(
-            h.state.link_writer.as_ref(),
-            link.protocol_id,
-            link.endpoint_id,
-        )
-        .await
-        .expect("read link")
-        .expect("link persisted");
+        // The batch's staged patches are the only place its result lives until
+        // the flush: make them durable, then read the row back.
+        h.state.link_writer.flush().await.expect("flush");
+        let stored = h
+            .state
+            .db
+            .read_link_row(link.protocol_id, link.endpoint_id)
+            .await
+            .expect("read link")
+            .expect("link persisted");
         assert!(
             stored.error.is_none(),
             "stale marker swept at batch completion: {stored:?}"
@@ -1625,7 +1588,7 @@ mod tests {
         for link in &h.state.endpoints[0].links {
             assert!(matches!(link.latency, Some(Latency::Fast { delay: 10 })));
             assert!(link.error.is_none());
-            assert_gate_clear(h.state.link_writer.as_ref(), link).await;
+            assert_gate_clear(h.state.scheduler.as_ref(), link);
         }
     }
 
@@ -1657,7 +1620,7 @@ mod tests {
                 link.error.is_none(),
                 "cancelled link must not write a marker"
             );
-            assert_gate_clear(h.state.link_writer.as_ref(), link).await;
+            assert_gate_clear(h.state.scheduler.as_ref(), link);
         }
     }
 
@@ -1761,7 +1724,7 @@ mod tests {
             for link in &row.links {
                 assert!(matches!(link.latency, Some(Latency::Real { .. })));
                 assert!(link.error.is_none());
-                assert_gate_clear(h.state.link_writer.as_ref(), link).await;
+                assert_gate_clear(h.state.scheduler.as_ref(), link);
             }
         }
         // Regression (reviewer F1): the deferred-real retry was spawned but
@@ -1813,7 +1776,7 @@ mod tests {
                 link.error.is_none(),
                 "stopped batch must not mark: {link:?}"
             );
-            assert_gate_clear(h.state.link_writer.as_ref(), link).await;
+            assert_gate_clear(h.state.scheduler.as_ref(), link);
         }
         // Only the in-flight probe ran; the sibling was retired without a probe.
         assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 1);

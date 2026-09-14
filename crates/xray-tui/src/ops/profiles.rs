@@ -42,9 +42,9 @@ pub async fn clear_expired_errors(db: &Database, ttl_hours: Option<i64>) {
             return;
         }
     };
-    let cutoff = now_ts()
-        .checked_sub(jiff::Span::new().hours(ttl_hours))
-        .unwrap_or_else(|_| now_ts());
+    // The stored `updated_at` is epoch seconds, so the cutoff is too — no
+    // timestamp formatting on the hot sweep path.
+    let cutoff = xray_tui_db::models::to_epoch(now_ts()) - ttl_hours * 3600;
     // The swept endpoints' ordering keys are derived state: collect them
     // before the update and refresh after, so a cleared marker cannot leave a
     // stale position behind (the page reads the keys, not the links).
@@ -125,17 +125,29 @@ pub(crate) async fn load_profiles_rows(
     clear_expired_errors(db, load.error_ttl_hours).await;
     let req = page_request(load);
     let meta = db.profiles_page(&req).await?;
-    let rows = db.load_page_rows(&meta.ids).await?;
+    // One statement for the whole page: the typed hydration binds ~600
+    // parameters per page (turso: ~0.8 ms each), the projection inlines the
+    // ids and decodes the display columns only.
+    let rows = db.load_page_projection(&meta.ids).await?;
+    Ok((rows, meta))
+}
+
+/// Fetch ONE page for an already-swept reload — the re-anchor path needs the
+/// rows again but must not repeat the sweep's writes.
+async fn load_profiles_page_only(
+    db: &Database,
+    load: &ProfilesLoad,
+) -> Result<(Vec<EndpointRow>, PageMeta), DatabaseError> {
+    let req = page_request(load);
+    let meta = db.profiles_page(&req).await?;
+    let rows = db.load_page_projection(&meta.ids).await?;
     Ok((rows, meta))
 }
 
 /// Build the query request a [`ProfilesLoad`] describes.
 fn page_request(load: &ProfilesLoad) -> PageRequest {
-    let now = now_ts();
-    let threshold = |ttl_secs: i64| -> Timestamp {
-        now.checked_sub(jiff::Span::new().seconds(ttl_secs))
-            .unwrap_or(now)
-    };
+    let now = xray_tui_db::models::to_epoch(now_ts());
+    let threshold = |ttl_secs: i64| -> i64 { now.saturating_sub(ttl_secs) };
     // Active and Stale share both bounds; the view decides which of them the
     // query uses — Active: `last_seen_at >= active`; Stale: `>= stale` and NOT
     // `>= active`. Passing `now` for Active made the window `last_seen_at >=
@@ -146,10 +158,7 @@ fn page_request(load: &ProfilesLoad) -> PageRequest {
             threshold(load.purgatory_retention_secs),
         ),
         // `All`: no predicate is emitted, so the bounds are unused.
-        PurgatoryView::All => (
-            Timestamp::from_second(0).unwrap_or(now),
-            Timestamp::from_second(0).unwrap_or(now),
-        ),
+        PurgatoryView::All => (0, 0),
     };
     PageRequest {
         view: load.view,
@@ -238,9 +247,12 @@ pub async fn reload_profiles_preserving_selection(state: &mut AppState) {
                 && let Ok(Some(offset)) = state.db.profiles_anchor(&page_request(&load), id).await
             {
                 // Re-anchor once on the row's new position, then follow it.
+                // Page + rows only: the sweep already ran for this reload, and
+                // repeating its writes would resurrect nothing but cost a
+                // second pass over the error TTL.
                 state.page_offset = offset;
                 let load = ProfilesLoad::from(&*state);
-                if let Ok((rows, meta)) = load_profiles_rows(&state.db, &load).await {
+                if let Ok((rows, meta)) = load_profiles_page_only(&state.db, &load).await {
                     apply_profiles_rows(state, rows, &meta);
                     if let Some(index) =
                         state.endpoints.iter().position(|row| row.endpoint.id == id)
@@ -540,6 +552,7 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
     set_core_field(&mut fields, link.core_type);
     state.mode = AppMode::EditServer {
         protocol_id: endpoint_id,
+        proto_kind: protocol.proto_kind,
         fields,
         focus_index: 0,
         form_errors: HashMap::new(),
@@ -1266,8 +1279,9 @@ pub(crate) mod test_support {
     };
     use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
 
-    pub fn ts(secs: i64) -> jiff::Timestamp {
-        jiff::Timestamp::from_second(secs).expect("valid ts")
+    /// Epoch seconds — the storage unit of every timestamp column.
+    pub fn ts(secs: i64) -> i64 {
+        secs
     }
 
     /// Minimal typed `EndpointRow` with `n` links (protocol ids
@@ -1279,7 +1293,6 @@ pub(crate) mod test_support {
             host_type: HostType::Ipv4,
             port: 443,
             ports: Vec::new(),
-            parent_id: None,
             last_source: None,
             manual_protocol_override: None,
             resolved_as: Vec::new(),
@@ -1296,8 +1309,6 @@ pub(crate) mod test_support {
                 config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: ts(0),
-                task_id: None,
-                task_queue: Vec::new(),
                 latency: None,
                 speed_bps: None,
                 error: None,
@@ -1363,7 +1374,6 @@ pub(crate) mod xray_tui_db_helper {
         Protocol {
             id: ProtocolId::new(id),
             sig: id,
-            cred_hash: 0,
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,
@@ -1596,8 +1606,6 @@ mod edit_tests {
                 config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: super::test_support::ts(0),
-                task_id: None,
-                task_queue: Vec::new(),
                 latency: None,
                 speed_bps: None,
                 error: None,
@@ -1810,9 +1818,7 @@ mod view_window_tests {
         let now = now_ts();
         let aged = |id: i64, days: i64| {
             let mut row = fake_row(id, &format!("h{id}.example"), 1);
-            row.links[0].last_seen_at = now
-                .checked_sub(jiff::Span::new().seconds(days * DAY))
-                .expect("ts");
+            row.links[0].last_seen_at = xray_tui_db::models::to_epoch(now) - days * DAY;
             row
         };
         persist_rows(&db, &[aged(1, 1), aged(2, 10), aged(3, 40)]).await;
@@ -1896,7 +1902,7 @@ mod sort_tests {
 
 #[cfg(test)]
 mod ttl_tests {
-    use super::test_support::{fake_row, ts};
+    use super::test_support::fake_row;
     use super::*;
     use std::sync::Arc;
     use xray_tui_config::AppConfig;
@@ -1936,7 +1942,7 @@ mod ttl_tests {
             EndpointId::new(endpoint_id),
         )
         .update()
-        .updated_at(ts(secs))
+        .updated_at(secs)
         .exec(&mut conn)
         .await
         .unwrap();

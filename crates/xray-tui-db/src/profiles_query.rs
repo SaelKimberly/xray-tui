@@ -1,20 +1,34 @@
 //! Raw-SQL owner of the Profiles page query (ADR 0001).
 //!
 //! Ordering, filtering, counting and paging are SQL; the page IS the filtered
-//! list. Every statement here is read-only, binds its parameters, and decodes
-//! only ids and keys — model hydration stays on the typed path
-//! ([`crate::Database::load_page_rows`]).
+//! list. The page queries decode ids and keys.
+//!
+//! Hydration is the exception that proves the rule: [`Database::
+//! load_page_projection`] decodes whole rows (endpoint + links + the
+//! protocols' display columns) from ONE statement, because binding a page's
+//! ids into the typed hydration reads costs ~0.8 ms per parameter in turso.
+//! Everything it decodes comes back through toasty's own [`Load`] impls (see
+//! the projection section at the bottom of this file), so the models it
+//! returns are the same values the typed path returns — minus the deferred
+//! JSON carriers the page never reads.
 //!
 //! The ORDER BY reads the materialized keys in `endpoint_rank`
 //! ([`crate::endpoint_rank`]), which the Rust ordering law computes. SQL never
 //! re-derives that law: an index-driven scan of 200 rows replaced a
 //! `ROW_NUMBER()` window that cost ~975 ms per page on the reference feed.
 
+use std::collections::HashMap;
+
 use crate::Database;
 use crate::error::{DatabaseError, Result};
-use crate::models_toasty::{EndpointId, ProfileStats, ProtocolId, PurgatoryView};
-use jiff::Timestamp;
+use crate::models_toasty::{
+    ConfigType, Endpoint, EndpointId, EndpointRow, ErrorInfo, HostType, Latency, ProfileErr,
+    ProfileStats, Protocol, ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
+};
+use toasty::Deferred;
+use toasty::schema::Load;
 use toasty_core::stmt::Value;
+use xray_tui_proto::proto_spec::{CoreType, ProtocolKind, SecurityType, TransportType};
 
 /// Default rows per page.
 pub const DEFAULT_PAGE_SIZE: usize = 200;
@@ -43,8 +57,9 @@ pub enum PageSort {
 #[derive(Debug, Clone)]
 pub struct PageRequest {
     pub view: PurgatoryView,
-    pub active_threshold: Timestamp,
-    pub stale_threshold: Timestamp,
+    /// View window bounds, in epoch seconds (the unit the key columns store).
+    pub active_threshold: i64,
+    pub stale_threshold: i64,
     pub search: Option<String>,
     pub group_id: Option<String>,
     pub sort: PageSort,
@@ -103,21 +118,6 @@ impl Sql {
         }
         Ok(query.exec(conn).await?)
     }
-}
-
-/// Fixed-width RFC3339 binding for range predicates.
-///
-/// Matches the stored 30-character nanosecond format
-/// (`2026-09-11T07:38:50.858130960Z`), so lexicographic comparison equals
-/// chronological comparison. jiff trims trailing zeros, hence the explicit
-/// `{:09}` fraction.
-#[must_use]
-pub fn sql_ts(ts: Timestamp) -> String {
-    let base = Timestamp::from_second(ts.as_second())
-        .map_or_else(|_| "1970-01-01T00:00:00Z".to_string(), |t| t.to_string());
-    let nanos = ts.subsec_nanosecond().unsigned_abs();
-    let head = base.strip_suffix('Z').unwrap_or(&base);
-    format!("{head}.{nanos:09}Z")
 }
 
 /// Escape LIKE metacharacters for an `ESCAPE '\'` clause.
@@ -213,7 +213,7 @@ fn order_by(sql: &mut Sql, order: &[OrderTerm]) {
 /// predicates.
 ///
 /// Membership comes from the `EXISTS` terms — the SAME terms
-/// [`Database::profiles_count`] counts — so the page and the footer cannot
+/// [`Database::profiles_page`] counts — so the page and the footer cannot
 /// disagree, and an endpoint whose rank row is missing (or stale) still lists;
 /// only its position degrades.
 fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
@@ -247,18 +247,17 @@ fn view_predicate(sql: &mut Sql, req: &PageRequest) {
     // "Some link falls in the band" is the same question as "the newest link
     // does", so the window reads the stored maximum instead of scanning
     // `profile_stats` per row.
-    let nanos = |ts: Timestamp| i64::try_from(ts.as_nanosecond()).unwrap_or(i64::MAX);
     match req.view {
         PurgatoryView::All => {
             sql.push("1 = 1");
         }
         PurgatoryView::Active => {
-            let ts = sql.bind(nanos(req.active_threshold));
+            let ts = sql.bind(req.active_threshold);
             sql.push(&format!("k.rank_newest_seen >= {ts}"));
         }
         PurgatoryView::Stale => {
-            let stale = sql.bind(nanos(req.stale_threshold));
-            let active = sql.bind(nanos(req.active_threshold));
+            let stale = sql.bind(req.stale_threshold);
+            let active = sql.bind(req.active_threshold);
             sql.push(&format!(
                 "k.rank_newest_seen >= {stale} AND k.rank_newest_seen < {active}"
             ));
@@ -310,22 +309,6 @@ fn decode_count(row: &Value) -> Result<u64> {
     }
 }
 
-fn decode_pair(row: &Value) -> Result<(EndpointId, ProtocolId)> {
-    let Value::Record(record) = row else {
-        return Err(DatabaseError::Generic(format!(
-            "profiles_query: unexpected row: {row:?}"
-        )));
-    };
-    match (record.fields.first(), record.fields.get(1)) {
-        (Some(Value::I64(eid)), Some(Value::I64(pid))) => {
-            Ok((EndpointId::new(*eid), ProtocolId::new(*pid)))
-        }
-        other => Err(DatabaseError::Generic(format!(
-            "profiles_query: unexpected pair row: {other:?}"
-        ))),
-    }
-}
-
 // ── Public queries ──────────────────────────────────────────────────────
 
 impl Database {
@@ -347,12 +330,6 @@ impl Database {
         Ok(PageMeta { ids, total, offset })
     }
 
-    /// The filtered total across all pages (the footer count).
-    pub async fn profiles_count(&self, req: &PageRequest) -> Result<u64> {
-        let mut conn = self.connection().await?;
-        self.profiles_count_with(&mut conn, req).await
-    }
-
     async fn profiles_count_with(
         &self,
         conn: &mut toasty::Connection,
@@ -363,59 +340,6 @@ impl Database {
         base_from_where(&mut sql, req, needs_endpoints(req));
         let rows = sql.exec(conn).await?;
         rows.first().map_or(Ok(0), decode_count)
-    }
-
-    /// Every endpoint id in the filtered view, in display order.
-    pub async fn profiles_ids(&self, req: &PageRequest) -> Result<Vec<EndpointId>> {
-        let mut conn = self.connection().await?;
-        let mut sql = Sql::new();
-        base_select(&mut sql, req, PROJ_ID, needs_endpoints(req));
-        order_by(&mut sql, &req.order_terms());
-        let rows = sql.exec(&mut conn).await?;
-        rows.iter().map(decode_id).collect()
-    }
-
-    /// `(endpoint_id, protocol_id)` for every link of the filtered view — the
-    /// batch-planning input.
-    pub async fn profiles_link_pairs(
-        &self,
-        req: &PageRequest,
-    ) -> Result<Vec<(EndpointId, ProtocolId)>> {
-        let mut conn = self.connection().await?;
-        let mut sql = Sql::new();
-        sql.push(
-            "SELECT ps.endpoint_id, ps.protocol_id FROM profile_stats ps WHERE ps.endpoint_id IN (",
-        );
-        base_select(&mut sql, req, PROJ_ID, needs_endpoints(req));
-        sql.push(") ORDER BY ps.endpoint_id, ps.protocol_id");
-        let rows = sql.exec(&mut conn).await?;
-        rows.iter().map(decode_pair).collect()
-    }
-
-    /// Endpoints carrying a persisted failure marker on any link.
-    pub async fn profiles_failed_ids(&self) -> Result<Vec<EndpointId>> {
-        let mut conn = self.connection().await?;
-        let rows = toasty::sql::query(
-            "SELECT DISTINCT ps.endpoint_id FROM profile_stats ps WHERE ps.error = 1",
-        )
-        .exec(&mut conn)
-        .await?;
-        rows.iter().map(decode_id).collect()
-    }
-
-    /// Endpoint ids eligible for enrichment seeding (IP hosts and resolved DNS
-    /// hosts) across the filtered view.
-    pub async fn profiles_enrich_seed_ids(&self, req: &PageRequest) -> Result<Vec<EndpointId>> {
-        let mut conn = self.connection().await?;
-        let mut sql = Sql::new();
-        base_select(&mut sql, req, PROJ_ID, true);
-        // Mirrors `ops/enrich.rs`: IP hosts, plus DNS hosts that already carry
-        // a cached resolution. An unresolved DNS host must NOT be seeded — an
-        // empty `endpoint_info` entry blocks the startup seeding pass and
-        // makes `should_resolve` treat the endpoint as a never-retried IP host.
-        sql.push(" AND (e.host_type IN ('ipv4','ipv6') OR e.resolved_as <> '[]')");
-        let rows = sql.exec(&mut conn).await?;
-        rows.iter().map(decode_id).collect()
     }
 
     /// Offset the endpoint currently occupies in the ordered view — used to
@@ -492,55 +416,428 @@ impl Database {
     }
 }
 
-impl Database {
-    /// Per-endpoint link order for a page's endpoints: the decision-16 order
-    /// used by the expanded panel and the sub-row navigation.
-    pub async fn profile_link_order(
-        &self,
-        endpoint_ids: &[EndpointId],
-    ) -> Result<std::collections::HashMap<EndpointId, Vec<ProtocolId>>> {
-        if endpoint_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        let mut conn = self.connection().await?;
-        let mut sql = Sql::new();
-        sql.push(
-            "SELECT ps.endpoint_id, ps.protocol_id FROM profile_stats ps WHERE ps.endpoint_id IN (",
-        );
-        for (i, id) in endpoint_ids.iter().enumerate() {
-            if i > 0 {
-                sql.push(", ");
-            }
-            let bind = sql.bind(id.get());
-            sql.push(&bind);
-        }
-        sql.push(") ORDER BY ps.endpoint_id, ");
-        // The stored rank row already carries the representative link; the
-        // per-link order still comes from the law as SQL expresses it below.
-        sql.push(
-            "CASE WHEN ps.error = 1 AND ps.error_kind IN ('real','name') THEN 2147483645 \
-             WHEN ps.error = 1 AND ps.error_kind = 'fast' THEN 2147483646 \
-             WHEN ps.latency IS NULL THEN 2147483644 \
-             WHEN ps.latency = 'real' THEN ps.latency_delay \
-             ELSE 1073741824 + ps.latency_delay END ASC, ps.last_seen_at DESC, ps.protocol_id ASC",
-        );
+// ── Page projection: one statement per page (H1) ────────────────────────
 
-        let rows = sql.exec(&mut conn).await?;
-        let mut out: std::collections::HashMap<EndpointId, Vec<ProtocolId>> =
-            std::collections::HashMap::new();
-        for row in &rows {
-            let (eid, pid) = decode_pair(row)?;
-            out.entry(eid).or_default().push(pid);
+/// The projection's columns, in decode order.
+///
+/// The SQL text and the positional decoder both read this list, so a column
+/// can never be read at the wrong index. Every `endpoints` and
+/// `profile_stats` column is present; `protocols` omits its three deferred
+/// JSON carriers (`transport_data`, `security_data`, `config`) — no page
+/// consumer reads them, and decoding them is what made the typed page
+/// hydration cost ~0.5 s on the reference feed (7,672 endpoints).
+const PAGE_PROJECTION: &[&str] = &[
+    // endpoints (11)
+    "e.id",
+    "e.host",
+    "e.host_type",
+    "e.port",
+    "e.ports",
+    "e.last_source",
+    "e.manual_protocol_override",
+    "e.resolved_as",
+    "e.resolved_at",
+    "e.created_at",
+    // profile_stats (22)
+    "ps.protocol_id",
+    "ps.endpoint_id",
+    "ps.core_type",
+    "ps.config_type",
+    "ps.last_used_at",
+    "ps.last_seen_at",
+    "ps.latency",
+    "ps.latency_delay",
+    "ps.latency_ip",
+    "ps.speed_bps",
+    "ps.error",
+    "ps.error_kind",
+    "ps.error_text",
+    "ps.traffic_today_up",
+    "ps.traffic_today_down",
+    "ps.traffic_total_up",
+    "ps.traffic_total_down",
+    "ps.created_at",
+    "ps.updated_at",
+    "ps.version",
+    // protocols (10; the JSON carriers are absent on purpose)
+    "pr.id",
+    "pr.sig",
+    "pr.proto_kind",
+    "pr.transport_type",
+    "pr.security_type",
+    "pr.security_sni",
+    "pr.security_fp",
+    "pr.security_insecure",
+    "pr.created_at",
+];
+
+/// Positional reader over one projection row.
+///
+/// The driver hands back each SQLite column as a bare [`Value`]
+/// (`I64`/`String`/`Null`), never as the engine's converted shapes, so the
+/// JSON-array and timestamp columns are decoded here from their stored text
+/// and everything else through toasty's own [`Load`] impl.
+struct Projection<'a> {
+    fields: &'a [Value],
+    at: usize,
+}
+
+impl<'a> Projection<'a> {
+    fn new(row: &'a Value) -> Result<Self> {
+        match row {
+            Value::Record(record) => Ok(Self {
+                fields: &record.fields,
+                at: 0,
+            }),
+            other => Err(DatabaseError::Generic(format!(
+                "profiles_query: unexpected row: {other:?}"
+            ))),
         }
-        Ok(out)
+    }
+
+    /// The next column's raw value.
+    fn take(&mut self) -> Result<Value> {
+        let value = self.fields.get(self.at).cloned().ok_or_else(|| {
+            DatabaseError::Generic(format!(
+                "profiles_query: projection row has {} columns, column {} wanted",
+                self.fields.len(),
+                self.at + 1
+            ))
+        })?;
+        self.at += 1;
+        Ok(value)
+    }
+
+    /// The next column, decoded through `T`'s own `Load` impl — the same one
+    /// the typed reads use, so an enum or scalar can never decode differently
+    /// here than it does on the ORM path.
+    fn next<T: Load<Output = T>>(&mut self) -> Result<T> {
+        let column = self.at;
+        let value = self.take()?;
+        T::load(value).map_err(|e| {
+            DatabaseError::Generic(format!(
+                "profiles_query: projection column {column} ({}): {e}",
+                PAGE_PROJECTION.get(column).copied().unwrap_or("?")
+            ))
+        })
+    }
+
+    fn next_i64(&mut self) -> Result<i64> {
+        let column = self.at;
+        match self.take()? {
+            Value::I64(n) => Ok(n),
+            other => Err(DatabaseError::Generic(format!(
+                "profiles_query: projection column {column} ({}): expected an integer, got {other:?}",
+                PAGE_PROJECTION.get(column).copied().unwrap_or("?")
+            ))),
+        }
+    }
+
+    fn next_opt_i64(&mut self) -> Result<Option<i64>> {
+        let column = self.at;
+        match self.take()? {
+            Value::Null => Ok(None),
+            Value::I64(n) => Ok(Some(n)),
+            other => Err(DatabaseError::Generic(format!(
+                "profiles_query: projection column {column} ({}): expected an integer or NULL, got {other:?}",
+                PAGE_PROJECTION.get(column).copied().unwrap_or("?")
+            ))),
+        }
+    }
+
+    fn next_endpoint_id(&mut self) -> Result<EndpointId> {
+        Ok(EndpointId::new(self.next_i64()?))
+    }
+
+    fn next_protocol_id(&mut self) -> Result<ProtocolId> {
+        Ok(ProtocolId::new(self.next_i64()?))
+    }
+
+    fn next_opt_protocol_id(&mut self) -> Result<Option<ProtocolId>> {
+        Ok(self.next_opt_i64()?.map(ProtocolId::new))
+    }
+
+    /// SQLite stores BOOLEAN as an INTEGER, which `Load` for `bool` rejects.
+    fn next_opt_bool(&mut self) -> Result<Option<bool>> {
+        Ok(self.next_opt_i64()?.map(|n| n != 0))
+    }
+
+    /// A JSON-array TEXT column (`ports`, `task_queue`): the stored text is
+    /// what toasty itself wrote, so parsing it directly is exact.
+    fn next_u16_vec(&mut self) -> Result<Vec<u16>> {
+        let (column, text) = self.take_json_text()?;
+        serde_json::from_str(&text).map_err(|e| {
+            DatabaseError::Generic(format!(
+                "profiles_query: projection column {column} ({}): invalid JSON array: {e}",
+                PAGE_PROJECTION.get(column).copied().unwrap_or("?")
+            ))
+        })
+    }
+
+    /// A JSON-array-of-strings TEXT column (`resolved_as`).
+    fn next_string_vec(&mut self) -> Result<Vec<String>> {
+        let (column, text) = self.take_json_text()?;
+        serde_json::from_str(&text).map_err(|e| {
+            DatabaseError::Generic(format!(
+                "profiles_query: projection column {column} ({}): invalid JSON array: {e}",
+                PAGE_PROJECTION.get(column).copied().unwrap_or("?")
+            ))
+        })
+    }
+
+    fn take_json_text(&mut self) -> Result<(usize, String)> {
+        let column = self.at;
+        let text: String = self.next()?;
+        Ok((column, text))
+    }
+
+    /// An epoch-seconds INTEGER timestamp column.
+    fn next_ts(&mut self) -> Result<i64> {
+        self.next_i64()
+    }
+
+    fn next_opt_ts(&mut self) -> Result<Option<i64>> {
+        self.next_opt_i64()
     }
 }
 
-/// Order one endpoint's already-loaded links by [`Database::profile_link_order`].
-pub fn order_links(links: &mut [ProfileStats], order: Option<&Vec<ProtocolId>>) {
-    let Some(order) = order else {
-        return;
+/// `endpoints` (11 columns, in [`PAGE_PROJECTION`] order).
+#[expect(
+    clippy::similar_names,
+    reason = "`resolved_as`/`resolved_at` are the model's own column names, decoded in column order"
+)]
+fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<Endpoint> {
+    let id = p.next_endpoint_id()?;
+    let host: String = p.next()?;
+    let host_type: HostType = p.next()?;
+    let port: u16 = p.next()?;
+    let ports: Vec<u16> = p.next_u16_vec()?;
+    let last_source: Option<String> = p.next()?;
+    let manual_protocol_override = p.next_opt_protocol_id()?;
+    let resolved_as: Vec<String> = p.next_string_vec()?;
+    let resolved_at = p.next_opt_ts()?;
+    let created_at = p.next_ts()?;
+    Ok(Endpoint {
+        id,
+        host,
+        host_type,
+        port,
+        ports,
+        last_source,
+        manual_protocol_override,
+        resolved_as,
+        resolved_at,
+        created_at,
+        links: Deferred::default(),
+        group_links: Deferred::default(),
+    })
+}
+
+/// `profile_stats` (22 columns, in [`PAGE_PROJECTION`] order). The three
+/// multi-column embeds (`latency`, `error`, `traffic`) are flattened in the
+/// table, so they are reassembled by hand — the parity test against
+/// [`Database::load_page_rows`] pins every one of them.
+fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
+    let protocol_id = p.next_protocol_id()?;
+    let endpoint_id = p.next_endpoint_id()?;
+    let core_type: CoreType = p.next()?;
+    let config_type: ConfigType = p.next()?;
+    let last_used_at = p.next_opt_ts()?;
+    let last_seen_at = p.next_ts()?;
+    let latency_kind: Option<String> = p.next()?;
+    let latency_delay: Option<i64> = p.next()?;
+    let latency_ip: Option<String> = p.next()?;
+    let speed_bps: Option<i64> = p.next()?;
+    let error_flag = p.next_opt_bool()?;
+    let error_kind: Option<ProfileErr> = p.next()?;
+    let error_text: Option<String> = p.next()?;
+    let today_up: i64 = p.next()?;
+    let today_down: i64 = p.next()?;
+    let total_up: i64 = p.next()?;
+    let total_down: i64 = p.next()?;
+    let created_at = p.next_ts()?;
+    let updated_at = p.next_ts()?;
+    let version: u64 = p.next()?;
+
+    let latency = latency_delay.and_then(|delay| {
+        let delay = i32::try_from(delay).unwrap_or(i32::MAX);
+        match latency_kind.as_deref() {
+            Some("real") => Some(Latency::Real {
+                delay,
+                ip: latency_ip,
+            }),
+            Some("fast") => Some(Latency::Fast { delay }),
+            _ => None,
+        }
+    });
+    let error = match (error_flag, error_kind) {
+        // `ErrorInfo.text` is not optional: the flag only ever accompanies a
+        // text on the write paths, so a missing one is a corrupt row.
+        (Some(true), Some(kind)) => Some(ErrorInfo {
+            kind,
+            text: error_text.unwrap_or_default(),
+        }),
+        (Some(true), None) => {
+            return Err(DatabaseError::Generic(
+                "profiles_query: link carries an error flag without a kind".to_string(),
+            ));
+        }
+        _ => None,
     };
-    let rank = |pid: ProtocolId| order.iter().position(|p| *p == pid).unwrap_or(usize::MAX);
-    links.sort_by_key(|l| rank(l.protocol_id));
+
+    Ok(ProfileStats {
+        protocol_id,
+        endpoint_id,
+        core_type,
+        config_type,
+        last_used_at,
+        last_seen_at,
+        latency,
+        speed_bps,
+        error,
+        traffic: TrafficStats {
+            today_up,
+            today_down,
+            total_up,
+            total_down,
+        },
+        created_at,
+        updated_at,
+        version,
+        protocol: Deferred::default(),
+        endpoint: Deferred::default(),
+    })
+}
+
+/// `protocols` (10 columns, in [`PAGE_PROJECTION`] order). `None` when the
+/// link's protocol row is absent: the join is LEFT and every `pr.*` column is
+/// NULL together, exactly as [`Database::load_endpoint_rows`] drops it.
+fn decode_projected_protocol(p: &mut Projection<'_>) -> Result<Option<Protocol>> {
+    let id: Option<i64> = p.next()?;
+    let sig: Option<i64> = p.next()?;
+    let proto_kind: Option<ProtocolKind> = p.next()?;
+    let transport_type: Option<TransportType> = p.next()?;
+    let security_type: Option<SecurityType> = p.next()?;
+    let sni: Option<String> = p.next()?;
+    let fp: Option<String> = p.next()?;
+    let insecure = p.next_opt_bool()?;
+    let created_at: Option<i64> = p.next_opt_ts()?;
+
+    let Some(id) = id else {
+        debug_assert_eq!(
+            [sig.is_none(), proto_kind.is_none()],
+            [true; 2],
+            "a LEFT JOIN nulls every protocol column together"
+        );
+        return Ok(None);
+    };
+    let (Some(sig), Some(proto_kind), Some(transport_type), Some(security_type), Some(created_at)) =
+        (sig, proto_kind, transport_type, security_type, created_at)
+    else {
+        return Err(DatabaseError::Generic(
+            "profiles_query: partial protocol row".to_string(),
+        ));
+    };
+    Ok(Some(Protocol {
+        id: ProtocolId::new(id),
+        sig,
+        proto_kind,
+        transport: Transport {
+            r#type: transport_type,
+            data: Deferred::default(),
+        },
+        security: Security {
+            r#type: security_type,
+            sni,
+            fp,
+            insecure,
+            data: Deferred::default(),
+        },
+        config: Deferred::default(),
+        created_at,
+        links: Deferred::default(),
+    }))
+}
+
+impl Database {
+    /// One page's rows in ONE statement: the endpoints, their links and the
+    /// links' protocol display columns, joined and decoded positionally.
+    ///
+    /// The typed path ([`Database::load_page_rows`]) spends most of its time
+    /// binding the page's ids into three `IN (...)` hydration reads — turso
+    /// charges ~0.8 ms per bound parameter, and there are ~600 of them for a
+    /// 200-row page (measured: 488 ms end to end, 29 ms for the same rows
+    /// returned by a single inlined-id statement). The ids are therefore
+    /// inlined as integer literals — the same rule
+    /// [`crate::endpoint_rank::refresh`] follows — and the projection carries
+    /// only display columns, so no deferred JSON is decoded.
+    ///
+    /// `ids` are page ids (they all have at least one link — the page source
+    /// requires it), returned in the order given. The three deferred JSON
+    /// carriers on `Protocol` (`transport.data`, `security.data`, `config`)
+    /// come back unloaded: reading one is a bug, not a fallback, because the
+    /// connect path re-reads its protocol through
+    /// [`Database::load_protocol_with_config`].
+    pub async fn load_page_projection(&self, ids: &[EndpointId]) -> Result<Vec<EndpointRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.connection().await?;
+        let mut sql = Sql::new();
+        sql.push("SELECT ");
+        sql.push(&PAGE_PROJECTION.join(", "));
+        sql.push(
+            " FROM endpoints e JOIN profile_stats ps ON ps.endpoint_id = e.id \
+             LEFT JOIN protocols pr ON pr.id = ps.protocol_id WHERE e.id IN (",
+        );
+        for (i, id) in ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(", ");
+            }
+            sql.push(&id.get().to_string());
+        }
+        sql.push(")");
+        let rows = sql.exec(&mut conn).await?;
+        drop(conn);
+
+        let mut endpoints: HashMap<EndpointId, Endpoint> = HashMap::new();
+        let mut links: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();
+        let mut protocols: HashMap<ProtocolId, Protocol> = HashMap::new();
+        for row in &rows {
+            let mut p = Projection::new(row)?;
+            let endpoint = decode_projected_endpoint(&mut p)?;
+            let link = decode_projected_link(&mut p)?;
+            let protocol = decode_projected_protocol(&mut p)?;
+            links.entry(endpoint.id).or_default().push(link);
+            endpoints.entry(endpoint.id).or_insert(endpoint);
+            if let Some(protocol) = protocol {
+                protocols.entry(protocol.id).or_insert(protocol);
+            }
+        }
+
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(endpoint) = endpoints.remove(id) else {
+                continue;
+            };
+            let links = links.remove(id).unwrap_or_default();
+            let protocols = links
+                .iter()
+                .filter_map(|l| protocols.get(&l.protocol_id).map(|p| (p.id, p.clone())))
+                .collect();
+            let dns_unresolved =
+                endpoint.host_type == HostType::Dns && endpoint.resolved_as.is_empty();
+            let mut row = EndpointRow {
+                endpoint,
+                links,
+                protocols,
+                selected_protocol: 0,
+                expanded: false,
+            };
+            row.sort_links_by_test_priority(dns_unresolved);
+            row.select_best_measured_link();
+            out.push(row);
+        }
+        Ok(out)
+    }
 }

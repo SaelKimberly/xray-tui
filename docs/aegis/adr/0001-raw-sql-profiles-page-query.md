@@ -75,3 +75,39 @@ Delete `profiles_query.rs` and express the page query with the typed API once
 toasty #421 (or an equivalent) provides aggregation and window functions. The
 module's API (`PageRequest`/`PageMeta`/`profiles_page`/`load_page_rows`) is
 shaped so the TUI does not change when that happens.
+
+## Amendment — 2026-09-14: the projection, and ids as literals
+
+Two of the rules above no longer describe the module. Both changes come from the
+DB↔TUI flow audit (`docs/aegis/specs/2026-09-14-db-tui-flow-audit.md`, H1) and
+are in force:
+
+1. **Hydration moved into this module** — `Database::load_page_projection`
+   returns `Vec<EndpointRow>` from ONE statement (endpoints ⋈ links LEFT JOIN
+   protocols), so "model hydration stays on the typed `load_page_rows` path" is
+   no longer true. `load_page_rows` survives as the typed REFERENCE
+   implementation that `tests/profiles_query.rs::page_projection_matches_the_orm_rows`
+   pins the projection against; it has no production caller.
+   The decoded set is bounded on purpose: the display columns only, with the
+   three deferred JSON carriers (`transport_data`, `security_data`, `config`)
+   left unloaded — no page consumer reads them, and decoding them was ~0.5 s of
+   the typed path's cost. Reading one is a bug, not a fallback: the connect path
+   re-reads its protocol through `load_protocol_with_config`.
+
+2. **Ids are interpolated as integer literals, not bound** — turso charges
+   ~0.8 ms per BOUND parameter, so binding a 200-id page (~600 parameters across
+   the three hydration reads) cost ~480 ms of the 488 ms the typed path spent.
+   The safety argument replaces the bind-only rule rather than weakening it: the
+   interpolated values are `i64` from typed `EndpointId` newtypes, never text and
+   never user input; every other predicate (thresholds, search, group) still
+   binds. Measured 1,027 ms → 49.6 ms for the same 200 rows, 63 ms including the
+   page's ids and count, on a 7,656-endpoint / 15,312-link feed.
+
+Also retired in the same pass: `profile_link_order` / `order_links`. The SQL
+link order disagreed with the decision-16 law for a DNS-unresolved endpoint (a
+live measurement sorted above a fresh failure; the law sinks every link of such
+an endpoint to tier 5), so the comparator is the single implementation again and
+`load_page_rows` no longer re-orders links. `profiles_ids`,
+`profiles_link_pairs`, `profiles_failed_ids`, `profiles_enrich_seed_ids` and the
+public `profiles_count` wrapper were callerless and are gone; the page's total
+comes back with the page.

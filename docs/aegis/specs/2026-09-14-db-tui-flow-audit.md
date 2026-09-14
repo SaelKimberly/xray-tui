@@ -129,3 +129,83 @@ consistent — the cheapest wins in this audit are deletions.
 | **4** | S2 + S3 + S4 + S5 + Tier 3: schema and surface cleanup | one wipe (tag 9), then the full suite |
 
 Each phase is independently shippable; phases 1–3 need no schema change, phase 4 does.
+
+## 7. Delivered — phase 1 (page load), measured
+
+Probe: fresh DB seeded through the bulk paths with 7,656 endpoints × 2 links
+(15,312 links), in-memory turso, page size 200. `probe_page_cost.rs`, deleted after
+this record (the numbers are reproducible from the seed it used).
+
+| Operation | Before | After |
+| --- | --- | --- |
+| `load_page_rows` (typed hydration, 200 rows) | 1,027 ms | — (kept as the parity oracle) |
+| `load_page_projection` (one statement, 200 rows) | — | **49.6 ms** |
+| `profiles_page` (count + ordered ids) | (in the 12-statement load) | 13.2 ms |
+| `profiles_count` alone | — | 7.5 ms |
+| `profiles_anchor` | 65 ms (earlier probe) | 49.4 ms |
+| **page load end to end** | **~1,040 ms** | **63 ms** (16.5×) |
+
+Decisions this changed:
+
+- **1.4 (count caching) dropped**: the count is 7.5 ms of the 63 ms load (12%). Reusing it
+  needs a dataset-generation counter that every mutation site must remember to bump, and a
+  missed site shows a wrong footer total — a correctness risk for a tenth of a load. The scan
+  stays.
+- **1.5 (anchor-then-load) narrowed**: anchoring FIRST costs 49 ms on every tick to avoid a
+  second load that only the (rare) "selected row left the page" case pays. The common path
+  therefore stays one load, and the re-anchor path now uses `load_profiles_page_only` so the
+  error-TTL sweep — which writes — runs once per reload instead of twice.
+- **1.3 turned out to be a correctness fix, not a cleanup**: the retired SQL link order put a
+  measured success above a failure on a DNS-unresolved endpoint, while the law (decision 16,
+  tier 5) sinks every link of such an endpoint. `page_projection_matches_the_orm_rows` pins
+  the law's order for that pair (protocols 99 before 13 on a fresh failure beat a live
+  measurement).
+
+## 8. Delivered — phases 2 and 3
+
+**Phase 2 (gate, writes, import, retention)**
+
+- The gate's persistence seam (`SchedulerDb`) is gone from the batch's hot path: it reads the
+  caller's snapshot and its own staged state, so a transition costs a map lookup. The writer's
+  drain now coalesces one patch per link (three column groups → one write), and
+  `apply_link_patches` writes each existing row with ONE literal `UPDATE` covering only the
+  patch's groups — no SELECT per row, no bound parameters (turso charges ~0.8 ms each). The
+  existence probe runs once per 400-row chunk. Turso has no `UPDATE ... FROM (VALUES ...)`, so
+  the per-row statements stay per-row.
+- `persist_parsed` builds the batch and writes it in one transaction through the bulk upserts
+  (the shape `stream_import` already used), instead of N autocommit upserts on the UI task.
+- `remove_failed_servers` deletes through one `delete_endpoints` transaction; the typed
+  per-endpoint delete is now that same function with a one-element slice. Routing-rule reorder
+  is one transaction.
+- Retention is wired: a 10-minute task (main.rs, same cadence as the log TTL) purges endpoints
+  whose newest link aged past the retention window and reports `CoreEvent::RetentionPurged`, so
+  the page re-reads. `purge_expired` had no caller before this.
+
+**Phase 3 (schema, one wipe at tag 9)**
+
+- Task state is runtime-only: `profile_stats.task_id`/`task_queue` are gone, `TaskScheduler`
+  owns `HashMap<(ProtocolId, EndpointId), LinkTasks>`, `update_scheduler_state` and
+  `sweep_orphans` are deleted, and `SchedulerDb` (trait + 3 impls + its mock) is deleted — the
+  gate no longer has a database handle at all, which is why orphan ids are now
+  unrepresentable rather than reconciled. Batch start calls `scheduler.reset()`.
+- Timestamps are epoch SECONDS integers (9 columns): `sql_ts` (the fixed-width RFC3339 binder)
+  and `parse_nanos` are deleted, the rank keys (`rank_seen`/`rank_display_seen`/
+  `rank_newest_seen`) and `RankLink` compare seconds, `PageRequest` thresholds are seconds, and
+  `to_epoch`/`from_epoch`/`now_epoch` are the only conversion points. `#[auto]` came off the
+  four timestamp fields on purpose: on an integer column toasty's auto strategy is
+  `Increment`, not "now", so the writers stamp them.
+- `protocols.cred_hash` and `endpoints.parent_id` are gone, with the child-endpoint machinery
+  (`endpoints_by_parent`, `upsert_resolved_ip_children`): `resolved_as` + `resolved_at` are the
+  single owner of a DNS endpoint's resolutions.
+- Index: `profile_stats.last_seen_at` (retention cutoff + staleness windows). `error`
+  deliberately is not indexed — it is an embed, and `#[index]` has no `IndexableField` for one;
+  the TTL sweep's scan is ~7 ms on a reload.
+- Dead query surface deleted: `profiles_ids`, `profiles_link_pairs`, `profiles_failed_ids`,
+  `profiles_enrich_seed_ids`, the public `profiles_count` wrapper, and `LinkWriter::read` /
+  `overlay_pending` (the write-behind writer has no reader left).
+- `SCHEMA_VERSION` 8 → 9: a v8 file is WIPED and rebuilt (the destructive test pins it).
+
+Verification: `cargo nextest run --workspace` 1914/1914, `cargo clippy --workspace
+--all-targets` 0 warnings, `cargo fmt --check` clean. The projection parity test, the 7-sort ×
+2-direction ordering golden, the anchor golden and the paging golden all pass on the rebuilt
+schema.
