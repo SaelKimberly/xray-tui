@@ -1,7 +1,7 @@
 # ADR 0002 — Write-behind `profile_stats` persistence
 
 Date: 2026-09-11
-Status: accepted
+Status: accepted — amended 2026-09-14 (the gate left the writer, and the groups narrowed; see the amendment at the end)
 Supersedes: the per-write autocommit path for `profile_stats` batch workloads
 Spec: `docs/aegis/specs/2026-09-11-write-behind-link-writer-design.md`
 

@@ -1,7 +1,7 @@
 # ADR 0001 — Raw SQL for the Profiles page query
 
 Date: 2026-09-11
-Status: accepted
+Status: accepted — amended 2026-09-14 (the projection, and ids as literals; see the amendment at the end)
 Supersedes: nothing (amends `AGENTS.md` decision 4's "zero raw SQL" rule)
 Spec: `docs/aegis/specs/2026-09-11-profiles-page-query-design.md`
 

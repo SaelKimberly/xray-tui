@@ -1,7 +1,7 @@
 # ADR 0003 — Materialized per-endpoint ordering keys
 
 Date: 2026-09-14
-Status: accepted
+Status: accepted — amended 2026-09-14 (seconds, one link order, one group set; see the amendment at the end)
 Supersedes: ADR 0001 §paging (the SQL window core), decision 21 §paging
 Spec: `docs/aegis/specs/2026-09-14-profiles-stored-sort-key-design.md`
 
@@ -124,3 +124,34 @@ an index.
   every link of an unresolved endpoint — so the two orders differ for those
   endpoints, and `load_page_rows_preserves_page_and_link_order` is the guard.
   Retiring either side is a deliberate law decision, not free work.
+
+## Amendment — 2026-09-14: seconds, one link order, one group set
+
+Three consequences above are no longer true; the stored-keys decision itself is
+unchanged and still in force (the covering index serves the page at 8–14 ms).
+
+1. **The recency tiebreak is seconds, not nanoseconds** — the "Sub-second
+   recency now participates" bullet is reversed. `profile_stats.last_seen_at` is
+   an epoch-second INTEGER (tag 9; see ADR 0001's amendment for the schema
+   pass), `RankLink::seen_secs` reads it directly, and `compute_rank` orders by
+   `-seen_secs`. Second precision is also the law's original granularity: two
+   links seen inside one second tie and the protocol id breaks it. The
+   `last_seen_at` TEXT parse (`parse_nanos`) and the nanos unit went with it.
+2. **The TASK-only skip is gone with the TASK group** — `LinkGroups` now has
+   RESULT and TRAFFIC only (`task_id`/`task_queue` were dropped: task state is
+   runtime-only), and both remaining groups can move a key, so every patch
+   refreshes its endpoint's keys. `KEY_AFFECTING` was deleted with the skip it
+   expressed; the measured 450 ms/792 ms split no longer applies.
+3. **`profile_link_order` WAS retired** — this ADR said "must not be retired as
+   duplicate work", and that was right about the disagreement: the SQL weight
+   let a live measurement sort above a fresh failure on a DNS-unresolved
+   endpoint, where the law sinks every link to tier 5. The law won. The panel
+   order is `RankLink::key` (via `EndpointRow::sort_links_by_test_priority`),
+   `load_page_rows` no longer re-orders links, and
+   `page_projection_matches_the_orm_rows` pins the divergent pair (protocols 99
+   then 13). The guard test's premise — that two orders exist — is what changed,
+   not the law.
+
+The hydration bullet was also acted on rather than accepted: the page is a
+one-statement raw read with the ids interpolated as integer literals
+(`load_page_projection`, 1,027 ms → 49.6 ms), and ADR 0001 was amended for it.
