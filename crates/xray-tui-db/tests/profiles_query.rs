@@ -452,6 +452,49 @@ async fn resolving_a_dns_host_moves_its_stored_key() {
     assert_eq!(after.first(), Some(&unresolved), "a 5 ms real link leads");
 }
 
+/// A TASK-only patch is key-neutral for an EXISTING link, but not when it
+/// inserts a missing one: the insert writes the whole snapshot, so the
+/// endpoint's key appears (or moves) and the page must show it.
+#[tokio::test]
+async fn a_task_patch_that_inserts_a_link_still_moves_the_key() {
+    let db = Database::in_memory().await.expect("db");
+    let mut conn = db.connection().await.expect("conn");
+    seed_endpoint(&mut conn, 1, HostType::Ipv4, &[]).await;
+    drop(conn);
+
+    let page = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page")
+        .ids;
+    assert!(page.is_empty(), "no links, no key, not listed");
+
+    // The scheduler's group, for a link that has never been persisted.
+    let mut link = link_value(1, 101, Some(25), None, 100);
+    link.task_id = Some(7);
+    db.apply_link_patches(&[LinkPatch {
+        link,
+        groups: LinkGroups::TASK,
+    }])
+    .await
+    .expect("patch");
+
+    let page = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page")
+        .ids;
+    assert_eq!(page, vec![EndpointId::new(1)], "the inserted link keys it");
+
+    // And the key reflects the inserted snapshot, not a placeholder: the
+    // endpoint is in the real-success band.
+    let anchored = db
+        .profiles_anchor(&request(PageSort::Test, true, 0, 100), EndpointId::new(1))
+        .await
+        .expect("anchor");
+    assert_eq!(anchored, Some(0));
+}
+
 /// Deleting an endpoint's links removes its key: the page drives from the rank
 /// table, so a lingering key would list a linkless row.
 #[tokio::test]

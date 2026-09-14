@@ -672,6 +672,11 @@ impl Database {
                 .on_create(|create| create.task_queue(Vec::<u16>::new()))
                 .exec(&mut tx)
                 .await?;
+                // An INSERT writes the whole snapshot whatever the patch's
+                // groups are, so it can move the endpoint's key even for a
+                // TASK-only patch (which the filter above would skip) — the
+                // endpoint may not have had this link at all a moment ago.
+                touched.push(patch.link.endpoint_id);
                 applied += 1;
                 continue;
             };
