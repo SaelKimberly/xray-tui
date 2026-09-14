@@ -391,6 +391,22 @@ mod tests {
         }
     }
 
+    /// A page request filtered to one group (the retired
+    /// `get_active_endpoints_by_group` coverage, now on the query).
+    fn group_page_request(group: &str) -> xray_tui_db::profiles_query::PageRequest {
+        xray_tui_db::profiles_query::PageRequest {
+            view: xray_tui_db::models::PurgatoryView::All,
+            active_threshold: jiff::Timestamp::from_second(0).expect("ts"),
+            stale_threshold: jiff::Timestamp::from_second(0).expect("ts"),
+            search: None,
+            group_id: Some(group.to_string()),
+            sort: xray_tui_db::profiles_query::PageSort::Test,
+            ascending: true,
+            offset: 0,
+            limit: 10_000,
+        }
+    }
+
     #[tokio::test]
     async fn streaming_import_splits_and_persists_in_batches() {
         let db = Arc::new(Database::in_memory().await.expect("db"));
@@ -419,11 +435,11 @@ mod tests {
         .await;
         assert_eq!(count, 4, "one link per unique host");
         assert_eq!(summary.total_errors, 0);
-        let rows = db
-            .get_active_endpoints_by_group("g1", jiff::Timestamp::from_second(0).unwrap())
+        let meta = db
+            .profiles_page(&group_page_request("g1"))
             .await
             .expect("rows");
-        assert_eq!(rows.len(), 4);
+        assert_eq!(meta.ids.len(), 4);
     }
 
     #[tokio::test]
@@ -452,10 +468,10 @@ mod tests {
         )
         .await;
         assert_eq!(count, 2, "exactly the two URLs before the failure persist");
-        let rows = db
-            .get_active_endpoints_by_group("g1", jiff::Timestamp::from_second(0).unwrap())
+        let meta = db
+            .profiles_page(&group_page_request("g1"))
             .await
             .expect("rows");
-        assert_eq!(rows.len(), 2, "no rows after the failure point");
+        assert_eq!(meta.ids.len(), 2, "no rows after the failure point");
     }
 }

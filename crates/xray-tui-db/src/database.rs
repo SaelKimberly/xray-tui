@@ -283,169 +283,6 @@ fn first_i64(rows: &[Value]) -> Option<i64> {
 // ── Read queries (public API) ───────────────────────────────────────────
 
 impl Database {
-    /// Active endpoints: at least one link with `last_seen_at >=
-    /// active_threshold` (the profiles Active tab). Endpoints ordered by id.
-    ///
-    /// Built with plain full-table scans + an in-memory filter — no correlated
-    /// EXISTS subqueries and no `endpoint_id IN (...)` lists (see
-    /// [`Self::load_tab_rows`] for why both blow up super-linearly at 10k+
-    /// endpoints and wedged the UI on large subscription reloads).
-    pub async fn get_active_endpoints(
-        &self,
-        active_threshold: Timestamp,
-    ) -> Result<Vec<EndpointRow>> {
-        self.load_tab_rows(|row| row.links.iter().any(|l| l.last_seen_at >= active_threshold))
-            .await
-    }
-
-    /// Active endpoints filtered by group membership (endpoint has an
-    /// `endpoint_groups` link for `group_id` and is active).
-    pub async fn get_active_endpoints_by_group(
-        &self,
-        group_id: &str,
-        active_threshold: Timestamp,
-    ) -> Result<Vec<EndpointRow>> {
-        let mut conn = self.conn().await?;
-        let members: std::collections::HashSet<EndpointId> =
-            EndpointGroup::filter(EndpointGroup::fields().group_id().eq(group_id))
-                .exec(&mut conn)
-                .await?
-                .into_iter()
-                .map(|eg| eg.endpoint_id)
-                .collect();
-        drop(conn);
-        self.load_tab_rows(move |row| {
-            members.contains(&row.endpoint.id)
-                && row.links.iter().any(|l| l.last_seen_at >= active_threshold)
-        })
-        .await
-    }
-
-    /// Stale endpoints: `max(last_seen_at)` in `[stale_threshold,
-    /// active_threshold)` — at least one link as old as `stale_threshold` and
-    /// none as fresh as `active_threshold`.
-    pub async fn get_stale_endpoints(
-        &self,
-        active_threshold: Timestamp,
-        stale_threshold: Timestamp,
-    ) -> Result<Vec<EndpointRow>> {
-        self.load_tab_rows(|row| {
-            row.links.iter().any(|l| l.last_seen_at >= stale_threshold)
-                && !row.links.iter().any(|l| l.last_seen_at >= active_threshold)
-        })
-        .await
-    }
-
-    /// Assemble [`EndpointRow`]s for a tab load with PLAIN full-table scans
-    /// and an in-memory filter — the third rewrite of this hot path.
-    ///
-    /// Why not the "obvious" SQL shapes:
-    /// - `Endpoint::filter(links().any(...))` compiles to a correlated EXISTS;
-    ///   with no index on `profile_stats.endpoint_id` (PK is
-    ///   `(protocol_id, endpoint_id)`) each endpoint probes the whole links
-    ///   table → O(endpoints × links), ~2.6s at 10.5k/37k.
-    /// - `ProfileStats::filter(endpoint_id IN ids)` — toasty expands `in_list`
-    ///   to row-value `IN (VALUES (?1)..(?N))`; 10.5k ids cost ~14s of pure
-    ///   SQLite statement-parse + VM setup (the same VALUES blowup the 2026-09
-    ///   include fix removed from the other leg).
-    ///
-    /// Three full scans (`Endpoint::all`, `ProfileStats::all`,
-    /// `Protocol::all` — `protocols` is bounded by distinct configs, not
-    /// servers) + one in-memory join, then the caller's predicate filters.
-    /// Linear in table size: ~17s → well under a second at 10.5k endpoints,
-    /// and it stays linear as feeds grow instead of degrading quadratically.
-    /// One transient cost: the whole `profile_stats` table is materialized
-    /// per load (~37k rows ≈ tens of MB); acceptable for the tab load.
-    async fn load_tab_rows<F>(&self, keep: F) -> Result<Vec<EndpointRow>>
-    where
-        F: Fn(&EndpointRow) -> bool,
-    {
-        let mut conn = self.conn().await?;
-        let endpoints: Vec<Endpoint> = Endpoint::all().exec(&mut conn).await?;
-        let links: Vec<ProfileStats> = ProfileStats::all().exec(&mut conn).await?;
-        let protocols: Vec<Protocol> = Protocol::all().exec(&mut conn).await?;
-        let protocol_by_id: HashMap<ProtocolId, Protocol> =
-            protocols.into_iter().map(|p| (p.id, p)).collect();
-
-        let mut by_endpoint: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();
-        for link in links {
-            by_endpoint.entry(link.endpoint_id).or_default().push(link);
-        }
-
-        let mut rows = Vec::with_capacity(endpoints.len());
-        for endpoint in endpoints {
-            let links = by_endpoint.remove(&endpoint.id).unwrap_or_default();
-            let protocols = links
-                .iter()
-                .filter_map(|l| {
-                    protocol_by_id
-                        .get(&l.protocol_id)
-                        .map(|p| (p.id, p.clone()))
-                })
-                .collect();
-            let dns_unresolved =
-                endpoint.host_type == HostType::Dns && endpoint.resolved_as.is_empty();
-            let mut row = EndpointRow {
-                endpoint,
-                links,
-                protocols,
-                selected_protocol: 0,
-                expanded: false,
-            };
-            row.sort_links_by_test_priority(dns_unresolved);
-            // Single-row display follows the best measured link (survives
-            // restarts via the persisted latency columns); the sub-table
-            // keeps test-priority order.
-            row.select_best_measured_link();
-            rows.push(row);
-        }
-        // Deterministic page order (the newtype id path cannot be ordered in SQL).
-        rows.sort_by_key(|r| r.endpoint.id);
-        Ok(rows.into_iter().filter(keep).collect())
-    }
-
-    /// Stale endpoint ids only (`max(last_seen_at)` in
-    /// `[stale_threshold, active_threshold)`), without loading any links.
-    ///
-    /// The COUNT path never pays for link load + row assembly: the stale
-    /// window is pushed into SQL as `has-a-link >= stale_threshold AND NOT
-    /// has-a-link >= active_threshold`, which is exactly
-    /// `stale_threshold <= max(last_seen_at) < active_threshold` (linkless
-    /// endpoints fail the first branch, matching the in-memory filter of
-    /// [`Self::get_stale_endpoints`]).
-    pub async fn get_stale_ids(
-        &self,
-        active_threshold: Timestamp,
-        stale_threshold: Timestamp,
-    ) -> Result<Vec<EndpointId>> {
-        let mut conn = self.conn().await?;
-        let endpoints: Vec<Endpoint> = Endpoint::filter(
-            Endpoint::fields()
-                .links()
-                .any(ProfileStats::fields().last_seen_at().ge(stale_threshold))
-                .and(
-                    Endpoint::fields()
-                        .links()
-                        .any(ProfileStats::fields().last_seen_at().ge(active_threshold))
-                        .not(),
-                ),
-        )
-        .exec(&mut conn)
-        .await?;
-        Ok(endpoints.into_iter().map(|e| e.id).collect())
-    }
-
-    pub async fn get_stale_count(
-        &self,
-        active_threshold: Timestamp,
-        stale_threshold: Timestamp,
-    ) -> Result<usize> {
-        let ids = self
-            .get_stale_ids(active_threshold, stale_threshold)
-            .await?;
-        Ok(ids.len())
-    }
-
     /// Single endpoint by id with all links and protocols.
     pub async fn get_endpoint(&self, id: EndpointId) -> Result<Option<EndpointRow>> {
         let mut conn = self.conn().await?;
@@ -1399,6 +1236,47 @@ mod tests {
     }
 
     /// Insert one endpoint with one protocol and one link at `last_seen`.
+    use crate::models_toasty::PurgatoryView;
+
+    /// A one-shot page request for the view predicates.
+    fn req(
+        view: PurgatoryView,
+        active: Timestamp,
+        stale: Timestamp,
+    ) -> crate::profiles_query::PageRequest {
+        crate::profiles_query::PageRequest {
+            view,
+            active_threshold: active,
+            stale_threshold: stale,
+            search: None,
+            group_id: None,
+            sort: crate::profiles_query::PageSort::Test,
+            ascending: true,
+            offset: 0,
+            limit: 10_000,
+        }
+    }
+
+    /// Endpoint ids in page order.
+    async fn ids(db: &Database, req: &crate::profiles_query::PageRequest) -> Vec<i64> {
+        db.profiles_page(req)
+            .await
+            .expect("page")
+            .ids
+            .iter()
+            .map(|id| id.get())
+            .collect()
+    }
+
+    /// The page's assembled rows.
+    async fn rows_of(
+        db: &Database,
+        req: &crate::profiles_query::PageRequest,
+    ) -> Vec<crate::models_toasty::EndpointRow> {
+        let meta = db.profiles_page(req).await.expect("page");
+        db.load_page_rows(&meta.ids).await.expect("rows")
+    }
+
     async fn seed_endpoint(
         conn: &mut toasty::Connection,
         endpoint_id: i64,
@@ -1474,27 +1352,15 @@ mod tests {
         .await;
 
         // Active: only the recent endpoint.
-        let active = db
-            .get_active_endpoints(ts(now - 3_600))
-            .await
-            .expect("active");
-        let active_ids: Vec<i64> = active.iter().map(|r| r.endpoint.id.get()).collect();
-        assert_eq!(active_ids, vec![1]);
+        let active = req(PurgatoryView::Active, ts(now - 3_600), ts(now - 7_200));
+        assert_eq!(ids(&db, &active).await, vec![1]);
 
         // Stale: only the old endpoint.
-        let stale = db
-            .get_stale_endpoints(ts(now - 3_600), ts(now - 7_200))
-            .await
-            .expect("stale");
-        let stale_ids: Vec<i64> = stale.iter().map(|r| r.endpoint.id.get()).collect();
-        assert_eq!(stale_ids, vec![2]);
+        let stale = req(PurgatoryView::Stale, ts(now - 3_600), ts(now - 7_200));
+        assert_eq!(ids(&db, &stale).await, vec![2]);
 
         // Count matches the stale view.
-        let count = db
-            .get_stale_count(ts(now - 3_600), ts(now - 7_200))
-            .await
-            .expect("count");
-        assert_eq!(count, 1);
+        assert_eq!(db.profiles_count(&stale).await.expect("count"), 1);
     }
 
     #[tokio::test]
@@ -1504,7 +1370,7 @@ mod tests {
         seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
         seed_link(&mut conn, 1, 1002, 20).await;
 
-        let rows = db.get_active_endpoints(ts(0)).await.expect("load");
+        let rows = rows_of(&db, &req(PurgatoryView::All, ts(0), ts(0))).await;
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.endpoint.id, EndpointId::new(1));
@@ -1552,22 +1418,16 @@ mod tests {
         .await
         .expect("link group b");
 
-        let from_a = db
-            .get_active_endpoints_by_group("source-a", ts(0))
-            .await
-            .expect("group a");
-        let from_b = db
-            .get_active_endpoints_by_group("source-b", ts(0))
-            .await
-            .expect("group b");
-        let from_c = db
-            .get_active_endpoints_by_group("source-c", ts(0))
-            .await
-            .expect("group c");
-        assert_eq!(from_a.len(), 1);
-        assert_eq!(from_b.len(), 1);
-        assert!(from_c.is_empty(), "unlinked group matches nothing");
-        assert_eq!(from_a[0].endpoint.id, EndpointId::new(1));
+        let group = |id: &str| crate::profiles_query::PageRequest {
+            group_id: Some(id.to_string()),
+            ..req(PurgatoryView::All, ts(0), ts(0))
+        };
+        assert_eq!(ids(&db, &group("source-a")).await, vec![1]);
+        assert_eq!(ids(&db, &group("source-b")).await, vec![1]);
+        assert!(
+            ids(&db, &group("source-c")).await.is_empty(),
+            "unlinked group matches nothing"
+        );
     }
 
     #[tokio::test]
@@ -1693,7 +1553,7 @@ mod tests {
             .expect("link");
         }
 
-        let rows = db.get_active_endpoints(ts(0)).await.expect("load");
+        let rows = rows_of(&db, &req(PurgatoryView::All, ts(0), ts(0))).await;
         let row = &rows[0];
         // Both links sink to tier 5; recency decides.
         assert_eq!(row.links[0].protocol_id, ProtocolId::new(1002));

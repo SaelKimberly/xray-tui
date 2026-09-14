@@ -9,9 +9,9 @@
 use jiff::Timestamp;
 use toasty::{Deferred, Json};
 use xray_tui_db::models::{
-    ConfigType, DnsSetting, Endpoint, EndpointGroup, EndpointId, ErrorInfo, Group, HostType,
-    Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, RoutingRule, Security, TrafficStats,
-    Transport,
+    ConfigType, DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRow, ErrorInfo, Group,
+    HostType, Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, PurgatoryView, RoutingRule,
+    Security, TrafficStats, Transport,
 };
 use xray_tui_db::{Database, LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
@@ -21,6 +21,46 @@ use xray_tui_proto::proto_spec::{
 };
 
 /// Helper: create in-memory database.
+/// A one-shot page request: the view predicates plus a group filter, all rows.
+fn page_req(
+    view: PurgatoryView,
+    active: Timestamp,
+    stale: Timestamp,
+    group: Option<&str>,
+) -> xray_tui_db::profiles_query::PageRequest {
+    xray_tui_db::profiles_query::PageRequest {
+        view,
+        active_threshold: active,
+        stale_threshold: stale,
+        search: None,
+        group_id: group.map(str::to_string),
+        sort: xray_tui_db::profiles_query::PageSort::Test,
+        ascending: true,
+        offset: 0,
+        limit: 10_000,
+    }
+}
+
+/// The page's endpoint ids, in display order.
+async fn page_ids(db: &Database, req: &xray_tui_db::profiles_query::PageRequest) -> Vec<i64> {
+    db.profiles_page(req)
+        .await
+        .expect("page")
+        .ids
+        .iter()
+        .map(|id| id.get())
+        .collect()
+}
+
+/// The page's assembled rows.
+async fn page_rows(
+    db: &Database,
+    req: &xray_tui_db::profiles_query::PageRequest,
+) -> Vec<EndpointRow> {
+    let meta = db.profiles_page(req).await.expect("page");
+    db.load_page_rows(&meta.ids).await.expect("rows")
+}
+
 async fn test_db() -> Database {
     Database::in_memory().await.expect("open in-memory db")
 }
@@ -130,14 +170,15 @@ async fn seed_link(
 // ── EndpointRow assembly ────────────────────────────────────────────────
 
 #[tokio::test]
-async fn get_active_endpoints_assembles_rows_with_links_and_protocols() {
+async fn page_rows_assemble_links_and_protocols() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
 
     seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
     seed_link(&mut conn, 1, 1002, 20).await;
 
-    let rows = db.get_active_endpoints(ts(0)).await.expect("active");
+    let all = page_req(PurgatoryView::All, ts(0), ts(0), None);
+    let rows = page_rows(&db, &all).await;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row.endpoint.id, EndpointId::new(1));
@@ -148,7 +189,7 @@ async fn get_active_endpoints_assembles_rows_with_links_and_protocols() {
     assert!(row.protocols.contains_key(&ProtocolId::new(1001)));
     assert!(row.protocols.contains_key(&ProtocolId::new(1002)));
 
-    // Newest link first (untested tier, recency order).
+    // Decision-16 link order (untested tier, recency first).
     assert_eq!(row.links[0].protocol_id, ProtocolId::new(1002));
     assert_eq!(row.links[1].protocol_id, ProtocolId::new(1001));
 
@@ -181,7 +222,7 @@ async fn large_page_loads_via_batched_in_list() {
         .await;
     }
 
-    let rows = db.get_active_endpoints(ts(0)).await.expect("page");
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
     assert_eq!(rows.len(), 1000, "every endpoint on the page");
     assert!(
         rows.iter().all(|r| r.links.len() == 1),
@@ -220,7 +261,7 @@ async fn rows_are_sorted_by_test_priority() {
     )
     .await;
 
-    let rows = db.get_active_endpoints(ts(0)).await.expect("active");
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
     let row = &rows[0];
     let order: Vec<i64> = row.links.iter().map(|l| l.protocol_id.get()).collect();
     assert_eq!(order, vec![1003, 1002, 1001], "real-ok, fast-ok, untested");
@@ -250,7 +291,7 @@ async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
     )
     .await;
 
-    let rows = db.get_active_endpoints(ts(0)).await.expect("active");
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
     let row = &rows[0];
     assert_eq!(
         row.best_test_priority_key(true).expect("key").0,
@@ -316,25 +357,24 @@ async fn active_and_stale_windows() {
     )
     .await;
 
-    let active = db
-        .get_active_endpoints(ts(now - 3_600))
-        .await
-        .expect("active");
-    let active_ids: Vec<i64> = active.iter().map(|r| r.endpoint.id.get()).collect();
-    assert_eq!(active_ids, vec![1]);
+    let active = page_req(
+        PurgatoryView::Active,
+        ts(now - 3_600),
+        ts(now - 7_200),
+        None,
+    );
+    assert_eq!(page_ids(&db, &active).await, vec![1]);
 
-    let stale = db
-        .get_stale_endpoints(ts(now - 3_600), ts(now - 7_200))
-        .await
-        .expect("stale");
-    let stale_ids: Vec<i64> = stale.iter().map(|r| r.endpoint.id.get()).collect();
-    assert_eq!(stale_ids, vec![2]);
+    let stale = page_req(PurgatoryView::Stale, ts(now - 3_600), ts(now - 7_200), None);
+    assert_eq!(page_ids(&db, &stale).await, vec![2]);
+    assert_eq!(
+        db.profiles_count(&stale).await.expect("count"),
+        1,
+        "the footer count matches the stale window"
+    );
 
-    let count = db
-        .get_stale_count(ts(now - 3_600), ts(now - 7_200))
-        .await
-        .expect("count");
-    assert_eq!(count, 1);
+    let all = page_req(PurgatoryView::All, ts(now - 3_600), ts(now - 7_200), None);
+    assert_eq!(page_ids(&db, &all).await, vec![1, 2]);
 }
 
 #[tokio::test]
@@ -400,24 +440,19 @@ async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
     // 7: boundary — max exactly == active_threshold -> NOT stale.
     seed_endpoint(&mut conn, 7, 7001, "7.7.7.7", HostType::Ipv4, 443, active).await;
 
-    let stale_ids = db.get_stale_ids(ts(active), ts(stale)).await.expect("ids");
-    let count = db
-        .get_stale_count(ts(active), ts(stale))
-        .await
-        .expect("count");
-    let rows = db
-        .get_stale_endpoints(ts(active), ts(stale))
-        .await
-        .expect("rows");
+    let stale_req = page_req(PurgatoryView::Stale, ts(active), ts(stale), None);
+    let stale_ids = page_ids(&db, &stale_req).await;
+    let count = db.profiles_count(&stale_req).await.expect("count");
+    let rows = page_rows(&db, &stale_req).await;
 
     let expected: Vec<i64> = vec![2, 6];
-    let mut got: Vec<i64> = stale_ids.iter().map(|id| id.get()).collect();
+    let mut got = stale_ids.clone();
     got.sort_unstable();
     assert_eq!(
         got, expected,
-        "id-only path selects exactly the stale window"
+        "the stale window selects exactly the boundary rows"
     );
-    assert_eq!(count, expected.len(), "count == id-only path length");
+    assert_eq!(count, expected.len() as u64, "count == id path length");
     let mut row_ids: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect();
     row_ids.sort_unstable();
     assert_eq!(
@@ -453,22 +488,13 @@ async fn group_filter_selects_by_group_membership() {
     .await
     .expect("link group b");
 
-    let from_a = db
-        .get_active_endpoints_by_group("source-a", ts(0))
-        .await
-        .expect("group a");
-    let from_b = db
-        .get_active_endpoints_by_group("source-b", ts(0))
-        .await
-        .expect("group b");
-    let from_c = db
-        .get_active_endpoints_by_group("source-c", ts(0))
-        .await
-        .expect("group c");
-    assert_eq!(from_a.len(), 1);
-    assert_eq!(from_a[0].endpoint.id, EndpointId::new(1));
-    assert_eq!(from_b.len(), 1);
-    assert!(from_c.is_empty(), "unlinked group matches nothing");
+    let group = |id: &str| page_req(PurgatoryView::All, ts(0), ts(0), Some(id));
+    assert_eq!(page_ids(&db, &group("source-a")).await, vec![1]);
+    assert_eq!(page_ids(&db, &group("source-b")).await, vec![1]);
+    assert!(
+        page_ids(&db, &group("source-c")).await.is_empty(),
+        "unlinked group matches nothing"
+    );
 }
 
 // ── Single-row lookups ──────────────────────────────────────────────────
@@ -1275,10 +1301,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         tx.commit().await.expect("commit 2");
     }
 
-    let row = db
-        .get_active_endpoints_by_group("g1", ts(0))
-        .await
-        .expect("group read");
+    let row = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), Some("g1"))).await;
     assert_eq!(row.len(), 1, "one endpoint despite duplicate upserts");
     assert_eq!(row[0].endpoint.port, 8443, "port updated");
     assert_eq!(row[0].links.len(), 1, "one link despite duplicate upserts");
@@ -1370,10 +1393,7 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     .expect("upsert group link");
 
     // The subscription-shaped sequence assembles into one group row.
-    let rows = db
-        .get_active_endpoints_by_group("g1", ts(0))
-        .await
-        .expect("group");
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), Some("g1"))).await;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row.endpoint.id, EndpointId::new(1));
@@ -1385,10 +1405,13 @@ async fn subscription_upsert_flow_assembles_group_rows() {
 
     // A threshold past the link's last_seen_at drops the endpoint.
     assert!(
-        db.get_active_endpoints_by_group("g1", ts(100))
-            .await
-            .expect("fresh threshold")
-            .is_empty()
+        page_ids(
+            &db,
+            &page_req(PurgatoryView::Active, ts(100), ts(100), Some("g1"))
+        )
+        .await
+        .is_empty(),
+        "the active window excludes a link last seen before the threshold"
     );
 }
 
