@@ -263,28 +263,7 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         repair_missing(conn).await?;
         return Ok(());
     }
-    let endpoints: Vec<Endpoint> = Endpoint::all().exec(conn).await?;
-    let links: Vec<ProfileStats> = ProfileStats::all().exec(conn).await?;
-    let mut by_endpoint: HashMap<EndpointId, Vec<RankLink>> = HashMap::new();
-    for link in links {
-        by_endpoint
-            .entry(link.endpoint_id)
-            .or_default()
-            .push(RankLink::from(&link));
-    }
-    let ranks: Vec<EndpointRank> = endpoints
-        .into_iter()
-        .filter_map(|endpoint| {
-            let links = by_endpoint.remove(&endpoint.id)?;
-            compute_rank(
-                endpoint.id,
-                dns_unresolved_endpoint(endpoint.host_type, &endpoint.resolved_as),
-                endpoint.manual_protocol_override.map(ProtocolId::get),
-                &links,
-            )
-        })
-        .collect();
-    let written = write(conn, &ranks).await?;
+    let written = backfill_all(conn).await?;
     tracing::info!(target: "xray_tui_db", "endpoint_rank: backfilled {written} rows");
     Ok(())
 }
@@ -396,6 +375,35 @@ pub(crate) async fn prune(
             .await?;
     }
     Ok(endpoint_ids.len())
+}
+
+/// Recompute EVERY endpoint's stored keys from its current links.
+///
+/// For the wholesale resets (`clear_all_stats`) where nothing narrower is
+/// correct: every link just lost the columns the keys are made of.
+pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Result<usize> {
+    let endpoints: Vec<Endpoint> = Endpoint::all().exec(conn).await?;
+    let links: Vec<ProfileStats> = ProfileStats::all().exec(conn).await?;
+    let mut by_endpoint: HashMap<EndpointId, Vec<RankLink>> = HashMap::new();
+    for link in links {
+        by_endpoint
+            .entry(link.endpoint_id)
+            .or_default()
+            .push(RankLink::from(&link));
+    }
+    let ranks: Vec<EndpointRank> = endpoints
+        .into_iter()
+        .filter_map(|endpoint| {
+            let links = by_endpoint.remove(&endpoint.id)?;
+            compute_rank(
+                endpoint.id,
+                dns_unresolved_endpoint(endpoint.host_type, &endpoint.resolved_as),
+                endpoint.manual_protocol_override.map(ProtocolId::get),
+                &links,
+            )
+        })
+        .collect();
+    write(conn, &ranks).await
 }
 
 /// Backfill rank rows for endpoints that have links but no row yet.

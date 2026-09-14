@@ -769,6 +769,9 @@ impl Database {
             .last_seen_at(ts)
             .exec(&mut conn)
             .await?;
+        // `last_seen_at` is the order's recency tiebreak and the view windows'
+        // input, so a "last used" stamp moves the stored key.
+        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
         Ok(())
     }
 
@@ -885,6 +888,9 @@ impl Database {
             .manual_protocol_override(protocol_id)
             .exec(&mut conn)
             .await?;
+        // The override decides the endpoint's DISPLAY link, whose columns the
+        // non-Test sorts read.
+        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
         Ok(())
     }
 
@@ -1032,6 +1038,9 @@ impl Database {
             .speed_bps(None)
             .exec(&mut conn)
             .await?;
+        // Every column this clears feeds a stored key: a wholesale reset must
+        // rebuild them all, not leave the old bands in place.
+        crate::endpoint_rank::backfill_all(&mut conn).await?;
         Ok(())
     }
 
@@ -1045,6 +1054,7 @@ impl Database {
             .last_seen_at(now)
             .exec(&mut conn)
             .await?;
+        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
         Ok(())
     }
 
