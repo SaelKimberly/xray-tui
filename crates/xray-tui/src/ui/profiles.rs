@@ -511,6 +511,33 @@ fn protocol_info_cell(row: &EndpointRow) -> String {
     center_pad(&info, PROTOCOL_INFO_WIDTH)
 }
 
+/// Recompute the selection-dependent fields of one cached display row.
+///
+/// Everything else in [`DisplayRowData`] is independent of the selection, which
+/// is what lets a selection move patch two rows instead of rebuilding the list.
+fn restyle_row(
+    row: &mut DisplayRowData,
+    index: usize,
+    selected: usize,
+    state: &AppState,
+    palette: &ratatui_cheese::theme::Palette,
+    source: &EndpointRow,
+) {
+    let is_connected = state.connected_protocol_id.as_ref() == Some(&source.endpoint.id.get());
+    row.row_style = match (index == selected, is_connected) {
+        (true, true) => ThemeStyles::table_row_connected(palette)
+            .add_modifier(ratatui::style::Modifier::UNDERLINED),
+        (false, true) => ThemeStyles::table_row_connected(palette),
+        (true, false) => ThemeStyles::table_row_selected(palette),
+        (false, false) => ThemeStyles::table_row_normal(palette),
+    };
+    row.panel_selected = if index == selected {
+        state.selected_sub
+    } else {
+        None
+    };
+}
+
 fn build_display_rows(
     rows: &[&EndpointRow],
     selected: usize,
@@ -523,10 +550,12 @@ fn build_display_rows(
     // dirty bits. All comparisons are reference/flag reads; the only per-row
     // work on a hit is the `expanded` zip.
     let mut cache = state.display_rows_cache.borrow_mut();
-    if !cache.rows.is_empty()
+    // The cache key deliberately EXCLUDES the selection: only the selected row
+    // and the previously selected one carry selection-dependent styling, so a
+    // PgUp/PgDn/Home/End move patches two rows instead of rebuilding 40k of
+    // them (~160 ms per keypress at the reported scale).
+    let structurally_cached = !cache.rows.is_empty()
         && cache.gen_id == state.endpoints_gen
-        && cache.selected_index == selected
-        && cache.selected_sub == state.selected_sub
         && cache.connected_protocol_id == state.connected_protocol_id
         && cache.dirty == 0
         && cache.multi_select.len() == state.multi_select.len()
@@ -539,8 +568,22 @@ fn build_display_rows(
             .expanded
             .iter()
             .zip(rows.iter())
-            .all(|(c, r)| *c == r.expanded)
-    {
+            .all(|(c, r)| *c == r.expanded);
+    if structurally_cached {
+        let selection_changed =
+            cache.selected_index != selected || cache.selected_sub != state.selected_sub;
+        if selection_changed {
+            let previous = cache.selected_index;
+            for index in [previous, selected] {
+                if let Some(row) = cache.rows.get_mut(index)
+                    && index < rows.len()
+                {
+                    restyle_row(row, index, selected, state, palette, rows[index]);
+                }
+            }
+            cache.selected_index = selected;
+            cache.selected_sub = state.selected_sub;
+        }
         return cache.rows.clone();
     }
 
@@ -1477,6 +1520,47 @@ mod tests {
         let heights = vec![1u16, 1, 10, 1, 1];
         let offset = compute_scroll_offset(&heights, 2, 8);
         assert!(offset < heights.len());
+    }
+
+    /// A selection move patches only the two affected rows: the rest of the
+    /// cached list must be identical (same allocation content), and the styles
+    /// must swap.
+    #[tokio::test]
+    async fn selection_move_patches_styles_without_rebuilding_the_list() {
+        use crate::ops::profiles::test_support::test_state;
+        let rows = vec![
+            endpoint_row(1, "a.example", 443),
+            endpoint_row(2, "b.example", 443),
+            endpoint_row(3, "c.example", 443),
+        ];
+        let state = test_state(rows).await;
+        let palette = state.current_palette();
+        let refs: Vec<&xray_tui_db::models::EndpointRow> = state.endpoints.iter().collect();
+
+        let first = build_display_rows(&refs, 0, &state, &palette);
+        assert_eq!(
+            first[0].row_style,
+            ThemeStyles::table_row_selected(&palette)
+        );
+        assert_eq!(first[1].row_style, ThemeStyles::table_row_normal(&palette));
+
+        // Move the selection: row 0 and row 1 restyle, row 2 is untouched.
+        let moved = build_display_rows(&refs, 1, &state, &palette);
+        assert_eq!(moved[0].row_style, ThemeStyles::table_row_normal(&palette));
+        assert_eq!(
+            moved[1].row_style,
+            ThemeStyles::table_row_selected(&palette)
+        );
+        assert_eq!(moved[2].row_style, ThemeStyles::table_row_normal(&palette));
+        assert_eq!(moved.len(), 3);
+
+        // Same selection again: still consistent (cache hit).
+        let again = build_display_rows(&refs, 1, &state, &palette);
+        assert_eq!(
+            again[1].row_style,
+            ThemeStyles::table_row_selected(&palette)
+        );
+        assert_eq!(again[0].row_style, ThemeStyles::table_row_normal(&palette));
     }
 
     /// Minimal `EndpointRow` with just enough to be filtered and described:
