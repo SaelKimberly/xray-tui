@@ -1,7 +1,7 @@
 # ADR 0002 — Write-behind `profile_stats` persistence
 
 Date: 2026-09-11
-Status: accepted — amended 2026-09-14 (the gate left the writer, and the groups narrowed; see the amendment at the end)
+Status: accepted — amended 2026-09-14 (the gate left the writer, and the groups narrowed; amendment 2: the existence probe's predicate; see the amendments at the end)
 Supersedes: the per-write autocommit path for `profile_stats` batch workloads
 Spec: `docs/aegis/specs/2026-09-11-write-behind-link-writer-design.md`
 
@@ -95,3 +95,38 @@ Invariants 3 and 4 changed; the rest stand.
   pins it.
 - `LinkWriter::read`/`overlay_pending`/`db_read_count` were deleted with their
   only caller: nothing reads a link through the writer any more.
+
+## Amendment 2 — 2026-09-14: the existence probe's predicate is load-bearing
+
+`apply_link_patches`' per-chunk existence probe must stay a `VALUES`-CTE join:
+
+```sql
+WITH pairs(p, e) AS (VALUES (1, 2), (3, 4), …)
+SELECT ps.protocol_id, ps.endpoint_id FROM profile_stats ps
+JOIN pairs ON ps.protocol_id = pairs.p AND ps.endpoint_id = pairs.e
+```
+
+The amendment above described "one existence probe per 400-row chunk" without
+its shape, and the first implementation emitted a
+`(protocol_id = .. AND endpoint_id = ..) OR …` chain. That chain is **left-deep**:
+its expression depth grows one level per pair, so SQLite/turso reject it from ~99
+pairs on (`SQLITE_MAX_EXPR_DEPTH` = 100) with `Parse error: Expression tree is
+too large (maximum depth 100)`. `LINK_PATCH_CHUNK_ROWS` is 400 and the flush
+window 512, so **every flush window wider than ~99 rows failed its whole
+transaction**; `LinkWriter::flush` merged the failed chunk back and retried, so a
+Fast-ping batch over three subscriptions persisted *nothing* (no ping result, no
+traffic) and logged the failure every 200 ms until the window shrank. 90 pairs
+still parse, which is why the failure needed a real batch to appear.
+
+Measured on a 20k-link table, 400 pairs per statement (this engine, debug build):
+
+| Predicate | Cost | Note |
+| --- | --- | --- |
+| `OR` chain, 90 pairs × 5 statements | 18 ms | index-driven; unscalable (dies at 99 pairs/statement) |
+| row-value `(p, e) IN ((..), ..)` | 757 ms | parses at any width, but scans — not index-driven |
+| `UNION ALL` of 400 per-pair `SELECT`s | — | overflows turso's parser stack |
+| `VALUES`-CTE join (chosen) | 9 ms | flat at 5,000 pairs, exact pairs only, composite-key index |
+
+Pinned by
+`tests/integration.rs::apply_link_patches_applies_a_window_wider_than_the_expression_depth_limit`
+(a 500-row window: the class guard, whatever the predicate's shape).

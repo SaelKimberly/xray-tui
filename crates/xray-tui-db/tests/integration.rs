@@ -1668,6 +1668,68 @@ async fn apply_link_patches_empty_is_a_noop() {
     assert_eq!(db.apply_link_patches(&[]).await.expect("apply"), 0);
 }
 
+/// A window wider than SQLite's expression-depth limit must still apply.
+///
+/// The writer's window is `DEFAULT_FLUSH_ROWS` (512) and the patch chunk is
+/// 400, so a normal batch window is far wider than the ~99 pairs a
+/// `(protocol_id = .. AND endpoint_id = ..) OR …` predicate can express before
+/// `SQLITE_MAX_EXPR_DEPTH` (100) rejects the statement. When the existence
+/// probe used that chain, every window past ~99 rows failed the whole
+/// transaction and a Fast-ping batch persisted nothing (2026-09-14: "Parse
+/// error: Expression tree is too large (maximum depth 100)" on every flush).
+#[tokio::test]
+async fn apply_link_patches_applies_a_window_wider_than_the_expression_depth_limit() {
+    // Wider than the ~99 pairs the old predicate could express, and wider than
+    // one `LINK_PATCH_CHUNK_ROWS` (400), so it spans two chunks.
+    const ROWS: i64 = 500;
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("conn");
+    for id in 1..=ROWS {
+        seed_endpoint(
+            &mut conn,
+            id,
+            id * 10,
+            "h.example",
+            HostType::Ipv4,
+            443,
+            100,
+        )
+        .await;
+    }
+
+    let mut patches = Vec::new();
+    for id in 1..=ROWS {
+        let mut link = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(id * 10),
+            EndpointId::new(id),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("load")
+        .expect("row");
+        link.latency = Some(Latency::Fast { delay: 7 });
+        patches.push(LinkPatch {
+            link,
+            groups: LinkGroups::RESULT,
+        });
+    }
+
+    assert_eq!(
+        db.apply_link_patches(&patches).await.expect("apply"),
+        patches.len()
+    );
+
+    let persisted: Vec<ProfileStats> = ProfileStats::all().exec(&mut conn).await.expect("links");
+    assert_eq!(persisted.len(), patches.len());
+    assert!(
+        persisted
+            .iter()
+            .all(|l| l.latency == Some(Latency::Fast { delay: 7 })),
+        "every row in the window carries the patched result"
+    );
+}
+
 /// A result patch taken before another writer bumped the row must land, and
 /// must not clobber the scheduler columns that writer changed.
 /// Every group is isolated: a patch writes its own group and leaves the others

@@ -305,7 +305,10 @@ impl Database {
     }
 }
 
-/// Rows per literal statement chunk in [`Database::apply_link_patches`].
+/// Rows per literal statement chunk in [`Database::apply_link_patches`] — a
+/// statement-size bound, not a predicate-depth one: the chunk's existence probe
+/// is a `VALUES`-CTE join that stays flat and index-driven at any width (see
+/// [`existing_link_keys`]), so this number is free to move.
 const LINK_PATCH_CHUNK_ROWS: usize = 400;
 
 /// A SQL TEXT literal: single quotes doubled, so a stored error message can
@@ -335,24 +338,40 @@ fn sql_opt_num(n: Option<i64>) -> String {
 }
 
 /// The `(protocol_id, endpoint_id)` pairs of `patches` that exist as rows.
+///
+/// One statement whose expression depth does NOT grow with the number of pairs.
+/// A `(protocol_id = .. AND endpoint_id = ..) OR …` chain is left-deep and dies
+/// at ~99 pairs with `SQLITE_MAX_EXPR_DEPTH` ("Expression tree is too large
+/// (maximum depth 100)") — every flush window wider than that failed its whole
+/// transaction, so a Fast-ping batch persisted nothing and retried forever
+/// (2026-09-14). The flat alternatives are traps on this engine, measured over
+/// 20k links with 400 pairs: a row-value `(p, e) IN ((..), ..)` list costs
+/// 757 ms (not index-driven), and a `UNION ALL` of per-pair SELECTs overflows
+/// turso's parser stack. This `WITH … (VALUES …) JOIN` costs 9 ms, uses the
+/// composite key index, and matches exact pairs only (an absent pair yields
+/// nothing) — verified to 5,000 pairs.
 async fn existing_link_keys(
     tx: &mut impl Executor,
     patches: &[LinkPatch],
 ) -> Result<std::collections::HashSet<(i64, i64)>> {
     use std::fmt::Write as _;
 
-    let mut sql = String::from("SELECT protocol_id, endpoint_id FROM profile_stats WHERE ");
+    let mut sql = String::from("WITH pairs(p, e) AS (VALUES ");
     for (i, patch) in patches.iter().enumerate() {
         if i > 0 {
-            sql.push_str(" OR ");
+            sql.push(',');
         }
         let _ = write!(
             sql,
-            "(protocol_id = {} AND endpoint_id = {})",
+            "({}, {})",
             patch.link.protocol_id.get(),
             patch.link.endpoint_id.get()
         );
     }
+    sql.push_str(
+        ") SELECT ps.protocol_id, ps.endpoint_id FROM profile_stats ps \
+         JOIN pairs ON ps.protocol_id = pairs.p AND ps.endpoint_id = pairs.e",
+    );
     let rows = toasty::sql::query(sql).exec(tx).await?;
     let mut out = std::collections::HashSet::with_capacity(rows.len());
     for row in &rows {

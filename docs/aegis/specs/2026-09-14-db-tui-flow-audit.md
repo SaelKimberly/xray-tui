@@ -169,8 +169,12 @@ Decisions this changed:
   caller's snapshot and its own staged state, so a transition costs a map lookup. The writer's
   drain now coalesces one patch per link (three column groups → one write), and
   `apply_link_patches` writes each existing row with ONE literal `UPDATE` covering only the
-  patch's groups — no SELECT per row, no bound parameters (turso charges ~0.8 ms each). The
-  existence probe runs once per 400-row chunk. Turso has no `UPDATE ... FROM (VALUES ...)`, so
+  groups — no SELECT per row, no bound parameters (turso charges ~0.8 ms each). The
+  existence probe runs once per 400-row chunk, as one `VALUES`-CTE join on the composite key. Its
+  shape is load-bearing: the first version chained `(protocol_id = .. AND endpoint_id = ..) OR …`,
+  which is left-deep and exceeds `SQLITE_MAX_EXPR_DEPTH` from ~99 pairs, so every flush window
+  wider than that failed its whole transaction and persisted nothing (fixed 2026-09-14; ADR 0002
+  §amendment 2 has the measurements). Turso has no `UPDATE ... FROM (VALUES ...)`, so
   the per-row statements stay per-row.
 - `persist_parsed` builds the batch and writes it in one transaction through the bulk upserts
   (the shape `stream_import` already used), instead of N autocommit upserts on the UI task.
