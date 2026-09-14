@@ -1742,8 +1742,11 @@ async fn apply_link_patches_applies_a_window_wider_than_the_expression_depth_lim
 /// predicate-dependent: the probe's set is built from the ROWS the statement
 /// returned, so an over-fetching predicate (a cross-product superset) still
 /// yields an exact verdict — it only costs more (measured: 40 ms vs 8 ms per
-/// 400 pairs). What this test pins is the verdict split at batch scale, which no
-/// other test crosses the 99-pair mark to reach.
+/// 400 pairs). The two directions this test can actually catch are therefore the
+/// INSERT path at batch scale, and UNDER-fetch (a predicate that reports an
+/// existing pair as absent): the seeded rows carry a distinct `last_seen_at`,
+/// which the group-narrow `UPDATE` leaves alone but the whole-snapshot upsert
+/// the absent path uses would reset.
 #[tokio::test]
 async fn apply_link_patches_probe_is_exact_for_absent_and_near_miss_pairs() {
     const EXISTING: i64 = 120;
@@ -1758,7 +1761,7 @@ async fn apply_link_patches_probe_is_exact_for_absent_and_near_miss_pairs() {
             "h.example",
             HostType::Ipv4,
             443,
-            100,
+            100 + id,
         )
         .await;
     }
@@ -1796,29 +1799,39 @@ async fn apply_link_patches_probe_is_exact_for_absent_and_near_miss_pairs() {
         patches.len(),
         "the absent pairs were inserted, not skipped as already-present"
     );
-    let by_key: std::collections::HashMap<(i64, i64), Option<Latency>> = persisted
+    let by_key: std::collections::HashMap<(i64, i64), (Option<Latency>, i64)> = persisted
         .iter()
         .map(|l| {
             (
                 (l.protocol_id.get(), l.endpoint_id.get()),
-                l.latency.clone(),
+                (l.latency.clone(), l.last_seen_at),
             )
         })
         .collect();
     for k in 0..ABSENT {
         let key = ((k + 1) * 10, k + 2);
         assert_eq!(
-            by_key.get(&key),
-            Some(&Some(Latency::Fast { delay: 9 })),
+            by_key.get(&key).map(|(latency, _)| latency.clone()),
+            Some(Some(Latency::Fast { delay: 9 })),
             "the absent pair {key:?} was inserted with its patched result"
         );
     }
     for id in 1..=EXISTING {
+        let key = (id * 10, id);
+        let (latency, last_seen_at) = by_key.get(&key).expect("row");
         assert_eq!(
-            by_key.get(&(id * 10, id)),
-            Some(&Some(Latency::Fast { delay: 7 })),
-            "the existing pair ({}, {id}) took the patched result",
-            id * 10
+            latency,
+            &Some(Latency::Fast { delay: 7 }),
+            "the existing pair {key:?} took the patched result"
+        );
+        // The probe reported this pair as EXISTING, so the write was the
+        // group-narrow `UPDATE`: `last_seen_at` (owned by another writer) must
+        // keep its persisted value. An under-fetching probe would route the row
+        // through the whole-snapshot upsert instead and silently reset it.
+        assert_eq!(
+            *last_seen_at,
+            100 + id,
+            "the existing pair {key:?} kept its unpatched columns"
         );
     }
 }
