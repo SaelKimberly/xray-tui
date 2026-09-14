@@ -1516,6 +1516,65 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     );
 }
 
+/// A file carrying a different schema tag is DISCARDED, not migrated
+/// (decision 4) — the path a pre-alpha upgrade takes whenever a table is
+/// added or a column changes. Pinned here because it is destructive and
+/// load-bearing: the row seeded under the old tag must be gone afterwards.
+#[tokio::test]
+async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("stale.db");
+
+    {
+        let db = Database::open(&path).await.expect("fresh open");
+        let mut conn = db.connection().await.expect("connection");
+        toasty::create!(Endpoint {
+            id: EndpointId::new(7),
+            host: "seeded.example".to_string(),
+            host_type: HostType::Ipv4,
+            port: 443,
+            ports: Vec::<u16>::new(),
+            resolved_as: Vec::<String>::new(),
+        })
+        .exec(&mut conn)
+        .await
+        .expect("seed");
+        // Pretend the file was written by the previous schema generation.
+        toasty::sql::query("PRAGMA user_version = 7")
+            .exec(&mut conn)
+            .await
+            .expect("tag");
+    }
+
+    let db = Database::open(&path).await.expect("reopen");
+    let mut conn = db.connection().await.expect("connection");
+    let rows = toasty::sql::query("PRAGMA user_version")
+        .exec(&mut conn)
+        .await
+        .expect("version");
+    assert_eq!(
+        first_i64(&rows),
+        Some(8),
+        "the file is rebuilt at the new tag"
+    );
+    let rows = toasty::sql::query(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'endpoint_rank'",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("count");
+    assert_eq!(first_i64(&rows), Some(1), "the new table exists");
+    assert!(
+        Endpoint::filter_by_id(EndpointId::new(7))
+            .first()
+            .exec(&mut conn)
+            .await
+            .expect("read")
+            .is_none(),
+        "the old generation's rows are gone: the tag is a wipe, not a migration"
+    );
+}
+
 #[tokio::test]
 async fn in_memory_db_has_full_schema_and_roundtrips() {
     let db = Database::in_memory().await.expect("in-memory db");
