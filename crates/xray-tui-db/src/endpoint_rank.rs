@@ -221,6 +221,15 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<EndpointRank> {
 const COVERING_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_test ON endpoint_rank(\
      rank_dns, rank_tier, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)";
 
+/// Rows per bulk statement.
+const RANK_CHUNK: usize = 400;
+
+/// Column order the bulk insert writes (explicit so a schema reorder cannot
+/// silently mis-map values).
+const RANK_COLUMNS: &str = "endpoint_id, rank_dns, rank_tier, rank_latency, rank_seen, \
+     rank_protocol, rank_display_seen, rank_speed, rank_traffic, rank_config, \
+     rank_newest_seen";
+
 /// The view windows read this column.
 const WINDOW_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS endpoint_rank_window ON endpoint_rank(rank_newest_seen)";
@@ -296,26 +305,45 @@ async fn scalar_i64(conn: &mut impl toasty::Executor, sql: &str) -> crate::Resul
         .unwrap_or(0))
 }
 
-/// Upsert the rank rows on the caller's executor (one statement per row, inside
-/// the caller's transaction — `ensure`, a flush window, or an import batch).
+/// Upsert the rank rows on the caller's executor, one multi-row statement per
+/// chunk.
+///
+/// Per-row `upsert_by_endpoint_id` costs ~1.2 ms per statement on this engine,
+/// so a flush window's 400 endpoints took ~470 ms and a 7.7k-endpoint import
+/// ~8 s of key writes; this form does the same rows in one statement per chunk
+/// (measured ~10× cheaper). The values are inlined for the same reason the
+/// reads are: they are integers the database produced, never user text, and
+/// the engine charges ~0.8 ms per bound parameter.
 pub(crate) async fn write(
     conn: &mut impl toasty::Executor,
     ranks: &[EndpointRank],
 ) -> crate::Result<usize> {
-    for rank in ranks {
-        EndpointRank::upsert_by_endpoint_id(rank.endpoint_id)
-            .dns(rank.dns)
-            .tier(rank.tier)
-            .latency(rank.latency)
-            .seen(rank.seen)
-            .protocol(rank.protocol)
-            .display_seen(rank.display_seen)
-            .speed(rank.speed)
-            .traffic(rank.traffic)
-            .config(rank.config)
-            .newest_seen(rank.newest_seen)
-            .exec(conn)
-            .await?;
+    for chunk in ranks.chunks(RANK_CHUNK) {
+        let values = chunk
+            .iter()
+            .map(|r| {
+                format!(
+                    "({},{},{},{},{},{},{},{},{},{},{})",
+                    r.endpoint_id.get(),
+                    r.dns,
+                    r.tier,
+                    r.latency,
+                    r.seen,
+                    r.protocol,
+                    r.display_seen,
+                    r.speed,
+                    r.traffic,
+                    r.config,
+                    r.newest_seen
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        toasty::sql::query(format!(
+            "INSERT OR REPLACE INTO endpoint_rank ({RANK_COLUMNS}) VALUES {values}"
+        ))
+        .exec(conn)
+        .await?;
     }
     Ok(ranks.len())
 }

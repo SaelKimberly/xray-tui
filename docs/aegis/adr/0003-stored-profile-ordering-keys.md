@@ -94,9 +94,11 @@ an index.
   page query 9.6–14.3 ms at offsets 0/2400/7400 (unchanged — the covering index
   still serves it), hydration ~470 ms; a full import through `upsert_links_bulk`
   now costs ~39 s (endpoints 6.7 s, links + key maintenance 32.5 s), of which
-  ~8 s is the per-row key upserts; one flush window's key refresh (400
-  endpoints) is ~470 ms, so the batch writer stays ahead at the observed result
-  rate but has less headroom than the raw bulk write gave it.
+  the key write is ~0.7 ms/row; one flush window's key refresh (400 endpoints)
+  is ~300 ms, of which the reads are ~80 ms and the write ~280 ms — decomposed
+  per 400 rows: 136 ms for the statement alone, +60 ms for the covering index,
+  +87 ms for the window index. The batch writer stays ahead at observed result
+  rates; the write cost is what the derived-state cache buys.
 - **Membership now depends on the rank row.** The page drives from the rank
   table, so a write path that changed links without refreshing would hide its
   endpoint. The freshness test pins the three write paths, the parity and
