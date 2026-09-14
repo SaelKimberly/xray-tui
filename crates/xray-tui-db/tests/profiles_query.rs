@@ -501,9 +501,9 @@ fn dns_unresolved(row: &xray_tui_db::models::EndpointRow) -> bool {
 /// Not `EndpointRow::active_link()`: that falls back to `links[selected_protocol]`
 /// — the untested link when nothing is measured — while the ordering rule is
 /// "no measured link, no value" (the SQL's `COALESCE(..., sentinel)`).
-fn display_link<'a>(
-    row: &'a xray_tui_db::models::EndpointRow,
-) -> Option<&'a xray_tui_db::models::ProfileStats> {
+fn display_link(
+    row: &xray_tui_db::models::EndpointRow,
+) -> Option<&xray_tui_db::models::ProfileStats> {
     if let Some(pid) = row.endpoint.manual_protocol_override
         && let Some(link) = row.links.iter().find(|l| l.protocol_id == pid)
     {
@@ -522,7 +522,7 @@ fn display_link<'a>(
         })
 }
 
-fn config_type_rank(link: &xray_tui_db::models::ProfileStats) -> i32 {
+const fn config_type_rank(link: &xray_tui_db::models::ProfileStats) -> i32 {
     match link.config_type {
         ConfigType::Form => 0,
         ConfigType::ShareUrl => 1,
@@ -589,25 +589,22 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
 
     for sort in ALL_SORTS {
         for ascending in [true, false] {
-            let mut expected: Vec<i64> = match sort {
-                // Address compares host text, which the i64 key above cannot
-                // carry; sort by the column itself.
-                PageSort::Address => {
-                    let mut v: Vec<(String, i64)> = rows
-                        .iter()
-                        .map(|r| (r.endpoint.host.clone(), r.endpoint.id.get()))
-                        .collect();
-                    v.sort();
-                    v.into_iter().map(|(_, id)| id).collect()
-                }
-                _ => {
-                    let mut v: Vec<((i64, i64, i64, i64), i64)> = rows
-                        .iter()
-                        .map(|r| (oracle_key(r, sort), r.endpoint.id.get()))
-                        .collect();
-                    v.sort();
-                    v.into_iter().map(|(_, id)| id).collect()
-                }
+            // Address compares host text, which the numeric key cannot carry;
+            // every other sort uses the oracle tuple.
+            let mut expected: Vec<i64> = if sort == PageSort::Address {
+                let mut v: Vec<(String, i64)> = rows
+                    .iter()
+                    .map(|r| (r.endpoint.host.clone(), r.endpoint.id.get()))
+                    .collect();
+                v.sort_unstable();
+                v.into_iter().map(|(_, id)| id).collect()
+            } else {
+                let mut v: Vec<((i64, i64, i64, i64), i64)> = rows
+                    .iter()
+                    .map(|r| (oracle_key(r, sort), r.endpoint.id.get()))
+                    .collect();
+                v.sort_unstable();
+                v.into_iter().map(|(_, id)| id).collect()
             };
             if !ascending {
                 expected.reverse();
