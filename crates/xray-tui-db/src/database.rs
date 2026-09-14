@@ -549,6 +549,36 @@ impl Database {
         Ok(settings.into_iter().next())
     }
 
+    /// Assemble the page's rows in the page's order.
+    ///
+    /// The typed read supplies the models; the ordering comes from the page
+    /// query ([`crate::profiles_query::Database::profiles_page`]) for the rows
+    /// and from [`Self::profile_link_order`] for each row's links, so the
+    /// decision-16 order has one source (the SQL expression) rather than being
+    /// re-derived here.
+    pub async fn load_page_rows(&self, ids: &[EndpointId]) -> Result<Vec<EndpointRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn().await?;
+        let endpoints: Vec<Endpoint> =
+            Endpoint::filter(toasty::stmt::in_list(Endpoint::fields().id(), ids.to_vec()))
+                .exec(&mut conn)
+                .await?;
+        let mut rows = self.load_endpoint_rows(endpoints, &mut conn).await?;
+        drop(conn);
+
+        let order = self.profile_link_order(ids).await?;
+        for row in &mut rows {
+            crate::profiles_query::order_links(&mut row.links, order.get(&row.endpoint.id));
+        }
+
+        // Page order, not id order: the caller's sequence IS the display order.
+        let mut by_id: HashMap<EndpointId, EndpointRow> =
+            rows.into_iter().map(|row| (row.endpoint.id, row)).collect();
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
     /// Assemble [`EndpointRow`]s for a small endpoint set (the single-endpoint
     /// lookups [`Self::get_endpoint`] / [`Self::get_endpoint_by_protocol_id`]
     /// — the tab loads go through [`Self::load_tab_rows`] instead).

@@ -456,3 +456,29 @@ async fn every_statement_runs_against_a_pushed_schema() {
         db.profiles_page(&req).await.expect("view page");
     }
 }
+
+/// The page's rows come back in the page's order, with each row's links in the
+/// decision-16 link order the panel renders.
+#[tokio::test]
+async fn load_page_rows_preserves_page_and_link_order() {
+    let db = seed_fixture().await;
+    let req = request(PageSort::Test, true, 0, 2);
+    let page = db.profiles_page(&req).await.expect("page");
+    assert_eq!(page.ids.len(), 2);
+
+    let rows = db.load_page_rows(&page.ids).await.expect("rows");
+    let row_ids: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect();
+    let page_ids: Vec<i64> = page.ids.iter().map(|id| id.get()).collect();
+    assert_eq!(row_ids, page_ids, "page order, not id order");
+
+    let order = db.profile_link_order(&page.ids).await.expect("link order");
+    for row in &rows {
+        let expected = order.get(&row.endpoint.id).expect("endpoint present");
+        let got: Vec<i64> = row.links.iter().map(|l| l.protocol_id.get()).collect();
+        let expected: Vec<i64> = expected.iter().map(|p| p.get()).collect();
+        assert_eq!(got, expected, "links in decision-16 order");
+    }
+
+    // Empty page: no query, no rows.
+    assert!(db.load_page_rows(&[]).await.expect("empty").is_empty());
+}
