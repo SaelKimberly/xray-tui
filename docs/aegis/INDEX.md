@@ -12,3 +12,4 @@
 | 2026-09-14 | spec | `specs/2026-09-14-profiles-stored-sort-key-design.md` | Profiles sort keys: materialize the per-endpoint ordering | implemented |
 | 2026-09-14 | adr | `adr/0003-stored-profile-ordering-keys.md` | Materialized per-endpoint ordering keys | accepted |
 | 2026-09-14 | spec | `specs/2026-09-14-db-tui-flow-audit.md` | DB ↔ TUI flow audit (queries, entities, indexes, memory) | research complete; plan in §6 |
+| 2026-09-14 | spec | `specs/2026-09-14-native-ping-pipeline-design.md` | Native ping pipeline: real ping on the in-process core | design (awaiting user review) |
