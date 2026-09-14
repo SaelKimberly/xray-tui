@@ -52,9 +52,15 @@ pub struct AppState {
     /// Currently selected theme name from config or UI selection.
     pub theme_name: ratatui_themes::ThemeName,
     pub current_tab: Tab,
+    /// The loaded Profiles page: the window the tab renders and indexes.
+    /// `selected_index` indexes this vector, never the whole feed.
     pub endpoints: Vec<EndpointRow>,
-    /// Cached filtered/sorted profile indices for performance.
-    pub cached_filtered_indices: RefCell<Vec<usize>>,
+    /// Filtered total across all pages (footer count).
+    pub page_total: u64,
+    /// Offset of the loaded page in the ordered view.
+    pub page_offset: usize,
+    /// Set when the Profiles page needs a refetch (search, sort, view, or a
+    /// mutation landed); the event loop refetches before rendering.
     pub filter_cache_valid: Cell<bool>,
     /// Generation counter bumped on every profile mutation.
     /// Used to skip redundant reloads.
@@ -441,8 +447,9 @@ impl AppState {
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),
             endpoints: Vec::new(),
-            cached_filtered_indices: RefCell::new(Vec::new()),
             filter_cache_valid: Cell::new(true),
+            page_total: 0,
+            page_offset: 0,
             endpoints_gen: 0,
             reload_gen: 0,
             groups: Vec::new(),
@@ -606,6 +613,24 @@ impl AppState {
     }
     pub async fn reload_routing_rules(&mut self) {
         profiles::reload_routing_rules(self).await;
+    }
+
+    /// Set the Profiles sort column. The page restarts from the top: an offset
+    /// taken in the previous order is meaningless in the new one, and the
+    /// ordering itself is applied by the query, not in memory.
+    pub fn set_sort(&mut self, column: SortColumn) {
+        self.sort_column = column;
+        self.sort_ascending = true;
+        self.page_offset = 0;
+        self.selected_index = 0;
+        self.selected_sub = None;
+        self.filter_cache_valid.set(false);
+    }
+
+    /// The filtered total across all pages (the page holds one window of it).
+    #[must_use]
+    pub const fn profiles_total(&self) -> u64 {
+        self.page_total
     }
 
     pub fn filtered_profiles(&self) -> impl Iterator<Item = &EndpointRow> {

@@ -359,11 +359,15 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 let tx = state.core_event_tx.clone();
                 tokio::spawn(async move {
                     match crate::ops::profiles::load_profiles_rows(&db, &load).await {
-                        Ok(rows) => {
+                        Ok((rows, meta)) => {
                             if let Some(t) = &tx {
                                 crate::try_send_or_warn(
                                     t,
-                                    CoreEvent::ProfilesRowsReady { generation, rows },
+                                    CoreEvent::ProfilesRowsReady {
+                                        generation,
+                                        rows,
+                                        meta,
+                                    },
                                     "profiles_ready",
                                 );
                             }
@@ -378,9 +382,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 });
                 state.reload_groups().await;
             }
-            CoreEvent::ProfilesRowsReady { generation, rows } => {
+            CoreEvent::ProfilesRowsReady {
+                generation,
+                rows,
+                meta,
+            } => {
                 if generation == state.reload_gen {
-                    crate::ops::profiles::apply_profiles_rows(state, rows);
+                    crate::ops::profiles::apply_profiles_rows(state, rows, meta);
                 }
                 // A newer reload superseded this one — drop the stale rows.
             }
@@ -1057,6 +1065,14 @@ mod tests {
         };
     }
 
+    fn empty_page_meta() -> xray_tui_db::profiles_query::PageMeta {
+        xray_tui_db::profiles_query::PageMeta {
+            ids: Vec::new(),
+            total: 0,
+            offset: 0,
+        }
+    }
+
     async fn event_state() -> (AppState, tokio::sync::mpsc::Sender<CoreEvent>) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
@@ -1445,6 +1461,7 @@ mod tests {
         tx.send(CoreEvent::ProfilesRowsReady {
             generation: 4,
             rows: vec![row.clone()],
+            meta: empty_page_meta(),
         })
         .await
         .unwrap();
@@ -1455,6 +1472,7 @@ mod tests {
         tx.send(CoreEvent::ProfilesRowsReady {
             generation: 5,
             rows: vec![row],
+            meta: empty_page_meta(),
         })
         .await
         .unwrap();

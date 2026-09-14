@@ -14,6 +14,7 @@ use crate::{common_field_defaults, get_field, profile_to_fields};
 use xray_tui_db::Database;
 use xray_tui_db::DatabaseError;
 use xray_tui_db::models::{EndpointRow, ProfileStats, PurgatoryView};
+use xray_tui_db::profiles_query::{PageMeta, PageRequest, PageSort};
 use xray_tui_proto::proto_spec::{CoreType as ProtoCoreType, ParsedProto, ProtocolKind};
 
 /// Unix-seconds now, as a `Timestamp` (the typed staleness clock).
@@ -63,6 +64,14 @@ pub(crate) struct ProfilesLoad {
     pub purgatory_ttl_secs: i64,
     pub purgatory_retention_secs: i64,
     pub error_ttl_hours: Option<i64>,
+    pub search: Option<String>,
+    pub sort: PageSort,
+    pub ascending: bool,
+    pub offset: usize,
+    pub limit: usize,
+    /// Group filter; the Profiles tab has no group selector today (the
+    /// subscription views use `group_id` through the query directly).
+    pub group_id: Option<String>,
 }
 
 impl From<&AppState> for ProfilesLoad {
@@ -72,6 +81,12 @@ impl From<&AppState> for ProfilesLoad {
             purgatory_ttl_secs: s.purgatory_ttl_secs,
             purgatory_retention_secs: s.purgatory_retention_secs,
             error_ttl_hours: s.config.speed_test.error_ttl_hours,
+            search: (!s.search_query.is_empty()).then(|| s.search_query.clone()),
+            sort: page_sort(s.sort_column),
+            ascending: s.sort_ascending,
+            offset: s.page_offset,
+            limit: PROFILES_PAGE_SIZE,
+            group_id: None,
         }
     }
 }
@@ -83,7 +98,7 @@ impl From<&AppState> for ProfilesLoad {
 pub(crate) async fn load_profiles_rows(
     db: &Database,
     load: &ProfilesLoad,
-) -> Result<Vec<EndpointRow>, DatabaseError> {
+) -> Result<(Vec<EndpointRow>, PageMeta), DatabaseError> {
     let now = now_ts();
     // Error-TTL sweep (design §6.4): clear failure markers older than the
     // configured TTL before rows are (re)loaded, so a swept error never
@@ -93,28 +108,41 @@ pub(crate) async fn load_profiles_rows(
         now.checked_sub(jiff::Span::new().seconds(ttl_secs))
             .unwrap_or(now)
     };
-    match load.view {
-        PurgatoryView::Active => {
-            db.get_active_endpoints(threshold(load.purgatory_ttl_secs))
-                .await
-        }
-        PurgatoryView::Stale => {
-            let active = threshold(load.purgatory_ttl_secs);
-            let stale = threshold(load.purgatory_retention_secs);
-            db.get_stale_endpoints(active, stale).await
-        }
-        PurgatoryView::All => {
-            db.get_active_endpoints(Timestamp::from_second(0).unwrap_or(now))
-                .await
-        }
-    }
+    let (active_threshold, stale_threshold) = match load.view {
+        PurgatoryView::Active => (now, now),
+        PurgatoryView::Stale => (
+            threshold(load.purgatory_ttl_secs),
+            threshold(load.purgatory_retention_secs),
+        ),
+        // `All`: everything is "active" as of the epoch.
+        PurgatoryView::All => (
+            Timestamp::from_second(0).unwrap_or(now),
+            Timestamp::from_second(0).unwrap_or(now),
+        ),
+    };
+    let req = PageRequest {
+        view: load.view,
+        active_threshold,
+        stale_threshold,
+        search: load.search.clone(),
+        group_id: load.group_id.clone(),
+        sort: load.sort,
+        ascending: load.ascending,
+        offset: load.offset,
+        limit: load.limit,
+    };
+    let meta = db.profiles_page(&req).await?;
+    let rows = db.load_page_rows(&meta.ids).await?;
+    Ok((rows, meta))
 }
 
 /// The UI half of a profile reload: swap in fresh rows, invalidate filters,
 /// re-clamp the selection, and seed background enrichment for rows that lack
 /// cached `endpoint_info`.
-pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>) {
+pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>, meta: PageMeta) {
     state.endpoints = rows;
+    state.page_total = meta.total;
+    state.page_offset = meta.offset;
     state.filter_cache_valid.set(false);
     clamp_selection(state);
     // Enrich new endpoints in the background (IP hosts + persisted DNS cache;
@@ -136,7 +164,7 @@ pub async fn reload_profiles(state: &mut AppState) {
     }
     let load = ProfilesLoad::from(&*state);
     match load_profiles_rows(&state.db, &load).await {
-        Ok(rows) => apply_profiles_rows(state, rows),
+        Ok((rows, meta)) => apply_profiles_rows(state, rows, meta),
         Err(e) => {
             state.log_trace(
                 "error",
@@ -192,80 +220,33 @@ pub async fn reload_routing_rules(state: &mut AppState) {
     state.routing_rules = state.db.get_all_routing_rules().await.unwrap_or_default();
 }
 
+/// The loaded page, in display order. The page IS the filtered list: the query
+/// applied the view, search, group, and sort, and `selected_index` indexes this
+/// window.
 pub fn filtered_profiles(state: &AppState) -> impl Iterator<Item = &EndpointRow> {
-    if !state.filter_cache_valid.get() {
-        let indices = compute_filtered_indices(state);
-        *state.cached_filtered_indices.borrow_mut() = indices;
-        state.filter_cache_valid.set(true);
-    }
-    let indices: Vec<usize> = state.cached_filtered_indices.borrow().clone();
-    indices.into_iter().map(move |i| &state.endpoints[i])
+    state.endpoints.iter()
 }
 
+/// Length of the indexed space (the page), used by selection clamping and
+/// navigation. The feed-wide count is [`AppState::profiles_total`].
 pub fn filtered_len(state: &AppState) -> usize {
-    if !state.filter_cache_valid.get() {
-        let indices = compute_filtered_indices(state);
-        *state.cached_filtered_indices.borrow_mut() = indices;
-        state.filter_cache_valid.set(true);
-    }
-    state.cached_filtered_indices.borrow().len()
+    state.endpoints.len()
 }
 
-fn compute_filtered_indices(state: &AppState) -> Vec<usize> {
-    let mut indices: Vec<usize> = state
-        .endpoints
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            if !state.search_query.is_empty() {
-                let q = state.search_query.to_lowercase();
-                let address = row.endpoint.host.to_lowercase();
-                let port = row.endpoint.port.to_string();
-                if !address.contains(&q) && !port.contains(&q) {
-                    return false;
-                }
-            }
-            true
-        })
-        .map(|(i, _)| i)
-        .collect();
+/// The page size.
+pub(crate) const PROFILES_PAGE_SIZE: usize = 200;
 
-    let asc = state.sort_ascending;
-    indices.sort_by(|&a, &b| {
-        let a_row = &state.endpoints[a];
-        let b_row = &state.endpoints[b];
-        let cmp = match state.sort_column {
-            SortColumn::ConfigType => config_type_rank(a_row).cmp(&config_type_rank(b_row)),
-            SortColumn::LastSeen => a_row
-                .active_link()
-                .map(|l| l.last_seen_at)
-                .cmp(&b_row.active_link().map(|l| l.last_seen_at)),
-            SortColumn::Address => a_row.endpoint.host.cmp(&b_row.endpoint.host),
-            SortColumn::Port => a_row.endpoint.port.cmp(&b_row.endpoint.port),
-            SortColumn::Test => {
-                let ka = a_row.best_test_priority_key(endpoint_dns_unresolved(state, a_row));
-                let kb = b_row.best_test_priority_key(endpoint_dns_unresolved(state, b_row));
-                ka.cmp(&kb)
-            }
-            SortColumn::Speed => {
-                let sa = a_row.active_link().and_then(|l| l.speed_bps).unwrap_or(-1);
-                let sb = b_row.active_link().and_then(|l| l.speed_bps).unwrap_or(-1);
-                sa.cmp(&sb)
-            }
-            SortColumn::Traffic => {
-                let traffic = |row: &EndpointRow| {
-                    row.active_link()
-                        .map_or(0, |l| l.traffic.total_down + l.traffic.total_up)
-                };
-                traffic(a_row).cmp(&traffic(b_row))
-            }
-            SortColumn::Core => resolved_core(state, a_row)
-                .as_str()
-                .cmp(resolved_core(state, b_row).as_str()),
-        };
-        if asc { cmp } else { cmp.reverse() }
-    });
-    indices
+/// Map the UI sort column onto the query's sort enum.
+pub(crate) const fn page_sort(column: SortColumn) -> PageSort {
+    match column {
+        SortColumn::ConfigType => PageSort::ConfigType,
+        SortColumn::Address => PageSort::Address,
+        SortColumn::Port => PageSort::Port,
+        SortColumn::Test => PageSort::Test,
+        SortColumn::Speed => PageSort::Speed,
+        SortColumn::Traffic => PageSort::Traffic,
+        SortColumn::LastSeen => PageSort::LastSeen,
+    }
 }
 
 /// Sort rank for the config-type column: Form before `ShareUrl` (hand-made
@@ -1587,120 +1568,39 @@ mod clamp_tests {
 
 #[cfg(test)]
 mod sort_tests {
-    use super::test_support::fake_row;
     use super::*;
-    use crate::AppState;
-    use std::sync::Arc;
-    use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
 
-    fn set_delay(row: &mut EndpointRow, proto_id: i64, delay: i32, real: bool) {
-        let link = row
-            .links
-            .iter_mut()
-            .find(|l| l.protocol_id.get() == proto_id)
-            .expect("link exists");
-        link.latency = if real {
-            Some(Latency::Real { delay, ip: None })
-        } else {
-            Some(Latency::Fast { delay })
-        };
+    /// The tab no longer sorts in memory: it asks the query for the order. What
+    /// the UI owns is the mapping from its column enum to the query's sort enum,
+    /// and the order parity is pinned against the Rust oracle in the db crate
+    /// (`profiles_query::tests`).
+    #[test]
+    fn sort_columns_map_onto_the_query_sorts() {
+        assert_eq!(page_sort(SortColumn::Test), PageSort::Test);
+        assert_eq!(page_sort(SortColumn::Address), PageSort::Address);
+        assert_eq!(page_sort(SortColumn::Port), PageSort::Port);
+        assert_eq!(page_sort(SortColumn::LastSeen), PageSort::LastSeen);
+        assert_eq!(page_sort(SortColumn::Speed), PageSort::Speed);
+        assert_eq!(page_sort(SortColumn::Traffic), PageSort::Traffic);
+        assert_eq!(page_sort(SortColumn::ConfigType), PageSort::ConfigType);
     }
 
-    fn set_error(row: &mut EndpointRow, proto_id: i64, kind: ProfileErr) {
-        let link = row
-            .links
-            .iter_mut()
-            .find(|l| l.protocol_id.get() == proto_id)
-            .expect("link exists");
-        link.error = Some(ErrorInfo {
-            kind,
-            text: "boom".into(),
-        });
-    }
-
+    /// Changing the sort restarts from the first page: a page offset from the
+    /// old order is meaningless in the new one.
     #[tokio::test]
-    async fn test_sort_ranks_by_best_protocol_tier() {
+    async fn sort_change_resets_the_page_offset() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(
+        let db = std::sync::Arc::new(
             xray_tui_db::Database::open(dir.path().join("t.db"))
                 .await
                 .unwrap(),
         );
-        let mut state = AppState::new(db, AppConfig::default()).await;
-        // E1: real-ok 300ms; E2: fast-ok 100ms; E3: untested.
-        let mut e1 = fake_row(1, "e1.example", 1);
-        set_delay(&mut e1, 100, 300, true);
-        let mut e2 = fake_row(2, "e2.example", 1);
-        set_delay(&mut e2, 200, 100, false);
-        let e3 = fake_row(3, "e3.example", 1);
-        state.endpoints = vec![e1, e2, e3];
-        state.sort_column = SortColumn::Test;
-        state.sort_ascending = true;
-        state.filter_cache_valid.set(false);
-
-        let order: Vec<i64> = state
-            .filtered_profiles()
-            .map(|r| r.endpoint.id.get())
-            .collect();
-        assert_eq!(order, vec![1, 2, 3]); // real beats fast beats untested
-    }
-
-    #[tokio::test]
-    async fn test_sort_sinks_failures_and_dns() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(
-            xray_tui_db::Database::open(dir.path().join("t.db"))
-                .await
-                .unwrap(),
-        );
-        let mut state = AppState::new(db, AppConfig::default()).await;
-        // E1 untested; E2 fast-ok but real-failed; E3 dns-unresolved.
-        let e1 = fake_row(1, "e1.example", 1);
-        let mut e2 = fake_row(2, "e2.example", 1);
-        set_delay(&mut e2, 200, 100, false);
-        set_error(&mut e2, 200, ProfileErr::Real);
-        let mut e3 = fake_row(3, "dns.example", 1);
-        e3.endpoint.host_type = xray_tui_db::models::HostType::Dns;
-        state.endpoints = vec![e1, e2, e3];
-        state.sort_column = SortColumn::Test;
-        state.sort_ascending = true;
-        state.filter_cache_valid.set(false);
-
-        let order: Vec<i64> = state
-            .filtered_profiles()
-            .map(|r| r.endpoint.id.get())
-            .collect();
-        assert_eq!(order, vec![1, 2, 3]); // untested above real-failure above dns
-    }
-
-    #[tokio::test]
-    async fn test_sort_traffic_uses_active_link() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(
-            xray_tui_db::Database::open(dir.path().join("t.db"))
-                .await
-                .unwrap(),
-        );
-        let mut state = AppState::new(db, AppConfig::default()).await;
-        let mut e1 = fake_row(1, "e1.example", 1);
-        e1.links[0].traffic = xray_tui_db::models::TrafficStats {
-            today_up: 0,
-            today_down: 0,
-            total_up: 100,
-            total_down: 200,
-        };
-        let e2 = fake_row(2, "e2.example", 1); // zero traffic
-        state.endpoints = vec![e1, e2];
-        state.sort_column = SortColumn::Traffic;
-        state.sort_ascending = true;
-        state.filter_cache_valid.set(false);
-
-        let order: Vec<i64> = state
-            .filtered_profiles()
-            .map(|r| r.endpoint.id.get())
-            .collect();
-        assert_eq!(order, vec![2, 1]); // 0 before 300
+        let mut state = AppState::new(db, xray_tui_config::AppConfig::default()).await;
+        state.page_offset = 400;
+        state.selected_index = 3;
+        state.set_sort(SortColumn::Test);
+        assert_eq!(state.page_offset, 0, "offset reset");
+        assert_eq!(state.selected_index, 0, "selection returns to the top");
     }
 }
 

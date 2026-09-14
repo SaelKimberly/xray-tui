@@ -700,7 +700,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 SortColumn::Speed,
                 SortColumn::Traffic,
                 SortColumn::ConfigType,
-                SortColumn::Core,
                 SortColumn::LastSeen,
             ];
             let current_idx = all
@@ -708,18 +707,9 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 .position(|c| *c == state.sort_column)
                 .unwrap_or(0);
             let next_idx = (current_idx + 1) % all.len();
-            state.sort_column = all[next_idx];
-            state.sort_ascending = true;
-            state.filter_cache_valid.set(false);
-            // Restore selection by profile ID
-            if let Some(pid) = selected_id {
-                let pos = state
-                    .filtered_profiles()
-                    .position(|r| r.endpoint.id.get() == pid);
-                if let Some(pos) = pos {
-                    state.selected_index = pos;
-                }
-            }
+            let _ = selected_id;
+            // The query owns the order, so the page restarts at the top.
+            state.set_sort(all[next_idx]);
         }
         // CRUD shortcuts (profiles tab)
         KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {

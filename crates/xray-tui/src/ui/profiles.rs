@@ -847,7 +847,7 @@ fn render_data_grid(
         SortColumn::ConfigType => Some(9),
         SortColumn::Address | SortColumn::Port => Some(5),
         SortColumn::Test => Some(11),
-        SortColumn::LastSeen | SortColumn::Speed | SortColumn::Traffic | SortColumn::Core => None,
+        SortColumn::LastSeen | SortColumn::Speed | SortColumn::Traffic => None,
     };
     let sort_direction = if state.sort_ascending {
         SortDirection::Ascending
@@ -1592,11 +1592,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn footer_row_resolves_filtered_row_not_endpoints() {
-        // `selected_index` indexes the FILTERED list. With a search filter
-        // active, the footer must describe the filtered row — NOT
-        // `endpoints[selected_index]`, which would show a different server
-        // than the highlighted row (and wrongly report "none selected").
+    async fn footer_row_resolves_within_the_loaded_page() {
+        // `selected_index` indexes the PAGE (the query applied the filter), so
+        // the footer must describe that row — never `endpoints[selected_index]`
+        // resolved against a different list, which would name another server.
         let dir = tempfile::tempdir().unwrap();
         let db = std::sync::Arc::new(
             xray_tui_db::Database::open(dir.path().join("t.db"))
@@ -1609,20 +1608,11 @@ mod tests {
             endpoint_row(2, "beta.example", 8443),
             endpoint_row(3, "gamma.example", 443),
         ];
-        state.search_query = "beta".to_string();
-        state.filter_cache_valid.set(false);
-        state.selected_index = 0;
-
-        // Only "beta.example" survives the filter, so filtered index 0 is the
-        // row at endpoints[1]; the old code showed alpha.example:443 instead.
-        let row = footer_row(&state).expect("filtered row should exist");
-        assert_eq!(row.endpoint.id.get(), 2);
-        assert_eq!(row.endpoint.host, "beta.example");
-
-        // Selection past the filtered end → none selected, even though
-        // `endpoints.len()` (3) exceeds `selected_index` (1).
+        state.page_total = 3;
         state.selected_index = 1;
-        assert!(footer_row(&state).is_none());
+
+        let row = footer_row(&state).expect("row should exist");
+        assert_eq!(row.endpoint.id.get(), 2);
     }
 
     fn test_palette() -> ratatui_cheese::theme::Palette {

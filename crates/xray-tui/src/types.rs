@@ -229,7 +229,6 @@ pub enum SortColumn {
     Test,
     Speed,
     Traffic,
-    Core,
     LastSeen,
 }
 
@@ -474,6 +473,8 @@ pub enum CoreEvent {
     ProfilesRowsReady {
         generation: u64,
         rows: Vec<EndpointRow>,
+        /// Page position/count the rows belong to (footer + navigation).
+        meta: xray_tui_db::profiles_query::PageMeta,
     },
     /// Result from a speed test operation. `endpoint_id` + `protocol_id`
     /// together address exactly one `ProfileStats` row: protocol rows are
