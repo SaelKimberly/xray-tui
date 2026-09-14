@@ -90,4 +90,13 @@ an index.
   nanoseconds (matching the stored `last_seen_at` text the SQL used), where the
   old Rust oracle truncated to seconds.
 - Hydration (~450 ms, the `in_list` parameter cost) is unchanged and now the
-  dominant term of a page fetch; it is tracked separately from this decision.
+  dominant term of a page fetch. The fix is a raw read with the endpoint ids
+  inlined (integers from the database, never user text — the same rule the rank
+  table already uses), which contradicts ADR 0001's "parameterised binds only":
+  amend that ADR before implementing, or accept the term.
+- **`profile_link_order` is NOT redundant and must not be retired as duplicate
+  work.** The SQL link order uses `weight(ps)` with no DNS collapse, while
+  `EndpointRow::sort_links_by_test_priority(dns_unresolved)` forces tier 5 for
+  every link of an unresolved endpoint — so the two orders differ for those
+  endpoints, and `load_page_rows_preserves_page_and_link_order` is the guard.
+  Retiring either side is a deliberate law decision, not free work.
