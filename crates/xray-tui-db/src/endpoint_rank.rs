@@ -262,8 +262,7 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<EndpointRank> {
 // engine parses ~0.8 ms per bound parameter (200 ids = 174 ms; the same
 // statement with literals = 9.7 ms), which would dominate every refresh.
 
-const RANK_DDL: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS endpoint_rank (\
+const RANK_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS endpoint_rank (\
         endpoint_id INTEGER PRIMARY KEY, \
         rank_dns INTEGER NOT NULL, \
         rank_tier INTEGER NOT NULL, \
@@ -274,8 +273,7 @@ const RANK_DDL: &[&str] = &[
         rank_speed INTEGER NOT NULL, \
         rank_traffic INTEGER NOT NULL, \
         rank_config INTEGER NOT NULL, \
-        rank_newest_seen INTEGER NOT NULL)",
-];
+        rank_newest_seen INTEGER NOT NULL)"];
 
 /// Indexes, created AFTER the fill: maintaining them across the backfill's
 /// inserts costs more than building them once at the end.
@@ -462,6 +460,21 @@ impl crate::Database {
         let mut conn = self.connection().await?;
         refresh(&mut conn, endpoint_ids).await
     }
+}
+
+/// Delete rank rows whose endpoint no longer has any link.
+///
+/// The page drives from this table, so a lingering row would list a linkless
+/// endpoint. Called by the deletion owners (`purge_expired`) rather than on a
+/// timer: they are the only writers that remove links.
+pub(crate) async fn prune(conn: &mut impl toasty::Executor) -> crate::Result<usize> {
+    let rows = toasty::sql::query(
+        "DELETE FROM endpoint_rank WHERE endpoint_id NOT IN \
+         (SELECT endpoint_id FROM profile_stats)",
+    )
+    .exec(conn)
+    .await?;
+    Ok(rows.len())
 }
 
 /// Backfill rank rows for endpoints that have links but no row yet.

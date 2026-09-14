@@ -427,6 +427,46 @@ async fn link_writes_keep_the_stored_keys_current() {
     assert_eq!(page().await, vec![EndpointId::new(1), EndpointId::new(2)]);
 }
 
+/// `resolved_as` is part of the ordering law: a DNS host that resolves moves
+/// out of the unresolved band, and the page must show it there immediately.
+#[tokio::test]
+async fn resolving_a_dns_host_moves_its_stored_key() {
+    let db = seed_fixture().await;
+    let unresolved = EndpointId::new(6); // dns host, no `resolved_as`, real 5 ms
+    let before = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page")
+        .ids;
+    assert_eq!(before.last(), Some(&unresolved), "unresolved sinks");
+
+    db.update_endpoint_resolution(unresolved, vec!["203.0.113.6".to_string()], ts(200))
+        .await
+        .expect("resolve");
+
+    let after = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page")
+        .ids;
+    assert_eq!(after.first(), Some(&unresolved), "a 5 ms real link leads");
+}
+
+/// Deleting an endpoint's links removes its key: the page drives from the rank
+/// table, so a lingering key would list a linkless row.
+#[tokio::test]
+async fn purging_endpoints_drops_their_keys() {
+    let db = seed_fixture().await;
+    let purged = db.purge_expired(ts(100_000)).await.expect("purge");
+    assert!(purged > 0, "the fixture's rows are older than the cutoff");
+    let page = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page");
+    assert!(page.ids.is_empty(), "got {:?}", page.ids);
+    assert_eq!(page.total, 0);
+}
+
 #[tokio::test]
 async fn anchor_and_page_agree_after_a_weight_change() {
     let db = seed_fixture().await;

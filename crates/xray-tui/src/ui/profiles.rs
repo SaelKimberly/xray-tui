@@ -1146,10 +1146,12 @@ mod page_window_tests {
     use super::*;
     use crate::ops::profiles::{PROFILES_PAGE_SIZE, move_selection, reload_profiles, test_support};
 
-    /// Two full pages of endpoints, loaded through the real query path.
+    /// Two FULL pages of endpoints, loaded through the real query path — a
+    /// short second page would let the display cache miss on row count alone
+    /// and mask a stale page.
     async fn two_page_state() -> AppState {
         let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
-        let count = PROFILES_PAGE_SIZE + 5;
+        let count = PROFILES_PAGE_SIZE * 2;
         for i in 1..=count as i64 {
             let row = test_support::fake_row(i, &format!("h{i:05}.example"), 1);
             db.upsert_endpoint(&row.endpoint).await.unwrap();

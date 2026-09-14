@@ -764,6 +764,9 @@ impl Database {
                         .resolved_at(Some(at))
                         .exec(&mut conn)
                         .await?;
+                    // `resolved_as` IS part of the ordering law: an endpoint
+                    // moves out of (or into) the DNS-unresolved band here.
+                    crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
                     Ok(())
                 }
             },
@@ -899,6 +902,9 @@ impl Database {
                 .exec(&mut tx)
                 .await?;
             Self::purge_orphan_protocols(&mut tx).await?;
+            // The page drives from `endpoint_rank`: drop the keys of the rows
+            // whose links just went away, or the tab would list them again.
+            crate::endpoint_rank::prune(&mut tx).await?;
         }
 
         tx.commit().await?;
@@ -925,6 +931,9 @@ impl Database {
             .exec(&mut tx)
             .await?;
         Self::purge_orphan_protocols(&mut tx).await?;
+        // The page drives from `endpoint_rank`: a deleted endpoint must not
+        // leave its key behind.
+        crate::endpoint_rank::prune(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())

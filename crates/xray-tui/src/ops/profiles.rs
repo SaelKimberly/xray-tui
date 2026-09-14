@@ -171,6 +171,11 @@ pub(crate) fn apply_profiles_rows(state: &mut AppState, rows: Vec<EndpointRow>, 
     state.endpoints = rows;
     state.page_total = meta.total;
     state.page_offset = meta.offset;
+    // A new page is a structural change: the display-row cache key compares the
+    // loaded row COUNT and per-row expanded flags, so two same-length pages
+    // (the common case) would otherwise re-serve the previous page's rows —
+    // numbers included — for a frame that nothing else dirtied.
+    state.endpoints_gen = state.endpoints_gen.wrapping_add(1);
     // The page was just read: nothing pending.
     state.filter_cache_valid.set(true);
     clamp_selection(state);
