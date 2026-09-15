@@ -1,7 +1,7 @@
 # Native ping pipeline: real ping on the in-process core
 
 Date: 2026-09-14
-Status: design (awaiting user review)
+Status: implemented (2026-09-14, ADR 0004)
 Supersedes (on accept): `docs/native-core-integration.md` §6, D6, work item 7, and the
 "Native anywhere in the real-ping path" out-of-scope bullet
 Related: decision 15 (batch keying), decision 16 (test-priority tiers + labels),
@@ -218,8 +218,9 @@ Consequences that MUST be handled:
 | `crates/xray-tui-core/src/speed_test.rs`: `real_ping`, `wait_for_socks5`, `RealPingResult` | replaced by the native probe; `tcp_ping`/`udp_ping`/`speed_test`/`udp_test` stay |
 | SOCKS client cache policy bit only used by `real_ping` | prune to the remaining callers' shape |
 | `AppState.core_pool`, `ops/ping.rs::get_or_create_pool` | pool no longer exists |
-| re-exports of `RealPingManager`/`CorePool` (`ping/mod.rs`, `core/lib.rs`), `ConfigBuilder::build_multi` | `build_multi` has zero callers (dead since it was written) |
+| re-exports of `RealPingManager`/`CorePool` (`ping/mod.rs`, `core/lib.rs`) | deleted with the module |
 | `xray-tui-core/src/ping/mod.rs`: `PingResult`, `ProfileKey` (real-path types) | `PingError::NotSupported` stays — the fast manager returns it |
+| `ConfigBuilder::build_multi` (`config_builder/mod.rs` + `xray.rs`/`singbox.rs` + `MultiInboundItem`) | **DEFERRED** — genuinely dead (zero callers since it was written), but it is a separate dead-code sweep in three files, not part of this cutover; recorded in the plan status. |
 
 `ConfigBuilder::build` STAYS: `connect.rs` still builds subprocess configs for the
 subprocess connect path.

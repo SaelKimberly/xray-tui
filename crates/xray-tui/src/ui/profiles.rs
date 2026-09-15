@@ -406,11 +406,11 @@ fn compute_test_cell(
     palette: &ratatui_cheese::theme::Palette,
 ) -> (String, Style) {
     use xray_tui_db::models::ProfileErr;
-    let failure = match row
-        .active_link()
-        .and_then(|l| l.error.as_ref())
-        .map(|e| e.kind)
-    {
+    let active_error = row.active_link().and_then(|l| l.error.as_ref());
+    // A "not testable by the native engine" marker is a STATUS, not a failed
+    // measurement, so it outranks a stored delay (see `test_cell_content`).
+    let untestable = active_error.is_some_and(crate::ops::ping::is_untestable_marker);
+    let failure = match active_error.map(|e| e.kind) {
         Some(ProfileErr::Real | ProfileErr::Name) => Some(TestFailure::Real),
         Some(ProfileErr::Fast) => Some(TestFailure::Fast),
         None => None,
@@ -425,6 +425,7 @@ fn compute_test_cell(
     test_cell_content(
         row.endpoint.host_type == xray_tui_db::models::HostType::Dns,
         resolved,
+        untestable,
         failure,
         active_delay,
         palette,
@@ -445,6 +446,7 @@ enum TestFailure {
 fn test_cell_content(
     host_is_dns: bool,
     resolved: bool,
+    untestable: bool,
     failure: Option<TestFailure>,
     active_delay: Option<i32>,
     palette: &ratatui_cheese::theme::Palette,
@@ -452,6 +454,14 @@ fn test_cell_content(
     let bad = ThemeStyles::test_delay_bad(palette);
     if host_is_dns && !resolved {
         return (format!("[{}]", center_cell("name", 4)), bad);
+    }
+    if untestable {
+        // The native engine cannot test this row: the marker is a status about
+        // the row, not a failed attempt, so it outranks a stored delay the same
+        // way `[name]` does. It renders as `[real]` (the persisted kind is
+        // `ProfileErr::Real` — the frozen `error_kind` CHECK leaves no other
+        // kind to store).
+        return (format!("[{}]", center_cell("real", 4)), bad);
     }
     // A measured delay wins over a failure marker: a link that carries both a
     // successful measurement and a later failure (e.g. a batch probe that
@@ -1750,13 +1760,13 @@ mod tests {
     #[test]
     fn test_cell_colors_delay_by_threshold() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(false, true, None, Some(12), &palette);
+        let (t, s) = test_cell_content(false, true, false, None, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
         assert_eq!(s.fg, Some(palette.success));
-        let (t, s) = test_cell_content(false, true, None, Some(612), &palette);
+        let (t, s) = test_cell_content(false, true, false, None, Some(612), &palette);
         assert_eq!(t, "[ 612]");
         assert_eq!(s.fg, Some(ratatui::style::Color::Yellow));
-        let (t, s) = test_cell_content(false, true, None, Some(1234), &palette);
+        let (t, s) = test_cell_content(false, true, false, None, Some(1234), &palette);
         assert_eq!(t, "[1234]");
         assert_eq!(s.fg, Some(palette.error));
     }
@@ -1764,18 +1774,18 @@ mod tests {
     #[test]
     fn test_cell_blank_without_measurement() {
         let palette = test_palette();
-        let (t, _) = test_cell_content(false, true, None, None, &palette);
+        let (t, _) = test_cell_content(false, true, false, None, None, &palette);
         assert_eq!(t, "      ");
     }
 
     #[test]
     fn test_cell_shows_name_when_dns_unresolved() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(true, false, None, Some(12), &palette);
+        let (t, s) = test_cell_content(true, false, false, None, Some(12), &palette);
         assert_eq!(t, "[name]");
         assert_eq!(s.fg, Some(palette.error));
         // Resolved DNS name behaves like a normal host.
-        let (t, _) = test_cell_content(true, true, None, Some(12), &palette);
+        let (t, _) = test_cell_content(true, true, false, None, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
     }
 
@@ -1785,21 +1795,35 @@ mod tests {
         // A measured delay wins over a failure marker: a link carrying both a
         // success and a later failure still shows its result. Labels appear
         // only when the active link has NO measurement.
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), Some(12), &palette);
+        let (t, _) = test_cell_content(
+            false,
+            true,
+            false,
+            Some(TestFailure::Real),
+            Some(12),
+            &palette,
+        );
         assert_eq!(t, "[ 12 ]");
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), Some(12), &palette);
+        let (t, _) = test_cell_content(
+            false,
+            true,
+            false,
+            Some(TestFailure::Fast),
+            Some(12),
+            &palette,
+        );
         assert_eq!(t, "[ 12 ]");
         // Both marker classes present with no delay → [real]: real-err
         // (tier 3) ranks above fast-err (tier 4), the real check being the
         // deeper probe (T20 flip).
-        let (t, s) = test_cell_content(false, true, Some(TestFailure::Real), None, &palette);
+        let (t, s) = test_cell_content(false, true, false, Some(TestFailure::Real), None, &palette);
         assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(palette.error));
         // Only a fast-class failure marker with no delay → [fast].
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), None, &palette);
+        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Fast), None, &palette);
         assert_eq!(t, "[fast]");
         // No failure markers → the delay shows even when untested links exist.
-        let (t, _) = test_cell_content(false, true, None, Some(30), &palette);
+        let (t, _) = test_cell_content(false, true, false, None, Some(30), &palette);
         assert_eq!(t, "[ 30 ]");
     }
 
@@ -1807,19 +1831,42 @@ mod tests {
     fn test_cell_label_precedence_matrix() {
         let palette = test_palette();
         // (a) only real markers → [real]
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), None, &palette);
+        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Real), None, &palette);
         assert_eq!(t, "[real]");
         // (b) only fast markers → [fast]
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Fast), None, &palette);
+        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Fast), None, &palette);
         assert_eq!(t, "[fast]");
         // (c) both real and fast markers → [real] (tier-consistent)
-        let (t, _) = test_cell_content(false, true, Some(TestFailure::Real), None, &palette);
+        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Real), None, &palette);
         assert_eq!(t, "[real]");
         // (d) DNS-unresolved + fast marker → [name] (DNS tier 5 is deepest)
-        let (t, _) = test_cell_content(true, false, Some(TestFailure::Fast), None, &palette);
+        let (t, _) = test_cell_content(true, false, false, Some(TestFailure::Fast), None, &palette);
         assert_eq!(t, "[name]");
         // (e) no markers, no measurement → blank
-        let (t, _) = test_cell_content(false, true, None, None, &palette);
+        let (t, _) = test_cell_content(false, true, false, None, None, &palette);
         assert_eq!(t, "      ");
+    }
+
+    #[test]
+    fn untestable_marker_outranks_a_measured_delay() {
+        let palette = test_palette();
+        // A stored (fast) delay must not hide the "cannot be tested" status —
+        // that is the whole point of the marker.
+        let (t, s) = test_cell_content(false, true, true, None, Some(12), &palette);
+        assert_eq!(t, "[real]");
+        assert_eq!(s.fg, Some(palette.error));
+        // A genuine failure marker still lets a measured delay win.
+        let (t, _) = test_cell_content(
+            false,
+            true,
+            false,
+            Some(TestFailure::Real),
+            Some(12),
+            &palette,
+        );
+        assert_eq!(t, "[ 12 ]");
+        // DNS-unresolved stays the deepest state.
+        let (t, _) = test_cell_content(true, false, true, None, None, &palette);
+        assert_eq!(t, "[name]");
     }
 }

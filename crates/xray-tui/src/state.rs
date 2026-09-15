@@ -7,10 +7,10 @@ use tokio::task::JoinHandle;
 
 use toasty::{Deferred, Json};
 use xray_tui_config::AppConfig;
+use xray_tui_core::CoreType;
 use xray_tui_core::grpc_client;
 use xray_tui_core::log_heed::HeedLogStorage;
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{CorePool, CoreType};
 use xray_tui_db::Database;
 use xray_tui_db::hash::stable_hash;
 use xray_tui_db::models::{
@@ -129,8 +129,6 @@ pub struct AppState {
     pub connected_protocol_id: Option<i64>,
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
-    /// Pooled core for single-ping reuse (lazy — created on first single real ping).
-    pub core_pool: Option<Arc<CorePool>>,
     pub last_test_tcp: Option<u64>,
     /// Shared batch progress (total, completed) displayed in status bar.
     pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
@@ -506,7 +504,6 @@ impl AppState {
             core_task_handle: None,
             shutdown_token: Arc::new(AtomicBool::new(false)),
             speed_test_stop: Arc::new(AtomicBool::new(false)),
-            core_pool: None, // lazily created on first single real ping
             batch_progress: None,
             term_height: Cell::new(80),
             heed_storage: None,

@@ -1,12 +1,8 @@
 mod adapters;
-mod real;
 
 #[cfg(feature = "quic-ping")]
 pub use adapters::QuicPingAdapter;
 pub use adapters::{FastPingAdapter, FastPingManager, TcpPingAdapter, UdpPingAdapter};
-pub use real::CorePool;
-pub use real::RealPingManager;
-pub use real::SinglePingReq;
 
 use std::fmt;
 
@@ -58,21 +54,4 @@ impl fmt::Display for PingError {
             Self::Other(s) => write!(f, "{s}"),
         }
     }
-}
-
-/// Result of a ping operation on one profile.
-#[derive(Debug, Clone)]
-pub struct PingResult {
-    pub profile_key: ProfileKey,
-    pub latency_ms: Option<u64>,
-    pub ip_info: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Identifies a unique server triple (protocol, host, port).
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct ProfileKey {
-    pub config_type: i32,
-    pub address: String,
-    pub port: u16,
 }

@@ -184,7 +184,7 @@ pub async fn run_native_session(
 /// consumes (mirrors `xray_tui_core::config_builder::endpoint_essentials` —
 /// kept local because that helper is crate-private to xray-tui-core).
 #[must_use]
-fn endpoint_essentials(endpoint: &Endpoint) -> EndpointEssentials {
+pub(crate) fn endpoint_essentials(endpoint: &Endpoint) -> EndpointEssentials {
     EndpointEssentials {
         host: endpoint.host.clone(),
         host_type: match endpoint.host_type {

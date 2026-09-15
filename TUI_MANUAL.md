@@ -289,7 +289,12 @@ Test and apply immediately.
 in the Test column). The label reflects the endpoint's ACTIVE (preferred)
 link, and only when it has NO measured delay — a link that carries both a
 successful measurement and a later failure marker still shows its delay (the
-expanded panel keeps per-link markers). Markers persist across restarts;
+expanded panel keeps per-link markers). One exception: a profile the native
+engine cannot test (a protocol kind or config it has no implementation for)
+is marked `[real]` with the reason, and that marker outranks a stored delay —
+it says something about the profile, not about a failed attempt. Such rows
+are never removed by **Remove Bad Servers** (they are fine, just untestable
+here). Markers persist across restarts;
 `error_ttl_hours` (empty = never) clears them automatically on profile reload
 and at batch finish. The preferred link is the best measured one (real-ok
 lowest delay, else fast-ok lowest): auto-selected after every fast/real

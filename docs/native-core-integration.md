@@ -315,14 +315,18 @@ enum TraceEvent {
 
 - Fast ping (Phase 1, in-process adapters) + single TCP ping: unaffected —
   already no subprocess.
-- Real ping (Phase 2 + single real ping from menu): **native is never used.**
-  `RealPingManager::real_ping` and `CorePool::ping` dispatch on the concrete
-  `core_type` (an exhaustive `Xray`/`SingBox` match on the proto enum) and spawn
-  temp subprocess cores with a `BackendConfig`, exactly as before this slice.
-  The planned ephemeral-`NativeCoreServer` probe (`native_ping`) does not exist
-  — see D6. Consequence: with no core binaries installed, real pings fail with
-  "Binary not found" even for profiles that connect natively (known
-  limitation). Test column semantics unchanged.
+- Real ping (Phase 2 + single real ping from menu): **AMENDED (2026-09-14, ADR 0004).**
+  The subprocess temp cores are gone. `ops/ping_native.rs` dials the native engine
+  (`xray_tui_native::probe::fetch`: one tunnel per attempt, one HTTP/1.1 request
+  over it, target TLS verified against Mozilla roots, ALPN pinned to `http/1.1`),
+  so the whole `CorePool`/`RealPingManager`/temp-config-dir/port-allocator/SOCKS-
+  readiness arm is deleted and `find_binary` is no longer on any test path. Rows the
+  engine cannot serve fail fast with a persisted `ProfileErr::Real` marker whose text
+  starts with `UNTESTABLE_PREFIX` ("not testable by the native engine: <reason>",
+  reasons from `capability::support_reason`). Test-column semantics otherwise
+  unchanged; the marker outranks a stored delay (decision 16).
+- `ConfigBuilder::build` stays (the subprocess CONNECT path still builds configs);
+  `build_multi` stays dead for now (no caller since it was written).
 
 ## Decisions & rationale
 
@@ -333,7 +337,7 @@ enum TraceEvent {
 | D3 | `NativeCoreServer` lives in xray-tui-native, not xray-tui-core; events not the `CoreManager` trait | Layering: core is the subprocess facade (tonic/heed/LMDB). Native implements the server + telemetry against proto types only; the TUI adapts events to `CoreEvent`. No new cross-crate trait; the branch in connect.rs mirrors the existing core-type branches. |
 | D4 | Telemetry reuses `CoreEvent::StatsUpdate/SysStatsUpdate/LogLine` shapes | Statistics/logs screens, day-reset, and DB accumulation stay untouched; the trace is the only new event family. |
 | D5 | Capability predicate excludes native-worse configs, not native-equal | pq-enc diverges (native fails, xray works) → excluded. Equal-failure combos (e.g. reality-over-kcp) route to native. |
-| D6 | ~~Real ping for native = ephemeral native server~~ — **SUPERSEDED**: real ping always uses subprocess temp cores | `real_ping`/`CorePool::ping` already dispatch on the link's concrete `core_type`, so batch semantics and the Test column are identical without new code; a native probe path would add a second core lifecycle for no observable gain. |
+| D6 | ~~Real ping for native = ephemeral native server~~ — **SUPERSEDED**, then **RE-OPENED AND REVERSED (2026-09-14, ADR 0004)**: real ping runs on the native engine and the subprocess probe arm is deleted | The 2026-09-03 rationale ("a native probe path would add a second core lifecycle for no observable gain") inverted once the goal became a binary-free install: the native probe REMOVES a lifecycle — no temp config dir, no process spawn, no port allocator, no SOCKS readiness poll, no pool lock across the probe — and rows the engine cannot serve get an honest `[real]` marker instead of "Binary not found". |
 
 ## Out of scope (v1)
 
@@ -341,8 +345,8 @@ enum TraceEvent {
 - Routing-rule parity (custom rules + sniffing) through the native route engine.
 - TUN/http inbound beyond CONNECT; outbound-only kinds (Redirect/TProxy/Mixed).
 - Trace persistence across sessions; per-conn logs beyond failures (debug frames).
-- Native anywhere in the real-ping path — real pings always spawn subprocess
-  temp cores (§6).
+- ~~Native anywhere in the real-ping path~~ — **REVERSED (2026-09-14, ADR 0004)**:
+  the real-ping path IS native now (§6, D6).
 
 ## Risks
 
@@ -381,8 +385,10 @@ enum TraceEvent {
    (updater/bin_manager/RealCoreManager). **No core-crate resolver:** the
    `resolve_runtime_core` that shipped is a private connect-time helper in
    `crates/xray-tui/src/ops/connect.rs` (§1).
-7. ~~Core ping: native real-ping entry~~ — **SUPERSEDED** (§6): no
-   `native_ping`; real pings always use subprocess temp cores.
+7. ~~Core ping: native real-ping entry~~ — **SUPERSEDED** by D6, then **DELIVERED
+   (2026-09-14, ADR 0004)** as `ops/ping_native.rs` +
+   `xray_tui_native::probe::fetch` (dial → TLS → one HTTP/1.1 request over the
+   tunnel), NOT as an ephemeral SOCKS server.
 8. TUI: connect.rs native branch + adapter task (events → CoreEvent);
    disconnect; drain flush.
 9. TUI: status/statistics/actions labels for native; updater panel note

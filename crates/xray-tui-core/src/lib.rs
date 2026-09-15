@@ -24,13 +24,10 @@ pub use log_heed::HeedLogStorage;
 #[cfg(feature = "quic-ping")]
 pub use ping::QuicPingAdapter;
 pub use ping::{
-    CorePool, FastPingAdapter, FastPingManager, PingCapability, PingError, PingResult, ProfileKey,
-    RealPingManager, SinglePingReq, TcpPingAdapter, UdpPingAdapter,
+    FastPingAdapter, FastPingManager, PingCapability, PingError, TcpPingAdapter, UdpPingAdapter,
 };
 pub use process::{CoreManager, MockCoreManager, ProcessError, RealCoreManager};
-pub use speed_test::{
-    SpeedTestError, TestType, real_ping, speed_test, tcp_ping, udp_ping, udp_test, wait_for_socks5,
-};
+pub use speed_test::{SpeedTestError, TestType, speed_test, tcp_ping, udp_ping, udp_test};
 
 /// Ensure the process-level rustls `CryptoProvider` is installed (idempotent).
 ///

@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
@@ -8,14 +7,16 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
 use xray_tui_core::speed_test::TestType;
-use xray_tui_core::{CorePool, SinglePingReq};
 use xray_tui_db::Database;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{Endpoint, EndpointId, EndpointRow, ProfileStats, ProtocolId, TaskKind};
+use xray_tui_native::capability;
+use xray_tui_proto::proto_spec::ProtocolConfig;
 
 use crate::AppState;
+use crate::ops::ping_native::{self, NativeProbeReq};
 use crate::ops::scheduler::{ScheduleOutcome, TaskScheduler};
-use crate::state::{link_is_failed, load_protocol_with_config};
+use crate::state::load_protocol_with_config;
 use crate::try_send_or_warn;
 use crate::types::CoreEvent;
 /// Bound on concurrent single-test tasks (menu-triggered pings): the spawned
@@ -24,6 +25,37 @@ use crate::types::CoreEvent;
 /// paths already gate through their own semaphore/JoinSet.
 static SINGLE_TEST_SEMAPHORE: std::sync::LazyLock<Semaphore> =
     std::sync::LazyLock::new(|| Semaphore::new(16));
+
+/// Prefix of the persisted marker text for a row the native engine cannot test.
+///
+/// The marker is a [`xray_tui_db::models::ProfileErr::Real`] — the only failure
+/// kind the frozen `error_kind` CHECK accepts (a new variant would be a schema
+/// wipe, decision 4) — so the TEXT is the discriminator. One writer
+/// ([`untestable_marker_text`]) and one reader ([`is_untestable_marker`], used
+/// by the Test-cell precedence and by the Remove-Bad-Servers guard).
+pub const UNTESTABLE_PREFIX: &str = "not testable by the native engine: ";
+
+/// The persisted marker text for a link the native engine cannot test.
+#[must_use]
+pub fn untestable_marker_text(reason: &str) -> String {
+    format!("{UNTESTABLE_PREFIX}{reason}")
+}
+
+/// True when a persisted failure marker means "never attempted" (the native
+/// engine cannot serve this row) rather than "the probe ran and failed".
+#[must_use]
+pub fn is_untestable_marker(error: &xray_tui_db::models::ErrorInfo) -> bool {
+    error.text.starts_with(UNTESTABLE_PREFIX)
+}
+
+/// A link counts as "failed" for the Remove-Bad-Servers sweep only when a probe
+/// actually ran: the untestable marker says the native engine cannot serve the
+/// row, and deleting a profile for that is wrong.
+fn is_removable_failure(link: &ProfileStats) -> bool {
+    link.error
+        .as_ref()
+        .is_some_and(|e| !is_untestable_marker(e))
+}
 
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
 pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
@@ -122,38 +154,12 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
     });
 }
 
-/// Get the shared core pool, creating it lazily on first use.
+/// Start real ping (one HTTP probe through the native engine).
 ///
-/// Single real pings draw ports from this pool's single allocator, so a warm
-/// pooled core and any future batch core can never collide on a port.
-fn get_or_create_pool(state: &mut AppState) -> Arc<CorePool> {
-    if let Some(p) = &state.core_pool {
-        return p.clone();
-    }
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| Path::new(".").to_path_buf())
-        .join("xray-tui");
-    let bin_dir = config_dir.join("bin");
-    let bin_configs_dir = config_dir.join("binConfigs");
-    let proxy_addr = state.config.inbound.listen.clone();
-    let base_port = state.config.inbound.socks_port;
-    let pool = Arc::new(CorePool::new(
-        bin_dir,
-        bin_configs_dir,
-        proxy_addr,
-        base_port,
-    ));
-    state.core_pool = Some(pool.clone());
-    pool
-}
-
-/// Start real ping (HTTP through proxy) using a pooled warm core for
-/// single-ping reuse.
-///
-/// The pool is created lazily on first use. Subsequent single pings reuse the
-/// same core: sing-box via SIGHUP reload, xray-core via stop+restart. The
-/// `Protocol` row is re-loaded WITH its deferred `config` included inside the
-/// spawned task — the pool's `ConfigBuilder::build` refuses unloaded configs.
+/// The `Protocol` row is re-loaded WITH its deferred `config` inside the
+/// spawned task (the probe consumes the typed [`ProtocolConfig`]), then the
+/// native capability gate decides between a probe and the persisted
+/// "not testable" marker.
 pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
     if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         return;
@@ -162,7 +168,6 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
     // Resolve by the (endpoint, protocol) pair — see `start_tcp_ping` for why
     // protocol-only lookup is wrong for shared `Protocol` rows.
     let endpoint;
-    let link;
     let protocol_id_typed;
     if let Some(r) = state
         .endpoints
@@ -171,7 +176,6 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         && let Some(l) = r.links.iter().find(|l| l.protocol_id.get() == protocol_id)
     {
         endpoint = r.endpoint.clone();
-        link = l.clone();
         protocol_id_typed = l.protocol_id;
     } else {
         state.log_trace("error", "tui::ops::ping", "Profile not found for real ping");
@@ -188,8 +192,6 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
     state.testing_profiles.insert((endpoint_id, protocol_id));
     state.mark_rows_dirty(crate::ui::profiles::ROWS_DIRTY_TEST);
 
-    // Lazily create the core pool on first use
-    let pool = get_or_create_pool(state);
     let db = state.db.clone();
 
     let ping_url = state.config.speed_test.ping_url.clone();
@@ -245,19 +247,41 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
             }
         };
 
-        let result = pool
-            .ping(
-                &endpoint,
-                &link,
-                &protocol,
-                SinglePingReq {
-                    ping_url: &ping_url,
-                    ip_api_url: &ip_api_url,
-                    timeout,
-                    retries,
+        let config = protocol.config.get().0.clone();
+        // Native capability gate: a row the engine cannot serve fails fast with
+        // the persisted `[real]` marker instead of a probe.
+        if let Some(reason) = capability::support_reason(protocol.proto_kind, &config) {
+            try_send_or_warn(
+                &tx,
+                CoreEvent::SpeedTestResult {
+                    endpoint_id,
+                    protocol_id,
+                    test_type: TestType::RealPing,
+                    latency_ms: None,
+                    speed_bps: None,
+                    ip_info: None,
+                    error: Some(untestable_marker_text(reason)),
                 },
-            )
-            .await;
+                "real_ping_untestable",
+            );
+            return;
+        }
+
+        let result = ping_native::real_ping(
+            &endpoint,
+            &config,
+            &NativeProbeReq {
+                ping_url: &ping_url,
+                ip_api_url: &ip_api_url,
+                timeout,
+                retries,
+            },
+        )
+        .await;
+        let (latency_ms, ip_info, error) = match result {
+            Ok(r) => (Some(r.latency_ms), r.ip_info, None),
+            Err(e) => (None, None, Some(e)),
+        };
 
         try_send_or_warn(
             &tx,
@@ -265,10 +289,10 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 endpoint_id,
                 protocol_id,
                 test_type: TestType::RealPing,
-                latency_ms: result.latency_ms,
+                latency_ms,
                 speed_bps: None,
-                ip_info: result.ip_info,
-                error: result.error,
+                ip_info,
+                error,
             },
             "real_ping_result",
         );
@@ -401,7 +425,7 @@ pub async fn remove_failed_servers(state: &mut AppState) {
     let to_remove: Vec<xray_tui_db::models::EndpointId> = state
         .endpoints
         .iter()
-        .filter(|r| r.links.iter().any(link_is_failed))
+        .filter(|r| r.links.iter().any(is_removable_failure))
         .map(|r| r.endpoint.id)
         .collect();
     let count = to_remove.len();
@@ -487,41 +511,23 @@ trait BatchProbeRunner: Send + Sync {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>>;
 
-    /// One real probe for a single link.
+    /// One real probe for a single link. `config` is the already-loaded
+    /// [`ProtocolConfig`] — the caller gates on it before it gets here.
     fn real<'a>(
         &'a self,
         endpoint: &'a Endpoint,
-        link: &'a ProfileStats,
-        protocol: &'a DbProtocol,
-        req: SinglePingReq<'a>,
+        config: &'a ProtocolConfig,
+        req: NativeProbeReq<'a>,
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>>;
 }
 
-/// Production runner: [`FastPingManager`] for fast probes, the shared
-/// [`CorePool`] for real probes — the exact dispatch pattern the kept
-/// `start_tcp_ping` / `start_real_ping` use.
+/// Production runner: [`xray_tui_core::FastPingManager`] for fast probes and
+/// the in-process native engine ([`crate::ops::ping_native`]) for real probes.
 ///
-/// While the batch is alive the pool's `batch_active` flag is set, so
-/// concurrent single pings take the fresh-core path instead of reusing a core
-/// the batch is touching.
-struct EngineProbeRunner {
-    pool: Arc<CorePool>,
-    batch_active: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl EngineProbeRunner {
-    fn new(pool: Arc<CorePool>) -> Self {
-        let batch_active = pool.batch_active_flag();
-        batch_active.store(true, Ordering::Relaxed);
-        Self { pool, batch_active }
-    }
-}
-
-impl Drop for EngineProbeRunner {
-    fn drop(&mut self) {
-        self.batch_active.store(false, Ordering::Relaxed);
-    }
-}
+/// The subprocess pool is gone: a real probe dials the native engine directly,
+/// so there is no warm process to share and no `batch_active` flag to raise
+/// against concurrent single pings.
+struct EngineProbeRunner;
 
 impl BatchProbeRunner for EngineProbeRunner {
     fn fast<'a>(
@@ -548,18 +554,16 @@ impl BatchProbeRunner for EngineProbeRunner {
     fn real<'a>(
         &'a self,
         endpoint: &'a Endpoint,
-        link: &'a ProfileStats,
-        protocol: &'a DbProtocol,
-        req: SinglePingReq<'a>,
+        config: &'a ProtocolConfig,
+        req: NativeProbeReq<'a>,
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let result = self.pool.ping(endpoint, link, protocol, req).await;
-            match result.error {
-                Some(e) => ProbeOutcome::Failed(e),
-                None => ProbeOutcome::Ok {
-                    latency_ms: result.latency_ms,
+            match ping_native::real_ping(endpoint, config, &req).await {
+                Ok(result) => ProbeOutcome::Ok {
+                    latency_ms: Some(result.latency_ms),
                     ip_info: result.ip_info,
                 },
+                Err(e) => ProbeOutcome::Failed(e),
             }
         })
     }
@@ -592,6 +596,14 @@ struct BatchShared {
     fast_config: HashMap<(ProtocolId, EndpointId), i32>,
     /// Endpoint rows by id (real probes need the full endpoint).
     endpoints: HashMap<EndpointId, Endpoint>,
+    /// Links the native engine cannot serve (kind-level gate, no config load),
+    /// keyed by identity and carrying the persisted marker text. The fast phase
+    /// still probes them; the real phase skips them and the batch emits their
+    /// markers once phase 1 has landed.
+    untestable: HashMap<(ProtocolId, EndpointId), String>,
+    /// Phase-1 bound (`fast_ping_concurrency`): the fast phase used to spawn one
+    /// future per link with no global cap at all.
+    fast_sem: Arc<Semaphore>,
     // ── phase tracking ────────────────────────────────────────────────
     pending_fast: AtomicUsize,
     pending_real: AtomicUsize,
@@ -630,6 +642,8 @@ pub(crate) struct BatchParams {
     ip_api_url: String,
     defer_delay: Duration,
     real_concurrency: usize,
+    fast_concurrency: usize,
+    /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
 }
 
@@ -650,6 +664,21 @@ impl From<BatchParams> for BatchShared {
             .plan
             .iter()
             .map(|pl| (pl.endpoint.id, pl.endpoint.clone()))
+            .collect();
+        // The kind-level testability gate: it needs only the in-memory
+        // `proto_kind`, so it is decided here — the one place every batch
+        // (production and test) passes through. The config-aware half runs
+        // inside the real probe, the only place a loaded config exists.
+        let untestable: HashMap<(ProtocolId, EndpointId), String> = p
+            .plan
+            .iter()
+            .filter(|pl| !capability::kind_supported(pl.protocol.proto_kind))
+            .map(|pl| {
+                (
+                    (pl.link.protocol_id, pl.link.endpoint_id),
+                    untestable_marker_text(capability::KIND_UNSUPPORTED_REASON),
+                )
+            })
             .collect();
         Self {
             sched: p.scheduler,
@@ -673,6 +702,8 @@ impl From<BatchParams> for BatchShared {
             total,
             fast_config,
             endpoints,
+            untestable,
+            fast_sem: Arc::new(Semaphore::new(p.fast_concurrency.max(1))),
             pending_fast: AtomicUsize::new(0),
             pending_real: AtomicUsize::new(0),
             done: AtomicU16::new(0),
@@ -749,6 +780,11 @@ pub(crate) async fn run_batch(params: BatchParams) {
         let _ = h.await;
     }
 
+    // Untestable rows get their `[real]` marker only now: a fast success writes
+    // `error = None`, so a marker emitted before phase 1 would be cleared by it
+    // (ordering, not a race — both go through the events handler).
+    shared.emit_untestable_markers();
+
     if !shared.real_phase {
         finish_batch(&shared).await;
         return;
@@ -760,6 +796,14 @@ pub(crate) async fn run_batch(params: BatchParams) {
     for plan in &shared.plan {
         if shared.stop.load(Ordering::Relaxed) {
             break;
+        }
+        // Untestable links never enter the real phase: their marker was emitted
+        // once phase 1 settled (`emit_untestable_markers`).
+        if shared
+            .untestable
+            .contains_key(&(plan.link.protocol_id, plan.link.endpoint_id))
+        {
+            continue;
         }
         match shared.sched.schedule(&plan.link, TaskKind::RealPing).await {
             ScheduleOutcome::Started(id) => {
@@ -964,6 +1008,9 @@ async fn run_task_chain(
         } else {
             match kind {
                 TaskKind::FastPing => {
+                    // Global phase-1 bound (`fast_ping_concurrency`): the batch
+                    // used to spawn one probe future per link with no cap.
+                    let _permit = Arc::clone(&shared.fast_sem).acquire_owned().await;
                     let outcome = shared.fast_probe(&link).await;
                     shared.emit_result(&link, TestType::TcpPing, &outcome);
                     shared.sched.complete(&link, id, kind).await;
@@ -1075,15 +1122,22 @@ impl BatchShared {
                 return ProbeOutcome::Failed(format!("Failed to load protocol: {e}"));
             }
         };
+        let config = protocol.config.get().0.clone();
+        // Config-level capability gate: kind-level refusals were already retired
+        // at plan time, so only a native-capable kind whose CONFIG the engine
+        // refuses reaches here. Its marker IS the probe's result — phase 2, so
+        // it lands after the fast result and is not cleared by it.
+        if let Some(reason) = capability::support_reason(protocol.proto_kind, &config) {
+            return ProbeOutcome::Failed(untestable_marker_text(reason));
+        }
         let Some(endpoint) = self.endpoints.get(&link.endpoint_id) else {
             return ProbeOutcome::Failed("Endpoint not found for real ping".to_string());
         };
         self.runner
             .real(
                 endpoint,
-                link,
-                &protocol,
-                SinglePingReq {
+                &config,
+                NativeProbeReq {
                     ping_url: &self.ping_url,
                     ip_api_url: &self.ip_api_url,
                     timeout: self.real_timeout,
@@ -1157,6 +1211,39 @@ impl BatchShared {
                 self.bump_progress();
             }
             _ => {}
+        }
+    }
+
+    /// Emit the persisted `[real]` marker for every link the native engine
+    /// cannot serve (kind-level gate, decided at plan time).
+    ///
+    /// Runs once per batch, after phase 1; for a real batch each retired link
+    /// also counts as a settled real task so the progress bar still reaches the
+    /// total.
+    fn emit_untestable_markers(&self) {
+        for ((protocol_id, endpoint_id), text) in &self.untestable {
+            let (protocol_id, endpoint_id) = (protocol_id.get(), endpoint_id.get());
+            let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
+                endpoint_id,
+                protocol_id,
+                test_type: TestType::RealPing,
+            });
+            try_send_or_warn(
+                &self.tx,
+                CoreEvent::SpeedTestResult {
+                    endpoint_id,
+                    protocol_id,
+                    test_type: TestType::RealPing,
+                    latency_ms: None,
+                    speed_bps: None,
+                    ip_info: None,
+                    error: Some(text.clone()),
+                },
+                "untestable_marker",
+            );
+            if self.real_phase {
+                self.bump_progress();
+            }
         }
     }
 
@@ -1259,8 +1346,7 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
     let Some(tx) = state.core_event_tx.clone() else {
         return;
     };
-    let pool = get_or_create_pool(state);
-    let runner: Arc<dyn BatchProbeRunner> = Arc::new(EngineProbeRunner::new(pool));
+    let runner: Arc<dyn BatchProbeRunner> = Arc::new(EngineProbeRunner);
     let db = state.db.clone();
     let writer = state.link_writer.clone();
     let scheduler = state.scheduler.clone();
@@ -1274,6 +1360,7 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
     let ping_url = state.config.speed_test.ping_url.clone();
     let ip_api_url = state.config.speed_test.ip_api_url.clone();
     let real_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
+    let fast_concurrency = state.config.speed_test.fast_ping_concurrency.max(1);
     let error_ttl_hours = state.config.speed_test.error_ttl_hours;
     // Sleep the full deferral window once, then re-schedule (the window is
     // measured in whole seconds and comes from the speed-test config via
@@ -1298,6 +1385,7 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
         ip_api_url,
         defer_delay,
         real_concurrency,
+        fast_concurrency,
         error_ttl_hours,
     }));
 }
@@ -1322,7 +1410,6 @@ mod tests {
         real_outcome: Mutex<ProbeOutcome>,
         fast_calls: Arc<AtomicUsize>,
         real_calls: Arc<AtomicUsize>,
-        real_probed: Arc<Mutex<HashSet<i64>>>,
         real_gate: Mutex<Option<Arc<Notify>>>,
         /// When set, every fast probe marks the endpoint's DNS failure — used
         /// to land a deferral deterministically between phase 1 and phase 2.
@@ -1342,7 +1429,6 @@ mod tests {
                 }),
                 fast_calls: Arc::new(AtomicUsize::new(0)),
                 real_calls: Arc::new(AtomicUsize::new(0)),
-                real_probed: Arc::new(Mutex::new(HashSet::new())),
                 real_gate: Mutex::new(None),
                 dns_mark_on_fast: Mutex::new(None),
             }
@@ -1369,13 +1455,11 @@ mod tests {
         fn real<'a>(
             &'a self,
             _endpoint: &'a Endpoint,
-            link: &'a ProfileStats,
-            _protocol: &'a DbProtocol,
-            _req: SinglePingReq<'a>,
+            _config: &'a ProtocolConfig,
+            _req: NativeProbeReq<'a>,
         ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.real_calls.fetch_add(1, Ordering::Relaxed);
-                self.real_probed.lock().insert(link.protocol_id.get());
                 // Clone the gate out of the lock so the await below does not
                 // hold the mutex guard across the yield point.
                 let gate = self.real_gate.lock().clone();
@@ -1445,6 +1529,7 @@ mod tests {
             ip_api_url: "http://127.0.0.1/ip".to_string(),
             defer_delay: Duration::from_millis(50),
             real_concurrency: 8,
+            fast_concurrency: 8,
             error_ttl_hours: None,
         }
     }
@@ -1635,7 +1720,6 @@ mod tests {
         await_batch_done(&mut h.state).await;
 
         assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 2);
-        assert_eq!(h.runner.real_probed.lock().len(), 2);
         for link in &h.state.endpoints[0].links {
             assert!(matches!(
                 link.latency,
@@ -1643,6 +1727,63 @@ mod tests {
             ));
             assert!(link.error.is_none());
         }
+    }
+
+    // ── native testability gate ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn untestable_kind_is_marked_and_still_fast_probed() {
+        let mut rows = vec![fake_row(1, "10.0.0.1", 1)];
+        // A kind with no native implementation. The plan-time gate reads the
+        // in-memory `proto_kind` only — the config is never loaded for it.
+        for proto in rows[0].protocols.values_mut() {
+            proto.proto_kind = xray_tui_proto::proto_spec::ProtocolKind::Tuic;
+        }
+        let mut h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        // Fast-only batch: the marker must still land (the gate runs for every
+        // ping operation) and the fast probe must still run (R1).
+        let handle = start_test_batch(&mut h, plan, false, false);
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        assert_eq!(
+            h.runner.fast_calls.load(Ordering::Relaxed),
+            1,
+            "the fast probe still runs for an untestable row"
+        );
+        assert_eq!(
+            h.runner.real_calls.load(Ordering::Relaxed),
+            0,
+            "no real probe for an untestable row"
+        );
+        // The marker lands AFTER the fast result: a fast success writes
+        // `error = None`, so the reverse order would erase it.
+        let link = &h.state.endpoints[0].links[0];
+        let error = link.error.as_ref().expect("marker persisted");
+        assert!(crate::ops::ping::is_untestable_marker(error), "{error:?}");
+        assert!(error.text.contains("no native implementation"), "{error:?}");
+    }
+
+    #[test]
+    fn untestable_markers_are_not_removable_failures() {
+        let mut row = fake_row(1, "10.0.0.1", 1);
+        let link = &mut row.links[0];
+        link.error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: untestable_marker_text("no native implementation for this protocol kind"),
+        });
+        assert!(
+            !is_removable_failure(link),
+            "an untestable row must survive Remove Bad Servers"
+        );
+        link.error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "timeout".to_string(),
+        });
+        assert!(is_removable_failure(link), "a real failure still counts");
+        link.error = None;
+        assert!(!is_removable_failure(link));
     }
 
     // ── all-fail error markers ───────────────────────────────────────────

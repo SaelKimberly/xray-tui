@@ -51,6 +51,8 @@ pub mod e2e;
 pub mod error;
 pub mod headers;
 pub mod inbound;
+/// HTTP-over-tunnel primitive (the real-ping probe's transport).
+pub mod probe;
 pub mod protocol;
 /// Buffered CSPRNG for non-secret randomness (padding, salts, ids). Key
 /// material never comes from here — see the module docs.

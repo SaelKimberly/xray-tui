@@ -2,11 +2,13 @@
 //! core may serve (spec brief §2).
 //!
 //! [`kind_supported`] is the cheap kind-only gate (display/sort paths that
-//! cannot load the full config); [`supported`] is the config-aware runtime
-//! gate (connect/ping paths). A row native serves *worse* than a subprocess
-//! — notably VLESS `mlkem768x25519plus` account encryption, where native
-//! diverges from real-xray interop (`NATIVE_CORE.md` `SP7` pq-enc) — returns
-//! `false` so Auto resolution falls back to the subprocess.
+//! cannot load the full config); [`support_reason`] is the config-aware
+//! runtime gate (connect/ping paths) and [`supported`] its bool form, so the
+//! reason it returns doubles as the user-visible `[real]` marker text. A row
+//! native serves *worse* than a subprocess — notably VLESS
+//! `mlkem768x25519plus` account encryption, where native diverges from
+//! real-xray interop (`NATIVE_CORE.md` `SP7` pq-enc) — is refused so Auto
+//! resolution falls back to the subprocess.
 //!
 //! The predicate mirrors the native dispatch arms, not xray's feature set:
 //! [`crate::protocol`], [`crate::transport`], and [`crate::security`]. A
@@ -63,11 +65,17 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
     )
 }
 
-/// True when native should serve this exact protocol+config row.
+/// Why native refuses this exact protocol+config row, or [`None`] when it
+/// serves it.
 ///
-/// `kind_supported(kind)` AND the config requests no native-worse/deferred
-/// feature, AND the config variant matches `kind` (a kind/config mismatch
-/// is never servable).
+/// The reason is the persisted, user-visible `[real]` marker text, so these
+/// strings are an interface, not log prose. `support_reason(kind,
+/// config).is_none()` is exactly [`supported`]. A row is refused when
+/// `kind_supported(kind)` is false (`"no native implementation for this
+/// protocol kind"`), when the config variant does not match `kind`
+/// (`"protocol kind and config type do not match"`), or when the config
+/// requests a native-worse/deferred feature — each predicate below documents
+/// its own string.
 ///
 /// The verdict is TCP-truthful — it covers the byte-stream path only.
 /// SOCKS5 UDP ASSOCIATE through the native proxy outbound is not
@@ -76,56 +84,79 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
 /// config error, so a native session drops the proxy UDP leg (debug-logged)
 /// no matter what this predicate answers. Gating UDP-capable shapes off
 /// that gap would cost them their native TCP path for a UDP leg no config
-/// can reach today — see `vless_supported` for the vision flows.
+/// can reach today — see `vless_reason` for the vision flows.
 ///
 /// The Shadowsocks row is the sharpest case of that stance: `SsConfig` has no
 /// transport field at all, so the verdict covers the plain-TCP dial plus
 /// optional `security` and nothing else — the UDP dial-end refuses a
 /// non-empty `security` inside `ss::udp::connect_udp`, and refuses a chain in
 /// `chain.rs::ss_udp_guard`, which is where both refusals belong.
+/// The reason a protocol kind has no native implementation at all.
+///
+/// Public because the ping gate decides this level WITHOUT a loaded config and
+/// must not duplicate the text.
+pub const KIND_UNSUPPORTED_REASON: &str = "no native implementation for this protocol kind";
+
 #[must_use]
-pub fn supported(kind: ProtocolKind, config: &ProtocolConfig) -> bool {
+pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<&'static str> {
     if !kind_supported(kind) {
-        return false;
+        return Some(KIND_UNSUPPORTED_REASON);
     }
     match (kind, config) {
-        (ProtocolKind::Vless, ProtocolConfig::Vless(cfg)) => vless_supported(cfg),
-        (ProtocolKind::Vmess, ProtocolConfig::Vmess(cfg)) => vmess_supported(cfg),
-        (ProtocolKind::Trojan, ProtocolConfig::Trojan(cfg)) => trojan_supported(cfg),
-        (ProtocolKind::Hysteria2, ProtocolConfig::Hysteria2(cfg)) => hysteria2_supported(cfg),
+        (ProtocolKind::Vless, ProtocolConfig::Vless(cfg)) => vless_reason(cfg),
+        (ProtocolKind::Vmess, ProtocolConfig::Vmess(cfg)) => vmess_reason(cfg),
+        (ProtocolKind::Trojan, ProtocolConfig::Trojan(cfg)) => trojan_reason(cfg),
+        (ProtocolKind::Hysteria2, ProtocolConfig::Hysteria2(cfg)) => hysteria2_reason(cfg),
         (ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022, ProtocolConfig::Ss(cfg)) => {
-            ss_supported(kind, cfg)
+            ss_reason(kind, cfg)
         }
-        _ => false,
+        _ => Some("protocol kind and config type do not match"),
     }
 }
 
-/// Transports native can build — a POSITIVE match of the arms
-/// `transport::connect` / `transport::upgrade` actually dispatch:
-/// tcp/ws/grpc/httpupgrade/xhttp/http (v2rayhttp) ride the dial + upgrade
-/// chain, xhttp+h3 replaces the dial with its own QUIC one, and kcp is a
-/// fresh UDP dial.
+/// True when native should serve this exact protocol+config row.
+///
+/// The bool form of [`support_reason`], which documents the predicate
+/// itself.
+#[must_use]
+pub fn supported(kind: ProtocolKind, config: &ProtocolConfig) -> bool {
+    support_reason(kind, config).is_none()
+}
+
+/// Why the transport is not buildable, or [`None`] — the transports native
+/// can build are a POSITIVE match of the arms `transport::connect` /
+/// `transport::upgrade` actually dispatch: tcp/ws/grpc/httpupgrade/xhttp/http
+/// (v2rayhttp) ride the dial + upgrade chain, xhttp+h3 replaces the dial with
+/// its own QUIC one, and kcp is a fresh UDP dial.
 ///
 /// Bare `TransportConfig::Quic` has no arm (`NotImplemented("transport
-/// quic")`) — xray-only, so deferred. The match is deliberately exhaustive
-/// (no wildcard): a variant added to `TransportConfig` breaks THIS function
-/// at compile time rather than inheriting `true`, which is the strongest
-/// fail-closed shape available — nothing new can pass unreviewed.
+/// quic")`) — xray-only, so deferred: `"transport is not implemented"`. The
+/// match is deliberately exhaustive (no wildcard): a variant added to
+/// `TransportConfig` breaks THIS function at compile time rather than
+/// inheriting `true`, which is the strongest fail-closed shape available —
+/// nothing new can pass unreviewed.
 ///
 /// `path` is the protocol row's own `path` field, forwarded for the mKCP
-/// seed check ([`kcp_supported`]); every other arm ignores it (their path
+/// seed check ([`kcp_reason`]); every other arm ignores it (their path
 /// lives inside the transport config).
-fn transport_supported(transport: &TransportConfig, path: Option<&str>) -> bool {
+fn transport_reason(transport: &TransportConfig, path: Option<&str>) -> Option<&'static str> {
     match transport {
         TransportConfig::Tcp
         | TransportConfig::Ws(_)
         | TransportConfig::Grpc(_)
         | TransportConfig::Http(_)
         | TransportConfig::HttpUpgrade(_)
-        | TransportConfig::XHttp(_) => true,
-        TransportConfig::Kcp(cfg) => kcp_supported(cfg, path),
-        TransportConfig::Quic => false,
+        | TransportConfig::XHttp(_) => None,
+        TransportConfig::Kcp(cfg) => kcp_reason(cfg, path),
+        TransportConfig::Quic => Some("transport is not implemented"),
     }
+}
+
+/// Bool form of [`transport_reason`] — the shape the direct dispatch-table
+/// test asserts on.
+#[cfg(test)]
+fn transport_supported(transport: &TransportConfig, path: Option<&str>) -> bool {
+    transport_reason(transport, path).is_none()
 }
 
 /// mKCP row: only the settings the native dial actually reads.
@@ -135,7 +166,8 @@ fn transport_supported(transport: &TransportConfig, path: Option<&str>) -> bool 
 /// knobs — ignoring them still interoperates. Two fields are not knobs but
 /// WIRE FORMAT, so ignoring them frames every datagram differently than the
 /// server expects: the packets are dropped and the dial hangs instead of
-/// failing loudly, the worst failure shape there is.
+/// failing loudly, the worst failure shape there is. Either of them is
+/// refused as `"mKCP seed or header_type is not implemented"`.
 ///
 /// - `seed`: mKCP's global obfuscation key. Clash configs carry it in
 ///   `KcpConfig::seed`; share links carry it in the protocol row's `path`
@@ -144,17 +176,18 @@ fn transport_supported(transport: &TransportConfig, path: Option<&str>) -> bool 
 /// - `header_type`: the packet camouflage header (`srtp`, `utp`,
 ///   `wechat-video`, `dtls`, `wireguard`, `dns`). Only the default `none`
 ///   is a bare mKCP datagram.
-fn kcp_supported(cfg: &KcpConfig, path: Option<&str>) -> bool {
+fn kcp_reason(cfg: &KcpConfig, path: Option<&str>) -> Option<&'static str> {
     let seeded =
         cfg.seed.as_deref().is_some_and(|s| !s.is_empty()) || path.is_some_and(|s| !s.is_empty());
     let camouflaged = cfg
         .header_type
         .as_deref()
         .is_some_and(|h| !(h.is_empty() || h == "none"));
-    !seeded && !camouflaged
+    (seeded || camouflaged).then_some("mKCP seed or header_type is not implemented")
 }
 
-/// True when the row's TLS fingerprint id is one native parses.
+/// Why the row's TLS fingerprint id is not one native parses, or [`None`]
+/// when it is.
 ///
 /// `security::wrap` feeds `fp` straight to [`parse_fingerprint_id`] in both
 /// arms (plain TLS and REALITY's default provisioner), and an id it does not
@@ -162,25 +195,29 @@ fn kcp_supported(cfg: &KcpConfig, path: Option<&str>) -> bool {
 /// would have connected. Gating on the SAME parser is what keeps the two
 /// lists from drifting: accepted ids are exactly `chrome`,
 /// `chrome-randomized`, `firefox`, `safari`, `random`, so xray-only ids
-/// (`randomized`, `ios`, `android`, `edge`, `360`, `qq`, …) defer to the
-/// subprocess.
+/// (`randomized`, `ios`, `android`, `edge`, `360`, `qq`, …) are refused as
+/// `"unparseable TLS fingerprint id"` and defer to the subprocess.
 ///
 /// No `fp` at all is supported: plain TLS then uses the engine default and
 /// REALITY the fixed chrome spec.
-fn security_supported(security: &SecurityConfig) -> bool {
-    security
-        .fp()
-        .is_none_or(|fp| parse_fingerprint_id(fp).is_ok())
+fn security_reason(security: &SecurityConfig) -> Option<&'static str> {
+    match security.fp() {
+        Some(fp) if parse_fingerprint_id(fp).is_err() => Some("unparseable TLS fingerprint id"),
+        _ => None,
+    }
 }
 
 /// VLESS row: no deferred account encryption or flow, a fingerprint native
 /// parses, implemented transport.
 ///
-/// Any non-empty `encryption` other than `"none"` defers — in particular
+/// Any non-empty `encryption` other than `"none"` is refused as `"vless
+/// account encryption is not implemented"` — in particular
 /// `mlkem768x25519plus.*`, whose native handshake diverges from real xray
 /// (fails where xray works), so it must never be Auto-selected. Flows are
 /// limited to the vision pair native encodes (`connect_vision`); any other
-/// non-empty flow is a `NotImplemented` guard.
+/// non-empty flow is a `NotImplemented` guard, refused as `"vless flow is
+/// not implemented"`. A fingerprint or transport refusal appends the
+/// [`security_reason`]/[`transport_reason`] string.
 ///
 /// Both vision flows stay supported even though a native session cannot
 /// carry their UDP leg (`xtls-rprx-vision-udp443` forces XUDP, and the proxy
@@ -188,19 +225,19 @@ fn security_supported(security: &SecurityConfig) -> bool {
 /// the most common native shape and its TCP path is fully implemented, so
 /// deferring it would trade a live fast path for a UDP leg that is dead on
 /// both sides of the decision.
-fn vless_supported(cfg: &VlessConfig) -> bool {
+fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
     if let Some(enc) = cfg.encryption.as_deref()
         && !enc.is_empty()
         && enc != "none"
     {
-        return false;
+        return Some("vless account encryption is not implemented");
     }
     if let Some(flow) = cfg.flow.as_deref()
         && !(flow.is_empty() || flow == "xtls-rprx-vision" || flow == "xtls-rprx-vision-udp443")
     {
-        return false;
+        return Some("vless flow is not implemented");
     }
-    security_supported(&cfg.security) && transport_supported(&cfg.transport, cfg.path.as_deref())
+    security_reason(&cfg.security).or_else(|| transport_reason(&cfg.transport, cfg.path.as_deref()))
 }
 
 /// `VMess` row: modern AEAD payload security only, a fingerprint native
@@ -210,32 +247,36 @@ fn vless_supported(cfg: &VlessConfig) -> bool {
 /// (`protocol::vmess::security_byte`): absent/`auto`/`aes-128-gcm`/
 /// `chacha20-poly1305` only. Legacy `none`/`zero`/`aes-128-cfb`/bare
 /// `chacha20` are xray-only (rejected server-side by xray 26.x too, but
-/// native has no arm at all). A non-zero `alter_id` selects the legacy
-/// pre-AEAD session scheme native never implemented.
-fn vmess_supported(cfg: &VmessConfig) -> bool {
+/// native has no arm at all), refused as `"legacy vmess payload security is
+/// not implemented"`. A non-zero `alter_id` selects the legacy pre-AEAD
+/// session scheme native never implemented, refused as `"vmess alter_id is
+/// not implemented"`. A fingerprint or transport refusal appends the
+/// [`security_reason`]/[`transport_reason`] string.
+fn vmess_reason(cfg: &VmessConfig) -> Option<&'static str> {
     if let Some(enc) = cfg.security.enc.as_deref()
         && !(enc.is_empty() || enc == "auto" || enc == "aes-128-gcm" || enc == "chacha20-poly1305")
     {
-        return false;
+        return Some("legacy vmess payload security is not implemented");
     }
     if let Some(aid) = cfg.alter_id.as_deref()
         && !(aid.is_empty() || aid == "0")
     {
-        return false;
+        return Some("vmess alter_id is not implemented");
     }
-    security_supported(&cfg.security) && transport_supported(&cfg.transport, cfg.path.as_deref())
+    security_reason(&cfg.security).or_else(|| transport_reason(&cfg.transport, cfg.path.as_deref()))
 }
 
 /// Trojan row: a fingerprint native parses, implemented transport.
 ///
 /// Trojan has no account-level encryption/flow variants in the typed config;
 /// security is none/tls/reality, all of which `security::wrap` implements —
-/// for the ids [`security_supported`] accepts.
-fn trojan_supported(cfg: &TrojanConfig) -> bool {
-    security_supported(&cfg.security) && transport_supported(&cfg.transport, cfg.path.as_deref())
+/// for the ids [`security_reason`] accepts. So the only refusals are the
+/// fingerprint and transport strings those two predicates return.
+fn trojan_reason(cfg: &TrojanConfig) -> Option<&'static str> {
+    security_reason(&cfg.security).or_else(|| transport_reason(&cfg.transport, cfg.path.as_deref()))
 }
 
-/// Hysteria2 row: always servable — and it MUST stay that way.
+/// Hysteria2 row: never refused — and it MUST stay that way.
 ///
 /// It is a self-contained QUIC dial (`protocol::hysteria2`, quinn's internal
 /// rustls), so there is no transport matrix and no fingerprint gate: the TLS
@@ -243,11 +284,11 @@ fn trojan_supported(cfg: &TrojanConfig) -> bool {
 /// `insecure` and never looks at `fp`, so an xray-only fingerprint id on a
 /// hysteria2 row is inert rather than fatal.
 ///
-/// `false` here is not fatal — xray-core DOES have a hysteria2 outbound
-/// (`protocol: "hysteria"`, `version: 2`; see `Hysteria2Config::inject_xray`
-/// in xray-tui-proto, unit-tested there), so a downgrade would serve the
-/// profile. The predicate stays `true` because nothing in the typed config
-/// requests a feature native lacks:
+/// A refusal here would not be fatal — xray-core DOES have a hysteria2
+/// outbound (`protocol: "hysteria"`, `version: 2`; see
+/// `Hysteria2Config::inject_xray` in xray-tui-proto, unit-tested there), so a
+/// downgrade would serve the profile. The predicate stays reason-free because
+/// nothing in the typed config requests a feature native lacks:
 ///
 /// Fields native reads: `auth`, `obfs_password` (Salamander — keyed off the
 /// password alone; the `obfs` TYPE string is never read), `down`
@@ -257,10 +298,10 @@ fn trojan_supported(cfg: &TrojanConfig) -> bool {
 /// `pin_sha256` (the QUIC dial carries no SPKI pin; only the plain-TLS path
 /// honours one). All of those are refinements: ignoring them still
 /// interoperates, so none of them gates. If a future config field DOES
-/// require xray semantics native lacks, return `false` for it — the Auto
+/// require xray semantics native lacks, return a reason for it — the Auto
 /// downgrade lands on xray-core, which can build the row.
-const fn hysteria2_supported(_cfg: &Hysteria2Config) -> bool {
-    true
+const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
+    None
 }
 
 /// Shadowsocks row (both kinds share this payload type): a native method
@@ -272,6 +313,12 @@ const fn hysteria2_supported(_cfg: &Hysteria2Config) -> bool {
 /// the chain. The UDP dial-end's own refusals (a non-empty `security` on the
 /// UDP path, chaining) live in `ss::udp::connect_udp`/`chain`, not here: this
 /// predicate stays TCP-truthful, exactly as [`supported`] documents.
+///
+/// Refusals, in check order: `"shadowsocks method is not implemented"`,
+/// `"shadowsocks method family does not match the protocol kind"`,
+/// `"shadowsocks SIP003 plugin is not implemented"`, `"shadowsocks 2022
+/// password key is malformed"`, then the [`security_reason`] fingerprint
+/// string.
 ///
 /// Every refusal below is a dead native dial the subprocess would have
 /// served:
@@ -294,23 +341,23 @@ const fn hysteria2_supported(_cfg: &Hysteria2Config) -> bool {
 /// - `password_key`: a malformed 2022 PSK (not base64, or the wrong length
 ///   for the method) is a fatal `NativeError::Config` in the connect path, so
 ///   refusing at gate time keeps Auto resolution on the subprocess.
-/// - `security_supported`: an xray-only uTLS fingerprint id is fatal on the
+/// - `security_reason`: an xray-only uTLS fingerprint id is fatal on the
 ///   SS TCP path too, because `security::wrap` parses it there like any
 ///   other TLS/REALITY row.
-fn ss_supported(kind: ProtocolKind, cfg: &SsConfig) -> bool {
+fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<&'static str> {
     let Ok(method) = resolve_method(cfg) else {
-        return false;
+        return Some("shadowsocks method is not implemented");
     };
     if method.kind() != kind {
-        return false;
+        return Some("shadowsocks method family does not match the protocol kind");
     }
     if cfg.plugin.is_some() || cfg.plugin_opts.is_some() {
-        return false;
+        return Some("shadowsocks SIP003 plugin is not implemented");
     }
     if password_key(method, &cfg.password).is_err() {
-        return false;
+        return Some("shadowsocks 2022 password key is malformed");
     }
-    security_supported(&cfg.security)
+    security_reason(&cfg.security)
 }
 
 #[cfg(test)]
@@ -571,6 +618,84 @@ mod tests {
             ProtocolKind::Vless,
             &ProtocolConfig::Vmess(vmess_cfg())
         ));
+    }
+
+    #[test]
+    fn support_reason_agrees_with_supported() {
+        // One row per refusal class plus an accepted row per native kind: the
+        // two entry points must never disagree, so the marker text can never
+        // describe a row `supported` accepts (or the reverse).
+        let mut vless_enc = vless_cfg();
+        vless_enc.encryption = Some("mlkem768x25519plus.native.0rtt".into());
+        let mut vless_flow = vless_cfg();
+        vless_flow.flow = Some("xtls-rprx-direct".into());
+        let mut vless_fp = vless_cfg();
+        vless_fp.security = tls_fp("ios");
+        let mut vless_kcp = vless_cfg();
+        vless_kcp.transport = TransportConfig::Kcp(KcpConfig {
+            seed: Some("obfs".into()),
+            ..KcpConfig::default()
+        });
+        let mut vless_quic = vless_cfg();
+        vless_quic.transport = TransportConfig::Quic;
+        let mut vmess_sec = vmess_cfg();
+        vmess_sec.security.enc = Some("aes-128-cfb".into());
+        let mut vmess_alter = vmess_cfg();
+        vmess_alter.alter_id = Some("1".into());
+        let mut trojan_fp = trojan_cfg();
+        trojan_fp.security = reality_fp("android");
+        let mut ss_legacy = ss_cfg("aes-128-cfb", "secret");
+        ss_legacy.method = "aes-128-cfb".into();
+        let mut ss_family = ss_cfg("2022-blake3-aes-128-gcm", "secret");
+        ss_family.method = "2022-blake3-aes-128-gcm".into();
+        let mut ss_plugin = ss_cfg("aes-256-gcm", "secret");
+        ss_plugin.plugin = Some("v2ray-plugin".into());
+
+        let rows: Vec<(ProtocolKind, ProtocolConfig)> = vec![
+            // Refusals.
+            (ProtocolKind::Tuic, ProtocolConfig::Vless(vless_cfg())),
+            (ProtocolKind::Vless, ProtocolConfig::Vmess(vmess_cfg())),
+            (ProtocolKind::Vless, ProtocolConfig::Vless(vless_enc)),
+            (ProtocolKind::Vless, ProtocolConfig::Vless(vless_flow)),
+            (ProtocolKind::Vless, ProtocolConfig::Vless(vless_fp)),
+            (ProtocolKind::Vless, ProtocolConfig::Vless(vless_kcp)),
+            (ProtocolKind::Vless, ProtocolConfig::Vless(vless_quic)),
+            (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_sec)),
+            (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_alter)),
+            (ProtocolKind::Trojan, ProtocolConfig::Trojan(trojan_fp)),
+            (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_legacy)),
+            (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_family)),
+            (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_plugin)),
+            // Accepted rows.
+            (ProtocolKind::Vless, ProtocolConfig::Vless(vless_cfg())),
+            (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_cfg())),
+            (ProtocolKind::Trojan, ProtocolConfig::Trojan(trojan_cfg())),
+            (
+                ProtocolKind::Hysteria2,
+                ProtocolConfig::Hysteria2(hysteria2_cfg()),
+            ),
+            (
+                ProtocolKind::Shadowsocks,
+                ProtocolConfig::Ss(ss_cfg("aes-256-gcm", "secret")),
+            ),
+        ];
+
+        let mut refusals = 0;
+        for (kind, config) in rows {
+            let reason = support_reason(kind, &config);
+            assert_eq!(
+                reason.is_none(),
+                supported(kind, &config),
+                "support_reason/supported disagree for {kind:?}"
+            );
+            if reason.is_some() {
+                refusals += 1;
+            }
+        }
+        assert!(
+            refusals >= 13,
+            "the table must exercise every refusal class"
+        );
     }
 
     #[test]

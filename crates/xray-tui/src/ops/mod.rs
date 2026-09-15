@@ -5,6 +5,7 @@ pub mod events;
 pub mod link_writer;
 pub mod native_connect;
 pub mod ping;
+pub mod ping_native;
 pub mod profiles;
 pub mod scheduler;
 pub mod settings;

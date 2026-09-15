@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -13,13 +13,6 @@ pub enum TestType {
     RealPing,
     SpeedTest,
     UdpTest,
-}
-
-/// Result of a real ping (HTTP through SOCKS5 proxy) test.
-#[derive(Debug, Clone)]
-pub struct RealPingResult {
-    pub latency_ms: u64,
-    pub ip_info: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -48,38 +41,6 @@ pub async fn tcp_ping(
         Ok(Ok(_)) => Ok(start.elapsed()),
         Ok(Err(e)) => Err(SpeedTestError::Io(e)),
         Err(_) => Err(SpeedTestError::Timeout(test_timeout)),
-    }
-}
-
-/// Poll a SOCKS5 proxy port until it responds with a valid server-selection
-/// (VER=5, METHOD=0x00), indicating the proxy stack is fully initialized.
-/// Polls every 50ms up to `deadline`. Returns `Some(())` on success, `None` on timeout.
-///
-/// Pattern from v2rayN's `WaitForProxyPort()` — more reliable than raw TCP connect
-/// because it confirms the SOCKS5 handshake layer is ready, not just the TCP listener.
-pub async fn wait_for_socks5(addr: &str, port: u16, deadline: Duration) -> Option<()> {
-    let start = Instant::now();
-    let greeting: [u8; 3] = [0x05, 0x01, 0x00]; // VER=5, NMETHODS=1, METHOD=0 (no auth)
-    let mut buf = [0u8; 2];
-    loop {
-        match TcpStream::connect((addr, port)).await {
-            Ok(mut stream) => {
-                // Send SOCKS5 greeting and check server selection
-                if stream.write_all(&greeting).await.is_ok()
-                    && stream.read_exact(&mut buf).await.is_ok()
-                    && buf == [0x05, 0x00]
-                {
-                    return Some(());
-                }
-            }
-            Err(_) if start.elapsed() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(_) => return None,
-        }
-        if start.elapsed() >= deadline {
-            return None;
-        }
     }
 }
 
@@ -158,85 +119,6 @@ async fn create_socks5_client_with_policy(
     let client = builder.build().map_err(SpeedTestError::Http)?;
     CLIENT_CACHE.lock().unwrap().insert(key, client.clone());
     Ok(client)
-}
-
-/// Real ping: send HTTP HEAD requests through SOCKS5 proxy to `url`, measure fastest response time.
-///
-/// Uses `socks5://` (NOT `socks5h://`) — the proxy resolves DNS locally.
-/// Up to `retries` requests are sent concurrently; the fastest 2xx response wins.
-/// On success, optionally fetches IP info from `ip_api_url` through the same proxy.
-///
-/// Optimizations (from sing-box/mihomo patterns):
-/// - HEAD instead of GET (avoids downloading response body)
-/// - No redirect following (probe URL doesn't redirect)
-/// - Parallel retries (first success wins, instead of sequential with sleep)
-/// - Pool max idle per host = 0 (no keepalive reuse across measurements)
-pub async fn real_ping(
-    proxy: &str,
-    port: u16,
-    url: &str,
-    ip_api_url: &str,
-    test_timeout: Duration,
-    retries: u32,
-) -> Result<RealPingResult, SpeedTestError> {
-    crate::ensure_tls_provider();
-    // Pooled probe client (Policy::none preserved via the cache's policy bit).
-    let client = create_socks5_client_with_policy(proxy, port, false, test_timeout, true).await?;
-
-    let start = std::time::Instant::now();
-    let mut best_latency: Option<u64> = None;
-    let mut last_error: Option<SpeedTestError> = None;
-
-    let retries = retries.max(1);
-    let futs: Vec<_> = (0..retries).map(|_| client.head(url).send()).collect();
-    let mut stream = futures_util::stream::iter(futs).buffer_unordered(retries as usize);
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(resp) if resp.status().is_success() => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                match best_latency {
-                    None => best_latency = Some(elapsed),
-                    Some(best) if elapsed < best => best_latency = Some(elapsed),
-                    _ => {}
-                }
-            }
-            Ok(resp) => {
-                last_error = Some(SpeedTestError::Http(resp.error_for_status().unwrap_err()));
-            }
-            Err(e) => {
-                last_error = Some(SpeedTestError::Http(e));
-            }
-        }
-    }
-
-    let latency_ms = best_latency.ok_or_else(|| {
-        last_error.unwrap_or_else(|| SpeedTestError::Proxy("all retries failed".to_string()))
-    })?;
-
-    // Fetch IP info on success — pooled client with default redirect policy.
-    let ip_info = {
-        match create_socks5_client_with_policy(proxy, port, false, Duration::from_secs(10), false)
-            .await
-        {
-            Ok(ip_client) => match ip_client.get(ip_api_url).send().await {
-                Ok(resp) => match resp.json::<serde_json::Value>().await {
-                    Ok(json) => {
-                        let ip = json.get("query").and_then(|v| v.as_str()).unwrap_or("-");
-                        let country = json.get("country").and_then(|v| v.as_str()).unwrap_or("-");
-                        Some(format!("{ip} | {country}"))
-                    }
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            },
-            Err(_) => None,
-        }
-    };
-
-    Ok(RealPingResult {
-        latency_ms,
-        ip_info,
-    })
 }
 
 /// Speed test: download `url` through SOCKS5 proxy, measure throughput.
@@ -451,13 +333,6 @@ mod tests {
         let fut = async { Err::<(), _>(std::io::Error::other("boom")) };
         let result = io_timeout(Duration::from_millis(100), fut).await;
         assert!(matches!(result, Err(SpeedTestError::Io(_))));
-    }
-
-    #[tokio::test]
-    async fn wait_for_socks5_timeout() {
-        // Port 1 is privileged — no real service listens there
-        let result = wait_for_socks5("127.0.0.1", 1, Duration::from_millis(100)).await;
-        assert!(result.is_none());
     }
 
     #[tokio::test]
