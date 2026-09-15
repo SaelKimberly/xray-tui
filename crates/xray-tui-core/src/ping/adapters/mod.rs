@@ -15,7 +15,7 @@ use xray_tui_proto::ProtocolKind;
 ///
 /// Design rule: an adapter MUST NOT support any protocol whose `address:port`
 /// is not extractable from profile metadata — such protocols get no adapter
-/// match and fall through to RealPingManager.
+/// match, so the fast probe reports "not supported by any adapter".
 #[async_trait::async_trait]
 pub trait FastPingAdapter: Send + Sync + std::fmt::Debug {
     fn transport(&self) -> PingCapability;

@@ -8,11 +8,11 @@ Status: IMPLEMENTED 2026-09-03 · Baseline: `b2c1786ecd67be191912f0f1b020fab3f87
   `{Xray, SingBox}` — nothing native-specific is persisted. Native preference is
   decided per connect in `ops/connect.rs::resolve_runtime_core` from the link's
   concrete stamp + `protocol_core_overrides` + the loaded config (see §1).
-- **Real ping (item 7 superseded):** no ephemeral native server and no
-  `native_ping`. `real_ping` and `CorePool::ping` dispatch on the link's
-  concrete `core_type` (`Xray`/`SingBox`), so Phase-2/single real pings always
-  run on temp subprocess cores with zero new code. A native real-ping path
-  remains possible later; it is not needed for Test-column parity.
+- **Real ping (item 7 delivered, 2026-09-14 · ADR 0004):** the probe runs on the
+  native engine (`ops/ping_native.rs` → `xray_tui_native::probe::fetch`); the
+  subprocess temp cores, the warm pool and `native_ping`'s SOCKS-server shape are
+  gone. Rows the engine cannot serve get a persisted `[real]` marker instead of a
+  probe.
 - **UDP ASSOCIATE trace:** TCP CONNECT + HTTP CONNECT legs emit full
   open/close/byte trace rows; UDP associations are relayed but untraced
   (byte accounting would need relay-loop surgery — documented gap).
@@ -76,8 +76,8 @@ User decisions (2026-09-03):
   `apply_stats_delta` accumulates onto `ProfileStats.traffic` (today/total, day
   reset) and `SysStatsUpdate` → `system_stats`.
 - `CoreManager` trait (`xray-tui-core/src/process.rs:12`, object-safe) is used as
-  `Box<dyn CoreManager>` only by the real-ping `CorePool`; connect.rs constructs
-  `RealCoreManager` concretely.
+  `Box<dyn CoreManager>` by connect's `RealCoreManager`; the real-ping `CorePool`
+  that also used it was deleted with the subprocess probe arm (ADR 0004).
 - Statistics tab (`ui/statistics.rs`) is a pure render of `active_link.traffic` +
   `state.system_stats` + connected core label. Logs: subprocess lines →
   `parse_core_log_line` → heed `LogMessage` + `CoreEvent::LogLine`; native has no

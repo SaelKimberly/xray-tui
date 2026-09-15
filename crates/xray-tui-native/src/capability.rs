@@ -65,6 +65,12 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
     )
 }
 
+/// The reason a protocol kind has no native implementation at all.
+///
+/// Public because the ping gate decides this level WITHOUT a loaded config and
+/// must not duplicate the text.
+pub const KIND_UNSUPPORTED_REASON: &str = "no native implementation for this protocol kind";
+
 /// Why native refuses this exact protocol+config row, or [`None`] when it
 /// serves it.
 ///
@@ -91,12 +97,6 @@ pub const fn kind_supported(kind: ProtocolKind) -> bool {
 /// optional `security` and nothing else — the UDP dial-end refuses a
 /// non-empty `security` inside `ss::udp::connect_udp`, and refuses a chain in
 /// `chain.rs::ss_udp_guard`, which is where both refusals belong.
-/// The reason a protocol kind has no native implementation at all.
-///
-/// Public because the ping gate decides this level WITHOUT a loaded config and
-/// must not duplicate the text.
-pub const KIND_UNSUPPORTED_REASON: &str = "no native implementation for this protocol kind";
-
 #[must_use]
 pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<&'static str> {
     if !kind_supported(kind) {
