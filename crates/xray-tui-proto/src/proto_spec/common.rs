@@ -135,7 +135,10 @@ impl TransportConfig {
                     "type".into(),
                     other.to_string().into(),
                 )), |recovered| {
-                    tracing::warn!(target: "proto_spec::common", transport = %other, recovered = %recovered, "Recovered transport type");
+                    // Per-row parse noise, not a user-visible fault: a
+                    // subscription of 25k rows wrote 739 of these lines in one
+                    // import (2026-09-15). The recovered value is in the event.
+                    tracing::debug!(target: "proto_spec::common", transport = %other, recovered = %recovered, "Recovered transport type");
                     Self::from_type_and_path(Some(recovered), path)
                 })
 
