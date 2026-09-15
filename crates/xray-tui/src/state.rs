@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -131,7 +131,7 @@ pub struct AppState {
     pub speed_test_stop: Arc<AtomicBool>,
     pub last_test_tcp: Option<u64>,
     /// Shared batch progress (total, completed) displayed in status bar.
-    pub batch_progress: Option<Arc<(AtomicU16, AtomicU16)>>,
+    pub batch_progress: Option<crate::types::BatchProgress>,
     pub last_test_real: Option<u64>,
     pub last_test_speed: Option<u64>,
     pub current_traffic_up: i64,

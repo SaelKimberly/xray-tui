@@ -102,9 +102,9 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             }
         }
     });
-    // One line naming the values a batch's behaviour depends on (the run's
-    // own record: per-result lines are `debug`, batches log one summary).
-    crate::ops::ping::log_startup_envelope(state);
+    // The startup envelope is logged once the first page has landed: it names
+    // the loaded page size, which is zero while the tab is still loading.
+    let mut envelope_logged = false;
     let refresh_interval = *state.config.gui.refresh_interval_secs;
     let mut last_tick = std::time::Instant::now();
     // Set when a Resize event is drained; forces the next loop iteration to redraw.
@@ -200,6 +200,10 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         // Draw when events were handled (input stays responsive), when a resize was
         // seen (immediate redraw), or at the refresh cadence while idle (default 5s —
         // previously the draw ran every 16ms frame at 60fps).
+        if !envelope_logged && !state.endpoints.is_empty() {
+            crate::ops::ping::log_startup_envelope(state);
+            envelope_logged = true;
+        }
         if resize_seen || events_seen || last_tick.elapsed() >= refresh_interval {
             last_tick = std::time::Instant::now();
             resize_seen = false;
@@ -1101,8 +1105,8 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Speed Test (Selected)"),
     SpeedTestMenuItem::Item("UDP Test (Selected)"),
     SpeedTestMenuItem::Separator,
-    SpeedTestMenuItem::Item("Fast Ping (All Visible)"),
-    SpeedTestMenuItem::Item("Fast + Real Ping (All Visible)"),
+    SpeedTestMenuItem::Item("Fast Ping (All Profiles)"),
+    SpeedTestMenuItem::Item("Fast + Real Ping (All Profiles)"),
     SpeedTestMenuItem::Item("Sort by Test"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,

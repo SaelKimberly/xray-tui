@@ -258,8 +258,8 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 │  Speed Test (Selected)                                │
 │  UDP Test (Selected)                                  │
 │  ─────                                                │
-│  Fast Ping (All Visible)                                │
-│  Fast + Real Ping (All Visible)                         │
+│  Fast Ping (All Profiles)                               │
+│  Fast + Real Ping (All Profiles)                        │
 │  ─────                                                │
 │  Clear All Stats                                      │
 │  Sort by Delay                                        │
@@ -277,8 +277,11 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 
 Progress is shown in the status bar during batch tests (`Testing: {completed}/{total}` or `Testing...`).
 
-**Batch behavior (Fast Ping / Real Ping / Fast+Real on All Visible):** the
-batch runs on a per-profile (protocol, endpoint) task queue — one live test
+**Batch behavior (Fast Ping / Real Ping / Fast+Real on All Profiles):** the
+"All Profiles" entry points test the whole DATABASE — every (protocol,
+endpoint) link it holds, not the rows the tab currently shows — so a filtered
+or paged view does not narrow a run (only links imported after the run starts
+can be missed). The batch runs on a per-profile (protocol, endpoint) task queue — one live test
 per profile, further tests queued FIFO up to `task_queue_limit` (default 3,
 `0` disables queueing). Profiles whose queue is full are skipped with a
 warning. Profiles whose DNS failed recently are deferred and retried after
@@ -563,8 +566,8 @@ appended when updates are available for installed backends.
    - **Real Ping** — measures response time through the proxy (same scoping)
    - **Speed Test** — downloads a test payload to measure throughput
    - **UDP Test** — tests UDP forwarding
-   - **Fast Ping (All Visible)** — batch fast pings all visible profiles
-   - **Fast + Real Ping (All Visible)** — batch fast ping followed by real ping for unsupported protocols
+   - **Fast Ping (All Profiles)** — batch fast pings every link in the database
+   - **Fast + Real Ping (All Profiles)** — the same fast phase, then a real ping per reachable link (links the fast phase proved unreachable are skipped, and rows the native engine cannot serve are marked `[real]` instead of probed)
    - **Sort by Delay** — re-sorts the table by delay ascending
    - **Remove Bad Servers** — removes profiles with failed tests
 5. Results populate the expanded panel's per-protocol sub-table; real-ping

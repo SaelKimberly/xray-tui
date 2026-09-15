@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
@@ -791,7 +791,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     // status bar reads the atomics directly; the batch task
                     // also updates them in place).
                     let entry = state.batch_progress.get_or_insert_with(|| {
-                        Arc::new((AtomicU16::new(total), AtomicU16::new(0)))
+                        Arc::new((AtomicU32::new(total), AtomicU32::new(0)))
                     });
                     entry.0.store(total, Ordering::Relaxed);
                     entry.1.store(completed, Ordering::Relaxed);
@@ -1068,7 +1068,7 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileSt
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{EndpointRow, HostType, Latency};
@@ -2182,7 +2182,7 @@ mod tests {
         // pressed mid-batch). Only after the batch's progress is gone does a
         // drained result re-arm the flag.
         let (mut state, tx) = event_state().await;
-        state.batch_progress = Some(Arc::new((AtomicU16::new(2), AtomicU16::new(0))));
+        state.batch_progress = Some(Arc::new((AtomicU32::new(2), AtomicU32::new(0))));
         state.speed_test_stop.store(true, Ordering::Relaxed);
         state.testing_profiles.insert((0, 8));
 

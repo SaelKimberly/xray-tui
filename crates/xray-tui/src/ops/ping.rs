@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -10,12 +10,15 @@ use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
 use xray_tui_db::LinkGroups;
 use xray_tui_db::models::Protocol as DbProtocol;
-use xray_tui_db::models::{Endpoint, EndpointId, EndpointRow, ProfileStats, ProtocolId, TaskKind};
+use xray_tui_db::models::{
+    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, TaskKind,
+};
 use xray_tui_native::capability;
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
 use crate::AppState;
 use crate::ops::ping_native::{self, NativeProbeReq};
+use crate::ops::profiles::PROFILES_PAGE_SIZE;
 use crate::ops::scheduler::{ScheduleOutcome, TaskScheduler};
 use crate::state::load_protocol_with_config;
 use crate::try_send_or_warn;
@@ -484,10 +487,24 @@ pub async fn remove_failed_servers(state: &mut AppState) {
 // two batches racing to fire promoted tasks on the same link, and the shared
 // progress bar displays one batch.
 
+/// Where a batch's plan comes from.
+///
+/// The "all" entry points test the FEED, not the viewport: the loaded page is
+/// 200 endpoint rows, so a batch scoped to it tested 272 of the 4,523 links in
+/// the 2026-09-15 feed while the user expected the whole database. Only links
+/// that appear *after* the plan is built can be missed.
+#[derive(Debug)]
+enum PlanSource {
+    /// Every link in the database.
+    Feed,
+    /// An explicit plan: the selected-endpoint entry points, and tests.
+    Links(Vec<PlanLink>),
+}
+
 /// One link in a batch plan: the scheduler identity (link snapshot), the
 /// endpoint (probe target + dedup identity), and the protocol row snapshot
 /// (fast config type; real probes reload the row WITH config inside the task).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PlanLink {
     link: ProfileStats,
     endpoint: Endpoint,
@@ -629,7 +646,9 @@ struct BatchShared {
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    progress: Arc<(AtomicU16, AtomicU16)>,
+    progress: crate::types::BatchProgress,
+    /// The resolved plan: `PlanSource` is the input shape, resolved before the
+    /// shared state exists (a feed load is async, this struct is not).
     plan: Vec<PlanLink>,
     real_phase: bool,
     dedup_endpoints: bool,
@@ -642,7 +661,7 @@ struct BatchShared {
     real_concurrency: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
-    total: u16,
+    total: u32,
     /// Fast config type per link (derived from the plan's protocol kind).
     fast_config: HashMap<(ProtocolId, EndpointId), i32>,
     /// Endpoint rows by id (real probes need the full endpoint).
@@ -658,7 +677,7 @@ struct BatchShared {
     // ── phase tracking ────────────────────────────────────────────────
     pending_fast: AtomicUsize,
     pending_real: AtomicUsize,
-    done: AtomicU16,
+    done: AtomicU32,
     phase1_settled: Notify,
     real_settled: Notify,
     // ── fast-probe dedup: one TCP ping per unique (address, port) ─────
@@ -666,6 +685,14 @@ struct BatchShared {
     /// Links whose fast probe failed for a hard unreachability reason: phase 2
     /// does not re-probe them (the probe cannot pass where the dial did not).
     hard_fast: Mutex<HashSet<(ProtocolId, EndpointId)>>,
+    /// The delay phase 1 measured, per link, for as long as the batch runs.
+    ///
+    /// The RESULT group writes `latency` and `error` together and every patch
+    /// is built from the plan-time snapshot, so a phase-2 patch would carry
+    /// `latency = None` and wipe the measurement the same batch had just taken
+    /// (160 of 218 real failures lost their fast delay on 2026-09-15). This is
+    /// the one field that must be composed back in.
+    fast_latency: Mutex<HashMap<(ProtocolId, EndpointId), i32>>,
     /// The batch's counters (see [`BatchCounters`]).
     counters: BatchCounters,
     /// Phase durations, for the summary line.
@@ -679,16 +706,16 @@ struct BatchShared {
 /// lines moved to `debug` for the same reason: a batch's volume is not a log).
 #[derive(Default)]
 struct BatchCounters {
-    fast_ok: AtomicU16,
-    fast_hard_failed: AtomicU16,
-    fast_soft_failed: AtomicU16,
-    real_ok: AtomicU16,
-    real_failed: AtomicU16,
-    untestable: AtomicU16,
+    fast_ok: AtomicU32,
+    fast_hard_failed: AtomicU32,
+    fast_soft_failed: AtomicU32,
+    real_ok: AtomicU32,
+    real_failed: AtomicU32,
+    untestable: AtomicU32,
     /// Phase-2 links retired because phase 1 proved them unreachable.
-    unreachable: AtomicU16,
-    deferred: AtomicU16,
-    queue_full: AtomicU16,
+    unreachable: AtomicU32,
+    deferred: AtomicU32,
+    queue_full: AtomicU32,
 }
 
 struct FastDedupInner {
@@ -706,8 +733,8 @@ pub(crate) struct BatchParams {
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    progress: Arc<(AtomicU16, AtomicU16)>,
-    plan: Vec<PlanLink>,
+    progress: crate::types::BatchProgress,
+    plan: PlanSource,
     real_phase: bool,
     dedup_endpoints: bool,
     fast_timeout: Duration,
@@ -722,11 +749,11 @@ pub(crate) struct BatchParams {
     error_ttl_hours: Option<i64>,
 }
 
-impl From<BatchParams> for BatchShared {
-    fn from(p: BatchParams) -> Self {
-        let total = u16::try_from(p.plan.len()).unwrap_or(u16::MAX);
-        let fast_config = p
-            .plan
+impl BatchShared {
+    /// Build the shared state from the (already resolved) plan.
+    fn new(p: BatchParams, plan: Vec<PlanLink>) -> Self {
+        let total = u32::try_from(plan.len()).unwrap_or(u32::MAX);
+        let fast_config = plan
             .iter()
             .map(|pl| {
                 (
@@ -735,8 +762,7 @@ impl From<BatchParams> for BatchShared {
                 )
             })
             .collect();
-        let endpoints = p
-            .plan
+        let endpoints = plan
             .iter()
             .map(|pl| (pl.endpoint.id, pl.endpoint.clone()))
             .collect();
@@ -744,8 +770,7 @@ impl From<BatchParams> for BatchShared {
         // `proto_kind`, so it is decided here — the one place every batch
         // (production and test) passes through. The config-aware half runs
         // inside the real probe, the only place a loaded config exists.
-        let untestable: HashMap<(ProtocolId, EndpointId), String> = p
-            .plan
+        let untestable: HashMap<(ProtocolId, EndpointId), String> = plan
             .iter()
             .filter(|pl| !capability::kind_supported(pl.protocol.proto_kind))
             .map(|pl| {
@@ -763,7 +788,7 @@ impl From<BatchParams> for BatchShared {
             runner: p.runner,
             stop: p.stop,
             progress: p.progress,
-            plan: p.plan,
+            plan,
             real_phase: p.real_phase,
             dedup_endpoints: p.dedup_endpoints,
             fast_timeout: p.fast_timeout,
@@ -781,7 +806,7 @@ impl From<BatchParams> for BatchShared {
             fast_sem: Arc::new(Semaphore::new(p.fast_concurrency.max(1))),
             pending_fast: AtomicUsize::new(0),
             pending_real: AtomicUsize::new(0),
-            done: AtomicU16::new(0),
+            done: AtomicU32::new(0),
             phase1_settled: Notify::new(),
             real_settled: Notify::new(),
             fast_dedup: Mutex::new(FastDedupInner {
@@ -789,6 +814,7 @@ impl From<BatchParams> for BatchShared {
                 in_flight: HashMap::new(),
             }),
             hard_fast: Mutex::new(HashSet::new()),
+            fast_latency: Mutex::new(HashMap::new()),
             counters: BatchCounters::default(),
             phase1_ms: AtomicU32::new(0),
             phase2_ms: AtomicU32::new(0),
@@ -798,9 +824,36 @@ impl From<BatchParams> for BatchShared {
 }
 
 /// Run one batch to completion. Spawned by the entry points; awaited directly
-/// by the tests.
-pub(crate) async fn run_batch(params: BatchParams) {
-    let shared = Arc::new(BatchShared::from(params));
+/// by the tests. Resolves its plan first (a feed-wide load is the batch task's
+/// job, not the UI's).
+pub(crate) async fn run_batch(mut params: BatchParams) {
+    let plan = match std::mem::replace(&mut params.plan, PlanSource::Links(Vec::new())) {
+        PlanSource::Feed => match load_feed_plan(&params.db, PROFILES_PAGE_SIZE).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::warn!(target: "tui::ops::ping", "batch: plan load failed: {e}");
+                let _ = params.tx.try_send(CoreEvent::BatchProgress {
+                    total: 0,
+                    completed: 0,
+                });
+                return;
+            }
+        },
+        PlanSource::Links(plan) => plan,
+    };
+    if plan.is_empty() {
+        tracing::warn!(target: "tui::ops::ping", "batch: no links to test");
+        let _ = params.tx.try_send(CoreEvent::BatchProgress {
+            total: 0,
+            completed: 0,
+        });
+        return;
+    }
+    params.progress.0.store(
+        u32::try_from(plan.len()).unwrap_or(u32::MAX),
+        Ordering::Relaxed,
+    );
+    let shared = Arc::new(BatchShared::new(params, plan));
     let _ = shared.tx.try_send(CoreEvent::BatchProgress {
         total: shared.total,
         completed: 0,
@@ -838,7 +891,9 @@ pub(crate) async fn run_batch(params: BatchParams) {
             }
             ScheduleOutcome::QueueFull => {
                 shared.counters.queue_full.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(target: "tui::ops::ping", "batch: link skipped, queue full");
+                // Per-link: a feed-wide batch would flood the log. The summary
+                // carries the count.
+                tracing::debug!(target: "tui::ops::ping", "batch: link skipped, queue full");
             }
         }
     }
@@ -927,7 +982,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
             }
             ScheduleOutcome::QueueFull => {
                 shared.counters.queue_full.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(target: "tui::ops::ping", "batch: real ping skipped, queue full");
+                tracing::debug!(target: "tui::ops::ping", "batch: real ping skipped, queue full");
             }
         }
     }
@@ -1075,7 +1130,7 @@ async fn finish_batch(shared: &BatchShared) {
 /// (`staged-left` is non-zero only if a flush never succeeded).
 fn summary_line(shared: &BatchShared) -> String {
     let counters = &shared.counters;
-    let load = |counter: &AtomicU16| counter.load(Ordering::Relaxed);
+    let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
     format!(
         "batch summary: links={} untestable={} queue-full={} deferred={} | phase1 ok={} hard-fail={} soft-fail={} ({} ms) | phase2 ok={} failed={} skipped-unreachable={} ({} ms) | stopped={} flushes={} staged-left={}",
         shared.plan.len(),
@@ -1349,6 +1404,13 @@ impl BatchShared {
             ProbeOutcome::Failed { text, .. } => (None, None, Some(text.as_str())),
         };
         let mut row = link.clone();
+        if let Some(delay) = self
+            .fast_latency
+            .lock()
+            .get(&(link.protocol_id, link.endpoint_id))
+        {
+            row.latency = Some(Latency::Fast { delay: *delay });
+        }
         if crate::ops::events::apply_test_result(
             &mut row, test_type, latency_ms, None, ip_info, error,
         ) {
@@ -1368,7 +1430,25 @@ impl BatchShared {
         // answered, and a real probe can only spend its timeout finding that
         // out again (253 of 350 phase-2 probes did exactly that, 2026-09-15).
         match (test_type, outcome) {
-            (TestType::TcpPing, ProbeOutcome::Ok { .. }) => {
+            (
+                TestType::TcpPing,
+                ProbeOutcome::Ok {
+                    latency_ms: Some(delay),
+                    ..
+                },
+            ) => {
+                self.counters.fast_ok.fetch_add(1, Ordering::Relaxed);
+                self.fast_latency.lock().insert(
+                    (link.protocol_id, link.endpoint_id),
+                    i32::try_from(*delay).unwrap_or(i32::MAX),
+                );
+            }
+            (
+                TestType::TcpPing,
+                ProbeOutcome::Ok {
+                    latency_ms: None, ..
+                },
+            ) => {
                 self.counters.fast_ok.fetch_add(1, Ordering::Relaxed);
             }
             (TestType::TcpPing, ProbeOutcome::Failed { hard: true, .. }) => {
@@ -1461,27 +1541,25 @@ impl BatchShared {
     /// total.
     fn emit_untestable_markers(&self) {
         self.counters.untestable.store(
-            u16::try_from(self.untestable.len()).unwrap_or(u16::MAX),
+            u32::try_from(self.untestable.len()).unwrap_or(u32::MAX),
             Ordering::Relaxed,
         );
-        for ((protocol_id, endpoint_id), text) in &self.untestable {
+        // One pass over the plan: a linear search per marker is quadratic, and a
+        // feed-wide plan makes that measurable.
+        for plan in &self.plan {
+            let key = (plan.link.protocol_id, plan.link.endpoint_id);
+            let Some(text) = self.untestable.get(&key) else {
+                continue;
+            };
             // Persist the marker from the plan's own snapshot: the events
             // handler only stages what the loaded page still holds.
-            if let Some(link) = self
-                .plan
-                .iter()
-                .find(|plan| {
-                    plan.link.protocol_id == *protocol_id && plan.link.endpoint_id == *endpoint_id
-                })
-                .map(|plan| &plan.link)
-            {
-                self.stage_result(
-                    link,
-                    TestType::RealPing,
-                    &ProbeOutcome::soft_failure(text.clone()),
-                );
-            }
-            let (protocol_id, endpoint_id) = (protocol_id.get(), endpoint_id.get());
+            self.stage_result(
+                &plan.link,
+                TestType::RealPing,
+                &ProbeOutcome::soft_failure(text.clone()),
+            );
+            let (protocol_id, endpoint_id) =
+                (plan.link.protocol_id.get(), plan.link.endpoint_id.get());
             let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
                 endpoint_id,
                 protocol_id,
@@ -1519,8 +1597,59 @@ impl BatchShared {
 // ── Entry points ───────────────────────────────────────────────────────────
 
 /// Build the per-link plan for every visible (filtered) endpoint.
-fn plan_all_visible(state: &AppState) -> Vec<PlanLink> {
-    state.filtered_profiles().flat_map(plan_row_links).collect()
+/// Every link in the database, planned for a batch — the "all profiles" entry
+/// points' source.
+///
+/// The tab's page query is reused page by page (same read path, same ordering
+/// as the grid), so the batch covers the feed rather than the viewport: "all
+/// visible" used to mean the loaded 200-row page, which tested 272 of the 4,523
+/// links in the 2026-09-15 feed. Links imported *after* this load are the only
+/// ones a run can miss.
+///
+/// `page_size` is a parameter so the multi-page walk is testable without a
+/// 200-row seed.
+async fn load_feed_plan(
+    db: &Database,
+    page_size: usize,
+) -> Result<Vec<PlanLink>, xray_tui_db::DatabaseError> {
+    use xray_tui_db::profiles_query::{PageRequest, PageSort};
+
+    let page_size = page_size.max(1);
+    let mut plan = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        // `PurgatoryView::All` and no search/group: the run is about the whole
+        // database, not about what the tab currently filters to. The thresholds
+        // are unused for that view.
+        let request = PageRequest {
+            view: xray_tui_db::models::PurgatoryView::All,
+            active_threshold: 0,
+            stale_threshold: 0,
+            search: None,
+            group_id: None,
+            sort: PageSort::Address,
+            ascending: true,
+            offset,
+            limit: page_size,
+        };
+        let meta = db.profiles_page(&request).await?;
+        if meta.ids.is_empty() {
+            break;
+        }
+        offset += meta.ids.len();
+        let rows = db.load_page_projection(&meta.ids).await?;
+        plan.extend(rows.iter().flat_map(plan_row_links));
+        if offset as u64 >= meta.total {
+            break;
+        }
+    }
+    tracing::info!(
+        target: "tui::ops::ping",
+        "batch: planned {} link(s) over {} endpoint(s) in the feed",
+        plan.len(),
+        offset,
+    );
+    Ok(plan)
 }
 
 /// Build the per-link plan for the currently selected endpoint (collapsed
@@ -1548,25 +1677,24 @@ fn plan_row_links(row: &EndpointRow) -> impl Iterator<Item = PlanLink> + '_ {
     })
 }
 
-/// Batch fast-ping every link of every visible endpoint.
+/// Batch fast-ping every link in the database.
 pub fn start_batch_ping(state: &mut AppState) {
-    let plan = plan_all_visible(state);
-    start_batch(state, plan, false, false);
+    start_batch(state, PlanSource::Feed, false, false);
 }
 
-/// Batch fast-ping every visible link, then real-ping each link. With
-/// `real_ping_test_all_protocols` unset (default), one successful real ping
-/// on an endpoint retires the remaining links' real tasks.
+/// Batch fast-ping every link in the database, then real-ping each link.
+///
+/// With `real_ping_test_all_protocols` unset (default), one successful real
+/// ping on an endpoint retires the remaining links' real tasks.
 pub fn start_batch_then_real_ping(state: &mut AppState) {
-    let plan = plan_all_visible(state);
     let dedup = !state.config.speed_test.real_ping_test_all_protocols;
-    start_batch(state, plan, true, dedup);
+    start_batch(state, PlanSource::Feed, true, dedup);
 }
 
 /// Fast-ping every link of the selected endpoint (collapsed multi-protocol rows).
 pub fn start_endpoint_batch_ping(state: &mut AppState) {
     let plan = plan_selected_endpoint(state);
-    start_batch(state, plan, false, false);
+    start_batch(state, PlanSource::Links(plan), false, false);
 }
 
 /// Fast-ping then real-ping every link of the selected endpoint. `dedup` is
@@ -1574,11 +1702,15 @@ pub fn start_endpoint_batch_ping(state: &mut AppState) {
 /// differ).
 pub fn start_endpoint_batch_real_ping(state: &mut AppState) {
     let plan = plan_selected_endpoint(state);
-    start_batch(state, plan, true, false);
+    start_batch(state, PlanSource::Links(plan), true, false);
 }
 
-fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedup_endpoints: bool) {
-    if plan.is_empty() {
+fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_endpoints: bool) {
+    // A feed-wide plan is loaded by the batch task (off the UI thread), so only
+    // an explicit plan can be known-empty here.
+    if let PlanSource::Links(plan) = &plan
+        && plan.is_empty()
+    {
         state.log_trace(
             "info",
             "tui::ops::ping",
@@ -1610,8 +1742,9 @@ fn start_batch(state: &mut AppState, plan: Vec<PlanLink>, real_phase: bool, dedu
     let writer = state.link_writer.clone();
     let scheduler = state.scheduler.clone();
     let stop = state.speed_test_stop.clone();
-    let total = u16::try_from(plan.len()).unwrap_or(u16::MAX);
-    let progress = Arc::new((AtomicU16::new(total), AtomicU16::new(0)));
+    // The total is filled in once the plan is resolved (the status bar shows
+    // "Testing..." while it is still zero).
+    let progress: crate::types::BatchProgress = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
     state.batch_progress = Some(progress.clone());
     let fast_timeout = *state.config.speed_test.tcp_timeout_secs;
     let real_timeout = *state.config.speed_test.real_ping_timeout_secs;
@@ -1748,6 +1881,13 @@ mod tests {
         // Persist the plan rows so the scheduler gate (`write_task_state`
         // requires the row) and the real-probe protocol loads work.
         for row in &rows {
+            // The page query drives from `endpoints` (joined to the stored
+            // ordering keys), so a DB-backed plan needs the endpoint row too.
+            state
+                .db
+                .upsert_endpoint(&row.endpoint)
+                .await
+                .expect("upsert endpoint");
             for link in &row.links {
                 state.db.upsert_link(link).await.expect("upsert link");
                 if let Some(proto) = row.protocols.get(&link.protocol_id) {
@@ -1776,7 +1916,7 @@ mod tests {
         real_phase: bool,
         dedup: bool,
     ) -> BatchParams {
-        let total = u16::try_from(plan.len()).unwrap_or(u16::MAX);
+        let total = u32::try_from(plan.len()).unwrap_or(u32::MAX);
         BatchParams {
             scheduler: h.state.scheduler.clone(),
             db: h.state.db.clone(),
@@ -1784,8 +1924,8 @@ mod tests {
             tx: h.tx.clone(),
             runner: h.runner.clone(),
             stop: h.state.speed_test_stop.clone(),
-            progress: Arc::new((AtomicU16::new(total), AtomicU16::new(0))),
-            plan,
+            progress: Arc::new((AtomicU32::new(total), AtomicU32::new(0))),
+            plan: PlanSource::Links(plan),
             real_phase,
             dedup_endpoints: dedup,
             fast_timeout: Duration::from_secs(2),
@@ -1866,6 +2006,68 @@ mod tests {
                 assert!(link.error.is_none(), "no marker expected: {link:?}");
                 assert_gate_clear(h.state.scheduler.as_ref(), link);
             }
+        }
+    }
+
+    // ── the batch tests the feed, not the viewport ───────────────────────
+
+    /// "All profiles" means the database, not the loaded page: the page is 200
+    /// endpoint rows, so a page-scoped run tested 272 of the 4,523 links in the
+    /// 2026-09-15 feed. The plan loader walks every page of the tab's query.
+    #[tokio::test]
+    async fn the_feed_plan_covers_every_page_of_links() {
+        let rows: Vec<EndpointRow> = (1..=5)
+            .map(|i| fake_row(i, &format!("10.0.0.{i}"), 1))
+            .collect();
+        let h = harness(rows.clone()).await;
+
+        // page_size 2 over 5 endpoints: three pages, one of them partial — the
+        // walk must stop on `total`, not on a short page.
+        let plan = load_feed_plan(&h.state.db, 2).await.expect("feed plan");
+        let mut hosts: Vec<String> = plan.iter().map(|pl| pl.endpoint.host.clone()).collect();
+        hosts.sort();
+        let mut expected: Vec<String> = rows.iter().map(|r| r.endpoint.host.clone()).collect();
+        expected.sort();
+        assert_eq!(hosts, expected, "every link in the feed is planned");
+    }
+
+    /// A feed-scoped batch does not depend on the loaded page at all: with an
+    /// empty page it still probes every link the database holds.
+    #[tokio::test]
+    async fn a_feed_batch_probes_links_outside_the_loaded_page() {
+        let rows: Vec<EndpointRow> = (1..=3)
+            .map(|i| fake_row(i, &format!("10.0.0.{i}"), 1))
+            .collect();
+        let mut h = harness(rows.clone()).await;
+        h.state.endpoints.clear();
+
+        let p = BatchParams {
+            plan: PlanSource::Feed,
+            ..build_params(&h, Vec::new(), false, false)
+        };
+        h.state.batch_progress = Some(p.progress.clone());
+        run_batch(p).await;
+
+        assert_eq!(
+            h.runner.fast_calls.load(Ordering::Relaxed),
+            3,
+            "the feed's links are probed even though the page is empty"
+        );
+        for row in &rows {
+            let link = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+                row.links[0].protocol_id,
+                row.links[0].endpoint_id,
+            )
+            .first()
+            .exec(&mut h.state.db.connection().await.expect("conn"))
+            .await
+            .expect("read")
+            .expect("row");
+            assert_eq!(
+                link.latency,
+                Some(Latency::Fast { delay: 10 }),
+                "a feed link's result is persisted: {link:?}"
+            );
         }
     }
 
@@ -1990,6 +2192,45 @@ mod tests {
         }
     }
 
+    // ── a phase-2 patch keeps the phase-1 measurement ───────────────────
+
+    /// The RESULT group writes `latency` and `error` together, and every batch
+    /// patch is built from the plan-time snapshot — so a phase-2 failure used
+    /// to carry `latency = None` and erase the delay phase 1 had just measured
+    /// for the same link (160 of 218 real failures lost it on 2026-09-15; the
+    /// events handler used to mask this by staging from its live page row).
+    #[tokio::test]
+    async fn a_real_failure_keeps_the_fast_measurement() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let mut h = harness(rows.clone()).await;
+        *h.runner.real_outcome.lock() =
+            ProbeOutcome::soft_failure("timeout on probe attempt (limit 5s)");
+
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch(&mut h, plan, true, false);
+        handle.await.unwrap();
+
+        let link = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            rows[0].links[0].protocol_id,
+            rows[0].links[0].endpoint_id,
+        )
+        .first()
+        .exec(&mut h.state.db.connection().await.expect("conn"))
+        .await
+        .expect("read")
+        .expect("row");
+        assert_eq!(
+            link.latency,
+            Some(Latency::Fast { delay: 10 }),
+            "the fast delay survives a real-ping failure: {link:?}"
+        );
+        assert_eq!(
+            link.error.as_ref().map(|e| e.kind),
+            Some(ProfileErr::Real),
+            "and the marker still lands: {link:?}"
+        );
+    }
+
     // ── one summary line per batch ───────────────────────────────────────
 
     /// The batch's record is ONE line carrying every counter: per-result lines
@@ -2001,7 +2242,8 @@ mod tests {
     async fn the_batch_summary_reports_every_counter() {
         let rows = vec![fake_row(1, "10.0.0.1", 1)];
         let h = harness(rows.clone()).await;
-        let shared = BatchShared::from(build_params(&h, plan_from_rows(&rows), true, false));
+        let plan = plan_from_rows(&rows);
+        let shared = BatchShared::new(build_params(&h, plan.clone(), true, false), plan);
         let counters = &shared.counters;
         counters.fast_ok.store(7, Ordering::Relaxed);
         counters.fast_hard_failed.store(5, Ordering::Relaxed);
@@ -2364,7 +2606,7 @@ mod tests {
         handle.await.unwrap();
 
         let mut rx = h.state.core_event_rx.take().expect("event receiver");
-        let mut events: Vec<(u16, u16)> = Vec::new();
+        let mut events: Vec<(u32, u32)> = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             if let CoreEvent::BatchProgress { total, completed } = ev {
                 events.push((total, completed));

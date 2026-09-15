@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use ratatui_cheese::tree::TreeState;
 use xray_tui_config::import_export::{ParsedProfile, ValidationSummary};
@@ -534,8 +535,8 @@ pub enum CoreEvent {
     },
     /// Batch-level progress for real ping.
     BatchProgress {
-        total: u16,
-        completed: u16,
+        total: u32,
+        completed: u32,
     },
     /// Background whitelist files loaded; carries the ready checker.
     HostFeaturesLoaded(Arc<xray_tui_host_features::HostFeaturesChecker>),
@@ -560,3 +561,8 @@ pub enum ConfirmAction {
     ClearStats,
     Quit,
 }
+
+/// Shared batch progress: `(total, completed)` links, read by the status bar
+/// and written by the batch task. `u32`, not `u16`: a batch plans every link in
+/// the feed, and a feed can exceed 65,535 links.
+pub type BatchProgress = Arc<(AtomicU32, AtomicU32)>;
