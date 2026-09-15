@@ -70,13 +70,38 @@ pub struct ProbeResponse {
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// Dial `req.host:req.port` through `params` and issue `req` over the tunnel.
+///
+/// The whole attempt runs under ONE deadline of `req.timeout` (the caller's
+/// `real_ping_timeout_secs`): dial, security handshake, transport upgrade,
+/// protocol handshake, target TLS and the request head. The engine's per-step
+/// limits (`timeouts::DIAL`/`SECURITY`/… , 10 s each) are defence in depth, not
+/// the contract — without this wrapper a 5 s setting let a probe spend 10 s in
+/// the dial alone and report `timeout on tcp dial (limit 10s)`.
 pub async fn fetch(
     mut params: NativeConnectParams,
     req: &ProbeRequest<'_>,
 ) -> Result<ProbeResponse, NativeError> {
     params.target = TargetAddr::new(req.host, req.port);
-    let tunnel = crate::connect(params).await?;
-    fetch_over(tunnel, req).await
+    let started = Instant::now();
+    // Boxed: the wrapped attempt's state machine carries the dial, the engine
+    // TLS handshake and the hyper request together, and every caller awaits it
+    // inside its own function — one box per attempt keeps those futures small.
+    let attempt = async move {
+        let tunnel = crate::connect(params).await?;
+        fetch_over(tunnel, req).await
+    };
+    let response = Box::pin(tokio::time::timeout(req.timeout, attempt))
+        .await
+        .map_err(|_| NativeError::Timeout {
+            step: "probe attempt",
+            limit: req.timeout,
+        })??;
+    // The probe's latency is the whole span, the dial included — the same span
+    // the subprocess probe measured through its local SOCKS hop.
+    Ok(ProbeResponse {
+        elapsed: started.elapsed(),
+        ..response
+    })
 }
 
 /// Issue `req` over an already-connected stream (the target TLS wrap included
@@ -187,6 +212,77 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::{ProbeMethod, ProbeRequest, fetch_over};
+
+    /// A VLESS+TLS config as JSON — the proto's serde shape, the same one the
+    /// other engine tests build.
+    fn vless_tls() -> xray_tui_proto::proto_spec::ProtocolConfig {
+        serde_json::from_value(serde_json::json!({
+            "schema": "Vless",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "transport": { "type": "tcp" },
+            "security": { "type": "tls", "sni": "dest.test", "insecure": true }
+        }))
+        .expect("config parses")
+    }
+
+    /// A whole probe attempt is bounded by the caller's budget, not by the
+    /// engine's per-step limits: a peer that accepts the connection and then
+    /// never answers the TLS handshake used to fail at `timeouts::SECURITY`
+    /// (10 s) with `real_ping_timeout_secs` set to 5 s (or less).
+    #[tokio::test]
+    async fn a_stalled_handshake_is_bounded_by_the_attempt_budget() {
+        use std::time::Instant;
+
+        use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
+
+        use crate::addr::TargetAddr;
+        use crate::context::NativeConnectParams;
+        use crate::error::NativeError;
+        use crate::probe::fetch;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Accept, then stay silent past every engine step limit.
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+
+        let params = NativeConnectParams::new(
+            vless_tls(),
+            EndpointEssentials::new(addr.ip().to_string(), addr.port()),
+            TargetAddr::new("dest.test", 443),
+        );
+        let req = ProbeRequest {
+            host: "dest.test",
+            port: 443,
+            https: false,
+            method: ProbeMethod::Get,
+            path: "/",
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let err = fetch(params, &req)
+            .await
+            .expect_err("a silent peer must fail the probe");
+        assert!(
+            matches!(
+                err,
+                NativeError::Timeout {
+                    step: "probe attempt",
+                    ..
+                }
+            ),
+            "expected the attempt deadline, got {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the attempt budget must bound the handshake: {:?}",
+            started.elapsed()
+        );
+        server.abort();
+    }
 
     /// Read a request head (bounded) so the test can assert on it.
     async fn read_head(sock: &mut TcpStream) -> String {
