@@ -8,6 +8,7 @@
 //! CCS, and Finished, and verifies the server's Finished.
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::crypto::tls12::{
     Tls12Suite, finished_verify_data, key_block, master_secret, master_secret_ems,
@@ -30,6 +31,12 @@ const HS_SERVER_HELLO_DONE: u8 = 0x0E;
 const HS_CLIENT_KEY_EXCHANGE: u8 = 0x10;
 const HS_FINISHED: u8 = 0x14;
 
+// ── Named curves (RFC 4492 §5.1.1) ─────────────────────────────────────────
+/// X25519 (RFC 8422 §5.4) — keys and points are 32 bytes.
+const CURVE_X25519: u16 = 0x001D;
+/// secp256r1 / NIST P-256 — uncompressed points are 65 bytes.
+const CURVE_SECP256R1: u16 = 0x0017;
+
 // ── Server flight ──────────────────────────────────────────────────────────
 
 struct ServerFlight {
@@ -46,8 +53,12 @@ struct ServerFlight {
 }
 
 struct Ske {
-    /// Server's ephemeral X25519 public key.
-    server_pub: [u8; 32],
+    /// The server's ephemeral named curve (RFC 4492): 0x001D X25519, 0x0017
+    /// secp256r1.
+    curve: u16,
+    /// The server's ephemeral public point exactly as sent: 32 bytes for
+    /// X25519, 65 uncompressed bytes for secp256r1.
+    server_point: Vec<u8>,
     /// The `SignatureAndHashAlgorithm` from the SKE (RFC 5246 §7.4.3).
     sigalg: u16,
     /// The raw signature bytes.
@@ -165,7 +176,10 @@ fn parse_cert_12(body: &[u8]) -> Result<Vec<Vec<u8>>> {
 /// `curve_type(1) || named_curve(2) || pubkey_len(1) || pubkey ||
 /// sigalg(2) || sig_len(2) || sig`.
 ///
-/// Only X25519 (named curve 0x001D) is supported.
+/// X25519 (0x001D) and secp256r1 (0x0017) are supported. A server that offers
+/// only P-256 is common on TLS-1.2 hosts, and refusing it fails the handshake
+/// outright (reproduced live 2026-09-15: OpenSSL completed the handshake while
+/// this engine aborted with "only X25519 is supported").
 fn parse_ske(body: &[u8]) -> Result<Ske> {
     if body.is_empty() {
         return Err(TlsError::Handshake(
@@ -186,20 +200,28 @@ fn parse_ske(body: &[u8]) -> Result<Ske> {
             "TLS 1.2 ServerKeyExchange truncated at curve info".into(),
         ));
     }
-    let named_curve = u16::from_be_bytes([body[1], body[2]]);
-    if named_curve != 0x001D {
+    let curve = u16::from_be_bytes([body[1], body[2]]);
+    let expected_len = match curve {
+        CURVE_X25519 => 32,
+        CURVE_SECP256R1 => 65,
+        other => {
+            return Err(TlsError::Handshake(format!(
+                "TLS 1.2 ServerKeyExchange: unsupported named curve 0x{other:04X}, only X25519 (0x001D) and secp256r1 (0x0017) are supported"
+            )));
+        }
+    };
+    let pub_len = usize::from(body[3]);
+    if pub_len != expected_len || body.len() < 4 + pub_len + 4 {
         return Err(TlsError::Handshake(format!(
-            "TLS 1.2 ServerKeyExchange: unsupported named curve 0x{named_curve:04X}, only X25519 (0x001D) is supported"
+            "TLS 1.2 ServerKeyExchange: curve 0x{curve:04X} needs a {expected_len}-byte point, got {pub_len}"
         )));
     }
-    let pub_len = usize::from(body[3]);
-    if pub_len != 32 || body.len() < 4 + pub_len + 4 {
+    let server_point = body[4..4 + pub_len].to_vec();
+    if curve == CURVE_SECP256R1 && server_point[0] != 0x04 {
         return Err(TlsError::Handshake(
-            "TLS 1.2 ServerKeyExchange truncated at pubkey".into(),
+            "TLS 1.2 ServerKeyExchange: secp256r1 needs an uncompressed point (0x04)".into(),
         ));
     }
-    let mut server_pub = [0u8; 32];
-    server_pub.copy_from_slice(&body[4..4 + 32]);
     let params_end = 4 + pub_len;
     let params = body[..params_end].to_vec();
 
@@ -215,7 +237,8 @@ fn parse_ske(body: &[u8]) -> Result<Ske> {
     }
     let signature = body[params_end + 4..].to_vec();
     Ok(Ske {
-        server_pub,
+        curve,
+        server_point,
         sigalg,
         signature,
         params,
@@ -308,15 +331,56 @@ pub(crate) async fn drive12<S: AsyncRead + AsyncWrite + Unpin + Send>(
         signed_data: &signed_data,
     })?;
 
-    // 4. ECDHE shared secret.
-    let premaster = keypair.agree(&flight.ske.server_pub)?;
-
-    // 5. ClientKeyExchange: body = pubkey_len(1) || pubkey.
-    let cke_body = {
-        let mut v = Vec::with_capacity(33);
-        v.push(32);
-        v.extend_from_slice(&keypair.public_key());
-        v
+    // 4./5. ECDHE shared secret + the client's public point, per curve.
+    //
+    // X25519 reuses the hello's key pair (a TLS 1.2 server ignores the 1.3
+    // `key_share`, so the pair is free to serve both roles). secp256r1 has no
+    // such pair: the engine's key material is X25519-only, so the ephemeral
+    // P-256 key is generated here, once, for this handshake — ring owns it and
+    // consumes it in the agreement. Both curves yield a 32-byte premaster (the
+    // raw x-coordinate), so the key schedule is unchanged.
+    let (premaster, cke_body) = match flight.ske.curve {
+        CURVE_X25519 => {
+            let server_pub: [u8; 32] =
+                flight.ske.server_point.as_slice().try_into().map_err(|_| {
+                    TlsError::Handshake("TLS 1.2 X25519 point is not 32 bytes".into())
+                })?;
+            let premaster = keypair.agree(&server_pub)?;
+            let mut body = Vec::with_capacity(33);
+            body.push(32);
+            body.extend_from_slice(&keypair.public_key());
+            (premaster, body)
+        }
+        CURVE_SECP256R1 => {
+            use ring::agreement::{
+                ECDH_P256, EphemeralPrivateKey, UnparsedPublicKey, agree_ephemeral,
+            };
+            let rng = ring::rand::SystemRandom::new();
+            let ephemeral = EphemeralPrivateKey::generate(&ECDH_P256, &rng)
+                .map_err(|e| TlsError::Crypto(format!("P-256 key generation failed: {e}")))?;
+            let public = ephemeral
+                .compute_public_key()
+                .map_err(|e| TlsError::Crypto(format!("P-256 public key failed: {e}")))?;
+            let public = public.as_ref().to_vec();
+            let peer = UnparsedPublicKey::new(&ECDH_P256, &flight.ske.server_point);
+            // The raw ECDH output is the 32-byte x-coordinate — the same shape
+            // the X25519 arm produces, so the key schedule stays curve-blind.
+            let secret: Option<Zeroizing<[u8; 32]>> = agree_ephemeral(ephemeral, &peer, |secret| {
+                <[u8; 32]>::try_from(secret).ok().map(Zeroizing::new)
+            })
+            .map_err(|_| TlsError::Handshake("P-256 agreement failed".into()))?;
+            let secret = secret
+                .ok_or_else(|| TlsError::Handshake("P-256 shared secret is not 32 bytes".into()))?;
+            let mut body = Vec::with_capacity(1 + public.len());
+            body.push(u8::try_from(public.len()).unwrap_or(u8::MAX));
+            body.extend_from_slice(&public);
+            (secret, body)
+        }
+        other => {
+            return Err(TlsError::Handshake(format!(
+                "TLS 1.2 ServerKeyExchange: unsupported named curve 0x{other:04X}"
+            )));
+        }
     };
     let cke_raw = crate::handshake::make_hs_msg(HS_CLIENT_KEY_EXCHANGE, &cke_body);
     transcript.extend_from_slice(&cke_raw);

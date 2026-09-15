@@ -2139,6 +2139,81 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// A TLS-1.2-only rustls server restricted to one key-exchange group: the
+    /// knob that makes the server pick a curve the client did not put first.
+    fn tls12_server_config_kx(
+        cert: &rcgen::Certificate,
+        key: &rcgen::KeyPair,
+        kx_groups: &[&'static dyn rustls::crypto::SupportedKxGroup],
+    ) -> rustls::ServerConfig {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.kx_groups = kx_groups.to_vec();
+        rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// RFC 4492 ECDHE with secp256r1: a server that offers only P-256 is common
+    /// among TLS-1.2-only hosts, and the engine's X25519-only SKE path aborted
+    /// with "unsupported named curve 0x0017" where OpenSSL completed the
+    /// handshake (reproduced live 2026-09-15; see `parse_ske`). The server here
+    /// offers P-256 alone, so the round trip can only complete through the
+    /// P-256 agreement.
+    #[tokio::test]
+    async fn tls12_secp256r1_server_key_exchange() {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                .unwrap();
+        let cfg = tls12_server_config_kx(
+            &certified.cert,
+            &certified.signing_key,
+            &[rustls::crypto::ring::kx_group::SECP256R1],
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(cfg)).unwrap();
+            rustls_server_echo(stream, conn).await;
+        });
+
+        // X25519 first, P-256 second — the server's own preference decides.
+        let mut spec = tls12_spec();
+        for ext in &mut spec.extensions {
+            if let ExtensionSpec::SupportedGroups(groups) = ext {
+                *groups = vec![0x001D, 0x0017];
+            }
+        }
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let mut tls = connect(
+            stream,
+            HandshakeParams {
+                spec: &spec,
+                server_name: "localhost",
+                alpn: Some(&["http/1.1"]),
+                verifier: &AcceptAll,
+                rng: &rng,
+            },
+        )
+        .await
+        .unwrap();
+        tls.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.await.unwrap();
+    }
+
     /// Run one TLS 1.2 echo handshake against a rustls server built with
     /// `suite`/`tickets`, returning nothing but panicking on any failure.
     async fn tls12_echo_roundtrip(suite: Option<rustls::SupportedCipherSuite>, tickets: bool) {
