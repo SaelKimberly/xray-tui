@@ -153,6 +153,12 @@ impl LinkWriter {
     ///
     /// Called by the flush task, at batch end, and on quit. Returns the number
     /// of rows written.
+    ///
+    /// A failed transaction re-stages that window **and every window after it**
+    /// (the drain already removed them from the pending map): the caller retries
+    /// the whole remainder on the next tick. Re-staging only the failing window
+    /// dropped the rest of the drained batch — silent loss for any window wider
+    /// than one chunk.
     pub async fn flush(&self) -> xray_tui_db::Result<usize> {
         let _guard = self.gate.lock().await;
         let patches = self.drain();
@@ -160,21 +166,22 @@ impl LinkWriter {
             return Ok(0);
         }
         let mut written = 0usize;
-        for chunk in patches.chunks(self.flush_rows) {
+        for (index, chunk) in patches.chunks(self.flush_rows).enumerate() {
             match self.db.apply_link_patches(chunk).await {
                 Ok(n) => {
                     written += n;
                     self.flushes.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
-                    // Merge the failed chunk back; a newer staged entry wins.
-                    for patch in chunk {
+                    for pending in patches.chunks(self.flush_rows).skip(index).flatten() {
+                        // A newer staged entry (a result that landed while this
+                        // flush was writing) wins over the snapshot it replaced.
                         self.pending
                             .entry((
-                                (patch.link.protocol_id, patch.link.endpoint_id),
-                                patch.groups,
+                                (pending.link.protocol_id, pending.link.endpoint_id),
+                                pending.groups,
                             ))
-                            .or_insert_with(|| patch.link.clone());
+                            .or_insert_with(|| pending.link.clone());
                     }
                     return Err(err);
                 }
@@ -393,6 +400,58 @@ mod tests {
             "one patch per link"
         );
         assert_eq!(writer.flush_count(), 3, "one transaction per chunk");
+    }
+
+    /// A failed window must not take the windows after it down with it: the
+    /// drain already removed them from the pending map, so only re-staging the
+    /// failing window would silently drop the rest of the batch.
+    #[tokio::test]
+    async fn a_failed_flush_window_restages_the_whole_remainder() {
+        fn stage_window(writer: &LinkWriter, base: &ProfileStats, bias: i64) {
+            for idx in 0..3 {
+                let mut link = with_latency(base, i32::try_from(idx).expect("small idx"));
+                link.endpoint_id = EndpointId::new(bias + idx);
+                writer.stage(&link, LinkGroups::RESULT);
+            }
+        }
+
+        let (db, _) = seeded().await;
+        let base = persisted(&db).await;
+        // flush_rows = 1: three staged links become three windows.
+        let writer = LinkWriter::new(Arc::clone(&db), 1, DEFAULT_FLUSH_INTERVAL);
+
+        stage_window(&writer, &base, 10);
+        assert_eq!(writer.flush().await.expect("clean flush"), 3);
+
+        // Contention: another connection holds the write lock, so every write
+        // the window attempts fails with "database is locked" — the failure an
+        // overlapping subscription import produced in the 2026-09-15 batch.
+        let mut blocker = db.connection().await.expect("blocker connection");
+        let mut lock = blocker.transaction().await.expect("lock transaction");
+        toasty::sql::statement("UPDATE profile_stats SET version = version + 0")
+            .exec(&mut lock)
+            .await
+            .expect("take the write lock");
+
+        stage_window(&writer, &base, 20);
+        assert!(
+            writer.flush().await.is_err(),
+            "the held write lock must fail the flush"
+        );
+        assert_eq!(
+            writer.staged_len(),
+            3,
+            "every window the failed flush did not write is re-staged"
+        );
+
+        lock.rollback().await.expect("release the lock");
+        drop(blocker);
+        assert_eq!(
+            writer.flush().await.expect("retry after contention"),
+            3,
+            "the re-staged remainder lands on the next flush"
+        );
+        assert_eq!(writer.staged_len(), 0);
     }
 
     /// The drain removes: a stage landing while the drained snapshot is being

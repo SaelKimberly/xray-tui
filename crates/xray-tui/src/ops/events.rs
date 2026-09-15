@@ -68,6 +68,65 @@ const fn err_kind_for(test_type: TestType) -> ProfileErr {
     }
 }
 
+/// Overlay one probe result onto `row`'s RESULT columns
+/// (`latency*` / `speed_bps` / `error*`).
+///
+/// The single mapping behind both writers of a result: this module's handler
+/// (which owns the in-memory page) and the batch's own writer staging in
+/// `ops/ping.rs` (which must not depend on the page — a page reload mid-batch
+/// used to drop every result whose row it no longer held, silently).
+///
+/// Returns whether the row changed. A `Cancelled` error never persists: a
+/// stopped test is not a failure (the stop path emits `error:
+/// Some("Cancelled")` for sessions that never ran, and a marker would paint
+/// `[fast]`/`[real]` on endpoints whose tests were merely abandoned).
+#[must_use]
+pub(crate) fn apply_test_result(
+    row: &mut ProfileStats,
+    test_type: TestType,
+    latency_ms: Option<u64>,
+    speed_bps: Option<u64>,
+    ip_info: Option<&str>,
+    error: Option<&str>,
+) -> bool {
+    if let Some(err) = error {
+        if err == "Cancelled" {
+            return false;
+        }
+        // Persisted failure marker — the profiles Test column renders
+        // `[fast]`/`[real]` from `link.error.kind`; the measurement (if any)
+        // stays, so a dead host does not erase a previously measured delay.
+        row.error = Some(ErrorInfo {
+            kind: err_kind_for(test_type),
+            text: err.to_string(),
+        });
+        return true;
+    }
+    match test_type {
+        TestType::RealPing => {
+            row.latency = latency_ms.map(|ms| Latency::Real {
+                delay: ms as i32,
+                ip: exit_ip(ip_info),
+            });
+        }
+        TestType::TcpPing | TestType::UdpTest => {
+            row.latency = latency_ms.map(|ms| Latency::Fast { delay: ms as i32 });
+        }
+        TestType::SpeedTest => row.speed_bps = speed_bps.map(|v| v as i64),
+    }
+    row.error = None;
+    true
+}
+
+/// The exit IP out of a probe's `"<ip> | <country>"` answer.
+fn exit_ip(ip_info: Option<&str>) -> Option<String> {
+    ip_info
+        .and_then(|s| s.split('|').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Render a routing-engine event into an actions-log line.
 ///
 /// Pure so the five variant renderings stay unit-testable without a channel
@@ -462,61 +521,38 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .endpoints
                         .iter_mut()
                         .find(|r| r.endpoint.id.get() == endpoint_id);
-                    match row {
-                        Some(row) => {
-                            if let Some(link) = row
-                                .links
-                                .iter_mut()
-                                .find(|l| l.protocol_id.get() == protocol_id)
-                            {
-                                // A stopped test is not a failure: the stop path
-                                // emits `error: Some("Cancelled")` for sessions
-                                // that never ran, and persisting a failure
-                                // marker would paint `[fast]`/`[real]` red on
-                                // endpoints whose tests were merely abandoned.
-                                if error.is_some() && error.as_deref() != Some("Cancelled") {
-                                    // Persisted failure marker — the profiles
-                                    // Test column renders `[fast]`/`[real]`
-                                    // from `link.error.kind` (round maps
-                                    // removed in T17).
-                                    link.error = Some(ErrorInfo {
-                                        kind: err_kind_for(test_type),
-                                        text: error.clone().unwrap_or_default(),
-                                    });
-                                    // Staged, not committed: the flush task
-                                    // batches it off the UI task.
-                                    writer.stage(link, LinkGroups::RESULT);
-                                } else if error.is_none() {
-                                    // Success: record the measurement and clear
-                                    // any previous failure marker.
-                                    match test_type {
-                                        TestType::RealPing => {
-                                            link.latency = latency_ms.map(|ms| Latency::Real {
-                                                delay: ms as i32,
-                                                ip: ip_info
-                                                    .as_deref()
-                                                    .and_then(|s| s.split('|').next())
-                                                    .map(str::trim)
-                                                    .filter(|s| !s.is_empty())
-                                                    .map(str::to_string),
-                                            });
-                                        }
-                                        TestType::TcpPing | TestType::UdpTest => {
-                                            link.latency = latency_ms
-                                                .map(|ms| Latency::Fast { delay: ms as i32 });
-                                        }
-                                        TestType::SpeedTest => {
-                                            link.speed_bps = speed_bps.map(|v| v as i64);
-                                        }
-                                    }
-                                    link.error = None;
-                                    writer.stage(link, LinkGroups::RESULT);
-                                }
+                    if let Some(row) = row {
+                        if let Some(link) = row
+                            .links
+                            .iter_mut()
+                            .find(|l| l.protocol_id.get() == protocol_id)
+                        {
+                            // Staged, not committed: the flush task batches
+                            // it off the UI task. A stopped test returns
+                            // `false` and stages nothing.
+                            if apply_test_result(
+                                link,
+                                test_type,
+                                latency_ms,
+                                speed_bps,
+                                ip_info.as_deref(),
+                                error.as_deref(),
+                            ) {
+                                writer.stage(link, LinkGroups::RESULT);
                             }
-                            fmt_profile_id(protocol_id)
                         }
-                        None => fmt_profile_id(protocol_id),
+                    } else {
+                        // The page does not hold this row: the batch stages its
+                        // own results, so this is a UI-only miss (a page reload
+                        // while a batch runs). Never silent.
+                        tracing::debug!(
+                            target: "tui::ops::events",
+                            endpoint_id,
+                            protocol_id,
+                            "result for a row outside the loaded page: UI row not updated"
+                        );
                     }
+                    fmt_profile_id(protocol_id)
                 };
 
                 if let Some(ref err) = error {
@@ -535,8 +571,12 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     } else {
                         "success".to_string()
                     };
+                    // Success is per-result chatter: one line per link made a
+                    // 5-minute batch produce 32k log lines (2026-09-15). The
+                    // batch's own summary carries the counts; a failure stays
+                    // `warn` because it is the actionable class.
                     state.log_trace(
-                        "info",
+                        "debug",
                         "tui::ops::speedtest",
                         &format!("{test_type:?} {name}: {detail}"),
                     );

@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
+use xray_tui_db::LinkGroups;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{Endpoint, EndpointId, EndpointRow, ProfileStats, ProtocolId, TaskKind};
 use xray_tui_native::capability;
@@ -500,7 +501,49 @@ enum ProbeOutcome {
         latency_ms: Option<u64>,
         ip_info: Option<String>,
     },
-    Failed(String),
+    Failed {
+        text: String,
+        /// The endpoint was unreachable at the transport level, so the real
+        /// phase's probe cannot succeed either. Set only by the fast runner
+        /// (see [`hard_fast_failure`]).
+        hard: bool,
+    },
+}
+
+impl ProbeOutcome {
+    /// A failure the real phase must still probe (config, protocol-load and
+    /// engine-capability failures; a real probe answers a different question).
+    fn soft_failure(text: impl Into<String>) -> Self {
+        Self::Failed {
+            text: text.into(),
+            hard: false,
+        }
+    }
+}
+
+/// True when a fast probe's failure means the proxy is unreachable — the
+/// classes the real phase cannot pass either, so phase 2 skips the link.
+///
+/// Connect-class `PingError`s only: a timeout, or an IO error naming a refused
+/// connection, a missing route, an unreachable network, or an unresolvable
+/// host. Everything else stays probed — fd exhaustion, a TLS-level IO error or
+/// a protocol-level failure is local or ambiguous, and the fast adapter's
+/// `NotSupported`/`Other` classes say nothing about reachability.
+fn hard_fast_failure(err: &xray_tui_core::ping::PingError) -> bool {
+    use xray_tui_core::ping::PingError;
+    match err {
+        PingError::Timeout(_) => true,
+        PingError::Io(message) => [
+            "Connection refused",
+            "No route to host",
+            "Network is unreachable",
+            "failed to lookup address information",
+            "Name or service not known",
+        ]
+        .iter()
+        .any(|class| message.contains(class)),
+        PingError::NotSupported | PingError::Other(_) => false,
+    }
 }
 
 /// Probe execution seam. The production impl runs the real engines
@@ -551,7 +594,10 @@ impl BatchProbeRunner for EngineProbeRunner {
                     latency_ms: Some(dur.as_millis() as u64),
                     ip_info: None,
                 },
-                Err(e) => ProbeOutcome::Failed(e.to_string()),
+                Err(e) => ProbeOutcome::Failed {
+                    hard: hard_fast_failure(&e),
+                    text: e.to_string(),
+                },
             }
         })
     }
@@ -568,7 +614,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                     latency_ms: Some(result.latency_ms),
                     ip_info: result.ip_info,
                 },
-                Err(e) => ProbeOutcome::Failed(e),
+                Err(e) => ProbeOutcome::soft_failure(e),
             }
         })
     }
@@ -617,8 +663,32 @@ struct BatchShared {
     real_settled: Notify,
     // ── fast-probe dedup: one TCP ping per unique (address, port) ─────
     fast_dedup: Mutex<FastDedupInner>,
+    /// Links whose fast probe failed for a hard unreachability reason: phase 2
+    /// does not re-probe them (the probe cannot pass where the dial did not).
+    hard_fast: Mutex<HashSet<(ProtocolId, EndpointId)>>,
+    /// The batch's counters (see [`BatchCounters`]).
+    counters: BatchCounters,
+    /// Phase durations, for the summary line.
+    phase1_ms: AtomicU32,
+    phase2_ms: AtomicU32,
     // ── real-phase endpoint dedup: endpoints whose real ping succeeded ─
     completed_endpoints: Mutex<HashSet<i64>>,
+}
+
+/// Per-batch counters, folded into ONE summary line at the end (per-result
+/// lines moved to `debug` for the same reason: a batch's volume is not a log).
+#[derive(Default)]
+struct BatchCounters {
+    fast_ok: AtomicU16,
+    fast_hard_failed: AtomicU16,
+    fast_soft_failed: AtomicU16,
+    real_ok: AtomicU16,
+    real_failed: AtomicU16,
+    untestable: AtomicU16,
+    /// Phase-2 links retired because phase 1 proved them unreachable.
+    unreachable: AtomicU16,
+    deferred: AtomicU16,
+    queue_full: AtomicU16,
 }
 
 struct FastDedupInner {
@@ -718,6 +788,10 @@ impl From<BatchParams> for BatchShared {
                 cache: HashMap::new(),
                 in_flight: HashMap::new(),
             }),
+            hard_fast: Mutex::new(HashSet::new()),
+            counters: BatchCounters::default(),
+            phase1_ms: AtomicU32::new(0),
+            phase2_ms: AtomicU32::new(0),
             completed_endpoints: Mutex::new(HashSet::new()),
         }
     }
@@ -733,6 +807,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
     });
 
     // ── Phase 1: one FastPing task per link ───────────────────────────
+    let phase1_started = std::time::Instant::now();
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut deferred: Vec<PlanLink> = Vec::new();
     for plan in &shared.plan {
@@ -757,8 +832,12 @@ pub(crate) async fn run_batch(params: BatchParams) {
                 // The gate holder's completion promotes and fires this task.
                 shared.pending_fast.fetch_add(1, Ordering::Relaxed);
             }
-            ScheduleOutcome::DnsDeferred => deferred.push(plan.clone()),
+            ScheduleOutcome::DnsDeferred => {
+                shared.counters.deferred.fetch_add(1, Ordering::Relaxed);
+                deferred.push(plan.clone());
+            }
             ScheduleOutcome::QueueFull => {
+                shared.counters.queue_full.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(target: "tui::ops::ping", "batch: link skipped, queue full");
             }
         }
@@ -785,6 +864,11 @@ pub(crate) async fn run_batch(params: BatchParams) {
         let _ = h.await;
     }
 
+    shared.phase1_ms.store(
+        u32::try_from(phase1_started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        Ordering::Relaxed,
+    );
+
     // Untestable rows get their `[real]` marker only now: a fast success writes
     // `error = None`, so a marker emitted before phase 1 would be cleared by it
     // (ordering, not a race — both go through the events handler).
@@ -796,6 +880,7 @@ pub(crate) async fn run_batch(params: BatchParams) {
     }
 
     // ── Phase 2: one RealPing task per link, fired per endpoint ───────
+    let phase2_started = std::time::Instant::now();
     let mut per_endpoint: BTreeMap<i64, Vec<(ProfileStats, u16)>> = BTreeMap::new();
     let mut deferred_real: Vec<PlanLink> = Vec::new();
     for plan in &shared.plan {
@@ -808,6 +893,18 @@ pub(crate) async fn run_batch(params: BatchParams) {
             .untestable
             .contains_key(&(plan.link.protocol_id, plan.link.endpoint_id))
         {
+            continue;
+        }
+        // Phase 1 already proved this link's proxy unreachable (refused, no
+        // route, unresolvable, dial timeout): the real probe would only spend
+        // its whole timeout re-learning that. The row keeps its `[fast]`
+        // marker, which is the honest statement about it.
+        if shared
+            .hard_fast
+            .lock()
+            .contains(&(plan.link.protocol_id, plan.link.endpoint_id))
+        {
+            shared.counters.unreachable.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         match shared.sched.schedule(&plan.link, TaskKind::RealPing).await {
@@ -824,8 +921,12 @@ pub(crate) async fn run_batch(params: BatchParams) {
                 // start clean, so this is the rare defensive path).
                 shared.pending_real.fetch_add(1, Ordering::Relaxed);
             }
-            ScheduleOutcome::DnsDeferred => deferred_real.push(plan.clone()),
+            ScheduleOutcome::DnsDeferred => {
+                shared.counters.deferred.fetch_add(1, Ordering::Relaxed);
+                deferred_real.push(plan.clone());
+            }
             ScheduleOutcome::QueueFull => {
+                shared.counters.queue_full.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(target: "tui::ops::ping", "batch: real ping skipped, queue full");
             }
         }
@@ -892,8 +993,21 @@ pub(crate) async fn run_batch(params: BatchParams) {
     for h in deferred_real_handles {
         let _ = h.await;
     }
+    shared.phase2_ms.store(
+        u32::try_from(phase2_started.elapsed().as_millis()).unwrap_or(u32::MAX),
+        Ordering::Relaxed,
+    );
     finish_batch(&shared).await;
 }
+
+/// Attempts for the batch-end flush. Contention with a concurrent import is
+/// transient (the import commits in 500-link chunks) and the driver already
+/// waits `busy_timeout` (5 s) inside each attempt — so this is a short bounded
+/// retry, not a stacked backoff. A dedicated failure-injection test is not
+/// written: every injected failure costs the driver's full busy wait (measured
+/// in `link_writer`'s lock test), and the retry only decides how many times the
+/// same single call is repeated.
+const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 
 /// Signal the batch's end: total 0 makes the events handler clear the shared
 /// progress and re-arm the stop flag. Runs the error-TTL sweep first (design
@@ -907,8 +1021,28 @@ async fn finish_batch(shared: &BatchShared) {
     // Make the batch durable before the sweeps look at the rows: the staged
     // result/task writes land in one transaction here instead of one commit
     // per result on the UI task.
-    if let Err(e) = shared.writer.flush().await {
-        tracing::warn!(target: "tui::ops::ping", "batch flush failed: {e}");
+    //
+    // Retried: this is the batch's durability point, and the background flush
+    // loop may not outlive it. A failed attempt re-stages the whole unwritten
+    // remainder (see `LinkWriter::flush`), so a later attempt writes it all.
+    let mut flush_error = None;
+    for attempt in 0..FINAL_FLUSH_ATTEMPTS {
+        match shared.writer.flush().await {
+            Ok(_) => {
+                flush_error = None;
+                break;
+            }
+            Err(e) => {
+                flush_error = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50 << attempt.min(3))).await;
+            }
+        }
+    }
+    if let Some(e) = flush_error {
+        tracing::warn!(
+            target: "tui::ops::ping",
+            "batch flush failed after {FINAL_FLUSH_ATTEMPTS} attempts: {e}"
+        );
     }
     // Bound WAL growth: one checkpoint after the write burst, not per commit.
     // Bounded by a timeout — an in-memory database has no WAL to checkpoint
@@ -927,10 +1061,59 @@ async fn finish_batch(shared: &BatchShared) {
         .await;
     }
     crate::ops::profiles::clear_expired_errors(&shared.db, shared.error_ttl_hours).await;
+    // One line per batch: the per-result lines are `debug`, so this is the
+    // record a reader (and the next investigation) works from.
+    tracing::info!(target: "tui::ops::ping", "{}", summary_line(shared));
     let _ = shared.tx.try_send(CoreEvent::BatchProgress {
         total: 0,
         completed: 0,
     });
+}
+
+/// The batch's single log record: planned links, per-phase outcomes, the
+/// phase-2 skips, the phase timings and the writer's own durability answer
+/// (`staged-left` is non-zero only if a flush never succeeded).
+fn summary_line(shared: &BatchShared) -> String {
+    let counters = &shared.counters;
+    let load = |counter: &AtomicU16| counter.load(Ordering::Relaxed);
+    format!(
+        "batch summary: links={} untestable={} queue-full={} deferred={} | phase1 ok={} hard-fail={} soft-fail={} ({} ms) | phase2 ok={} failed={} skipped-unreachable={} ({} ms) | stopped={} flushes={} staged-left={}",
+        shared.plan.len(),
+        load(&counters.untestable),
+        load(&counters.queue_full),
+        load(&counters.deferred),
+        load(&counters.fast_ok),
+        load(&counters.fast_hard_failed),
+        load(&counters.fast_soft_failed),
+        shared.phase1_ms.load(Ordering::Relaxed),
+        load(&counters.real_ok),
+        load(&counters.real_failed),
+        load(&counters.unreachable),
+        shared.phase2_ms.load(Ordering::Relaxed),
+        shared.stop.load(Ordering::Relaxed),
+        shared.writer.flush_count(),
+        shared.writer.staged_len(),
+    )
+}
+
+/// One startup line naming the values a batch's behaviour depends on: the
+/// analysis of the 2026-09-15 run had to read them out of `config.json`, and
+/// the loaded page size is what the plan is bounded by.
+pub fn log_startup_envelope(state: &AppState) {
+    let speed = &state.config.speed_test;
+    tracing::info!(
+        target: "tui::ops::ping",
+        "startup: version={} page={} rows tcp-timeout={:?} real-timeout={:?} real-retries={} real-concurrency={} fast-concurrency={} dedup-endpoints={} error-ttl={:?}",
+        env!("CARGO_PKG_VERSION"),
+        state.endpoints.len(),
+        speed.tcp_timeout_secs,
+        speed.real_ping_timeout_secs,
+        speed.real_ping_retries,
+        speed.real_ping_concurrency,
+        speed.fast_ping_concurrency,
+        !speed.real_ping_test_all_protocols,
+        speed.error_ttl_hours,
+    );
 }
 
 /// Re-schedule a DNS-deferred fast link after the deferral window.
@@ -1061,7 +1244,7 @@ impl BatchShared {
     /// (address, port); followers await the owner's result and reuse it.
     async fn fast_probe(&self, link: &ProfileStats) -> ProbeOutcome {
         let Some(endpoint) = self.endpoints.get(&link.endpoint_id) else {
-            return ProbeOutcome::Failed("Endpoint not found for fast ping".to_string());
+            return ProbeOutcome::soft_failure("Endpoint not found for fast ping");
         };
         let key = (endpoint.host.clone(), endpoint.port);
         let (is_owner, notify) = {
@@ -1108,9 +1291,7 @@ impl BatchShared {
                 .cache
                 .get(&key)
                 .cloned()
-                .unwrap_or_else(|| {
-                    ProbeOutcome::Failed("fast ping dedup: owner result lost".to_string())
-                })
+                .unwrap_or_else(|| ProbeOutcome::soft_failure("fast ping dedup: owner result lost"))
         }
     }
 
@@ -1121,10 +1302,10 @@ impl BatchShared {
         let protocol = match load_protocol_with_config(&self.db, link.protocol_id).await {
             Ok(Some(p)) => p,
             Ok(None) => {
-                return ProbeOutcome::Failed("Protocol row not found for real ping".to_string());
+                return ProbeOutcome::soft_failure("Protocol row not found for real ping");
             }
             Err(e) => {
-                return ProbeOutcome::Failed(format!("Failed to load protocol: {e}"));
+                return ProbeOutcome::soft_failure(format!("Failed to load protocol: {e}"));
             }
         };
         let config = protocol.config.get().0.clone();
@@ -1133,10 +1314,10 @@ impl BatchShared {
         // refuses reaches here. Its marker IS the probe's result — phase 2, so
         // it lands after the fast result and is not cleared by it.
         if let Some(reason) = capability::support_reason(protocol.proto_kind, &config) {
-            return ProbeOutcome::Failed(untestable_marker_text(reason));
+            return ProbeOutcome::soft_failure(untestable_marker_text(reason));
         }
         let Some(endpoint) = self.endpoints.get(&link.endpoint_id) else {
-            return ProbeOutcome::Failed("Endpoint not found for real ping".to_string());
+            return ProbeOutcome::soft_failure("Endpoint not found for real ping");
         };
         self.runner
             .real(
@@ -1152,17 +1333,70 @@ impl BatchShared {
             .await
     }
 
+    /// Stage one link's RESULT columns from a probe outcome.
+    ///
+    /// The batch owns its link snapshots, so persistence does not depend on the
+    /// UI's loaded page: the events handler applies results to `state.endpoints`
+    /// and stages only what it finds there, and a page reload mid-batch (an
+    /// import moves every endpoint's ordering keys) used to drop those results
+    /// silently. Staging here is what makes "emitted == persisted" hold.
+    fn stage_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
+        let (latency_ms, ip_info, error) = match outcome {
+            ProbeOutcome::Ok {
+                latency_ms,
+                ip_info,
+            } => (*latency_ms, ip_info.as_deref(), None),
+            ProbeOutcome::Failed { text, .. } => (None, None, Some(text.as_str())),
+        };
+        let mut row = link.clone();
+        if crate::ops::events::apply_test_result(
+            &mut row, test_type, latency_ms, None, ip_info, error,
+        ) {
+            self.writer.stage(&row, LinkGroups::RESULT);
+        }
+    }
+
     /// Send the `SpeedTestResult` event for a completed probe. The
     /// `TestTypeUpdate` re-arms the events handler's per-protocol dedupe guard
     /// (`testing_profiles`) before the result lands — the established pattern
     /// for the two-phase batch (phase 2 re-arms for its real result).
     fn emit_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
+        // Persist first: the event below is a UI notification and may be
+        // dropped when the channel is full (`try_send`), the write may not.
+        self.stage_result(link, test_type, outcome);
+        // Phase 2 reads this: a hard fast failure means the proxy never
+        // answered, and a real probe can only spend its timeout finding that
+        // out again (253 of 350 phase-2 probes did exactly that, 2026-09-15).
+        match (test_type, outcome) {
+            (TestType::TcpPing, ProbeOutcome::Ok { .. }) => {
+                self.counters.fast_ok.fetch_add(1, Ordering::Relaxed);
+            }
+            (TestType::TcpPing, ProbeOutcome::Failed { hard: true, .. }) => {
+                self.counters
+                    .fast_hard_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.hard_fast
+                    .lock()
+                    .insert((link.protocol_id, link.endpoint_id));
+            }
+            (TestType::TcpPing, ProbeOutcome::Failed { hard: false, .. }) => {
+                self.counters
+                    .fast_soft_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            (_, ProbeOutcome::Ok { .. }) => {
+                self.counters.real_ok.fetch_add(1, Ordering::Relaxed);
+            }
+            (_, ProbeOutcome::Failed { .. }) => {
+                self.counters.real_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let (latency_ms, ip_info, error) = match outcome {
             ProbeOutcome::Ok {
                 latency_ms,
                 ip_info,
             } => (*latency_ms, ip_info.clone(), None),
-            ProbeOutcome::Failed(e) => (None, None, Some(e.clone())),
+            ProbeOutcome::Failed { text, .. } => (None, None, Some(text.clone())),
         };
         let endpoint_id = link.endpoint_id.get();
         let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
@@ -1226,7 +1460,27 @@ impl BatchShared {
     /// also counts as a settled real task so the progress bar still reaches the
     /// total.
     fn emit_untestable_markers(&self) {
+        self.counters.untestable.store(
+            u16::try_from(self.untestable.len()).unwrap_or(u16::MAX),
+            Ordering::Relaxed,
+        );
         for ((protocol_id, endpoint_id), text) in &self.untestable {
+            // Persist the marker from the plan's own snapshot: the events
+            // handler only stages what the loaded page still holds.
+            if let Some(link) = self
+                .plan
+                .iter()
+                .find(|plan| {
+                    plan.link.protocol_id == *protocol_id && plan.link.endpoint_id == *endpoint_id
+                })
+                .map(|plan| &plan.link)
+            {
+                self.stage_result(
+                    link,
+                    TestType::RealPing,
+                    &ProbeOutcome::soft_failure(text.clone()),
+                );
+            }
             let (protocol_id, endpoint_id) = (protocol_id.get(), endpoint_id.get());
             let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
                 endpoint_id,
@@ -1419,6 +1673,9 @@ mod tests {
         /// When set, every fast probe marks the endpoint's DNS failure — used
         /// to land a deferral deterministically between phase 1 and phase 2.
         dns_mark_on_fast: Mutex<Option<(Arc<TaskScheduler>, EndpointId)>>,
+        /// Per-address fast outcome, for the tests that need a mixed batch
+        /// (an unreachable link next to a reachable one).
+        fast_by_addr: Mutex<std::collections::HashMap<String, ProbeOutcome>>,
     }
 
     impl StubRunner {
@@ -1436,6 +1693,7 @@ mod tests {
                 real_calls: Arc::new(AtomicUsize::new(0)),
                 real_gate: Mutex::new(None),
                 dns_mark_on_fast: Mutex::new(None),
+                fast_by_addr: Mutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -1444,7 +1702,7 @@ mod tests {
         fn fast<'a>(
             &'a self,
             _config_type: i32,
-            _addr: &'a str,
+            addr: &'a str,
             _port: u16,
             _timeout: Duration,
         ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
@@ -1452,6 +1710,9 @@ mod tests {
                 self.fast_calls.fetch_add(1, Ordering::Relaxed);
                 if let Some((sched, eid)) = &*self.dns_mark_on_fast.lock() {
                     sched.mark_dns_failure(*eid);
+                }
+                if let Some(outcome) = self.fast_by_addr.lock().get(addr) {
+                    return outcome.clone();
                 }
                 self.fast_outcome.clone()
             })
@@ -1608,8 +1869,168 @@ mod tests {
         }
     }
 
-    // ── error-TTL sweep at batch completion ──────────────────────────────
+    // ── the batch, not the page, is the record ───────────────────────────
 
+    /// A batch persists its own results: the UI page is a view, and a page
+    /// that no longer holds the row (an import moves every endpoint's ordering
+    /// keys while the batch runs) must not cost the write. The handler used to
+    /// be the only writer of a result, so every link it could not find in the
+    /// loaded page was logged and dropped.
+    #[tokio::test]
+    async fn batch_persists_results_the_page_no_longer_holds() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1), fake_row(2, "10.0.0.2", 1)];
+        let mut h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        // The page is replaced mid-batch: the events handler finds no row.
+        h.state.endpoints.clear();
+
+        let handle = start_test_batch(&mut h, plan, true, false);
+        handle.await.unwrap();
+
+        // `finish_batch` flushes: the result is in the database.
+        for row in &rows {
+            let link = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+                row.links[0].protocol_id,
+                row.links[0].endpoint_id,
+            )
+            .first()
+            .exec(&mut h.state.db.connection().await.expect("conn"))
+            .await
+            .expect("read")
+            .expect("row");
+            assert!(
+                matches!(
+                    &link.latency,
+                    Some(Latency::Real { delay: 50, ip: Some(ip) }) if ip == "1.2.3.4"
+                ),
+                "the batch's own staging must persist the result: {link:?}"
+            );
+            assert!(link.error.is_none(), "no marker expected: {link:?}");
+        }
+    }
+
+    // ── phase 2 skips what phase 1 proved unreachable ────────────────────
+
+    /// A link whose fast probe hard-failed (refused / unreachable /
+    /// unresolvable / timeout) is not real-probed: the probe can only spend its
+    /// whole timeout re-learning the same thing. A soft failure (a TLS-level
+    /// error, say) still gets its probe — that answers a different question.
+    #[tokio::test]
+    async fn phase_two_skips_links_the_fast_probe_proved_unreachable() {
+        let rows = vec![
+            fake_row(1, "10.0.0.1", 1),
+            fake_row(2, "10.0.0.2", 1),
+            fake_row(3, "10.0.0.3", 1),
+        ];
+        let mut h = harness(rows.clone()).await;
+        {
+            let mut by_addr = h.runner.fast_by_addr.lock();
+            by_addr.insert(
+                "10.0.0.1".to_string(),
+                ProbeOutcome::Failed {
+                    text: "IO: Connection refused (os error 111)".to_string(),
+                    hard: true,
+                },
+            );
+            by_addr.insert(
+                "10.0.0.2".to_string(),
+                ProbeOutcome::soft_failure("TLS error: handshake error: alert: 2 40"),
+            );
+        }
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch(&mut h, plan, true, false);
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            h.runner.real_calls.load(Ordering::Relaxed),
+            2,
+            "only the soft-failed and the reachable link are real-probed"
+        );
+
+        let persisted = |row: &EndpointRow| {
+            let (protocol_id, endpoint_id) = (row.links[0].protocol_id, row.links[0].endpoint_id);
+            let db = h.state.db.clone();
+            async move {
+                xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+                    protocol_id,
+                    endpoint_id,
+                )
+                .first()
+                .exec(&mut db.connection().await.expect("conn"))
+                .await
+                .expect("read")
+                .expect("row")
+            }
+        };
+
+        let skipped = persisted(&rows[0]).await;
+        assert!(
+            matches!(
+                skipped.error.as_ref().map(|e| e.kind),
+                Some(ProfileErr::Fast)
+            ),
+            "the unreachable link keeps its fast marker: {skipped:?}"
+        );
+        assert_eq!(
+            skipped.error.as_ref().map(|e| e.text.as_str()),
+            Some("IO: Connection refused (os error 111)")
+        );
+
+        for row in &rows[1..] {
+            let link = persisted(row).await;
+            assert!(
+                matches!(
+                    &link.latency,
+                    Some(Latency::Real { delay: 50, ip: Some(ip) }) if ip == "1.2.3.4"
+                ),
+                "a probed link carries the real result: {link:?}"
+            );
+        }
+    }
+
+    // ── one summary line per batch ───────────────────────────────────────
+
+    /// The batch's record is ONE line carrying every counter: per-result lines
+    /// moved to `debug` (a 5-minute run wrote 32k of them on 2026-09-15, and
+    /// reconstructing the run from them was the whole cost of the
+    /// investigation). This pins the record's fields so a later edit cannot
+    /// drop one silently.
+    #[tokio::test]
+    async fn the_batch_summary_reports_every_counter() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let h = harness(rows.clone()).await;
+        let shared = BatchShared::from(build_params(&h, plan_from_rows(&rows), true, false));
+        let counters = &shared.counters;
+        counters.fast_ok.store(7, Ordering::Relaxed);
+        counters.fast_hard_failed.store(5, Ordering::Relaxed);
+        counters.fast_soft_failed.store(3, Ordering::Relaxed);
+        counters.real_ok.store(2, Ordering::Relaxed);
+        counters.real_failed.store(4, Ordering::Relaxed);
+        counters.untestable.store(1, Ordering::Relaxed);
+        counters.unreachable.store(5, Ordering::Relaxed);
+        counters.deferred.store(6, Ordering::Relaxed);
+        counters.queue_full.store(8, Ordering::Relaxed);
+        shared.phase1_ms.store(120, Ordering::Relaxed);
+        shared.phase2_ms.store(340, Ordering::Relaxed);
+
+        let line = summary_line(&shared);
+        for expected in [
+            "links=1",
+            "untestable=1",
+            "queue-full=8",
+            "deferred=6",
+            "phase1 ok=7 hard-fail=5 soft-fail=3 (120 ms)",
+            "phase2 ok=2 failed=4 skipped-unreachable=5 (340 ms)",
+            "stopped=false",
+            "staged-left=0",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in: {line}");
+        }
+    }
+
+    // ── error-TTL sweep at batch completion ──────────────────────────────
     #[tokio::test]
     async fn batch_completion_sweeps_stale_error_markers() {
         // A link with a persisted error whose updated_at predates the TTL.
@@ -1797,7 +2218,7 @@ mod tests {
     async fn all_fail_writes_real_error_markers_on_every_link() {
         let rows = vec![fake_row(1, "10.0.0.1", 2), fake_row(2, "10.0.0.2", 1)];
         let mut h = harness(rows.clone()).await;
-        *h.runner.real_outcome.lock() = ProbeOutcome::Failed("timeout".to_string());
+        *h.runner.real_outcome.lock() = ProbeOutcome::soft_failure("timeout");
         let plan = plan_from_rows(&rows);
         let handle = start_test_batch(&mut h, plan, true, false);
         handle.await.unwrap();

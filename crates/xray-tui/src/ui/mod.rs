@@ -102,6 +102,9 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             }
         }
     });
+    // One line naming the values a batch's behaviour depends on (the run's
+    // own record: per-result lines are `debug`, batches log one summary).
+    crate::ops::ping::log_startup_envelope(state);
     let refresh_interval = *state.config.gui.refresh_interval_secs;
     let mut last_tick = std::time::Instant::now();
     // Set when a Resize event is drained; forces the next loop iteration to redraw.
