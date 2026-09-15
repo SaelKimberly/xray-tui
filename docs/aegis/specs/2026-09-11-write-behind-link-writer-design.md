@@ -112,15 +112,17 @@ group and stale for every other, so overlaying onto the current row means a
 result patch can never write traffic or scheduler state, and no version
 bookkeeping is needed (the loaded model is always current).
 
-**All writers of `profile_stats`, and the group each one owns**:
+**All writers of `profile_stats`, and the group each one owns** (the group
+vocabulary is `LinkGroups` in `xray-tui-db`; `RESULT`/`TRAFFIC` are the two the
+`LinkWriter` stages, SOURCE is the import's update surface):
 
 | Group | Columns | Writers |
 | --- | --- | --- |
 | `RESULT` | `latency`, `latency_delay`, `latency_ip`, `speed_bps`, `error`, `error_kind`, `error_text` | ping/real-ping results (via `LinkWriter`), `clear_expired_errors` (error columns only) |
-| `TASK` | `task_id`, `task_queue` | the scheduler gate (via `LinkWriter`) |
 | `TRAFFIC` | `traffic_today_up/down`, `traffic_total_up/down` | `CoreEvent::StatsUpdate` (`ops/events.rs:269`) and `drain_pending_stats_updates` (`ops/connect.rs:645`) — routed through `LinkWriter` |
 | `ACTIVITY` | `last_used_at`, `last_seen_at` | `Database::update_last_used` (`ops/connect.rs:193`) — narrow typed write, moved off `upsert_link` |
-| `SOURCE` | `core_type`, `config_type`, `last_seen_at`, insert | subscription/import (`upsert_links_bulk`) — restricted to these columns so an import refresh can no longer overwrite test results |
+| `SOURCE` | `core_type`, `config_type`, `last_seen_at` (on UPDATE); the whole snapshot on INSERT | subscription/import (`upsert_links_bulk`) — restricted to these columns on update so an import refresh cannot overwrite test results or traffic counters |
+| *(removed)* `TASK` | `task_id`, `task_queue` | died with the persisted gate: task state is runtime-only (`TaskScheduler.states`), so nothing about it reaches this table |
 
 No writer may write a group it does not own. `Settings`/`clear_expired_errors`
 is the one bulk UPDATE left outside the writer: it touches error columns only,
@@ -135,7 +137,12 @@ move to `LinkWriter`; `upsert_link`'s remaining callers are limited to the
 The groups are load-bearing, not cosmetic: the first implementation wrote the
 whole mutable column set, and the `apply_link_patches_survives_a_stale_snapshot`
 test caught a result patch wiping a concurrent scheduler write
-(`task_queue` → `[]`). A result patch must never touch scheduler columns and
+(`task_queue` → `[]`). The same lesson came back on 2026-09-15 through the
+import: `upsert_links_bulk` had drifted back to a whole-row typed upsert, so a
+subscription refresh wrote `latency = NULL`, `error = NULL` and zeroed traffic
+into every row it re-persisted — `import_refresh_preserves_result_and_traffic`
+(in `xray-tui-db`) is the guard, and the update branch now carries the SOURCE
+columns only (`on_create` carries the rest, where there is nothing to clobber). A result patch must never touch scheduler columns and
 vice versa, so the two writers of one row cannot clobber each other when their
 patches coalesce into the same flush.
 

@@ -15,3 +15,4 @@
 | 2026-09-14 | spec | `specs/2026-09-14-native-ping-pipeline-design.md` | Native ping pipeline: real ping on the in-process core | implemented |
 | 2026-09-14 | plan | `plans/2026-09-14-native-ping-pipeline.md` | Native real-ping pipeline — implementation | executed (T1-T6, T8; `build_multi` dead-code sweep deferred) |
 | 2026-09-14 | adr | `adr/0004-native-real-ping.md` | The real-ping probe engine is the native core | accepted |
+| 2026-09-15 | plan | `plans/2026-09-15-ping-pipeline-integrity.md` | Ping-pipeline persistence and observability — implementation | executed (T1-T11; the transient TLS class left unfixed by evidence, FD-at-scale verification deferred) |

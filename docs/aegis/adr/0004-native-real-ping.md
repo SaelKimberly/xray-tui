@@ -72,3 +72,17 @@ inverts:
   parity, and the gate/guard wiring; plus a real-core e2e
   (`crates/xray-tui-native/tests/probe_e2e.rs`, `#[ignore]`d without a core binary) that
   drives one HTTP request through a real xray-core VLESS server.
+
+## Amendment — 2026-09-15: the attempt deadline is the configured budget
+
+`ProbeRequest::timeout` (from `real_ping_timeout_secs`) bounded only the HTTP
+request step, while dial / security / transport / protocol ran under the
+engine's fixed 10 s `timeouts::*` constants — so a 5 s setting still produced
+`timeout on tcp dial (limit 10s)` (192 of 350 real probes in the measured run),
+and a pathological attempt could spend ~60 s across its steps. `probe::fetch`
+now runs `connect` + `fetch_over` under ONE `tokio::time::timeout(req.timeout)`
+reporting `NativeError::Timeout { step: "probe attempt", .. }`; the engine's
+per-step limits stay as defence in depth. The same wrapper makes the reported
+latency the whole probe span (dial included), matching the subprocess era's
+local-SOCKS measurement, and `a_stalled_handshake_is_bounded_by_the_attempt_budget`
+pins it against a peer that accepts and stays silent.

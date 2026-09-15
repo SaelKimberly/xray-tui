@@ -142,3 +142,50 @@ Pinned by two tests: `apply_link_patches_applies_a_window_wider_than_the_express
 `apply_link_patches_probe_is_exact_for_absent_and_near_miss_pairs` (the UPDATE vs
 INSERT verdict at 140 rows, absent pairs included — the failure mode that is
 silent, since an `UPDATE` matching zero rows drops the link without an error).
+
+## Amendment 3 — 2026-09-15: the import's group, the flush remainder, the batch's own record
+
+Evidence: the 09-15 Fast+Real batch (775 log lines) cross-checked against
+`profile_stats` — 172 of 446 emitted results never reached the database, and 3 of
+3 subscription refreshes ran while the batch was writing.
+
+1. **The import is back inside the group contract.** `upsert_links_bulk` had
+   drifted to a whole-row typed upsert, so an UPDATE wrote the fresh parse's
+   `latency = NULL`, `error = NULL` and zeroed traffic over whatever the ping
+   pipeline had just persisted (proved by a throwaway test, then by
+   `import_refresh_preserves_result_and_traffic`). The update branch now carries
+   `core_type`/`config_type`/`last_seen_at`/`updated_at`; the RESULT and TRAFFIC
+   columns are written through `on_create`, where there is nothing to clobber —
+   toasty's branch-specific upsert, so no existence probe and no second writer
+   path. The spec's §4.1 table is the contract; this ADR amendment is why it is
+   enforced in code rather than documented.
+2. **A failed flush window re-stages the whole remainder.** `drain()` empties
+   the pending map, and the flush loop returned at the first failing chunk —
+   every later window in that drained batch was dropped from a local `Vec`. One
+   chunk per batch (< 512 rows) hid it; a 30k-link batch did not.
+   `a_failed_flush_window_restages_the_whole_remainder` (a held write lock =
+   `database is locked`) fails on the old shape with `staged_len == 1` against
+   the expected 3.
+3. **Busy contention is retried at the batch boundary, not inside the patch
+   writer.** `apply_link_patches` deliberately does NOT get a retry loop: the
+   driver's `busy_timeout` is already 5 s per attempt and the background flush
+   task re-attempts every 200 ms, so a stacked `retry_on_busy` would multiply a
+   5 s stall by six. What was missing is the batch's own durability point, so
+   `finish_batch` retries its final flush `FINAL_FLUSH_ATTEMPTS` times with a
+   short backoff and the summary reports `flushes` / `staged-left`.
+4. **The batch stages its own results.** The events handler writes results onto
+   the loaded 200-row page and stages only what it finds there, so a page reload
+   mid-batch (an import moves every endpoint's stored ordering key) dropped the
+   rest with a `debug`-less log line identical to a persisted one.
+   `BatchShared::stage_result` (one mapping, shared with the handler as
+   `ops::events::apply_test_result`) stages RESULT from the batch's own snapshot;
+   the handler keeps its staging for single pings and logs a page miss.
+5. **Phase 2 no longer re-probes the unreachable.** A fast failure classified
+   hard (timeout/refused/no-route/unresolvable, from `PingError` in the runner)
+   retires the link's real task and leaves the `[fast]` marker: 253 of 350
+   phase-2 probes in the measured run were re-tests of hosts phase 1 had already
+   failed, ~226 s of the 555 s phase.
+
+Records: one `batch summary` INFO line per batch (`summary_line`) and one
+`startup` envelope; per-result success lines are `debug`, failures stay `warn`.
+That is what the next investigation reads instead of 32k per-result lines.
