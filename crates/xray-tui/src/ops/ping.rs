@@ -462,17 +462,22 @@ pub async fn remove_failed_servers(state: &mut AppState) {
 // Phase 1 schedules one `FastPing` task per link; the fast probes are
 // deduplicated by (address, port) — one TCP ping per unique address, the
 // result fanned out to every link sharing it (the old `FastCache` semantics).
-// `DnsDeferred` links are re-scheduled after the deferral window in a spawned
-// task; `QueueFull` links are skipped (the scheduler logs the warning).
-// Phase 2 (after every phase-1 task settles) schedules one `RealPing` task
-// per link, dispatched through the kept real-ping path (`CorePool::ping` with
-// the protocol row reloaded WITH config). With `dedup_endpoints` (the
-// `real_ping_test_all_protocols` negation), the first successful real ping on
-// an endpoint retires the remaining links' real tasks via
-// `scheduler.cancel_queued` + `complete` — cancelled tasks never write error
-// markers. The scheduler is the single gate authority: probes run only for
-// ids `schedule`/`complete` hand out, and every completion re-reads the link
-// (stale snapshots are rejected by the scheduler).
+// It is bounded by `fast_ping_concurrency` (one probe future per unique
+// address at a time). `DnsDeferred` links are re-scheduled after the deferral
+// window in a spawned task; `QueueFull` links are skipped (the scheduler logs
+// the warning).
+// Phase 2 (after every phase-1 task settles) schedules one `RealPing` task per
+// link on the native engine (`ops/ping_native.rs` with the protocol row
+// reloaded WITH config). Links the native engine cannot serve are retired at
+// plan time (kind gate) or by their own probe (config gate) and receive the
+// persisted `[real]` marker instead of a probe — `emit_untestable_markers`
+// runs after phase 1 so the marker is never cleared by a fast success. With
+// `dedup_endpoints` (the `real_ping_test_all_protocols` negation), the first
+// successful real ping on an endpoint retires the remaining links' real tasks
+// via `scheduler.cancel_queued` + `complete` — cancelled tasks never write
+// error markers. The scheduler is the single gate authority: probes run only
+// for ids `schedule`/`complete` hand out, and every completion re-reads the
+// link (stale snapshots are rejected by the scheduler).
 //
 // Batches are serialized (one at a time): the fire-handshake does not support
 // two batches racing to fire promoted tasks on the same link, and the shared
