@@ -1212,7 +1212,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         xray_tui_db::upsert_protocols_bulk(&mut tx, std::slice::from_ref(&protocol))
             .await
             .expect("bulk protocols");
-        xray_tui_db::upsert_links_bulk(&mut tx, &[link(50, None)])
+        xray_tui_db::upsert_links_bulk(&mut tx, &[link(50, Some(Latency::Fast { delay: 7 }))])
             .await
             .expect("bulk links");
         xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, std::slice::from_ref(&group_link))
@@ -1241,8 +1241,17 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         .await
         .expect("seed last_used_at");
 
-    // Re-upsert: port and latency update; last_used_at survives (owned by its
-    // own writer).
+    // Re-upsert: the SOURCE columns (port, last_seen_at) update; RESULT
+    // (latency) and TRAFFIC keep their stored values, and last_used_at survives
+    // (owned by its own writer). A subscription refresh re-persists the link
+    // from a fresh parse, so its snapshot measurement is not an update.
+    let mut refreshed = link(60, Some(Latency::Fast { delay: 123 }));
+    refreshed.traffic = TrafficStats {
+        today_up: 5,
+        today_down: 6,
+        total_up: 7,
+        total_down: 8,
+    };
     {
         let mut conn = db.connection().await.expect("connection 2");
         let mut tx = conn.transaction().await.expect("txn 2");
@@ -1252,7 +1261,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         xray_tui_db::upsert_protocols_bulk(&mut tx, &[protocol])
             .await
             .expect("bulk protocols update");
-        xray_tui_db::upsert_links_bulk(&mut tx, &[link(60, Some(Latency::Fast { delay: 123 }))])
+        xray_tui_db::upsert_links_bulk(&mut tx, &[refreshed])
             .await
             .expect("bulk links update");
         xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, std::slice::from_ref(&group_link))
@@ -1268,8 +1277,16 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
     assert_eq!(row[0].links[0].last_seen_at, ts(60), "last_seen_at updated");
     assert_eq!(
         row[0].links[0].latency,
-        Some(Latency::Fast { delay: 123 }),
-        "latency updated"
+        Some(Latency::Fast { delay: 7 }),
+        "a refresh snapshot does not overwrite the stored measurement"
+    );
+    assert_eq!(
+        (
+            row[0].links[0].traffic.today_up,
+            row[0].links[0].traffic.total_down
+        ),
+        (0, 0),
+        "a refresh snapshot does not overwrite the traffic counters"
     );
     assert_eq!(
         row[0].links[0].last_used_at,

@@ -1257,23 +1257,35 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
     Ok(())
 }
 
-/// Insert-or-update many per-pair link rows on the caller's executor.
+/// Insert-or-update many per-pair link rows on the caller's executor — the
+/// subscription/import path, and the one writer restricted to the SOURCE
+/// columns.
 ///
-/// Empty slice is a no-op. Field list identical to `Database::upsert_link`:
-/// `last_used_at` stays owned by
-/// their single-row writers and are preserved on update.
+/// Empty slice is a no-op. An **update** writes identity/config provenance only
+/// (`core_type`, `config_type`, `last_seen_at`, `updated_at`); the RESULT
+/// columns (`latency*`, `speed_bps`, `error*`) and the TRAFFIC counters are
+/// written **on create only**. The caller's snapshot comes from a fresh parse,
+/// so writing those columns on update silently wipes the measurements and
+/// counters the ping pipeline and the stats poller own — the whole-row shape
+/// this replaced did exactly that (2026-09-15: an import refresh running beside
+/// a Fast+Real batch destroyed every fast latency it had just written).
+/// `last_used_at` is likewise never touched here (its owner is
+/// [`Database::update_last_used`]).
 pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -> Result<()> {
     for s in links {
         ProfileStats::upsert_by_protocol_id_and_endpoint_id(s.protocol_id, s.endpoint_id)
             .core_type(s.core_type)
             .config_type(s.config_type)
             .last_seen_at(s.last_seen_at)
-            .latency(s.latency.clone())
-            .speed_bps(s.speed_bps)
-            .error(s.error.clone())
-            .traffic(s.traffic)
             .updated_at(now_epoch())
-            .on_create(|create| create.created_at(now_epoch()))
+            .on_create(|create| {
+                create
+                    .latency(s.latency.clone())
+                    .speed_bps(s.speed_bps)
+                    .error(s.error.clone())
+                    .traffic(s.traffic)
+                    .created_at(now_epoch())
+            })
             .exec(tx)
             .await?;
     }
@@ -2040,6 +2052,117 @@ mod tests {
             ep.manual_protocol_override,
             Some(ProtocolId::new(99)),
             "manual override preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_refresh_preserves_result_and_traffic() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        db.upsert_endpoint(&endpoint_struct(1, "1.2.3.4", HostType::Ipv4, 443))
+            .await
+            .expect("endpoint");
+        db.upsert_protocol(&protocol_struct(1001))
+            .await
+            .expect("protocol");
+
+        let mut probed = link_struct(1001, 1, 100);
+        probed.latency = Some(Latency::Fast { delay: 42 });
+        probed.error = Some(crate::models_toasty::ErrorInfo {
+            kind: crate::models_toasty::ProfileErr::Real,
+            text: "timeout on tcp dial".to_string(),
+        });
+        probed.traffic = TrafficStats {
+            today_up: 7,
+            today_down: 9,
+            total_up: 11,
+            total_down: 13,
+        };
+        db.upsert_link(&probed).await.expect("probed link");
+
+        // A subscription refresh re-persists the link from a fresh parse: its
+        // snapshot carries no measurement and zeroed counters, and one SOURCE
+        // column (the per-pair core override) genuinely changed.
+        let mut fresh = link_struct(1001, 1, 200);
+        fresh.core_type = CoreType::SingBox;
+        let mut tx = conn.transaction().await.expect("tx");
+        upsert_links_bulk(&mut tx, std::slice::from_ref(&fresh))
+            .await
+            .expect("bulk upsert");
+        tx.commit().await.expect("commit");
+
+        let stored = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(1001),
+            EndpointId::new(1),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("row");
+        assert_eq!(
+            stored.latency,
+            Some(Latency::Fast { delay: 42 }),
+            "a measurement survives an import refresh"
+        );
+        assert!(
+            stored.error.is_some(),
+            "a failure marker survives an import refresh"
+        );
+        assert_eq!(
+            (
+                stored.traffic.today_up,
+                stored.traffic.today_down,
+                stored.traffic.total_up,
+                stored.traffic.total_down
+            ),
+            (7, 9, 11, 13),
+            "traffic counters survive an import refresh"
+        );
+        assert_eq!(stored.last_seen_at, ts(200), "source column updates");
+        assert_eq!(
+            stored.core_type,
+            CoreType::SingBox,
+            "the per-pair core override still updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_insert_writes_the_whole_snapshot() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        db.upsert_endpoint(&endpoint_struct(1, "1.2.3.4", HostType::Ipv4, 443))
+            .await
+            .expect("endpoint");
+        db.upsert_protocol(&protocol_struct(1001))
+            .await
+            .expect("protocol");
+
+        let mut snapshot = link_struct(1001, 1, 300);
+        snapshot.traffic = TrafficStats {
+            today_up: 1,
+            today_down: 2,
+            total_up: 3,
+            total_down: 4,
+        };
+        let mut tx = conn.transaction().await.expect("tx");
+        upsert_links_bulk(&mut tx, std::slice::from_ref(&snapshot))
+            .await
+            .expect("bulk upsert");
+        tx.commit().await.expect("commit");
+
+        let stored = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(1001),
+            EndpointId::new(1),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("row");
+        assert_eq!(
+            stored.traffic.total_down, 4,
+            "a first insert stores the caller's snapshot"
         );
     }
 
