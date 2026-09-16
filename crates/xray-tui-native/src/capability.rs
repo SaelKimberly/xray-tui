@@ -630,7 +630,7 @@ mod tests {
         let mut vless_flow = vless_cfg();
         vless_flow.flow = Some("xtls-rprx-direct".into());
         let mut vless_fp = vless_cfg();
-        vless_fp.security = tls_fp("ios");
+        vless_fp.security = tls_fp("qq");
         let mut vless_kcp = vless_cfg();
         vless_kcp.transport = TransportConfig::Kcp(KcpConfig {
             seed: Some("obfs".into()),
@@ -733,20 +733,11 @@ mod tests {
 
     #[test]
     fn xray_only_fingerprints_deferred() {
-        // ids xray's uTLS accepts but `parse_fingerprint_id` refuses: native
-        // would fail the dial with `NativeError::Config` where the
-        // subprocess connects. The empty value is refused by the same
-        // parser, so it defers too.
-        for fp in [
-            "randomized",
-            "ios",
-            "android",
-            "edge",
-            "360",
-            "qq",
-            "chrome-130",
-            "",
-        ] {
+        // ids xray's uTLS accepts but `parse_fingerprint_id` refuses because
+        // no engine hello models them: native would otherwise dial with a
+        // shape the link did not ask for, so the row defers to the
+        // subprocess. The empty value is refused by the same parser.
+        for fp in ["android", "360", "qq", "chrome-130", ""] {
             assert!(!vless_with(tls_fp(fp)), "vless tls fp={fp:?}");
             assert!(!vless_with(reality_fp(fp)), "vless reality fp={fp:?}");
 
@@ -769,7 +760,20 @@ mod tests {
     #[test]
     fn native_fingerprints_supported() {
         // Exactly the ids the parser accepts — the gate must not narrow it.
-        for fp in ["chrome", "chrome-randomized", "firefox", "safari", "random"] {
+        // `randomized` is xray's alias for randomized Chrome; `edge` and `ios`
+        // are presets the roster carries (edge_106, Safari-on-iOS), so they
+        // are probed rather than marked untestable (2026-09-16: ~19 links per
+        // subscription fell into that marker for no reason).
+        for fp in [
+            "chrome",
+            "chrome-randomized",
+            "randomized",
+            "firefox",
+            "safari",
+            "edge",
+            "ios",
+            "random",
+        ] {
             assert!(vless_with(tls_fp(fp)), "vless tls fp={fp:?}");
             assert!(vless_with(reality_fp(fp)), "vless reality fp={fp:?}");
 
@@ -1036,17 +1040,18 @@ mod tests {
 
     #[test]
     fn ss_xray_only_fingerprint_defers() {
-        // `security::wrap` parses `fp` on the SS TCP path too, so an
-        // xray-only id is fatal there exactly as on vless/vmess/trojan.
+        // `security::wrap` parses `fp` on the SS TCP path too, so an id the
+        // engine has no hello for is fatal there exactly as on
+        // vless/vmess/trojan.
         let mut cfg = ss_cfg("aes-128-gcm", "pw");
-        cfg.security = tls_fp("ios");
+        cfg.security = tls_fp("qq");
         assert!(!ss_row(ProtocolKind::Shadowsocks, cfg));
 
         let mut cfg = ss_cfg(
             "2022-blake3-aes-256-gcm",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         );
-        cfg.security = reality_fp("edge");
+        cfg.security = reality_fp("android");
         assert!(!ss_row(ProtocolKind::Shadowsocks2022, cfg));
     }
 

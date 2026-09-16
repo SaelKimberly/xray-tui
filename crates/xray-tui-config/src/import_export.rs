@@ -666,9 +666,15 @@ fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<
 /// Consolidated validation summary for a batch of profile imports (e.g. subscription).
 #[derive(Debug, Clone, Default)]
 pub struct ValidationSummary {
+    /// Errors that made a candidate unusable (missing fields, host validation,
+    /// other parse failures). **Excludes** [`Self::security_warning_count`]:
+    /// a profile whose author disabled TLS verification imports fine, and
+    /// counting it here made a 23,574-link import log "16,325 errors" when
+    /// 16,140 of them were `insecure=true` warnings.
     pub total_errors: usize,
     pub missing_field_count: usize,
     pub host_validation_count: usize,
+    /// Profiles that imported but demand no certificate verification.
     pub security_warning_count: usize,
     pub other_count: usize,
 }

@@ -436,9 +436,10 @@ pub fn subscription_url_chunks(data: &[u8]) -> Result<Vec<String>, String> {
 
 /// Parse one batch of share URLs into profiles with a complete per-batch summary.
 ///
-/// The summary includes the security-warning scan + `total_errors`. This is
-/// the funnel shared by [`parse_subscription_data`] and the TUI's chunked
-/// import.
+/// The summary carries `total_errors` (candidates that could not be imported)
+/// plus `security_warning_count` (imported profiles that disable certificate
+/// verification) as separate counters. This is the funnel shared by
+/// [`parse_subscription_data`] and the TUI's chunked import.
 ///
 /// # Errors
 ///
@@ -467,10 +468,8 @@ pub fn parse_url_batch(
         })
         .count();
 
-    summary.total_errors = summary.missing_field_count
-        + summary.host_validation_count
-        + summary.security_warning_count
-        + summary.other_count;
+    summary.total_errors =
+        summary.missing_field_count + summary.host_validation_count + summary.other_count;
     (profiles, summary)
 }
 
