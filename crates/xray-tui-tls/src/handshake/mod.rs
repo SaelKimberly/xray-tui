@@ -34,8 +34,8 @@ use crate::hello::{BuildParams, build_hello, to_record};
 use crate::record::stream::{AppKeys, TlsStream};
 use crate::record::{
     CONTENT_APPLICATION_DATA, CONTENT_HANDSHAKE, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
-    HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO, MAX_RECORD_PAYLOAD, aead_aad,
-    parse_handshake_messages, skip_ccs,
+    HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
+    MAX_RECORD_PAYLOAD, aead_aad, parse_handshake_messages, skip_ccs,
 };
 use crate::spec::{ClientHelloSpec, ExtensionSpec, KeyShareGroup};
 
@@ -857,7 +857,20 @@ where
                     ee_raw = Some(raw);
                 }
                 HS_CERTIFICATE => {
-                    chain = Some(parse_certificate_message(body, offered_compress)?);
+                    chain = Some(parse_certificate_message(body)?);
+                    cert_raw = Some(raw);
+                }
+                HS_COMPRESSED_CERTIFICATE => {
+                    // RFC 8879 §4: the compressed Certificate replaces the
+                    // plain one; the decompressed payload is the Certificate
+                    // BODY (rustls parses it the same way — no 4-byte
+                    // handshake header inside).
+                    let cert_body = decompress_certificate_message(body, offered_compress)?;
+                    chain = Some(parse_certificate_message(&cert_body)?);
+                    // The transcript carries the message AS SENT: the server
+                    // hashed the `CompressedCertificate`, not a re-built
+                    // `Certificate` (hashing a rebuilt one fails its Finished
+                    // MAC — verified against Cloudflare's edge).
                     cert_raw = Some(raw);
                 }
                 HS_CERTIFICATE_VERIFY => {
@@ -996,10 +1009,11 @@ fn parse_encrypted_extensions(body: &[u8]) -> Result<()> {
 /// `cert_req_ctx_len(1) || ctx || certificate_list_len(3) || certificate_list`.
 ///
 /// Each list entry is `cert_data_len(3) || cert_data || extensions_len(2) ||
-/// extensions`; returns the DER chain, leaf first. Per RFC 8879 the server
-/// may compress each `cert_data` with one of the `compress_certificate`
-/// algorithms the client offered (see [`decompress_cert`]).
-fn parse_certificate_message(body: &[u8], offered_compress: &[u16]) -> Result<Vec<Vec<u8>>> {
+/// extensions`; returns the DER chain, leaf first. This is the body of a
+/// `Certificate` message (or of the payload a `CompressedCertificate`
+/// decompressed to — RFC 8879 §4 compresses this very body, so there is no
+/// per-entry compression to undo here).
+fn parse_certificate_message(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     if body.len() < 4 {
         return Err(TlsError::Handshake("Certificate message too short".into()));
     }
@@ -1029,10 +1043,7 @@ fn parse_certificate_message(body: &[u8], offered_compress: &[u16]) -> Result<Ve
         if pos + cert_len > list_end {
             return Err(TlsError::Handshake("certificate data truncated".into()));
         }
-        chain.push(decompress_cert(
-            &body[pos..pos + cert_len],
-            offered_compress,
-        )?);
+        chain.push(body[pos..pos + cert_len].to_vec());
         pos += cert_len;
         if pos + 2 > list_end {
             return Err(TlsError::Handshake(
@@ -1050,42 +1061,67 @@ fn parse_certificate_message(body: &[u8], offered_compress: &[u16]) -> Result<Ve
     Ok(chain)
 }
 
-/// Decompress one RFC 8879 `cert_data` entry.
+/// Decompress one RFC 8879 `CompressedCertificate` payload.
 ///
-///
-/// Decompression is bounded: a server-supplied compressed blob may not
-/// expand past [`MAX_CERT_BYTES`] (a decompression bomb would otherwise OOM
-/// the process). An over-bound stream fails the handshake; a stream that is
-/// not valid for the algorithm is skipped (next offered algorithm).
-fn decompress_cert(data: &[u8], offered: &[u16]) -> Result<Vec<u8>> {
-    if is_der_cert(data) {
-        return Ok(data.to_vec());
+/// `offered` is the `ClientHello`'s `compress_certificate` algorithm list (RFC
+/// 8879 §7.3: 1 zlib, 2 brotli, 3 zstd); a server that selects anything else
+/// is misbehaving and the message is rejected, as rustls does with
+/// `bad_certificate`. Decompression is bounded ([`MAX_CERT_BYTES`]): a
+/// server-supplied blob may not expand without limit.
+fn decompress_certificate_message(body: &[u8], offered: &[u16]) -> Result<Vec<u8>> {
+    // algorithm(2) || uncompressed_length(3) || compressed<1..2^24-1>
+    if body.len() < 8 {
+        return Err(TlsError::Handshake(
+            "CompressedCertificate too short".into(),
+        ));
     }
-    for &alg in offered {
-        let out = match alg {
-            0x0001 => decompress_bounded(flate2::read::ZlibDecoder::new(data))?,
-            0x0002 => decompress_bounded(brotli::Decompressor::new(data, 4096))?,
-            0x0003 => match zstd::stream::read::Decoder::new(data) {
-                Ok(d) => decompress_bounded(d)?,
-                Err(_) => None, // not a zstd stream — try the next algorithm
-            },
-            _ => None,
-        };
-        if let Some(out) = out.filter(|o| is_der_cert(o)) {
-            return Ok(out);
-        }
+    let algorithm = u16::from_be_bytes([body[0], body[1]]);
+    let uncompressed_len = u24(&body[2..5]);
+    let compressed_len = u24(&body[5..8]);
+    if body.len() != 8 + compressed_len {
+        return Err(TlsError::Handshake(format!(
+            "CompressedCertificate declares {compressed_len} compressed bytes, got {}",
+            body.len() - 8
+        )));
     }
-    Ok(data.to_vec())
+    if !offered.contains(&algorithm) {
+        return Err(TlsError::Handshake(format!(
+            "server compressed the Certificate with algorithm 0x{algorithm:04X}, which the \
+             ClientHello did not offer"
+        )));
+    }
+    let data = &body[8..];
+    let decompressed = match algorithm {
+        0x0001 => decompress_bounded(flate2::read::ZlibDecoder::new(data))?,
+        0x0002 => decompress_bounded(brotli::Decompressor::new(data, 4096))?,
+        0x0003 => match zstd::stream::read::Decoder::new(data) {
+            Ok(decoder) => decompress_bounded(decoder)?,
+            Err(_) => None,
+        },
+        _ => None,
+    }
+    .ok_or_else(|| {
+        TlsError::Handshake(format!(
+            "CompressedCertificate algorithm 0x{algorithm:04X} did not decode"
+        ))
+    })?;
+    if decompressed.len() != uncompressed_len {
+        return Err(TlsError::Handshake(format!(
+            "CompressedCertificate declares {uncompressed_len} uncompressed bytes, got {}",
+            decompressed.len()
+        )));
+    }
+    Ok(decompressed)
 }
 
-/// Maximum decompressed size of one RFC 8879 certificate entry.
+/// Maximum decompressed size of one RFC 8879 Certificate payload.
 const MAX_CERT_BYTES: u64 = 1 << 20;
 
 /// Decompress `reader` into at most [`MAX_CERT_BYTES`] bytes.
 ///
-/// `Ok(None)` when the input is not a valid stream of the algorithm (the
-/// caller tries the next offered algorithm); `Err` when the stream inflates
-/// past the bound (decompression bomb).
+/// `Ok(None)` when the input is not a valid stream for the selected
+/// algorithm; `Err` when the stream inflates past the bound (decompression
+/// bomb).
 fn decompress_bounded<R: std::io::Read>(mut reader: R) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
     let mut out = Vec::new();
@@ -1105,34 +1141,6 @@ fn decompress_bounded<R: std::io::Read>(mut reader: R) -> Result<Option<Vec<u8>>
     Ok(Some(out))
 }
 
-/// Is `data` a complete DER X.509 certificate (a SEQUENCE whose length
-/// field covers exactly the payload)? Compressed blobs never start with
-/// `0x30` followed by a self-consistent length, so this distinguishes raw
-/// from compressed `cert_data`.
-fn is_der_cert(data: &[u8]) -> bool {
-    if data.first() != Some(&0x30) {
-        return false;
-    }
-    der_sequence_length(data) == Some(data.len())
-}
-
-/// Length in bytes of a DER SEQUENCE (`0x30`, short/long form) given its
-/// header; `None` when the header is malformed or truncated.
-fn der_sequence_length(data: &[u8]) -> Option<usize> {
-    let b = *data.get(1)?;
-    if b & 0x80 == 0 {
-        return Some(2 + usize::from(b));
-    }
-    let n = usize::from(b & 0x7f);
-    if n == 0 || n > 4 || data.len() < 2 + n {
-        return None;
-    }
-    let mut len = 0usize;
-    for &byte in &data[2..2 + n] {
-        len = (len << 8) | usize::from(byte);
-    }
-    Some(2 + n + len)
-}
 /// Parse a `CertificateVerify` body: `signature_scheme(2) ||
 /// signature_len(2) || signature`; returns the signature scheme.
 fn parse_certificate_verify(body: &[u8]) -> Result<u16> {
@@ -1190,10 +1198,11 @@ mod tests {
 
     use super::{
         AEAD_TAG_LEN, AcceptAll, CONTENT_APPLICATION_DATA, HRR_RANDOM, HS_CERTIFICATE,
-        HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
-        HandshakeParams, TlsVersion, connect, decompress_cert, ensure_offered_sigalg, is_der_cert,
-        make_hs_msg, parse_certificate_message, parse_certificate_verify,
-        parse_encrypted_extensions, parse_server_hello, read_server_hs_messages,
+        HS_CERTIFICATE_VERIFY, HS_COMPRESSED_CERTIFICATE, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED,
+        HS_SERVER_HELLO, HandshakeParams, TlsVersion, connect, decompress_bounded,
+        decompress_certificate_message, ensure_offered_sigalg, make_hs_msg,
+        parse_certificate_message, parse_certificate_verify, parse_encrypted_extensions,
+        parse_server_hello, read_server_hs_messages,
     };
     use crate::crypto::{AeadKey, CipherSuiteId, KeySchedule};
     use crate::error::TlsError;
@@ -1514,7 +1523,7 @@ mod tests {
     #[test]
     fn parse_certificate_message_extracts_leaf_first_chain() {
         let msg = decode_hex(CERTIFICATE_VEC);
-        let chain = parse_certificate_message(&msg[4..], &[]).unwrap();
+        let chain = parse_certificate_message(&msg[4..]).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].len(), 0x0000_01b0);
         assert_eq!(&chain[0][..2], &[0x30, 0x82]);
@@ -1535,79 +1544,167 @@ mod tests {
         let mut body = vec![0x00]; // no certificate_request_context
         body.extend_from_slice(&u32::try_from(list.len()).unwrap().to_be_bytes()[1..]);
         body.extend_from_slice(&list);
-        let chain = parse_certificate_message(&body, &[]).unwrap();
+        let chain = parse_certificate_message(&body).unwrap();
         assert_eq!(chain, vec![leaf.to_vec(), root.to_vec()]);
     }
 
-    #[test]
-    fn parse_certificate_message_decompresses_offered_cert() {
-        use std::io::Write;
-
-        // A self-consistent DER blob (0x30 SEQUENCE, 0x81 long form, 26-byte
-        // body → total 29 bytes) that `is_der_cert` recognizes after
-        // decompression.
-        let mut der = vec![0x30u8, 0x81, 26];
-        der.extend_from_slice(&[0xAA; 26]);
-        assert!(is_der_cert(&der));
-
-        // Server compressed it with brotli (0x0002) — one of the offered
-        // algorithms. On drop the writer flushes the stream.
-        let mut compressed = Vec::new();
-        {
-            let mut w = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
-            w.write_all(&der).unwrap();
+    /// A `Certificate` body carrying one DER-shaped entry per element.
+    fn certificate_body(chain: &[&[u8]]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for der in chain {
+            list.extend_from_slice(&u32::try_from(der.len()).unwrap().to_be_bytes()[1..]);
+            list.extend_from_slice(der);
+            list.extend_from_slice(&0x0000u16.to_be_bytes()); // no per-cert extensions
         }
-        assert!(!is_der_cert(&compressed));
-
-        // Wrap the compressed cert_data in a Certificate body.
-        let mut entry = Vec::new();
-        entry.extend_from_slice(&u32::try_from(compressed.len()).unwrap().to_be_bytes()[1..]);
-        entry.extend_from_slice(&compressed);
-        entry.extend_from_slice(&0x0000u16.to_be_bytes()); // no per-cert extensions
         let mut body = vec![0x00]; // no certificate_request_context
-        body.extend_from_slice(&u32::try_from(entry.len()).unwrap().to_be_bytes()[1..]);
-        body.extend_from_slice(&entry);
+        body.extend_from_slice(&u32::try_from(list.len()).unwrap().to_be_bytes()[1..]);
+        body.extend_from_slice(&list);
+        body
+    }
 
-        // Without offering compression the raw bytes pass through.
+    /// A `CompressedCertificate` body (RFC 8879 §4):
+    /// `algorithm(2) || uncompressed_length(3) || compressed<1..2^24-1>`.
+    fn compressed_certificate_body(
+        algorithm: u16,
+        uncompressed_len: usize,
+        compressed: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&algorithm.to_be_bytes());
+        body.extend_from_slice(&u32::try_from(uncompressed_len).unwrap().to_be_bytes()[1..]);
+        body.extend_from_slice(&u32::try_from(compressed.len()).unwrap().to_be_bytes()[1..]);
+        body.extend_from_slice(compressed);
+        body
+    }
+
+    /// Brotli-compresses `data` (the algorithm Cloudflare's edge selected for
+    /// this engine's hello).
+    fn brotli_compress(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+            w.write_all(data).unwrap();
+        }
+        out
+    }
+
+    /// RFC 8879 §4: the payload is the Certificate BODY (no handshake header),
+    /// it is compressed with the algorithm the `ClientHello` offered, and the
+    /// two 3-byte lengths must agree with the actual bytes.
+    #[test]
+    fn compressed_certificate_decompresses_offered_algorithm() {
+        let body = certificate_body(&[&[0x30, 0x01, 0xAA]]);
+
+        // Brotli (0x0002) — what Cloudflare's edge picked for chrome_130.
+        let msg = compressed_certificate_body(0x0002, body.len(), &brotli_compress(&body));
         assert_eq!(
-            parse_certificate_message(&body, &[]).unwrap(),
-            vec![compressed.clone()]
+            decompress_certificate_message(&msg, &[0x0002, 0x0003]).unwrap(),
+            body
         );
-        // With brotli offered, the original DER is recovered.
-        let chain = parse_certificate_message(&body, &[0x0001, 0x0002, 0x0003]).unwrap();
-        assert_eq!(chain, vec![der]);
+
+        // zstd (0x0003) is advertised too and must decode identically.
+        let compressed = zstd::stream::encode_all(&body[..], 3).unwrap();
+        let msg = compressed_certificate_body(0x0003, body.len(), &compressed);
+        assert_eq!(
+            decompress_certificate_message(&msg, &[0x0002, 0x0003]).unwrap(),
+            body
+        );
     }
 
     #[test]
-    fn decompress_cert_rejects_decompression_bomb() {
-        use std::io::Write;
+    fn compressed_certificate_rejects_unoffered_algorithm_and_length_lies() {
+        let body = certificate_body(&[&[0x30, 0x01, 0xAA]]);
+        let msg = compressed_certificate_body(0x0002, body.len(), &brotli_compress(&body));
 
+        // The ClientHello offered only zstd: brotli is an unoffered selection.
+        let err = decompress_certificate_message(&msg, &[0x0003]).unwrap_err();
+        assert!(
+            err.to_string().contains("did not offer"),
+            "expected the unoffered-algorithm error, got: {err}"
+        );
+
+        // A declared uncompressed_length that lies about the payload aborts
+        // the handshake (RFC 8879 §4 makes this `bad_certificate`).
+        let mut lying = msg.clone();
+        let declared = u32::try_from(body.len()).unwrap() + 7;
+        lying[2..5].copy_from_slice(&declared.to_be_bytes()[1..]);
+        let err = decompress_certificate_message(&lying, &[0x0002]).unwrap_err();
+        assert!(
+            err.to_string().contains("declares"),
+            "expected the length-mismatch error, got: {err}"
+        );
+
+        // A compressed-vector length that disagrees with the body is refused
+        // before any decoder runs.
+        let mut truncated = msg;
+        truncated.truncate(truncated.len() - 1);
+        assert!(decompress_certificate_message(&truncated, &[0x0002]).is_err());
+    }
+
+    /// The flight reader must put the `CompressedCertificate` message AS SENT
+    /// into the transcript: the server hashed that message, so a re-built
+    /// `Certificate` would fail its Finished MAC (the `Finished MAC mismatch`
+    /// the 2026-09-16 batch logged against every Cloudflare-fronted link).
+    #[tokio::test]
+    async fn server_flight_keeps_compressed_certificate_as_sent() {
+        let suite = CipherSuiteId::Aes128GcmSha256;
+        let key = AeadKey::from_key_bytes(suite, &[0x11; 16]).unwrap();
+
+        let der = vec![0x30u8, 0x81, 26, 0xAA, 0xAA];
+        let cert_body = certificate_body(&[&der]);
+        let cc_body =
+            compressed_certificate_body(0x0002, cert_body.len(), &brotli_compress(&cert_body));
+        let cc_msg = make_hs_msg(HS_COMPRESSED_CERTIFICATE, &cc_body);
+
+        let ee_msg = make_hs_msg(HS_ENCRYPTED_EXTENSIONS, &[0x00, 0x00]);
+        let mut verify_body = Vec::new();
+        verify_body.extend_from_slice(&0x0403u16.to_be_bytes());
+        verify_body.extend_from_slice(&0x0040u16.to_be_bytes());
+        verify_body.extend_from_slice(&[0xAA; 64]);
+        let verify_msg = make_hs_msg(HS_CERTIFICATE_VERIFY, &verify_body);
+        let finished_msg = make_hs_msg(HS_FINISHED, &[0xBB; 32]);
+
+        let mut raw_flight = Vec::new();
+        raw_flight.extend_from_slice(&ee_msg);
+        raw_flight.extend_from_slice(&cc_msg);
+        raw_flight.extend_from_slice(&verify_msg);
+        raw_flight.extend_from_slice(&finished_msg);
+
+        let (mut client_stream, mut server_side) = tokio::io::duplex(64 * 1024);
+        write_encrypted_flight_chunk(&mut server_side, &key, 0, &raw_flight).await;
+
+        let parsed = read_server_hs_messages(&mut client_stream, &key, &[0x0002, 0x0003])
+            .await
+            .unwrap();
+        assert_eq!(parsed.chain, vec![der]);
+        assert_eq!(parsed.cert_raw, cc_msg, "transcript must carry type 25");
+        assert_eq!(parsed.sf_verify_data, vec![0xBB; 32]);
+    }
+
+    #[test]
+    fn decompression_bomb_is_bounded() {
         // 8 MiB of zeros compresses to a few hundred bytes — a classic
         // decompression bomb. The bounded decompressor must refuse it
         // instead of inflating it into memory.
         let bomb: Vec<u8> = vec![0x00; 8 << 20];
-        let mut compressed = Vec::new();
-        {
-            let mut w = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
-            w.write_all(&bomb).unwrap();
-        }
+        let compressed = brotli_compress(&bomb);
         assert!(compressed.len() < 1024, "bomb must compress small");
 
-        let err = decompress_cert(&compressed, &[0x0002]).unwrap_err();
+        let err = decompress_bounded(brotli::Decompressor::new(&compressed[..], 4096)).unwrap_err();
         assert!(
             err.to_string().contains("decompression bomb"),
             "expected the bound error, got: {err}"
         );
 
-        // A valid (bounded) certificate still decompresses fine.
-        let mut der = vec![0x30u8, 0x81, 26];
-        der.extend_from_slice(&[0xAA; 26]);
-        let mut small = Vec::new();
-        {
-            let mut w = brotli::CompressorWriter::new(&mut small, 4096, 5, 22);
-            w.write_all(&der).unwrap();
-        }
-        assert_eq!(decompress_cert(&small, &[0x0002]).unwrap(), der);
+        // A valid (bounded) certificate payload still decompresses fine.
+        let der = vec![0x30u8, 0x81, 26, 0xAA, 0xAA];
+        assert_eq!(
+            decompress_bounded(brotli::Decompressor::new(&brotli_compress(&der)[..], 4096))
+                .unwrap()
+                .unwrap(),
+            der
+        );
     }
 
     #[test]

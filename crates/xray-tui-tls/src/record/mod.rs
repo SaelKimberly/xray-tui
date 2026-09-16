@@ -24,6 +24,9 @@ pub const HS_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 pub const HS_CERTIFICATE: u8 = 0x0B;
 pub const HS_CERTIFICATE_VERIFY: u8 = 0x0F;
 pub const HS_FINISHED: u8 = 0x14;
+/// RFC 8879 §7.2 `compressed_certificate`, sent in place of `Certificate`
+/// when the client offered `compress_certificate`.
+pub const HS_COMPRESSED_CERTIFICATE: u8 = 0x19;
 
 /// Maximum acceptable record payload: 2^14 plaintext plus 272 slack — the
 /// TLS 1.3 `TLSInnerPlaintext` type byte (1), the maximum record padding
@@ -42,6 +45,37 @@ pub struct TlsRecord {
     pub payload: Vec<u8>,
 }
 
+/// Recognise a peer that answered a `ClientHello` in cleartext.
+///
+/// A TLS record's first byte is a content type (0x14..=0x17) and bytes 1-2 are
+/// the legacy version (0x03 0x0x), so a 5-byte header made entirely of
+/// printable ASCII cannot be a record. The common shape is a plaintext HTTP
+/// answer: `HTTP/1.1 400 Bad Request` puts `'P' '/'` in the length field, which
+/// a length check reports as the fixed, uninformative
+/// `record too large: 20527 bytes` (0x502F) on every such link.
+///
+/// Returns the printable header text when the peer is speaking cleartext.
+fn cleartext_hello_answer(header: [u8; 5]) -> Option<String> {
+    let printable = |b: u8| (0x20..0x7f).contains(&b) || matches!(b, b'\r' | b'\n' | b'\t');
+    if !header.iter().copied().all(printable) {
+        return None;
+    }
+    Some(
+        header
+            .iter()
+            .map(|&b| {
+                if b.is_ascii_whitespace() {
+                    ' '
+                } else {
+                    b as char
+                }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string(),
+    )
+}
+
 /// Read a single TLS record header + payload with a caller-reused buffer.
 ///
 /// The allocation-free counterpart of [`read_record`]: `payload` is cleared
@@ -57,6 +91,13 @@ where
 
     let content_type = header[0];
     let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+
+    if let Some(cleartext) = cleartext_hello_answer(header) {
+        return Err(TlsError::Handshake(format!(
+            "peer does not speak TLS: it answered in cleartext ({cleartext:?}) — the endpoint's \
+             port or its `security` setting is wrong"
+        )));
+    }
 
     if length > MAX_RECORD_PAYLOAD {
         return Err(TlsError::Handshake(format!(
@@ -264,6 +305,36 @@ mod tests {
     #[test]
     fn aad_matches_tls13_rule() {
         assert_eq!(aead_aad(0x0010), [0x17, 0x03, 0x03, 0x00, 0x10]);
+    }
+
+    /// A peer that answers a `ClientHello` in cleartext is named, not reported
+    /// as a bogus record size: `HTTP/1.1 …` puts `'P' '/'` (0x502F = 20527) in
+    /// the length field, which is the fixed number every such link logged.
+    #[tokio::test]
+    async fn read_record_names_a_cleartext_peer() {
+        let (mut stream, mut w) = tokio::io::duplex(1024);
+        w.write_all(b"HTTP/1.1 400 Bad Request\r\n").await.unwrap();
+
+        let err = read_record(&mut stream).await.unwrap_err().to_string();
+        assert!(
+            err.contains("does not speak TLS") && err.contains("HTTP/"),
+            "expected the cleartext-peer diagnosis, got: {err}"
+        );
+
+        // A real record header (content type < 0x20) is never mistaken for
+        // cleartext, even when its length field is oversized.
+        let mut header_only = [0x16, 0x03, 0x03, 0x50, 0x2f]; // length 20527
+        assert_eq!(cleartext_hello_answer(header_only), None);
+        header_only[0] = 0x15; // alert
+        assert_eq!(cleartext_hello_answer(header_only), None);
+    }
+
+    #[test]
+    fn cleartext_detection_accepts_only_fully_printable_headers() {
+        assert_eq!(cleartext_hello_answer(*b"HTTP/").as_deref(), Some("HTTP/"));
+        assert_eq!(cleartext_hello_answer(*b"<html").as_deref(), Some("<html"));
+        assert_eq!(cleartext_hello_answer([0x15, 0x03, 0x03, 0x00, 0x02]), None);
+        assert_eq!(cleartext_hello_answer(*b"GET \x01"), None);
     }
 
     #[tokio::test]

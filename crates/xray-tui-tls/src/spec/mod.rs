@@ -290,8 +290,12 @@ impl ExtensionSpec {
                 }
             }
             Self::ApplicationSettings(protos) => {
-                // ALPS (draft-ietf-tls-alps): 2-byte per-entry lengths (differs
-                // from ALPN), u16 list-length prefix.
+                // ALPS (draft-vvv-tls-alps §4): `ProtocolName
+                // supported_protocols<2..2^16-1>`, where `ProtocolName` is
+                // RFC 7301's `opaque ProtocolName<1..2^8-1>` — a u16 list
+                // length then u8-per-entry lengths, exactly like ALPN. A u16
+                // per-entry length is not that structure: Google answers it
+                // with `decode_error` and drops the connection.
                 let entries_len = alps_entries_len(protos)?;
                 let list_len = u16::try_from(entries_len)
                     .map_err(|_| TlsError::Spec("protocol list exceeds u16 length".to_string()))?;
@@ -391,18 +395,18 @@ fn write_alpn_entries<S: AsRef<str>>(protos: &[S], out: &mut Vec<u8>) -> Result<
     Ok(())
 }
 
-/// Length of ALPS entries (draft-ietf-tls-alps): per entry, a u16 BE
-/// length plus the raw protocol bytes.
+/// Length of ALPS entries (draft-vvv-tls-alps §4): per entry, a u8 BE
+/// `ProtocolName` length (RFC 7301) plus the raw protocol bytes.
 fn alps_entries_len<S: AsRef<str>>(protos: &[S]) -> Result<usize, TlsError> {
     let mut len = 0usize;
     for proto in protos {
         let bytes = proto.as_ref().as_bytes();
-        if bytes.len() > 0xFFFF {
+        if bytes.len() > 0xFF {
             return Err(TlsError::Spec(
-                "application_settings protocol exceeds u16 length".to_string(),
+                "application_settings protocol exceeds u8 length".to_string(),
             ));
         }
-        len += 2 + bytes.len();
+        len += 1 + bytes.len();
     }
     Ok(len)
 }
@@ -411,10 +415,10 @@ fn alps_entries_len<S: AsRef<str>>(protos: &[S]) -> Result<usize, TlsError> {
 fn write_alps_entries<S: AsRef<str>>(protos: &[S], out: &mut Vec<u8>) -> Result<(), TlsError> {
     for proto in protos {
         let bytes = proto.as_ref().as_bytes();
-        let len = u16::try_from(bytes.len()).map_err(|_| {
-            TlsError::Spec("application_settings protocol exceeds u16 length".to_string())
+        let len = u8::try_from(bytes.len()).map_err(|_| {
+            TlsError::Spec("application_settings protocol exceeds u8 length".to_string())
         })?;
-        out.extend_from_slice(&len.to_be_bytes());
+        out.push(len);
         out.extend_from_slice(bytes);
     }
     Ok(())
@@ -592,7 +596,7 @@ mod tests {
     #[case::application_settings(
         ExtensionSpec::ApplicationSettings(vec!["h2".into()]),
         RuntimeValues::default(),
-        vec![0x44, 0x69, 0x00, 0x06, 0x00, 0x04, 0x00, 0x02, b'h', b'2']
+        vec![0x44, 0x69, 0x00, 0x05, 0x00, 0x03, 0x02, b'h', b'2']
     )]
     #[case::record_size_limit(
         ExtensionSpec::RecordSizeLimit(0x00FF),

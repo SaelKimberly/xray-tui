@@ -15,13 +15,18 @@
 //! was fixed (secp256r1 ECDHE in `handshake::tls12`).
 //!
 //! ```text
-//! cargo run -p xray-tui-tls --example probe_host -- <host> <port> <sni> [attempts] [alpn,list]
+//! cargo run -p xray-tui-tls --example probe_host -- <host> <port> <sni> [attempts] [alpn,list] [--verify]
 //! ```
 //!
-//! Certificate verification is disabled (`insecure`): the probe answers "does
-//! a handshake complete", not "is the chain trusted" — a proxy server's chain
-//! is the operator's business, and a verification failure would hide the
-//! handshake outcome this tool exists to observe.
+//! Certificate verification is disabled by default (`insecure`): the probe
+//! answers "does a handshake complete", not "is the chain trusted" — a proxy
+//! server's chain is the operator's business, and a verification failure
+//! would hide the handshake outcome this tool exists to observe. Pass
+//! `--verify` to run the real `WebPKI` path instead — **required** to re-probe
+//! the verify-class failures a batch records (`server presented no
+//! certificate`, `chain verification failed`, `server name mismatch`,
+//! `invalid leaf certificate`), which `insecure` short-circuits before the
+//! chain is ever looked at.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,9 +40,11 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let verify = args.iter().any(|a| a == "--verify");
+    args.retain(|a| a != "--verify");
     if args.len() < 3 {
-        eprintln!("usage: probe_host <host> <port> <sni> [attempts] [alpn,list]");
+        eprintln!("usage: probe_host <host> <port> <sni> [attempts] [alpn,list] [--verify]");
         std::process::exit(2);
     }
     let host = args[0].clone();
@@ -48,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(4)
         .map(|list| list.split(',').map(str::to_string).collect());
 
-    println!("{host}:{port} sni={sni} attempts={attempts} alpn={alpn:?}");
+    println!("{host}:{port} sni={sni} attempts={attempts} alpn={alpn:?} verify={verify}");
     let mut tasks = Vec::with_capacity(attempts);
     for _ in 0..attempts {
         let (host, sni, alpn) = (host.clone(), sni.clone(), alpn.clone());
@@ -57,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(stream) => stream,
                 Err(e) => return format!("tcp dial failed: {e}"),
             };
-            let verifier = Arc::new(WebPkiVerifier::webpki_roots().with_insecure(true));
+            let verifier = Arc::new(WebPkiVerifier::webpki_roots().with_insecure(!verify));
             let mut config = TlsConfig::plain(
                 Some(Fingerprint::default_for(Browser::Chrome)),
                 verifier,
