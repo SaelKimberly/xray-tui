@@ -248,20 +248,12 @@ pub async fn build_settings_fields(
                         .to_string(),
                 ),
                 (
-                    "batch_page_size".into(),
-                    state.config.speed_test.batch_page_size.to_string(),
-                ),
-                (
                     "real_ping_retries".into(),
                     state.config.speed_test.real_ping_retries.to_string(),
                 ),
                 (
                     "real_ping_concurrency".into(),
                     state.config.speed_test.real_ping_concurrency.to_string(),
-                ),
-                (
-                    "real_ping_window".into(),
-                    state.config.speed_test.real_ping_window.to_string(),
                 ),
                 (
                     "fast_ping_concurrency".into(),
@@ -492,17 +484,11 @@ fn apply_settings_fields(
             if let Ok(d) = humantime::parse_duration(get_str("real_ping_timeout_secs")) {
                 *state.config.speed_test.real_ping_timeout_secs = d;
             }
-            if let Ok(v) = get_str("batch_page_size").parse::<usize>() {
-                state.config.speed_test.batch_page_size = v;
-            }
             if let Ok(v) = get_str("real_ping_retries").parse::<u32>() {
                 state.config.speed_test.real_ping_retries = v;
             }
             if let Ok(v) = get_str("real_ping_concurrency").parse::<usize>() {
                 state.config.speed_test.real_ping_concurrency = v;
-            }
-            if let Ok(v) = get_str("real_ping_window").parse::<usize>() {
-                state.config.speed_test.real_ping_window = v;
             }
             if let Ok(v) = get_str("fast_ping_concurrency").parse::<usize>() {
                 state.config.speed_test.fast_ping_concurrency = v;

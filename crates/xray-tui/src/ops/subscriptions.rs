@@ -349,7 +349,7 @@ async fn do_update_subscription(
         &validation,
     )
     .await;
-    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded: {count} links, {} errors", summary.total_errors);
+    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded: {count} links, {} errors, {} insecure-profile warnings", summary.total_errors, summary.security_warning_count);
 
     // Update group metadata (last_refreshed, status)
     if let Ok(groups) = db.get_all_groups().await

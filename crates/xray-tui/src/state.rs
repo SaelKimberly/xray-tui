@@ -692,6 +692,26 @@ impl AppState {
             });
         }
     }
+
+    /// Session-only activity line: the actions panel and the Logs tab show it
+    /// live, the heed store does **not** keep it.
+    ///
+    /// For per-result chatter, which is data rather than diagnostics: the
+    /// outcome lives on the link (`profile_stats.latency`/`error_text`, the
+    /// Test column's marker) and the batch's summary line carries the counts.
+    /// Persisting it made a 31k-link batch write 16k store rows in 16 minutes
+    /// (2026-09-16), which is what a log tab full of `TcpPing failed for …`
+    /// looks like afterwards.
+    pub fn log_activity(&mut self, level: &str, target: &str, message: &str) {
+        if let Some(tx) = &self.core_event_tx {
+            let _ = tx.try_send(crate::CoreEvent::TuiLog {
+                target: target.to_string(),
+                level: level.to_string(),
+                message: message.to_string(),
+            });
+        }
+    }
+
     /// Record one native-core trace event into the session activity log.
     pub fn record_native_trace(&mut self, event: &xray_tui_native::telemetry::TraceEvent) {
         self.native_activity.record(event);

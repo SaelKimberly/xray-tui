@@ -18,6 +18,7 @@ use std::time::Duration;
 use xray_tui_db::models::Endpoint;
 use xray_tui_native::addr::TargetAddr;
 use xray_tui_native::context::NativeConnectParams;
+use xray_tui_native::error::NativeError;
 use xray_tui_native::probe::{self, ProbeMethod, ProbeRequest};
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
@@ -25,6 +26,107 @@ use crate::ops::native_connect::endpoint_essentials;
 
 /// Exit-IP fetch budget (an `ip-api` JSON response, not a latency probe).
 const IP_INFO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a probe failed, at the granularity a batch reports.
+///
+/// The class is produced by the TYPED error where the failure happened (the
+/// engine's [`NativeError`], or the fast adapter's `PingError`) and is never
+/// re-parsed out of the user-facing text: the text is for the log and the DB,
+/// the class is what a batch summary counts. Ordering is the summary's print
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProbeClass {
+    /// A deadline expired (the attempt budget or the engine's step timeout).
+    Timeout,
+    /// The server socket would not open.
+    Dial,
+    /// The server's name did not resolve.
+    Dns,
+    /// The peer refused the connection.
+    Refused,
+    /// No route to the peer.
+    NoRoute,
+    /// The local network had no path to the peer.
+    Unreachable,
+    /// The TLS (or REALITY) handshake failed.
+    Tls,
+    /// The REALITY provisioning/authentication step failed.
+    Reality,
+    /// A transport upgrade (ws/grpc/xhttp/httpupgrade/v2rayhttp) failed.
+    Transport,
+    /// The proxy protocol handshake or its response framing failed.
+    Protocol,
+    /// The tunnel worked but the probe's own HTTP exchange did not.
+    Http,
+    /// The link could not be probed as configured (missing row, refused by the
+    /// capability gate, unparseable probe URL).
+    Config,
+    /// A local I/O failure.
+    Io,
+    Other,
+}
+
+impl ProbeClass {
+    /// The label the batch summary prints. Short: the line carries every class.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Dial => "dial",
+            Self::Dns => "dns",
+            Self::Refused => "refused",
+            Self::NoRoute => "no-route",
+            Self::Unreachable => "unreachable",
+            Self::Tls => "tls",
+            Self::Reality => "reality",
+            Self::Transport => "transport",
+            Self::Protocol => "protocol",
+            Self::Http => "http",
+            Self::Config => "config",
+            Self::Io => "io",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// A failed real probe: the class a batch counts plus the text it persists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeFailure {
+    pub class: ProbeClass,
+    pub text: String,
+}
+
+impl ProbeFailure {
+    /// Classify the engine's typed error, keeping its rendered text.
+    #[must_use]
+    pub fn from_engine(err: &NativeError) -> Self {
+        let class = match err {
+            // The capability gate raises `NotImplemented` before the dial on a
+            // probe path: both are "this row cannot be probed as configured".
+            NativeError::Config(_) | NativeError::NotImplemented { .. } => ProbeClass::Config,
+            NativeError::Dial(_) => ProbeClass::Dial,
+            NativeError::Tls(_) => ProbeClass::Tls,
+            NativeError::Reality(_) => ProbeClass::Reality,
+            NativeError::Transport(_) => ProbeClass::Transport,
+            NativeError::Protocol { .. } => ProbeClass::Protocol,
+            NativeError::Io(_) => ProbeClass::Io,
+            NativeError::Timeout { .. } => ProbeClass::Timeout,
+        };
+        Self {
+            class,
+            text: err.to_string(),
+        }
+    }
+
+    /// A failure this module raised itself (probe-URL shape, HTTP status).
+    #[must_use]
+    pub fn local(class: ProbeClass, text: impl Into<String>) -> Self {
+        Self {
+            class,
+            text: text.into(),
+        }
+    }
+}
 
 /// Parameters for one native real ping.
 pub struct NativeProbeReq<'a> {
@@ -99,13 +201,15 @@ pub fn parse_ip_info(body: &[u8]) -> Option<String> {
 
 /// Run one native real ping for `endpoint` + the already-loaded protocol config.
 ///
-/// `Err` carries the user-facing failure text the event path persists.
+/// `Err` carries the user-facing failure text the event path persists plus the
+/// class a batch counts.
 pub async fn real_ping(
     endpoint: &Endpoint,
     config: &ProtocolConfig,
     req: &NativeProbeReq<'_>,
-) -> Result<NativeProbeResult, String> {
-    let target = parse_probe_url(req.ping_url)?;
+) -> Result<NativeProbeResult, ProbeFailure> {
+    let target =
+        parse_probe_url(req.ping_url).map_err(|e| ProbeFailure::local(ProbeClass::Config, e))?;
     let params = NativeConnectParams::new(
         config.clone(),
         endpoint_essentials(endpoint),
@@ -129,7 +233,7 @@ async fn probe_attempts(
     params: &NativeConnectParams,
     target: &ProbeUrl,
     req: &NativeProbeReq<'_>,
-) -> Result<u64, String> {
+) -> Result<u64, ProbeFailure> {
     let attempts = req.retries.max(1);
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..attempts {
@@ -149,26 +253,38 @@ async fn probe_attempts(
             probe::fetch(params, &request)
                 .await
                 .map(|r| (r.status, r.elapsed.as_millis() as u64))
-                .map_err(|e| e.to_string())
+                .map_err(|e| ProbeFailure::from_engine(&e))
         });
     }
 
     let mut best: Option<u64> = None;
-    let mut last_error: Option<String> = None;
+    let mut last_error: Option<ProbeFailure> = None;
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(Ok((status, ms))) if (200..300).contains(&status) => {
                 best = Some(best.map_or(ms, |b| b.min(ms)));
             }
             Ok(Ok((status, _))) => {
-                last_error = Some(format!("unexpected status {status}"));
+                last_error = Some(ProbeFailure::local(
+                    ProbeClass::Http,
+                    format!("unexpected status {status}"),
+                ));
             }
             Ok(Err(e)) => last_error = Some(e),
-            Err(e) => last_error = Some(format!("probe task failed: {e}")),
+            Err(e) => {
+                last_error = Some(ProbeFailure::local(
+                    ProbeClass::Io,
+                    format!("probe task failed: {e}"),
+                ));
+            }
         }
     }
 
-    best.ok_or_else(|| last_error.unwrap_or_else(|| "all attempts failed".to_string()))
+    best.ok_or_else(|| {
+        last_error.unwrap_or_else(|| {
+            ProbeFailure::local(ProbeClass::Other, "all attempts failed".to_string())
+        })
+    })
 }
 
 /// Exit IP + country through a second tunnel; any failure is `None` (the

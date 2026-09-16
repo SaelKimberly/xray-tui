@@ -389,12 +389,12 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.updating_groups.remove(&group_id);
                 if summary.total_errors > 0 || summary.security_warning_count > 0 {
                     let msg = format!(
-                        "Subscription validation: {} errors (missing fields: {}, host validation: {}, security warnings: {}, other: {})",
+                        "Subscription validation: {} error(s) (missing fields: {}, host validation: {}, other: {}), {} warning(s) (profiles with insecure=true)",
                         summary.total_errors,
                         summary.missing_field_count,
                         summary.host_validation_count,
-                        summary.security_warning_count,
                         summary.other_count,
+                        summary.security_warning_count,
                     );
                     state.log_trace("warn", "tui::ops::subscriptions", &msg);
                 }
@@ -555,9 +555,15 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     fmt_profile_id(protocol_id)
                 };
 
-                if let Some(ref err) = error {
-                    state.log_trace(
-                        "warn",
+                if let Some(err) = &error {
+                    // Per-result lines are data, not diagnostics: the failure
+                    // TEXT is already persisted on the link (`profile_stats.
+                    // error_text`, the Test column's marker) and the batch's
+                    // summary carries the per-class counts. A 31k-link run
+                    // wrote 15,934 of these in 16 minutes (2026-09-16), so they
+                    // reach the actions panel only, never the log store.
+                    state.log_activity(
+                        "debug",
                         "tui::ops::speedtest",
                         &format!("{test_type:?} failed for {name}: {err}"),
                     );
@@ -571,11 +577,10 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     } else {
                         "success".to_string()
                     };
-                    // Success is per-result chatter: one line per link made a
-                    // 5-minute batch produce 32k log lines (2026-09-15). The
-                    // batch's own summary carries the counts; a failure stays
-                    // `warn` because it is the actionable class.
-                    state.log_trace(
+                    // Success is the same per-result chatter (one line per link
+                    // made a 5-minute batch produce 32k log lines on
+                    // 2026-09-15): actions panel only.
+                    state.log_activity(
                         "debug",
                         "tui::ops::speedtest",
                         &format!("{test_type:?} {name}: {detail}"),

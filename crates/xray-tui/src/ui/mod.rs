@@ -234,6 +234,25 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
         tracing::warn!(target: "tui::ui", "final link flush failed: {e}");
     }
 
+    // A batch that was still running when the user quit never reaches its own
+    // `batch summary` line (the runtime drop cancels the task), which is how
+    // the 2026-09-16 run left 31k persisted results with no record of the run
+    // in the log. Say what is true at exit: the progress counter's semantics
+    // (the FINAL phase — phase 1 of a fast+real batch is not counted, so this
+    // can read 0/N while phase 1 is running), and that the staged writes above
+    // were flushed.
+    if let Some(progress) = &state.batch_progress {
+        let (total, completed) = (
+            progress.0.load(Ordering::Relaxed),
+            progress.1.load(Ordering::Relaxed),
+        );
+        tracing::info!(
+            target: "tui::ops::ping",
+            "batch interrupted at quit: {completed} of {total} final-phase probe(s) reported, no batch summary; staged writes flushed, {} left staged",
+            state.link_writer.staged_len(),
+        );
+    }
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture)?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;

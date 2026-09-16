@@ -17,7 +17,7 @@ use xray_tui_native::capability;
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
 use crate::AppState;
-use crate::ops::ping_native::{self, NativeProbeReq};
+use crate::ops::ping_native::{self, NativeProbeReq, ProbeClass};
 use crate::ops::profiles::PROFILES_PAGE_SIZE;
 use crate::ops::scheduler::{ScheduleOutcome, TaskScheduler};
 use crate::state::load_protocol_with_config;
@@ -284,7 +284,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         .await;
         let (latency_ms, ip_info, error) = match result {
             Ok(r) => (Some(r.latency_ms), r.ip_info, None),
-            Err(e) => (None, None, Some(e)),
+            Err(e) => (None, None, Some(e.text)),
         };
 
         try_send_or_warn(
@@ -520,9 +520,12 @@ enum ProbeOutcome {
     },
     Failed {
         text: String,
+        /// Why it failed, for the batch's per-class counters (see
+        /// [`classify_fast_failure`] and [`ping_native::ProbeFailure`]).
+        class: ProbeClass,
         /// The endpoint was unreachable at the transport level, so the real
         /// phase's probe cannot succeed either. Set only by the fast runner
-        /// (see [`hard_fast_failure`]).
+        /// (see [`classify_fast_failure`]).
         hard: bool,
     },
 }
@@ -533,33 +536,48 @@ impl ProbeOutcome {
     fn soft_failure(text: impl Into<String>) -> Self {
         Self::Failed {
             text: text.into(),
+            class: ProbeClass::Config,
             hard: false,
         }
     }
 }
 
-/// True when a fast probe's failure means the proxy is unreachable — the
-/// classes the real phase cannot pass either, so phase 2 skips the link.
+/// Classify a fast probe's failure: the batch's class bucket plus whether the
+/// proxy is unreachable at the transport level — the classes the real phase
+/// cannot pass either, so phase 2 skips the link.
 ///
-/// Connect-class `PingError`s only: a timeout, or an IO error naming a refused
-/// connection, a missing route, an unreachable network, or an unresolvable
-/// host. Everything else stays probed — fd exhaustion, a TLS-level IO error or
-/// a protocol-level failure is local or ambiguous, and the fast adapter's
-/// `NotSupported`/`Other` classes say nothing about reachability.
-fn hard_fast_failure(err: &xray_tui_core::ping::PingError) -> bool {
+/// Connect-class `PingError`s are hard: a timeout, or an IO error naming a
+/// refused connection, a missing route, an unreachable network, or an
+/// unresolvable host. Everything else stays probed — fd exhaustion, a
+/// TLS-level IO error or a protocol-level failure is local or ambiguous, and
+/// the fast adapter's `NotSupported`/`Other` classes say nothing about
+/// reachability. The adapter renders OS failures into `PingError::Io` text, so
+/// this is the ONE site that reads that text; the class travels as a value
+/// from here on.
+fn classify_fast_failure(err: &xray_tui_core::ping::PingError) -> (ProbeClass, bool) {
     use xray_tui_core::ping::PingError;
     match err {
-        PingError::Timeout(_) => true,
-        PingError::Io(message) => [
-            "Connection refused",
-            "No route to host",
-            "Network is unreachable",
-            "failed to lookup address information",
-            "Name or service not known",
-        ]
-        .iter()
-        .any(|class| message.contains(class)),
-        PingError::NotSupported | PingError::Other(_) => false,
+        PingError::Timeout(_) => (ProbeClass::Timeout, true),
+        PingError::Io(message) => {
+            let class = if message.contains("failed to lookup address information")
+                || message.contains("Name or service not known")
+            {
+                ProbeClass::Dns
+            } else if message.contains("Connection refused") {
+                ProbeClass::Refused
+            } else if message.contains("No route to host") {
+                ProbeClass::NoRoute
+            } else if message.contains("Network is unreachable") {
+                ProbeClass::Unreachable
+            } else {
+                // Local resource failures (fd exhaustion) and ambiguous IO:
+                // classified, but not proof the endpoint is unreachable.
+                return (ProbeClass::Io, false);
+            };
+            (class, true)
+        }
+        PingError::NotSupported => (ProbeClass::Config, false),
+        PingError::Other(_) => (ProbeClass::Other, false),
     }
 }
 
@@ -611,10 +629,14 @@ impl BatchProbeRunner for EngineProbeRunner {
                     latency_ms: Some(dur.as_millis() as u64),
                     ip_info: None,
                 },
-                Err(e) => ProbeOutcome::Failed {
-                    hard: hard_fast_failure(&e),
-                    text: e.to_string(),
-                },
+                Err(e) => {
+                    let (class, hard) = classify_fast_failure(&e);
+                    ProbeOutcome::Failed {
+                        class,
+                        hard,
+                        text: e.to_string(),
+                    }
+                }
             }
         })
     }
@@ -631,7 +653,11 @@ impl BatchProbeRunner for EngineProbeRunner {
                     latency_ms: Some(result.latency_ms),
                     ip_info: result.ip_info,
                 },
-                Err(e) => ProbeOutcome::soft_failure(e),
+                Err(e) => ProbeOutcome::Failed {
+                    text: e.text,
+                    class: e.class,
+                    hard: false,
+                },
             }
         })
     }
@@ -709,8 +735,13 @@ struct BatchCounters {
     fast_ok: AtomicU32,
     fast_hard_failed: AtomicU32,
     fast_soft_failed: AtomicU32,
+    /// Phase-1 failures by class (the reason `fast_hard_failed` /
+    /// `fast_soft_failed` only count, never explain).
+    phase1_fail: Mutex<BTreeMap<ProbeClass, u32>>,
     real_ok: AtomicU32,
     real_failed: AtomicU32,
+    /// Phase-2 failures by class.
+    phase2_fail: Mutex<BTreeMap<ProbeClass, u32>>,
     untestable: AtomicU32,
     /// Phase-2 links retired because phase 1 proved them unreachable.
     unreachable: AtomicU32,
@@ -937,8 +968,27 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
     // ── Phase 2: one RealPing task per link, fired per endpoint ───────
     let phase2_started = std::time::Instant::now();
     let mut per_endpoint: BTreeMap<i64, Vec<(ProfileStats, u16)>> = BTreeMap::new();
+    // The dispatch order of those groups: insertion order (= the best-first
+    // sweep below). `per_endpoint` is keyed by the endpoint id — a hash — so
+    // iterating the map would fire in an arbitrary order.
+    let mut group_order: Vec<i64> = Vec::new();
     let mut deferred_real: Vec<PlanLink> = Vec::new();
-    for plan in &shared.plan {
+    // Best-first: phase 1 measured a delay for exactly the links that reach
+    // phase 2, and phase 2 is the long pole (2.6 results/s against 128 for
+    // phase 1 on 2026-09-16, so a full feed needs ~1.7 h). A run stopped
+    // part-way must therefore have tested the fastest — the most usable —
+    // links first; links with no phase-1 measurement keep plan order, last.
+    let phase1_latency = shared.fast_latency.lock().clone();
+    let mut phase2_order: Vec<usize> = (0..shared.plan.len()).collect();
+    phase2_order.sort_by_key(|&i| {
+        let link = &shared.plan[i].link;
+        phase1_latency
+            .get(&(link.protocol_id, link.endpoint_id))
+            .copied()
+            .unwrap_or(i32::MAX)
+    });
+    for index in phase2_order {
+        let plan = &shared.plan[index];
         if shared.stop.load(Ordering::Relaxed) {
             break;
         }
@@ -966,10 +1016,11 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
             ScheduleOutcome::Started(id) => {
                 shared.pending_real.fetch_add(1, Ordering::Relaxed);
                 let fresh = plan.link.clone();
-                per_endpoint
-                    .entry(plan.endpoint.id.get())
-                    .or_default()
-                    .push((fresh, id));
+                let eid = plan.endpoint.id.get();
+                if !per_endpoint.contains_key(&eid) {
+                    group_order.push(eid);
+                }
+                per_endpoint.entry(eid).or_default().push((fresh, id));
             }
             ScheduleOutcome::Queued(_) => {
                 // Promoted by the gate holder's completion (serialized batches
@@ -997,7 +1048,10 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
     // the first success.
     let sem = Arc::new(Semaphore::new(shared.real_concurrency.max(1)));
     let mut real_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for (_, group) in per_endpoint {
+    for eid in group_order {
+        let Some(group) = per_endpoint.remove(&eid) else {
+            continue;
+        };
         let shared = shared.clone();
         let sem = sem.clone();
         real_handles.push(tokio::spawn(async move {
@@ -1132,7 +1186,7 @@ fn summary_line(shared: &BatchShared) -> String {
     let counters = &shared.counters;
     let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
     format!(
-        "batch summary: links={} untestable={} queue-full={} deferred={} | phase1 ok={} hard-fail={} soft-fail={} ({} ms) | phase2 ok={} failed={} skipped-unreachable={} ({} ms) | stopped={} flushes={} staged-left={}",
+        "batch summary: links={} untestable={} queue-full={} deferred={} | phase1 ok={} hard-fail={} soft-fail={} {} ({} ms) | phase2 ok={} failed={} {} skipped-unreachable={} ({} ms) | stopped={} flushes={} staged-left={}",
         shared.plan.len(),
         load(&counters.untestable),
         load(&counters.queue_full),
@@ -1140,15 +1194,45 @@ fn summary_line(shared: &BatchShared) -> String {
         load(&counters.fast_ok),
         load(&counters.fast_hard_failed),
         load(&counters.fast_soft_failed),
+        class_histogram(&counters.phase1_fail),
         shared.phase1_ms.load(Ordering::Relaxed),
         load(&counters.real_ok),
         load(&counters.real_failed),
+        class_histogram(&counters.phase2_fail),
         load(&counters.unreachable),
         shared.phase2_ms.load(Ordering::Relaxed),
         shared.stop.load(Ordering::Relaxed),
         shared.writer.flush_count(),
         shared.writer.staged_len(),
     )
+}
+
+/// Count one failure into its class bucket.
+fn bump_class(map: &Mutex<BTreeMap<ProbeClass, u32>>, class: ProbeClass) {
+    *map.lock().entry(class).or_default() += 1;
+}
+
+/// Render a failure histogram as `[timeout=8924 dns=4119 …]`, in class order.
+/// Empty when nothing failed — the reason `hard-fail=` / `failed=` alone is not
+/// enough: a run's dominant class is what a fix is aimed at.
+fn class_histogram(map: &Mutex<BTreeMap<ProbeClass, u32>>) -> String {
+    // Snapshot first: the guard is released before any string work, so a
+    // probe task can never block on the summary's formatting.
+    let counts: Vec<(ProbeClass, u32)> = map.lock().iter().map(|(c, n)| (*c, *n)).collect();
+    if counts.is_empty() {
+        return "[]".to_string();
+    }
+    let mut out = String::from("[");
+    for (class, count) in counts {
+        if out.len() > 1 {
+            out.push(' ');
+        }
+        out.push_str(class.label());
+        out.push('=');
+        out.push_str(&count.to_string());
+    }
+    out.push(']');
+    out
 }
 
 /// One startup line naming the values a batch's behaviour depends on: the
@@ -1451,24 +1535,27 @@ impl BatchShared {
             ) => {
                 self.counters.fast_ok.fetch_add(1, Ordering::Relaxed);
             }
-            (TestType::TcpPing, ProbeOutcome::Failed { hard: true, .. }) => {
-                self.counters
-                    .fast_hard_failed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.hard_fast
-                    .lock()
-                    .insert((link.protocol_id, link.endpoint_id));
-            }
-            (TestType::TcpPing, ProbeOutcome::Failed { hard: false, .. }) => {
-                self.counters
-                    .fast_soft_failed
-                    .fetch_add(1, Ordering::Relaxed);
+            (TestType::TcpPing, ProbeOutcome::Failed { class, hard, .. }) => {
+                if *hard {
+                    self.counters
+                        .fast_hard_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.hard_fast
+                        .lock()
+                        .insert((link.protocol_id, link.endpoint_id));
+                } else {
+                    self.counters
+                        .fast_soft_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                bump_class(&self.counters.phase1_fail, *class);
             }
             (_, ProbeOutcome::Ok { .. }) => {
                 self.counters.real_ok.fetch_add(1, Ordering::Relaxed);
             }
-            (_, ProbeOutcome::Failed { .. }) => {
+            (_, ProbeOutcome::Failed { class, .. }) => {
                 self.counters.real_failed.fetch_add(1, Ordering::Relaxed);
+                bump_class(&self.counters.phase2_fail, *class);
             }
         }
         let (latency_ms, ip_info, error) = match outcome {
@@ -1809,6 +1896,8 @@ mod tests {
         /// Per-address fast outcome, for the tests that need a mixed batch
         /// (an unreachable link next to a reachable one).
         fast_by_addr: Mutex<std::collections::HashMap<String, ProbeOutcome>>,
+        /// Endpoint ids in the order their real probe STARTED (phase-2 order).
+        real_endpoint_order: Mutex<Vec<i64>>,
     }
 
     impl StubRunner {
@@ -1827,6 +1916,7 @@ mod tests {
                 real_gate: Mutex::new(None),
                 dns_mark_on_fast: Mutex::new(None),
                 fast_by_addr: Mutex::new(std::collections::HashMap::new()),
+                real_endpoint_order: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1853,12 +1943,13 @@ mod tests {
 
         fn real<'a>(
             &'a self,
-            _endpoint: &'a Endpoint,
+            endpoint: &'a Endpoint,
             _config: &'a ProtocolConfig,
             _req: NativeProbeReq<'a>,
         ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.real_calls.fetch_add(1, Ordering::Relaxed);
+                self.real_endpoint_order.lock().push(endpoint.id.get());
                 // Clone the gate out of the lock so the await below does not
                 // hold the mutex guard across the yield point.
                 let gate = self.real_gate.lock().clone();
@@ -2131,6 +2222,7 @@ mod tests {
                 "10.0.0.1".to_string(),
                 ProbeOutcome::Failed {
                     text: "IO: Connection refused (os error 111)".to_string(),
+                    class: ProbeClass::Refused,
                     hard: true,
                 },
             );
@@ -2256,6 +2348,12 @@ mod tests {
         counters.queue_full.store(8, Ordering::Relaxed);
         shared.phase1_ms.store(120, Ordering::Relaxed);
         shared.phase2_ms.store(340, Ordering::Relaxed);
+        // The classes are what a fix is aimed at: `hard-fail=5` alone cannot
+        // say whether the run failed on timeouts, DNS or refusals.
+        bump_class(&counters.phase1_fail, ProbeClass::Timeout);
+        bump_class(&counters.phase1_fail, ProbeClass::Timeout);
+        bump_class(&counters.phase1_fail, ProbeClass::Dns);
+        bump_class(&counters.phase2_fail, ProbeClass::Tls);
 
         let line = summary_line(&shared);
         for expected in [
@@ -2263,8 +2361,8 @@ mod tests {
             "untestable=1",
             "queue-full=8",
             "deferred=6",
-            "phase1 ok=7 hard-fail=5 soft-fail=3 (120 ms)",
-            "phase2 ok=2 failed=4 skipped-unreachable=5 (340 ms)",
+            "phase1 ok=7 hard-fail=5 soft-fail=3 [timeout=2 dns=1] (120 ms)",
+            "phase2 ok=2 failed=4 [tls=1] skipped-unreachable=5 (340 ms)",
             "stopped=false",
             "staged-left=0",
         ] {
@@ -2397,8 +2495,43 @@ mod tests {
         }
     }
 
-    // ── native testability gate ──────────────────────────────────────────
+    /// Phase 2 is the long pole (measured 2.6 results/s against 128 for phase
+    /// 1 on 2026-09-16), so a run stopped part-way must have tested the
+    /// fastest links first: the probe order is the phase-1 latency, ascending.
+    #[tokio::test]
+    async fn phase_two_probes_the_fastest_links_first() {
+        let rows = vec![
+            fake_row(1, "10.0.0.1", 1),
+            fake_row(2, "10.0.0.2", 1),
+            fake_row(3, "10.0.0.3", 1),
+        ];
+        let mut h = harness(rows.clone()).await;
+        {
+            let mut by_addr = h.runner.fast_by_addr.lock();
+            let slow = |ms| ProbeOutcome::Ok {
+                latency_ms: Some(ms),
+                ip_info: None,
+            };
+            by_addr.insert("10.0.0.1".to_string(), slow(300));
+            by_addr.insert("10.0.0.2".to_string(), slow(100));
+            by_addr.insert("10.0.0.3".to_string(), slow(200));
+        }
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch(&mut h, plan, true, false);
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
 
+        let order = h.runner.real_endpoint_order.lock().clone();
+        let expected: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect::<Vec<_>>();
+        // The rows are declared slowest-first: the probe order must reverse it.
+        assert_eq!(
+            order,
+            vec![expected[1], expected[2], expected[0]],
+            "phase 2 must probe in ascending phase-1 latency"
+        );
+    }
+
+    // ── native testability gate ──────────────────────────────────────────
     #[tokio::test]
     async fn untestable_kind_is_marked_and_still_fast_probed() {
         let mut rows = vec![fake_row(1, "10.0.0.1", 1)];
