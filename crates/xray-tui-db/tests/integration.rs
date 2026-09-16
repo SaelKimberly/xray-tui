@@ -1680,19 +1680,16 @@ async fn apply_link_patches_empty_is_a_noop() {
     assert_eq!(db.apply_link_patches(&[]).await.expect("apply"), 0);
 }
 
-/// A window wider than SQLite's expression-depth limit must still apply.
+/// A window wider than one statement chunk must still apply.
 ///
-/// The writer's window is `DEFAULT_FLUSH_ROWS` (512) and the patch chunk is
-/// 400, so a normal batch window is far wider than the ~99 pairs a
-/// `(protocol_id = .. AND endpoint_id = ..) OR …` predicate can express before
-/// `SQLITE_MAX_EXPR_DEPTH` (100) rejects the statement. When the existence
-/// probe used that chain, every window past ~99 rows failed the whole
-/// transaction and a Fast-ping batch persisted nothing (2026-09-14: "Parse
-/// error: Expression tree is too large (maximum depth 100)" on every flush).
+/// The writer's window is `DEFAULT_FLUSH_ROWS` (512) and a statement chunk is
+/// `LINK_STATEMENT_ROWS` (400), so a normal batch window spans two chunks (and
+/// four `ON CONFLICT` action buckets). The old per-row form's failure mode here
+/// was `SQLITE_MAX_EXPR_DEPTH`; the multi-row upsert has no per-row predicate,
+/// but a chunking bug would still drop the tail of the window.
 #[tokio::test]
-async fn apply_link_patches_applies_a_window_wider_than_the_expression_depth_limit() {
-    // Wider than the ~99 pairs the old predicate could express, and wider than
-    // one `LINK_PATCH_CHUNK_ROWS` (400), so it spans two chunks.
+async fn apply_link_patches_applies_a_window_wider_than_one_statement_chunk() {
+    // Wider than one `LINK_STATEMENT_ROWS` (400), so it spans two chunks.
     const ROWS: i64 = 500;
     let db = test_db().await;
     let mut conn = db.connection().await.expect("conn");
@@ -1742,25 +1739,21 @@ async fn apply_link_patches_applies_a_window_wider_than_the_expression_depth_lim
     );
 }
 
-/// The probe's verdict decides UPDATE vs INSERT per row, so at batch scale it
-/// must be right in BOTH directions: a pair that exists is updated in place, and
-/// a pair that does not is inserted through the typed upsert. Treating a missing
-/// pair as existing runs an `UPDATE` that matches zero rows, and the link is
-/// silently dropped (no result, no error).
+/// The chunk's conflict target decides INSERT vs UPDATE per row, so at batch
+/// scale it must be right in BOTH directions: a pair that exists is updated in
+/// place, and a pair that does not is inserted. A conflict target that never
+/// matches would insert a duplicate row (the composite PK rejects it), and one
+/// that over-matches would write the wrong row's columns.
 ///
 /// The absent pairs are **near-misses** — both of their ids are elsewhere in the
 /// window, only the pair is not (protocol 10 belongs to endpoint 1, endpoint 2
-/// holds protocol 20). Note the exactness here is structural, not
-/// predicate-dependent: the probe's set is built from the ROWS the statement
-/// returned, so an over-fetching predicate (a cross-product superset) still
-/// yields an exact verdict — it only costs more (measured: 40 ms vs 8 ms per
-/// 400 pairs). The two directions this test can actually catch are therefore the
-/// INSERT path at batch scale, and UNDER-fetch (a predicate that reports an
-/// existing pair as absent): the seeded rows carry a distinct `last_seen_at`,
-/// which the group-narrow `UPDATE` leaves alone but the whole-snapshot upsert
-/// the absent path uses would reset.
+/// holds protocol 20). The two directions this test can actually catch are the
+/// INSERT path at batch scale (a missing row is created with its patched result)
+/// and clobbering: the seeded rows carry a distinct `last_seen_at`, which the
+/// group-narrow `DO UPDATE` leaves alone but the whole-snapshot `VALUES` tuple
+/// would reset if the action wrote it.
 #[tokio::test]
-async fn apply_link_patches_probe_is_exact_for_absent_and_near_miss_pairs() {
+async fn apply_link_patches_upserts_absent_and_near_miss_pairs_exactly() {
     const EXISTING: i64 = 120;
     const ABSENT: i64 = 20;
     let db = test_db().await;

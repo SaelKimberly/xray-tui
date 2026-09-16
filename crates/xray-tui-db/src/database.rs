@@ -325,11 +325,14 @@ impl Database {
     }
 }
 
-/// Rows per literal statement chunk in [`Database::apply_link_patches`] — a
-/// statement-size bound, not a predicate-depth one: the chunk's existence probe
-/// is a `VALUES`-CTE join that stays flat and index-driven at any width (see
-/// [`existing_link_keys`]), so this number is free to move.
-const LINK_PATCH_CHUNK_ROWS: usize = 400;
+/// Rows per literal statement chunk in the link writers
+/// ([`Database::apply_link_patches`], [`upsert_links_bulk`]) — a
+/// statement-size bound, not a predicate-depth one: both writers emit one
+/// multi-row upsert per chunk, whose width does not change its expression depth
+/// (measured 2026-09-16: 400 / 1,000 / 2,000 rows per statement are equal
+/// within noise — 11.1 / 10.6 / 10.6 ms for a 512-patch window), so this
+/// number is free to move.
+const LINK_STATEMENT_ROWS: usize = 400;
 
 /// A SQL TEXT literal: single quotes doubled, so a stored error message can
 /// never terminate the literal. The values come from our own rows, never from
@@ -357,126 +360,143 @@ fn sql_opt_num(n: Option<i64>) -> String {
     n.map_or_else(|| "NULL".to_string(), |n| n.to_string())
 }
 
-/// The `(protocol_id, endpoint_id)` pairs of `patches` that exist as rows.
+const LINK_COMPARE_KEYS: &str = "protocol_id, endpoint_id";
+
+/// The `INSERT … VALUES (…),(…)` prefix both link writers share; a caller
+/// appends its tuples and then the `ON CONFLICT` action. The column order IS
+/// the order [`link_values_sql`] emits.
+const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, \
+     config_type, last_used_at, last_seen_at, latency, latency_delay, latency_ip, speed_bps, \
+     error, error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
+     traffic_total_down, created_at, updated_at, version) VALUES ";
+
+/// The whole-snapshot SQL tuple for one link.
 ///
-/// One statement whose expression depth does NOT grow with the number of pairs.
-/// A `(protocol_id = .. AND endpoint_id = ..) OR …` chain is left-deep and dies
-/// at ~99 pairs with `SQLITE_MAX_EXPR_DEPTH` ("Expression tree is too large
-/// (maximum depth 100)") — every flush window wider than that failed its whole
-/// transaction, so a Fast-ping batch persisted nothing and retried forever
-/// (2026-09-14). The flat alternatives are traps on this engine, measured over
-/// 20k links with 400 pairs: a row-value `(p, e) IN ((..), ..)` list costs
-/// 757 ms (not index-driven), and a `UNION ALL` of per-pair SELECTs overflows
-/// turso's parser stack. This `WITH … (VALUES …) JOIN` costs 9 ms, uses the
-/// composite key index, and matches exact pairs only (an absent pair yields
-/// nothing) — verified to 5,000 pairs.
-async fn existing_link_keys(
-    tx: &mut impl Executor,
-    patches: &[LinkPatch],
-) -> Result<std::collections::HashSet<(i64, i64)>> {
+/// SQL literals rather than binds: turso charges ~0.8 ms per bound parameter
+/// (200 ids = 174 ms against 9.7 ms for the same statement with literals), and a
+/// chunk carries 20 columns per row.
+fn link_values_sql(link: &ProfileStats, now: i64) -> String {
     use std::fmt::Write as _;
 
-    let mut sql = String::from("WITH pairs(p, e) AS (VALUES ");
-    for (i, patch) in patches.iter().enumerate() {
-        if i > 0 {
-            sql.push(',');
-        }
-        let _ = write!(
-            sql,
-            "({}, {})",
-            patch.link.protocol_id.get(),
-            patch.link.endpoint_id.get()
-        );
-    }
-    sql.push_str(
-        ") SELECT ps.protocol_id, ps.endpoint_id FROM profile_stats ps \
-         JOIN pairs ON ps.protocol_id = pairs.p AND ps.endpoint_id = pairs.e",
+    let mut sql = String::with_capacity(160);
+    let _ = write!(
+        sql,
+        "({}, {}, '{}', '{}', NULL, {}, ",
+        link.protocol_id.get(),
+        link.endpoint_id.get(),
+        core_type_str(link.core_type),
+        config_type_str(link.config_type),
+        link.last_seen_at
     );
-    let rows = toasty::sql::query(sql).exec(tx).await?;
-    let mut out = std::collections::HashSet::with_capacity(rows.len());
-    for row in &rows {
-        if let Value::Record(record) = row
-            && let (Some(Value::I64(pid)), Some(Value::I64(eid))) =
-                (record.fields.first(), record.fields.get(1))
-        {
-            out.insert((*pid, *eid));
+    match &link.latency {
+        Some(crate::models_toasty::Latency::Real { delay, ip }) => {
+            let _ = write!(sql, "'real', {delay}, {}", sql_opt_lit(ip.as_deref()));
         }
+        Some(crate::models_toasty::Latency::Fast { delay }) => {
+            let _ = write!(sql, "'fast', {delay}, NULL");
+        }
+        None => sql.push_str("NULL, NULL, NULL"),
     }
-    Ok(out)
-}
-
-/// The typed insert-or-replace of a whole snapshot (the fresh-row path).
-async fn upsert_link_row(tx: &mut impl Executor, link: &ProfileStats) -> Result<()> {
-    ProfileStats::upsert_by_protocol_id_and_endpoint_id(link.protocol_id, link.endpoint_id)
-        .core_type(link.core_type)
-        .config_type(link.config_type)
-        .last_seen_at(link.last_seen_at)
-        .latency(link.latency.clone())
-        .speed_bps(link.speed_bps)
-        .error(link.error.clone())
-        .traffic(link.traffic)
-        .updated_at(now_epoch())
-        .on_create(|create| create.created_at(now_epoch()))
-        .exec(tx)
-        .await?;
-    Ok(())
-}
-
-/// The single-statement UPDATE for one existing row, covering exactly the
-/// column groups `patch.groups` names. Empty when the patch carries no group.
-///
-/// `version = version + 1` keeps the row's optimistic-concurrency counter
-/// honest for the typed writers that still guard on it.
-fn link_patch_update_sql(patch: &LinkPatch, now: i64) -> String {
-    let link = &patch.link;
-    let mut sets: Vec<String> = Vec::with_capacity(5);
-    if patch.groups.contains(LinkGroups::RESULT) {
-        match &link.latency {
-            Some(crate::models_toasty::Latency::Real { delay, ip }) => {
-                sets.push("latency = 'real'".to_string());
-                sets.push(format!("latency_delay = {delay}"));
-                sets.push(format!("latency_ip = {}", sql_opt_lit(ip.as_deref())));
-            }
-            Some(crate::models_toasty::Latency::Fast { delay }) => {
-                sets.push("latency = 'fast'".to_string());
-                sets.push(format!("latency_delay = {delay}"));
-                sets.push("latency_ip = NULL".to_string());
-            }
-            None => {
-                sets.push("latency = NULL".to_string());
-                sets.push("latency_delay = NULL".to_string());
-                sets.push("latency_ip = NULL".to_string());
-            }
-        }
-        sets.push(format!("speed_bps = {}", sql_opt_num(link.speed_bps)));
-        match &link.error {
-            Some(error) => sets.push(format!(
-                "error = 1, error_kind = {}, error_text = {}",
+    let _ = write!(sql, ", {}, ", sql_opt_num(link.speed_bps));
+    match &link.error {
+        Some(error) => {
+            let _ = write!(
+                sql,
+                "1, {}, {}",
                 sql_lit(error_kind_str(error.kind)),
                 sql_lit(&error.text)
-            )),
-            None => sets.push("error = NULL, error_kind = NULL, error_text = NULL".to_string()),
+            );
         }
+        None => sql.push_str("NULL, NULL, NULL"),
     }
-    if patch.groups.contains(LinkGroups::TRAFFIC) {
-        sets.push(format!(
-            "traffic_today_up = {}, traffic_today_down = {}, traffic_total_up = {},              traffic_total_down = {}",
-            link.traffic.today_up,
-            link.traffic.today_down,
-            link.traffic.total_up,
-            link.traffic.total_down
-        ));
+    let _ = write!(
+        sql,
+        ", {}, {}, {}, {}, {}, {}, 1)",
+        link.traffic.today_up,
+        link.traffic.today_down,
+        link.traffic.total_up,
+        link.traffic.total_down,
+        now,
+        now
+    );
+    sql
+}
+
+/// The `ON CONFLICT (protocol_id, endpoint_id) …` action for one patch's column
+/// groups.
+///
+/// An existing row is written with exactly the patch's groups, so a column
+/// another writer owns (`last_used_at`) or another group owns keeps its
+/// persisted value — the disjointness [`LinkGroups`] exists for. A patch that
+/// carries no group at all only creates a missing row (`DO NOTHING`).
+fn link_patch_conflict_sql(has_result: bool, has_traffic: bool) -> String {
+    let mut sets: Vec<&str> = Vec::with_capacity(11);
+    if has_result {
+        sets.extend_from_slice(&[
+            "latency = excluded.latency",
+            "latency_delay = excluded.latency_delay",
+            "latency_ip = excluded.latency_ip",
+            "speed_bps = excluded.speed_bps",
+            "error = excluded.error",
+            "error_kind = excluded.error_kind",
+            "error_text = excluded.error_text",
+        ]);
+    }
+    if has_traffic {
+        sets.extend_from_slice(&[
+            "traffic_today_up = excluded.traffic_today_up",
+            "traffic_today_down = excluded.traffic_today_down",
+            "traffic_total_up = excluded.traffic_total_up",
+            "traffic_total_down = excluded.traffic_total_down",
+        ]);
     }
     if sets.is_empty() {
-        return String::new();
+        return format!(" ON CONFLICT({LINK_COMPARE_KEYS}) DO NOTHING");
     }
+    sets.push("updated_at = excluded.updated_at");
+    // `version` is the row's own optimistic-concurrency counter, so it only
+    // ever moves forward — the values tuple's `1` applies to a fresh row.
+    sets.push("version = version + 1");
     format!(
-        "UPDATE profile_stats SET {}, updated_at = {}, version = version + 1          WHERE protocol_id = {} AND endpoint_id = {}",
-        sets.join(", "),
-        now,
-        link.protocol_id.get(),
-        link.endpoint_id.get()
+        " ON CONFLICT({LINK_COMPARE_KEYS}) DO UPDATE SET {}",
+        sets.join(", ")
     )
+}
+
+/// The `ON CONFLICT` action of the import/refresh writer: SOURCE columns only.
+///
+/// The caller's snapshot comes from a fresh parse, so writing the RESULT columns
+/// (`latency*`, `speed_bps`, `error*`) or the TRAFFIC counters on update
+/// silently wipes the measurements and counters the ping pipeline and the stats
+/// poller own — the whole-row shape this replaced did exactly that
+/// (2026-09-15: an import refresh running beside a Fast+Real batch destroyed
+/// every fast latency it had just written). `last_used_at` is likewise never
+/// touched here (its owner is [`Database::update_last_used`]).
+const LINK_SOURCE_CONFLICT_SQL: &str = " ON CONFLICT(protocol_id, endpoint_id) DO UPDATE SET \
+     core_type = excluded.core_type, config_type = excluded.config_type, \
+     last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at";
+
+/// One multi-row upsert statement for a set of rows whose conflict action is
+/// uniform.
+async fn exec_link_upsert(
+    tx: &mut impl Executor,
+    rows: &[ProfileStats],
+    conflict: &str,
+    now: i64,
+) -> Result<()> {
+    for chunk in rows.chunks(LINK_STATEMENT_ROWS) {
+        let mut sql = String::with_capacity(chunk.len() * 160 + LINK_UPSERT_PREFIX.len());
+        sql.push_str(LINK_UPSERT_PREFIX);
+        for (i, link) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&link_values_sql(link, now));
+        }
+        sql.push_str(conflict);
+        toasty::sql::statement(sql).exec(tx).await?;
+    }
+    Ok(())
 }
 
 /// The `CHECK`-constrained storage text of a [`ProfileErr`] variant. An
@@ -487,6 +507,22 @@ const fn error_kind_str(kind: crate::models_toasty::ProfileErr) -> &'static str 
         crate::models_toasty::ProfileErr::Real => "real",
         crate::models_toasty::ProfileErr::Fast => "fast",
         crate::models_toasty::ProfileErr::Name => "name",
+    }
+}
+
+/// The `CHECK`-constrained storage text of a [`CoreType`] column value.
+const fn core_type_str(core: xray_tui_proto::proto_spec::CoreType) -> &'static str {
+    match core {
+        xray_tui_proto::proto_spec::CoreType::Xray => "xray",
+        xray_tui_proto::proto_spec::CoreType::SingBox => "sing_box",
+    }
+}
+
+/// The `CHECK`-constrained storage text of a [`ConfigType`] column value.
+const fn config_type_str(config: crate::models_toasty::ConfigType) -> &'static str {
+    match config {
+        crate::models_toasty::ConfigType::ShareUrl => "share_url",
+        crate::models_toasty::ConfigType::Form => "form",
     }
 }
 
@@ -821,57 +857,64 @@ impl Database {
     /// Apply one patch per row inside a single transaction.
     ///
     /// Each patch carries only the column *groups* that changed (see
-    /// [`LinkGroups`]). The row is read fresh inside the transaction and only
-    /// the patched groups are overlaid from the caller's snapshot, so a result
-    /// patch can never write traffic or scheduler state and vice versa: the
-    /// groups make the writers disjoint instead of merely sequential.
+    /// [`LinkGroups`]), and the groups decide the statement's `ON CONFLICT`
+    /// action, so the two independent writers of a `profile_stats` row — ping
+    /// results and the traffic poller — cannot clobber each other's columns:
+    /// the groups make the writers disjoint instead of merely sequential.
+    ///
+    /// One multi-row upsert per (chunk, group shape) replaces one existence
+    /// probe plus one `UPDATE` per row: turso has no
+    /// `UPDATE … FROM (VALUES …)` (measured 2026-09-16: parse error), so the
+    /// per-row form was one statement per link. Measured on a 512-patch window
+    /// over the reference feed: 29.0 ms → 10.6 ms.
     ///
     /// One transaction per batch replaces one commit per row — the write-behind
-    /// link writer calls this from its flush task, never from the UI task.
-    /// A row deleted mid-batch is skipped.
+    /// link writer calls this from its flush task, never from the UI task. A row
+    /// deleted mid-batch is re-created by its own patch (an upsert inserts what
+    /// it cannot update), which is the contract the callers rely on.
     pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize> {
         if patches.is_empty() {
             return Ok(0);
         }
         let mut conn = self.conn().await?;
-        let mut tx = conn.transaction().await?;
         let now = now_epoch();
         let mut touched: Vec<EndpointId> = Vec::with_capacity(patches.len());
 
-        for chunk in patches.chunks(LINK_PATCH_CHUNK_ROWS) {
-            // One existence probe for the chunk, with the ids as integer
-            // literals: turso charges ~0.8 ms per BOUND parameter, so 400
-            // probes at ~2 binds each would cost ~640 ms where this costs one
-            // statement. Turso has no `UPDATE ... FROM (VALUES ...)`, so the
-            // per-row writes below stay one statement per link.
-            let existing = existing_link_keys(&mut tx, chunk).await?;
-            for patch in chunk {
-                let key = (patch.link.protocol_id.get(), patch.link.endpoint_id.get());
-                if existing.contains(&key) {
-                    // The row exists: write ONLY the patch's column groups, so
-                    // a column another writer owns (`last_used_at`,
-                    // `last_seen_at`, `created_at`) keeps its persisted value.
-                    // Both groups can move the endpoint's stored ordering keys.
-                    touched.push(patch.link.endpoint_id);
-                    let sql = link_patch_update_sql(patch, now);
-                    if !sql.is_empty() {
-                        toasty::sql::statement(sql).exec(&mut tx).await?;
-                    }
-                } else {
-                    // A link that has never been persisted: the whole snapshot
-                    // goes in (there is nothing to clobber), through the typed
-                    // upsert so the enum/JSON encodings are the ORM's own.
-                    upsert_link_row(&mut tx, &patch.link).await?;
-                    // An INSERT writes the whole snapshot whatever the patch's
-                    // groups are, so it can move the endpoint's key even for a
-                    // groups-narrow patch — the endpoint may not have had this
-                    // link at all a moment ago.
-                    touched.push(patch.link.endpoint_id);
-                }
+        let mut tx = conn.transaction().await?;
+        // The `ON CONFLICT` action is per-STATEMENT, so the patches are
+        // bucketed by the action they need (both groups / RESULT / TRAFFIC /
+        // none) rather than by their exact bit pattern — `contains` is what
+        // decides the columns written, exactly as the per-row form did.
+        for (has_result, has_traffic) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let shape: Vec<&LinkPatch> = patches
+                .iter()
+                .filter(|p| {
+                    p.groups.contains(LinkGroups::RESULT) == has_result
+                        && p.groups.contains(LinkGroups::TRAFFIC) == has_traffic
+                })
+                .collect();
+            if shape.is_empty() {
+                continue;
             }
+            let conflict = link_patch_conflict_sql(has_result, has_traffic);
+            for chunk in shape.chunks(LINK_STATEMENT_ROWS) {
+                let mut sql = String::with_capacity(chunk.len() * 160 + LINK_UPSERT_PREFIX.len());
+                sql.push_str(LINK_UPSERT_PREFIX);
+                for (i, patch) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        sql.push(',');
+                    }
+                    sql.push_str(&link_values_sql(&patch.link, now));
+                }
+                sql.push_str(&conflict);
+                toasty::sql::statement(sql).exec(&mut tx).await?;
+            }
+            touched.extend(shape.iter().map(|p| p.link.endpoint_id));
         }
-
         tx.commit().await?;
+
         // Derived state: the patched endpoints' ordering keys follow their
         // links. Done after the commit (the page is read later, never here).
         touched.sort_unstable();
@@ -1298,37 +1341,27 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
 /// Empty slice is a no-op. An **update** writes identity/config provenance only
 /// (`core_type`, `config_type`, `last_seen_at`, `updated_at`); the RESULT
 /// columns (`latency*`, `speed_bps`, `error*`) and the TRAFFIC counters are
-/// written **on create only**. The caller's snapshot comes from a fresh parse,
-/// so writing those columns on update silently wipes the measurements and
+/// written **on create only** (they ride the `VALUES` tuple, which a conflicting
+/// row's `DO UPDATE` never reads). The caller's snapshot comes from a fresh
+/// parse, so writing those columns on update silently wipes the measurements and
 /// counters the ping pipeline and the stats poller own — the whole-row shape
 /// this replaced did exactly that (2026-09-15: an import refresh running beside
 /// a Fast+Real batch destroyed every fast latency it had just written).
 /// `last_used_at` is likewise never touched here (its owner is
 /// [`Database::update_last_used`]).
 pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -> Result<()> {
-    for s in links {
-        ProfileStats::upsert_by_protocol_id_and_endpoint_id(s.protocol_id, s.endpoint_id)
-            .core_type(s.core_type)
-            .config_type(s.config_type)
-            .last_seen_at(s.last_seen_at)
-            .updated_at(now_epoch())
-            .on_create(|create| {
-                create
-                    .latency(s.latency.clone())
-                    .speed_bps(s.speed_bps)
-                    .error(s.error.clone())
-                    .traffic(s.traffic)
-                    .created_at(now_epoch())
-            })
-            .exec(tx)
-            .await?;
-    }
+    // One multi-row upsert per chunk instead of one typed upsert per row
+    // (measured 2026-09-16 over the reference feed: 2,000 links 360 ms → 48 ms).
+    exec_link_upsert(tx, links, LINK_SOURCE_CONFLICT_SQL, now_epoch()).await?;
     // Derived state: the stored ordering keys follow the links, so every
     // link writer refreshes the endpoints it touched — here, inside the
     // caller's transaction, which makes the key update atomic with the write.
     let mut touched: Vec<EndpointId> = links.iter().map(|l| l.endpoint_id).collect();
     touched.sort_unstable_by_key(|id| id.get());
     touched.dedup();
+    if touched.is_empty() {
+        return Ok(());
+    }
     crate::endpoint_rank::refresh(tx, &touched).await?;
     Ok(())
 }
@@ -2569,5 +2602,140 @@ mod tests {
                 .is_some(),
             "endpoint + links survive group deletion"
         );
+    }
+
+    /// Aggregating a group's addresses into ONE blob, and decoding it without
+    /// hex parsing. Measured 2026-09-16, and **not** adopted for the page:
+    /// `docs/aegis/specs/2026-09-16-db-claim-verification.md` §2 row 6c.
+    ///
+    /// The idea (this test): `unhex(string_agg(hex(x), ''))` concatenates every
+    /// address of a group into a single BLOB, and the decoder slices it by a
+    /// fixed width — no comma split, no per-token hex parse, where the shipped
+    /// carrier is `group_concat(hex(ip_key), ',')` and decodes token by token.
+    ///
+    /// What the measurement says (200-endpoint resolved page, 277 addresses,
+    /// 7,656-endpoint feed, release build):
+    ///
+    /// * **The SQL side is not gated** — `string_agg`, `hex`, `unhex` and
+    ///   `FILTER` all work with the custom-types flag OFF (the flag this test
+    ///   passes is only what makes the `STRICT` DDL below legal; see the note in
+    ///   `docs/database-manual-sql.md`).
+    /// * **Equal in cost, identical in output**: statement 747–836 µs shipped
+    ///   against 758–776 µs as one blob (the spread is run-to-run noise), decode
+    ///   4.7 µs against 4.6–7.4 µs, and the decoded address sets are EQUAL
+    ///   (277 == 277). Parsing the shipped text form for a whole page costs
+    ///   8–14 µs, which is ≤0.4 % of a page.
+    /// * **The split variant is wrong, not just slower**: on a `(family, addr)`
+    ///   table the same `chunks::<4>()` decode returned **367** addresses where
+    ///   the packed key has 277 — a single concatenated blob cannot be sliced by
+    ///   one width when IPv4 and IPv6 are mixed, so it silently invents
+    ///   addresses. Two `FILTER`ed aggregates would be needed to fix that.
+    ///
+    /// So the shipped `group_concat(hex(ip_key))` stays: same result, same cost,
+    /// one authoritative spelling (the packed key's byte order IS address
+    /// order), and no mixed-family trap. If the blob form is ever adopted, the
+    /// correct decoder is a WALK over the packed key — the same bytes, family
+    /// byte then 4/16 octets — which is byte-identical to the shipped output and
+    /// needs no schema change.
+    #[tokio::test]
+    async fn test_array_agg_result_deserialize_to_ips() {
+        use toasty::stmt::Value;
+
+        #[derive(Debug, PartialEq)]
+        struct TestIPs {
+            epid: i64,
+            ipv4: Box<[std::net::Ipv4Addr]>,
+            ipv6: Box<[std::net::Ipv6Addr]>,
+        }
+
+        fn blob_to_ipv4(full_blob: &[u8]) -> Option<Box<[std::net::Ipv4Addr]>> {
+            let (ipv4_blobs, &[]) = full_blob.as_chunks::<4>() else {
+                return None;
+            };
+            Some(
+                ipv4_blobs
+                    .iter()
+                    .copied()
+                    .map(std::net::Ipv4Addr::from_octets)
+                    .collect(),
+            )
+        }
+        fn blob_to_ipv6(full_blob: &[u8]) -> Option<Box<[std::net::Ipv6Addr]>> {
+            let (ipv4_blobs, &[]) = full_blob.as_chunks::<16>() else {
+                return None;
+            };
+            Some(
+                ipv4_blobs
+                    .iter()
+                    .copied()
+                    .map(std::net::Ipv6Addr::from_octets)
+                    .collect(),
+            )
+        }
+
+        let db = Database::in_memory().await.expect("should open");
+        // let db = toasty::Db::builder()
+        //     .build(toasty_driver_turso::Turso::in_memory().experimental_custom_types(true))
+        //     .await
+        //     .expect("should open");
+        let mut conn = db.connection().await.expect("should connect");
+
+        toasty::sql::statement(
+            "CREATE TABLE IF NOT EXISTS test_ips (epid INTEGER, ipv4 BLOB, ipv6 BLOB);",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("should create");
+
+        toasty::sql::statement("INSERT INTO test_ips VALUES (?, ?, ?), (?, ?, ?);")
+            .bind(1_i32)
+            .bind((0_u8..4).collect::<Vec<_>>())
+            .bind((0_u8..16).collect::<Vec<_>>())
+            .bind(1_i32)
+            .bind((8_u8..12).collect::<Vec<_>>())
+            .bind((16_u8..32).collect::<Vec<_>>())
+            .exec(&mut conn)
+            .await
+            .expect("should insert");
+
+        let mut rows = toasty::sql::query(
+            "select epid, unhex(string_agg(hex(ipv4), '')) as ipv4, unhex(string_agg(hex(ipv6), '')) as ipv6 from test_ips group by epid",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("should select")
+        .into_iter()
+        .map(Value::into_record);
+
+        let test_ips = {
+            let row = rows.next().expect("at least one row");
+            let [Value::I64(epid), Value::Bytes(ipv4), Value::Bytes(ipv6)] = row.as_ref() else {
+                panic!("expected three columns (bigint, blob, blob), found: {row:#?}");
+            };
+            TestIPs {
+                epid: *epid,
+                ipv4: blob_to_ipv4(ipv4).expect("valid blob"),
+                ipv6: blob_to_ipv6(ipv6).expect("valid blob"),
+            }
+        };
+        assert_eq!(
+            test_ips,
+            TestIPs {
+                epid: 1,
+                ipv4: Box::from(&[
+                    std::net::Ipv4Addr::from_octets([0, 1, 2, 3]),
+                    std::net::Ipv4Addr::from_octets([8, 9, 10, 11])
+                ] as &[_]),
+                ipv6: Box::from(&[
+                    std::net::Ipv6Addr::from_octets([
+                        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+                    ]),
+                    std::net::Ipv6Addr::from_octets([
+                        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+                    ])
+                ] as &[_])
+            }
+        );
+        assert!(rows.next().is_none());
     }
 }

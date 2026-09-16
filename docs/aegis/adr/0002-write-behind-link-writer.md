@@ -1,7 +1,7 @@
 # ADR 0002 — Write-behind `profile_stats` persistence
 
 Date: 2026-09-11
-Status: accepted — amended 2026-09-14 (the gate left the writer, and the groups narrowed; amendment 2: the existence probe's predicate; see the amendments at the end)
+Status: accepted — amended 2026-09-14 (the gate left the writer, and the groups narrowed; amendment 2: the existence probe's predicate), 2026-09-16 (amendment 4: the per-row UPDATE and the existence probe are retired — supersedes amendments 1 and 2; see the amendments at the end)
 Supersedes: the per-write autocommit path for `profile_stats` batch workloads
 Spec: `docs/aegis/specs/2026-09-11-write-behind-link-writer-design.md`
 
@@ -189,3 +189,56 @@ Evidence: the 09-15 Fast+Real batch (775 log lines) cross-checked against
 Records: one `batch summary` INFO line per batch (`summary_line`) and one
 `startup` envelope; per-result success lines are `debug`, failures stay `warn`.
 That is what the next investigation reads instead of 32k per-result lines.
+
+## Amendment 4 — 2026-09-16: the per-row UPDATE and the existence probe are retired
+
+Amendment 2's probe and its per-row `UPDATE` are both **gone**. Both writers now
+emit one multi-row upsert per (statement chunk, `ON CONFLICT` action), so the
+probe's predicate shape — and `SQLITE_MAX_EXPR_DEPTH` as a constraint on this
+path — no longer exist. Superseded parts: amendment 1's "one existence probe per
+400-row chunk" and "writes an existing row with a single literal `UPDATE`",
+amendment 2 in full (its measurements stay as the record of why the per-row form
+was abandoned), and invariant 4's statement shapes.
+
+Why: `UPDATE … FROM (VALUES …)` is a parse error on this engine (measured
+2026-09-16: `near "(": syntax error`), so the per-row form was **one statement
+per link** and the probe was a separate statement per chunk. An
+`INSERT … VALUES (…),(…) ON CONFLICT(protocol_id, endpoint_id) DO UPDATE SET …`
+does the same work in one statement per chunk: the `VALUES` list is depth-flat
+(amendment 2's audit of 400 / 512 / 1,000 / 5,000 / 20,000 rows), the action both
+inserts a missing row and updates an existing one (so the probe's verdict is no
+longer needed), and `excluded.<column>` gives each group its own expression.
+
+The action is per-STATEMENT, so the patches are bucketed by the action they need
+— both groups / RESULT / TRAFFIC / none — and a patch with no group gets
+`DO NOTHING` (creates a missing row, writes no column). `contains` decides the
+buckets, exactly as the per-row form's `groups.contains(...)` did, so an unknown
+bit in `LinkGroups` cannot silently drop a group's columns. Invariant 4 stands as
+stated: RESULT and TRAFFIC remain disjoint — an existing row is written with
+exactly its patch's groups, and `last_used_at`, `last_seen_at` and `created_at`
+are written by their own owners only (the `VALUES` tuple carries them for the
+CREATE case, where there is nothing to clobber).
+
+Measured 2026-09-16 (reference feed: 7,656 endpoints / 15,312 links / 6,507
+addresses, ~3.7 MB file, release build, same machine, same probe binary for the
+before and after rows — `docs/aegis/specs/2026-09-16-db-claim-verification.md`):
+
+| Path | Before (per-row + probe) | After (multi-row upsert) | Δ |
+| --- | --- | --- | --- |
+| `apply_link_patches`, 512-patch window (incl. the rank refresh) | 29.0 ms | 10.0 ms | **2.9×** |
+| `upsert_links_bulk`, 2,000 links (incl. the rank refresh) | 360 ms | 44.3 ms | **8.1×** |
+
+Statement width is NOT the lever it was assumed to be: the same upsert at 400 /
+1,000 / 2,000 rows per statement measured 11.1 / 10.6 / 10.6 ms (within noise),
+and the rank writer's `INSERT OR REPLACE` at 400 / 1,000 / 2,000 measured
+11.4 / 11.5 / 11.3 ms. `LINK_STATEMENT_ROWS` therefore stays 400, and
+`LINK_PATCH_CHUNK_ROWS` is renamed `LINK_STATEMENT_ROWS` because it now bounds
+both writers' statements.
+
+Pinned by the same two tests, renamed to drop the probe:
+`apply_link_patches_applies_a_window_wider_than_one_statement_chunk` (a 500-row
+window spanning two chunks and all four action buckets) and
+`apply_link_patches_upserts_absent_and_near_miss_pairs_exactly` (the INSERT vs
+UPDATE verdict at 140 rows, absent pairs included — the failure mode that is
+silent, since a conflict target that never matches would try to insert a
+duplicate row).

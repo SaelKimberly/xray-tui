@@ -166,7 +166,7 @@ winnow = { version = "1" }
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
 deranged = { version = "0.5", features = ["serde"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
@@ -189,7 +189,7 @@ block-buffer = { version = "0.12", default-features = false, features = ["zeroiz
 chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 hybrid-array = { version = "0.4", default-features = false, features = ["zeroize"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
@@ -204,7 +204,8 @@ zeroize = { version = "1", features = ["derive"] }
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
 deranged = { version = "0.5", features = ["serde"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ipnet = { version = "2", features = ["serde"] }
 miniz_oxide = { version = "0.8", features = ["simd"] }
@@ -227,7 +228,8 @@ block-buffer = { version = "0.12", default-features = false, features = ["zeroiz
 chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
-getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hybrid-array = { version = "0.4", default-features = false, features = ["zeroize"] }
 nom = { version = "7" }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", default-features = false, features = ["visit"] }
@@ -275,7 +277,8 @@ ignored = [
     "futures-io",
     "futures-task",
     "futures-util",
-    "getrandom",
+    "getrandom-468e82937335b1c9",
+    "getrandom-9fbad63c4bcf4a8f",
     "h2",
     "hashbrown-9067fe90e8c1f593",
     "hashbrown-986da7b5efc2b80e",

@@ -244,7 +244,7 @@ window.
 | *(PK autoindex)* | `endpoints(id)` | every by-id lookup, all hydration |
 | *(PK autoindex)* | `endpoint_ip(endpoint_id, ip_key)` | the address set of an endpoint (prefix seek), PK uniqueness |
 | `endpoint_ip_by_key` *(raw)* | `endpoint_ip(ip_key, endpoint_id)` | address-ordered scans, `min(ip_key)` per endpoint, range lookups by address |
-| *(PK autoindex)* | `profile_stats(protocol_id, endpoint_id)` | pair lookups, the patch existence probe |
+| *(PK autoindex)* | `profile_stats(protocol_id, endpoint_id)` | pair lookups, the link upserts' `ON CONFLICT` target |
 | `index_profile_stats_by_protocol_id` | `profile_stats(protocol_id)` | per-protocol reads |
 | `index_profile_stats_by_endpoint_id` | `profile_stats(endpoint_id)` | the page's per-endpoint link reads |
 | `index_profile_stats_by_last_seen_at` | `profile_stats(last_seen_at)` | retention cutoff, staleness windows |
@@ -376,7 +376,7 @@ sequenceDiagram
     B->>B: apply_test_result → latency/error (RESULT group)
     B->>W: stage(link, RESULT) — no await
     Note over W: the pending map is authoritative —<br/>stage() never touches the DB
-    W->>D: on flush_interval/flush_rows: ONE transaction of<br/>narrow UPDATEs + one rank refresh per touched endpoint
+    W->>D: on flush_interval/flush_rows: ONE transaction of<br/>multi-row upserts + one rank refresh per touched endpoint
     Note over W,D: a failed window re-stages itself AND every window after it
 ```
 
@@ -419,8 +419,9 @@ flowchart LR
 | `load_page_projection` | one hydration statement, ids inlined | the page's rows (display columns only; the three deferred JSON carriers stay unloaded) |
 | `load_page_rows` | typed `in_list` reads + in-memory join | the reference implementation the projection is pinned against |
 | `update_endpoint_resolution` | `UPDATE endpoints` + `endpoint_ip` set rewrite + rank refresh | one transaction, retried on write contention |
-| `apply_link_patches` | one literal `UPDATE` per row + existence probe per chunk | the write-behind flush path |
+| `apply_link_patches` | one multi-row upsert per (chunk, group shape) | the write-behind flush path; 512-patch window ~10.0 ms vs ~29.0 ms for the retired per-row `UPDATE` + existence probe (ADR 0002 amendment 4) |
 | `endpoint_rank::refresh` / `backfill_all` / `repair_missing` | raw, id-inlined reads + a bulk upsert | never binds ids (~0.8 ms each) |
+| `upsert_links_bulk` | one multi-row upsert per chunk, SOURCE columns on conflict | the import path; 2,000 links ~44 ms vs ~360 ms for the per-row typed upsert (ADR 0002 amendment 4) |
 
 ## Changing the schema
 
