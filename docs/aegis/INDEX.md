@@ -20,3 +20,4 @@
 | 2026-09-15 | spec | `specs/2026-09-15-endpoint-ip-storage-design.md` | Endpoint addresses: storage, ordering, and what Turso 0.7.2 actually offers | implemented (schema tag 10) |
 | 2026-09-15 | adr | `adr/0005-endpoint-addresses-as-a-packed-key-table.md` | Resolved addresses are a packed-key table | accepted |
 | 2026-09-16 | spec | `specs/2026-09-16-db-claim-verification.md` | Database performance claims: verification and disposition | implemented (two write-path changes shipped; 4 reports + PDF dispositioned) |
+| 2026-09-16 | plan | `plans/2026-09-16-ping-engine-tls-fixes.md` | Ping-run log analysis: engine TLS fixes and batch observability | executed (T1-T11; subscription-retry design, class precision and toasty labels deferred) |
