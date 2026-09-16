@@ -134,7 +134,6 @@ async fn seed_endpoint(
         host_type,
         port,
         ports: Vec::<u16>::new(),
-        resolved_as: Vec::<String>::new(),
     })
     .exec(conn)
     .await
@@ -444,7 +443,6 @@ async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
         host_type: HostType::Ipv4,
         port: 443,
         ports: Vec::<u16>::new(),
-        resolved_as: Vec::<String>::new(),
     })
     .exec(&mut conn)
     .await
@@ -573,7 +571,6 @@ async fn get_endpoint_returns_linkless_row_with_empty_links() {
         host_type: HostType::Dns,
         port: 443,
         ports: Vec::<u16>::new(),
-        resolved_as: Vec::<String>::new(),
     })
     .exec(&mut conn)
     .await
@@ -833,7 +830,6 @@ async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
         host_type: HostType::Ipv4,
         port: 443,
         ports: Vec::<u16>::new(),
-        resolved_as: Vec::<String>::new(),
     })
     .exec(&mut conn)
     .await
@@ -946,7 +942,6 @@ async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
         host_type: HostType::Ipv4,
         port: 443,
         ports: Vec::<u16>::new(),
-        resolved_as: Vec::<String>::new(),
     })
     .exec(&mut conn)
     .await
@@ -1159,7 +1154,6 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         ports: Vec::<u16>::new(),
         last_source: Some("g1".to_string()),
         manual_protocol_override: None,
-        resolved_as: Vec::<String>::new(),
         resolved_at: None,
         created_at: ts(0),
         links: Deferred::default(),
@@ -1309,7 +1303,6 @@ async fn subscription_upsert_flow_assembles_group_rows() {
         ports: Vec::<u16>::new(),
         last_source: Some("g1".to_string()),
         manual_protocol_override: None,
-        resolved_as: Vec::<String>::new(),
         resolved_at: None,
         created_at: ts(0),
         links: Deferred::default(),
@@ -1407,7 +1400,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     let db = Database::open(&path).await.expect("fresh open");
     let mut conn = db.connection().await.expect("connection");
 
-    // Fresh open writes the 9-table schema AND tags it `user_version=9` so a
+    // Fresh open writes the typed schema AND tags it `user_version=10` so a
     // reopen can skip push_schema.
     let rows = toasty::sql::query("PRAGMA user_version")
         .exec(&mut conn)
@@ -1415,19 +1408,23 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .expect("read version");
     assert_eq!(
         first_i64(&rows),
-        Some(9),
-        "fresh open must tag the schema user_version=9"
+        Some(10),
+        "fresh open must tag the schema user_version=10"
     );
     let rows = toasty::sql::query(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
          AND name IN ('endpoints', 'protocols', 'profile_stats', \
                        'endpoint_groups', 'groups', 'routing_rules', 'dns_settings', \
-                       'route_probes', 'endpoint_rank')",
+                       'route_probes', 'endpoint_rank', 'endpoint_ip')",
     )
     .exec(&mut conn)
     .await
     .expect("count tables");
-    assert_eq!(first_i64(&rows), Some(9), "9-table schema created");
+    assert_eq!(
+        first_i64(&rows),
+        Some(10),
+        "the typed schema (10 tables) is created"
+    );
 
     // Seed data, then reopen: the tag preserves both schema and data.
     toasty::create!(Endpoint {
@@ -1437,7 +1434,6 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         host_type: HostType::Ipv4,
         port: 443,
         ports: Vec::<u16>::new(),
-        resolved_as: Vec::<String>::new(),
     })
     .exec(&mut conn)
     .await
@@ -1451,7 +1447,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .exec(&mut conn)
         .await
         .expect("read version");
-    assert_eq!(first_i64(&rows), Some(9), "reopen keeps the schema tag");
+    assert_eq!(first_i64(&rows), Some(10), "reopen keeps the schema tag");
     assert!(
         Endpoint::filter_by_id(EndpointId::new(9))
             .first()
@@ -1482,7 +1478,6 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
             host_type: HostType::Ipv4,
             port: 443,
             ports: Vec::<u16>::new(),
-            resolved_as: Vec::<String>::new(),
         })
         .exec(&mut conn)
         .await
@@ -1502,7 +1497,7 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         .expect("version");
     assert_eq!(
         first_i64(&rows),
-        Some(9),
+        Some(10),
         "the file is rebuilt at the new tag"
     );
     let rows = toasty::sql::query(

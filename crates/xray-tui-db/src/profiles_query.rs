@@ -18,6 +18,7 @@
 //! `ROW_NUMBER()` window that cost ~975 ms per page on the reference feed.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use crate::Database;
 use crate::error::{DatabaseError, Result};
@@ -51,6 +52,10 @@ pub enum PageSort {
     Speed,
     Traffic,
     ConfigType,
+    /// The endpoint's lowest resolved address (`endpoint_ip.ip_key`). The
+    /// addresses are the only IP fact stored per endpoint, so this is the one
+    /// sort the JSON-array column could not express at all.
+    Ip,
 }
 
 /// One page request. The thresholds are view filters, not ordering inputs.
@@ -191,6 +196,29 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
         ],
         PageSort::Port => vec![
             term("e.port".to_string(), true),
+            term("k.endpoint_id".to_string(), true),
+        ],
+        // Correlated on the RANK table, not on `endpoints`: the page source is
+        // `endpoint_rank k` and the join to `endpoints` is only added for the
+        // predicates that read it (`needs_endpoints`), so this sort does not
+        // pay for one. `min()` over the packed keys is memcmp — the address
+        // order.
+        //
+        // The sentinel `x'ff'` stands for "no address" and is greater than
+        // every key (each key starts with the family byte `0x04`/`0x06`), so
+        // an endpoint the resolver has not answered for sorts after the
+        // addressed ones ascending and before them descending — the reversal
+        // the other sorts rely on. It is not a NULL on purpose: every ordering
+        // term here is non-null (see `NO_SEEN`/`NO_SPEED`/`CONFIG_OTHER`),
+        // and the anchor query binds a sort term's value back into the
+        // comparison, which this engine refuses to type for a NULL.
+        PageSort::Ip => vec![
+            term(
+                "COALESCE((SELECT min(ip.ip_key) FROM endpoint_ip ip \
+                 WHERE ip.endpoint_id = k.endpoint_id), x'ff')"
+                    .to_string(),
+                true,
+            ),
             term("k.endpoint_id".to_string(), true),
         ],
     }
@@ -435,7 +463,18 @@ const PAGE_PROJECTION: &[&str] = &[
     "e.ports",
     "e.last_source",
     "e.manual_protocol_override",
-    "e.resolved_as",
+    // The resolved address set, from the table that owns it (one row per
+    // address, PK `(endpoint_id, ip_key)`). The column is the PACKED address,
+    // so the aggregate carries its hex and the decoder rebuilds the
+    // `IpAddr` — the engine has no `inet_ntoa`-style renderer (measured: the
+    // function does not exist), and storing a text copy beside the bytes
+    // would be a second, disagreeable spelling of the same fact.
+    //
+    // The rows come back in the PK scan order, i.e. key order — the same order
+    // the IP sort and the panel show — so the list needs no ORDER BY inside
+    // the aggregate (a correlated derived table with one would be materialized
+    // per row: measured 389 ms for a page against 29 ms for this shape).
+    "(SELECT group_concat(hex(ip_key), ',') FROM endpoint_ip ip WHERE ip.endpoint_id = e.id)",
     "e.resolved_at",
     "e.created_at",
     // profile_stats (22)
@@ -562,20 +601,22 @@ impl<'a> Projection<'a> {
         Ok(self.next_opt_i64()?.map(|n| n != 0))
     }
 
+    /// The next TEXT column, NULL as `None`.
+    fn next_opt_string(&mut self) -> Result<Option<String>> {
+        let column = self.at;
+        match self.take()? {
+            Value::Null => Ok(None),
+            Value::String(s) => Ok(Some(s)),
+            other => Err(DatabaseError::Generic(format!(
+                "profiles_query: projection column {column} ({}): expected text or NULL, got {other:?}",
+                PAGE_PROJECTION.get(column).copied().unwrap_or("?")
+            ))),
+        }
+    }
+
     /// A JSON-array TEXT column (`ports`, `task_queue`): the stored text is
     /// what toasty itself wrote, so parsing it directly is exact.
     fn next_u16_vec(&mut self) -> Result<Vec<u16>> {
-        let (column, text) = self.take_json_text()?;
-        serde_json::from_str(&text).map_err(|e| {
-            DatabaseError::Generic(format!(
-                "profiles_query: projection column {column} ({}): invalid JSON array: {e}",
-                PAGE_PROJECTION.get(column).copied().unwrap_or("?")
-            ))
-        })
-    }
-
-    /// A JSON-array-of-strings TEXT column (`resolved_as`).
-    fn next_string_vec(&mut self) -> Result<Vec<String>> {
         let (column, text) = self.take_json_text()?;
         serde_json::from_str(&text).map_err(|e| {
             DatabaseError::Generic(format!(
@@ -602,11 +643,7 @@ impl<'a> Projection<'a> {
 }
 
 /// `endpoints` (11 columns, in [`PAGE_PROJECTION`] order).
-#[expect(
-    clippy::similar_names,
-    reason = "`resolved_as`/`resolved_at` are the model's own column names, decoded in column order"
-)]
-fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<Endpoint> {
+fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<IpAddr>)> {
     let id = p.next_endpoint_id()?;
     let host: String = p.next()?;
     let host_type: HostType = p.next()?;
@@ -614,23 +651,35 @@ fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<Endpoint> {
     let ports: Vec<u16> = p.next_u16_vec()?;
     let last_source: Option<String> = p.next()?;
     let manual_protocol_override = p.next_opt_protocol_id()?;
-    let resolved_as: Vec<String> = p.next_string_vec()?;
+    let resolved_ips = p.next_opt_string()?.map_or_else(Vec::new, |text| {
+        let mut ips: Vec<std::net::IpAddr> = text
+            .split(',')
+            .filter_map(crate::endpoint_ip::key_from_hex)
+            .collect();
+        // Sorted by address, not by whatever order the aggregate emitted: the
+        // display order must be the table's order (IPv4 then IPv6, by
+        // address), and an aggregate's order is not a contract.
+        ips.sort_unstable();
+        ips
+    });
     let resolved_at = p.next_opt_ts()?;
     let created_at = p.next_ts()?;
-    Ok(Endpoint {
-        id,
-        host,
-        host_type,
-        port,
-        ports,
-        last_source,
-        manual_protocol_override,
-        resolved_as,
-        resolved_at,
-        created_at,
-        links: Deferred::default(),
-        group_links: Deferred::default(),
-    })
+    Ok((
+        Endpoint {
+            id,
+            host,
+            host_type,
+            port,
+            ports,
+            last_source,
+            manual_protocol_override,
+            resolved_at,
+            created_at,
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        },
+        resolved_ips,
+    ))
 }
 
 /// `profile_stats` (22 columns, in [`PAGE_PROJECTION`] order). The three
@@ -800,16 +849,18 @@ impl Database {
         let rows = sql.exec(&mut conn).await?;
         drop(conn);
 
-        let mut endpoints: HashMap<EndpointId, Endpoint> = HashMap::new();
+        let mut endpoints: HashMap<EndpointId, (Endpoint, Vec<IpAddr>)> = HashMap::new();
         let mut links: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();
         let mut protocols: HashMap<ProtocolId, Protocol> = HashMap::new();
         for row in &rows {
             let mut p = Projection::new(row)?;
-            let endpoint = decode_projected_endpoint(&mut p)?;
+            let (endpoint, resolved_ips) = decode_projected_endpoint(&mut p)?;
             let link = decode_projected_link(&mut p)?;
             let protocol = decode_projected_protocol(&mut p)?;
             links.entry(endpoint.id).or_default().push(link);
-            endpoints.entry(endpoint.id).or_insert(endpoint);
+            endpoints
+                .entry(endpoint.id)
+                .or_insert((endpoint, resolved_ips));
             if let Some(protocol) = protocol {
                 protocols.entry(protocol.id).or_insert(protocol);
             }
@@ -817,7 +868,7 @@ impl Database {
 
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(endpoint) = endpoints.remove(id) else {
+            let Some((endpoint, resolved_ips)) = endpoints.remove(id) else {
                 continue;
             };
             let links = links.remove(id).unwrap_or_default();
@@ -825,12 +876,15 @@ impl Database {
                 .iter()
                 .filter_map(|l| protocols.get(&l.protocol_id).map(|p| (p.id, p.clone())))
                 .collect();
-            let dns_unresolved =
-                endpoint.host_type == HostType::Dns && endpoint.resolved_as.is_empty();
+            let dns_unresolved = crate::endpoint_rank::dns_unresolved_endpoint(
+                endpoint.host_type,
+                !resolved_ips.is_empty(),
+            );
             let mut row = EndpointRow {
                 endpoint,
                 links,
                 protocols,
+                resolved_ips,
                 selected_protocol: 0,
                 expanded: false,
             };

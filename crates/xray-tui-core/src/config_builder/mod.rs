@@ -285,7 +285,6 @@ mod tests {
             ports: Vec::new(),
             last_source: None,
             manual_protocol_override: None,
-            resolved_as: Vec::new(),
             resolved_at: None,
             created_at: ts(0),
             links: Deferred::default(),

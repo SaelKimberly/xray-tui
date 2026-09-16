@@ -241,10 +241,10 @@ the main-table sort cache.
 
 **Test-priority sorting**: One comparator drives both the expandable sub-table order and the main-table Test column sort, defined in the db crate (owns `EndpointRow`):
 
-- `EndpointRow::sort_protocols_by_test_priority(dns_unresolved, rounds)` — re-sorts `protocols` in place. Ascending key `(tier, latency, -last_seen_at, id)`: tier 0 real-ok (`delay_source == Some(1)`), 1 fast/udp-ok, 2 untested, 3 real-err, 4 fast-err (fresh failure dominates stored success — round failed sets checked before persisted delay), 5 DNS-unresolved (`host_type == "dns"` with no resolved IPs). Latency only orders tiers 0-1.
+- `EndpointRow::sort_links_by_test_priority(dns_unresolved)` — re-sorts the row's links in place. Ascending key `(tier, latency, -last_seen_at, id)`: tier 0 real-ok (`Latency::Real`), 1 fast/udp-ok, 2 untested, 3 real-err, 4 fast-err (fresh failure dominates stored success — round failed sets checked before persisted delay), 5 DNS-unresolved (a `dns` host with no `endpoint_ip` row — `dns_unresolved_endpoint(host_type, has_address)`). Latency only orders tiers 0-1.
 - `EndpointRow::best_test_priority_key(...)` — min protocol key; the main-table sort representative (best protocol, user decision).
-- Runs at DB load (`deserialize_endpoint_rows`, rounds = None, DNS tier from `resolved_as`), live in `poll_core_events` (`SpeedTestResult` for TcpPing/RealPing success or failure; `EndpointInfoUpdated` on unresolved→resolved flip), and via `compute_filtered_indices` (`SortColumn::Test`, renamed from `Delay`) with `endpoint_dns_unresolved`/`session_rounds` helpers in `ops/profiles.rs`.
-- Provenance: `profile_extensions.delay_source` (0 fast, 1 real, 2 udp; SCHEMA_VERSION 4; upsert writes `unwrap_or(-1)`; only `Some(1)` = real). Writers: `SpeedTestResult` handler (from `test_type`) + `batch_upsert_buffer` (from session `ping_type`).
+- Runs at DB load (`load_page_projection` / the typed `load_page_rows`, rounds = None, the DNS tier read from the endpoint's empty address set), live in `poll_core_events` (`SpeedTestResult` for TcpPing/RealPing success or failure; `EndpointInfoUpdated` on unresolved→resolved flip), and — for the tab itself — in SQL: ordering is the page query's job (`PageSort`, the sort cycle's `SortColumn::Test` maps to it), with this comparator kept as the oracle the SQL order is pinned against (`page_order_matches_the_rust_oracle_for_every_sort`). `endpoint_dns_unresolved` in `ops/profiles.rs` delegates to `endpoint_rank::dns_unresolved`.
+- Provenance: the link's own `profile_stats` columns — `latency` (the `real`/`fast` kind) with `latency_delay`/`latency_ip`, and the failure marker `error` + `error_kind` + `error_text` (kind `real`/`fast`/`name`). Writers: the `SpeedTestResult` handler and the batch (one shared mapping, `ops::events::apply_test_result`), staged through `LinkWriter` (decision 22).
 - Invariant: **error events mutate nothing** — the `SpeedTestResult` handler gates the whole ext mutation + upsert behind `error.is_none()`, so a cancelled/failed test can never rank an untested protocol as real-ok or write a `delay = 0` row.
 
 **Stop testing**: `speed_test_stop: Arc<AtomicBool>` on AppState. Set via menu ("Stop Testing" at index 10)
@@ -692,17 +692,21 @@ ciphers and stripped from `x25519-dalek` by `default-features = false`.
 `crates/xray-tui-db/src/lib.rs` — toasty ORM database layer. `retry.rs` adds
 `retry_on_busy`/`is_busy_error` — SQLite write contention (toasty
 `is_serialization_failure` or "database is locked") is retried with 20ms-doubling
-backoff (1.28s cap). Wired into `update_endpoint_resolution` +
-`batch_flush_ping_buffer`, whose single-transaction bare-`?` commits previously
-dropped writes when the enrichment pipeline herded hundreds of concurrent writers.
+backoff (1.28s cap). Wired into `update_endpoint_resolution`, whose
+single-transaction commit previously dropped writes when the enrichment
+pipeline herded hundreds of concurrent writers.
 `Database::conn()` sets `PRAGMA busy_timeout=5000` on every pooled connection
 acquisition — the pragma in `open()` is per-connection and never reaches
 pool-created conns (deadpool default max_size 10), so concurrent writers now
 queue at the SQLite level instead of failing instantly; all write paths use
 `conn()`.
 
-**Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`, 9 tables):
-- `Endpoint` — server config; dedup key `stable_hash(host, port)` or `stable_hash("undefined", config_uid)`; `resolved_as`/`resolved_at` are the ONLY owner of a DNS host's resolutions
+Schema, indexes, invariants and flows are documented in **`docs/database.md`**
+(with diagrams); this section is the crate-level summary.
+
+**Models** (defined via `#[derive(toasty::Model)]` in `models_toasty.rs`, 10 tables):
+- `Endpoint` — server config; dedup key `stable_hash(host, port)` or `stable_hash("undefined", config_uid)`; `resolved_at` is the DNS-attempt stamp the resolution TTL gates on (the addresses themselves are `EndpointIp`'s)
+- `EndpointIp` — one row per resolved address of a DNS endpoint, PK `(endpoint_id, ip_key)`; `ip_key` is the address in a sortable packed encoding (family byte then big-endian octets), so B-tree byte order IS address order (ADR 0005)
 - `Protocol` — `#key id` = the identity uid (host/port excluded), plus `sig` for the grouping key; transport/security embeds; `config: Deferred<Json<ProtocolConfig>>`
 - `ProfileStats` — per `(protocol_id, endpoint_id)` pair: latency/speed/error/traffic; `last_seen_at` indexed (retention + staleness windows)
 - `EndpointRank` — the materialized ordering keys the Profiles page is ordered by (ADR 0003)
@@ -711,7 +715,7 @@ queue at the SQLite level instead of failing instantly; all write paths use
 
 All timestamps are epoch-SECOND integers (`to_epoch`/`from_epoch`/`now_epoch` are the conversion points); `#[auto]` is deliberately absent from them, because on an integer column toasty's auto strategy is `Increment`, not "now". Scheduler task state is NOT a column: it is runtime-only (see "Task gate" below).
 
-**Schema management**: no migration machinery. `db.push_schema()` runs only when the `PRAGMA user_version` tag differs from `SCHEMA_VERSION = 9`; toasty emits `CREATE TABLE` without `IF NOT EXISTS`, so on an existing DB the push fails and `Database::open` **deletes the file** and recreates the schema — a tag bump is a data reset, never a migration (7 = per-kind binary identity re-key, 8 = `endpoint_rank`, 9 = the durable-facts pass: task columns / `cred_hash` / `parent_id` dropped, timestamps to epoch seconds, `last_seen_at` index). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
+**Schema management**: no migration machinery. `db.push_schema()` runs only when the `PRAGMA user_version` tag differs from `SCHEMA_VERSION = 10`; toasty emits `CREATE TABLE` without `IF NOT EXISTS`, so on an existing DB the push fails and `Database::open` **deletes the file** and recreates the schema — a tag bump is a data reset, never a migration (7 = per-kind binary identity re-key, 8 = `endpoint_rank`, 9 = the durable-facts pass: task columns / `cred_hash` / `parent_id` dropped, timestamps to epoch seconds, `last_seen_at` index, 10 = `endpoint_ip`, the address set as a packed-key table replacing the JSON-array `resolved_as` column). System groups created by `init_default_groups()`. Known quirk: toasty's `push_schema` leaves a cross-process SQLITE_BUSY write lock on the db file for the life of the process (external sqlite3 access blocked while the app runs; app's own single-pooled-connection ops unaffected).
 **Log storage**: `TuiLogLayer` (in `main.rs`) captures `tracing::Event` emissions and sends to (a) `core_event_tx` for in-memory `log_cache` display and (b) `HeedLogStorage` via a non-blocking `std::sync::mpsc` channel. The `HeedLogStorage` (in `xray-tui-core::log_heed`) stores entries in an LMDB `logs` database keyed by big-endian u64 timestamp with postcard-encoded `LogMessage` values. A separate `targets` database tracks seen target strings. Batched writer (up to 100 msgs) runs in `spawn_blocking`; async read wrappers wrap LMDB reads in `spawn_blocking`. MapFull triggers auto-resize (1 GB default, doubles up to 8 GB) with backoff retry (50ms*(attempt+1), max 5) — the batch is retried after a successful resize, never dropped. Initial log loading is lazy (deferred to first Logs tab access).
 
 ### xray-tui-config (library crate)
@@ -918,15 +922,19 @@ Enrich each Profile: compute the identity (`uid = sig ^ cred_hash`, per-kind
 binary writer in the proto crate), set group_id, is_sub, sub_id
         │
         ▼
-subscription_upsert_profiles() — single BEGIN DEFERRED transaction:
-  1. INSERT OR REPLACE INTO profile_cores (dedup by sub_uid)
-  2. INSERT INTO group_profiles ON CONFLICT(group_id, sub_uid) DO UPDATE
-  3. INSERT OR IGNORE INTO group_profiles (ALL_GROUP_ID mirror)
-  4. DELETE graveyard orphans promoted back to this group
+persist_parsed_urls() → persist_parsed() — ONE transaction:
+  1. upsert_endpoints_bulk (identity fields only — never the resolution state)
+  2. upsert_protocols_bulk (config / transport / security)
+  3. upsert_links_bulk — SOURCE columns only (core_type, config_type,
+     last_seen_at); the RESULT and TRAFFIC columns are written ON CREATE, so a
+     refresh cannot wipe a measurement it just saw. Refreshes the touched
+     endpoints' ordering keys inside the same transaction.
+  4. upsert_endpoint_group_links_bulk (membership + per-source last_seen_at)
         │
         ▼
-move_orphans_to_graveyard() + purge_graveyard()
-upsert_subscription() — update subscription metadata
+group metadata (status / last_refreshed) — no move-to-purgatory: staleness is a
+view filter (PurgatoryView) over last_seen_at, and purge_expired reclaims only
+past the retention window
         │
         ▼
 Send CoreEvent::SubscriptionsUpdated via core_event_tx
@@ -942,7 +950,7 @@ AppState::new / reload_profiles
         │
         ▼
 spawn_enrich_ip_hosts: seed endpoint_info for IP hosts (host = own address)
-  and DNS hosts with persisted endpoints.resolved_as (no network)
+  and DNS hosts with a persisted address set (`endpoint_ip`, no network)
         │
         ▼
 x key (force) / connect_to_profile / SpeedTestResult (DNS hosts)
@@ -964,7 +972,10 @@ SpeedTestResult with ip_info (real ping)
         ▼
 poll_core_events EndpointInfoUpdated handler: merge by field group into
   state.endpoint_info (concurrent events must not clobber); persist DNS
-  resolutions via update_endpoint_resolution (only when resolved_at changed);
+  resolutions via update_endpoint_resolution (only when resolved_at changed),
+  which in ONE transaction stamps endpoints.resolved_at, rewrites the
+  endpoint_ip address set (deduped by key) and refreshes the endpoint's
+  ordering keys — the DNS-unresolved band moves with the set;
   failed lookups (empty IPs) materialize TTL-gated attempt entries
 ```
 

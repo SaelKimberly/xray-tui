@@ -7,7 +7,7 @@ use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRank, EndpointRow, Group, HostType,
+    DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointIp, EndpointRank, EndpointRow, Group,
     ProfileStats, Protocol, ProtocolId, RouteProbes, RoutingRule, TrafficStats, now_epoch,
 };
 use crate::retry_on_busy;
@@ -103,7 +103,13 @@ impl Database {
         // endpoint's resolutions live in `resolved_as`), and the two indexes
         // the purge / failed-sweep predicates need are added. Same contract as
         // every bump: a v8 file is WIPED, never migrated.
-        const SCHEMA_VERSION: i64 = 9;
+        //
+        // 10 = resolved addresses become a table: the JSON-array
+        // `endpoints.resolved_as` column is replaced by `endpoint_ip`, one row
+        // per address with a sortable key. A v9 file is WIPED (the addresses it
+        // holds cannot be moved: the old column is gone, and the enrichment
+        // pipeline re-resolves on the next pass).
+        const SCHEMA_VERSION: i64 = 10;
 
         let path_str = path
             .as_ref()
@@ -194,6 +200,12 @@ impl Database {
         {
             tracing::warn!(target: "xray_tui_db", "endpoint_rank: {e}");
         }
+        // `endpoint_ip`'s covering index — the address-ordered read path. Raw
+        // DDL for the same reason the rank indexes are: toasty's `#[index]` is
+        // single-column, and the sort wants `(ip_key, endpoint_id)` together.
+        if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
+            tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
+        }
         Ok(Self { db })
     }
 
@@ -209,7 +221,8 @@ impl Database {
                 RoutingRule,
                 DnsSetting,
                 RouteProbes,
-                EndpointRank
+                EndpointRank,
+                EndpointIp
             ))
             .build(driver)
             .await?;
@@ -253,7 +266,8 @@ impl Database {
                 RoutingRule,
                 DnsSetting,
                 RouteProbes,
-                EndpointRank
+                EndpointRank,
+                EndpointIp
             ))
             .build(driver)
             .await?;
@@ -285,6 +299,12 @@ impl Database {
             && let Err(e) = crate::endpoint_rank::ensure(&mut conn).await
         {
             tracing::warn!(target: "xray_tui_db", "endpoint_rank: {e}");
+        }
+        // `endpoint_ip`'s covering index — the address-ordered read path. Raw
+        // DDL for the same reason the rank indexes are: toasty's `#[index]` is
+        // single-column, and the sort wants `(ip_key, endpoint_id)` together.
+        if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
+            tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
         Ok(Self { db })
     }
@@ -642,7 +662,7 @@ impl Database {
         // `stmt::in_list` (the field struct implements `IntoExpr<EndpointId>`).
         let links: Vec<ProfileStats> = ProfileStats::filter(toasty::stmt::in_list(
             ProfileStats::fields().endpoint_id(),
-            ids,
+            ids.clone(),
         ))
         .exec(conn)
         .await?;
@@ -667,6 +687,9 @@ impl Database {
         for link in links {
             by_endpoint.entry(link.endpoint_id).or_default().push(link);
         }
+        // The address set is a table of its own now: one id-inlined read for
+        // the whole set, exactly like the links above.
+        let mut resolved = crate::endpoint_ip::load(conn, &ids).await?;
 
         let mut rows = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
@@ -679,12 +702,16 @@ impl Database {
                         .map(|p| (p.id, p.clone()))
                 })
                 .collect();
-            let dns_unresolved =
-                endpoint.host_type == HostType::Dns && endpoint.resolved_as.is_empty();
+            let resolved_ips = resolved.remove(&endpoint.id).unwrap_or_default();
+            let dns_unresolved = crate::endpoint_rank::dns_unresolved_endpoint(
+                endpoint.host_type,
+                !resolved_ips.is_empty(),
+            );
             let mut row = EndpointRow {
                 endpoint,
                 links,
                 protocols,
+                resolved_ips,
                 selected_protocol: 0,
                 expanded: false,
             };
@@ -709,12 +736,13 @@ impl Database {
     /// Insert or update one endpoint by id.
     ///
     /// Replaces the endpoint's identity fields (`host`, `host_type`, `port`,
-    /// `ports`, `parent_id`, `last_source`). The DNS-resolution cache
-    /// (`resolved_as` / `resolved_at`) and the manual protocol override are
-    /// owned by their dedicated writes ([`Self::update_endpoint_resolution`],
-    /// [`Self::set_manual_override`]) and are preserved on update — this
-    /// matches the old subscription path, which never clobbered an existing
-    /// endpoint's resolution state (INSERT OR IGNORE).
+    /// `ports`, `last_source`). The resolution state (the `endpoint_ip`
+    /// address set and `endpoints.resolved_at`) and the manual protocol
+    /// override are owned by their dedicated writes
+    /// ([`Self::update_endpoint_resolution`], [`Self::set_manual_override`])
+    /// and are preserved on update — this matches the old subscription path,
+    /// which never clobbered an existing endpoint's resolution state
+    /// (INSERT OR IGNORE).
     pub async fn upsert_endpoint(&self, e: &Endpoint) -> Result<()> {
         let mut conn = self.conn().await?;
         Endpoint::upsert_by_id(e.id)
@@ -724,10 +752,8 @@ impl Database {
             .ports(e.ports.clone())
             .last_source(e.last_source.clone())
             .on_create(|create| {
-                create
-                    .resolved_as(Vec::<String>::new())
-                    // No `#[auto]` on an integer timestamp: the writer stamps it.
-                    .created_at(now_epoch())
+                // No `#[auto]` on an integer timestamp: the writer stamps it.
+                create.created_at(now_epoch())
             })
             .exec(&mut conn)
             .await?;
@@ -913,14 +939,19 @@ impl Database {
         Ok(())
     }
 
-    /// Persist the DNS resolution of an endpoint host: `resolved_as = ips`,
-    /// `resolved_at = at`. Survives launches so the TUI does not re-resolve
-    /// DNS hosts on startup. Retried on write contention (the enrichment
-    /// pipeline resolves many endpoints concurrently), as the old code did.
+    /// Persist the DNS resolution of an endpoint host: its address set
+    /// (`endpoint_ip`) and `resolved_at`. Survives launches so the TUI does not
+    /// re-resolve DNS hosts on startup. Retried on write contention (the
+    /// enrichment pipeline resolves many endpoints concurrently), as the old
+    /// code did.
+    ///
+    /// The address set and the endpoint's rank keys move together: "has an
+    /// address" IS part of the ordering law (decision 16 tier 5), so an
+    /// endpoint leaves — or enters — the DNS-unresolved band here.
     pub async fn update_endpoint_resolution(
         &self,
         endpoint_id: EndpointId,
-        ips: Vec<String>,
+        ips: Vec<std::net::IpAddr>,
         at: i64,
     ) -> Result<()> {
         let db = self;
@@ -929,15 +960,15 @@ impl Database {
                 let ips = ips.clone();
                 async move {
                     let mut conn = db.conn().await?;
+                    let mut tx = conn.transaction().await?;
                     Endpoint::filter_by_id(endpoint_id)
                         .update()
-                        .resolved_as(ips)
                         .resolved_at(Some(at))
-                        .exec(&mut conn)
+                        .exec(&mut tx)
                         .await?;
-                    // `resolved_as` IS part of the ordering law: an endpoint
-                    // moves out of (or into) the DNS-unresolved band here.
-                    crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
+                    crate::endpoint_ip::replace(&mut tx, endpoint_id, &ips).await?;
+                    crate::endpoint_rank::refresh(&mut tx, &[endpoint_id]).await?;
+                    tx.commit().await?;
                     Ok(())
                 }
             },
@@ -1004,11 +1035,12 @@ impl Database {
             .delete()
             .exec(&mut tx)
             .await?;
+            Self::purge_orphan_protocols(&mut tx).await?;
+            crate::endpoint_ip::delete_for(&mut tx, &ids).await?;
             Endpoint::filter(toasty::stmt::in_list(Endpoint::fields().id(), ids.clone()))
                 .delete()
                 .exec(&mut tx)
                 .await?;
-            Self::purge_orphan_protocols(&mut tx).await?;
             // The page drives from `endpoint_rank`: drop the keys of the rows
             // whose links just went away, or the tab would list them again.
             crate::endpoint_rank::prune(&mut tx, &ids).await?;
@@ -1052,6 +1084,11 @@ impl Database {
         .delete()
         .exec(&mut tx)
         .await?;
+        Self::purge_orphan_protocols(&mut tx).await?;
+        // The address set is a child table, and nothing cascades on this
+        // engine (toasty's model emits no `REFERENCES`), so the deletion
+        // owners remove it here — in the same transaction as the endpoint.
+        crate::endpoint_ip::delete_for(&mut tx, endpoint_ids).await?;
         Endpoint::filter(toasty::stmt::in_list(
             Endpoint::fields().id(),
             endpoint_ids.to_vec(),
@@ -1059,7 +1096,6 @@ impl Database {
         .delete()
         .exec(&mut tx)
         .await?;
-        Self::purge_orphan_protocols(&mut tx).await?;
         // The page drives from `endpoint_rank`: a deleted endpoint must not
         // leave its key behind.
         crate::endpoint_rank::prune(&mut tx, endpoint_ids).await?;
@@ -1220,10 +1256,8 @@ pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> 
             .ports(e.ports.clone())
             .last_source(e.last_source.clone())
             .on_create(|create| {
-                create
-                    .resolved_as(Vec::<String>::new())
-                    // No `#[auto]` on an integer timestamp: the writer stamps it.
-                    .created_at(now_epoch())
+                // No `#[auto]` on an integer timestamp: the writer stamps it.
+                create.created_at(now_epoch())
             })
             .exec(tx)
             .await?;
@@ -1318,6 +1352,7 @@ pub async fn upsert_endpoint_group_links_bulk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models_toasty::HostType;
     use crate::models_toasty::{ConfigType, Latency, Security, TrafficStats, Transport};
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
@@ -1424,7 +1459,6 @@ mod tests {
             host_type,
             port,
             ports: Vec::<u16>::new(),
-            resolved_as: Vec::<String>::new(),
         })
         .exec(conn)
         .await
@@ -1613,7 +1647,7 @@ mod tests {
             host_type: HostType::Dns,
             port: 443,
             ports: Vec::<u16>::new(),
-            resolved_as: Vec::<String>::new(), // no cached resolution -> unresolved
+            // no address rows -> unresolved (the child table owns that fact)
         })
         .exec(&mut conn)
         .await
@@ -1676,7 +1710,6 @@ mod tests {
             host_type: HostType::Ipv4,
             port: 443,
             ports: Vec::<u16>::new(),
-            resolved_as: Vec::<String>::new(),
         })
         .exec(&mut conn)
         .await
@@ -1945,6 +1978,19 @@ mod tests {
 
     // ── Typed writes (Task 10) ───────────────────────────────────────────
 
+    /// An address literal, for the tests' write arguments.
+    fn ip(text: &str) -> std::net::IpAddr {
+        text.parse().expect("test address")
+    }
+
+    /// An endpoint's stored addresses, in the table's key order.
+    async fn stored_ips(conn: &mut toasty::Connection, id: i64) -> Vec<std::net::IpAddr> {
+        let mut rows = crate::endpoint_ip::load(conn, &[EndpointId::new(id)])
+            .await
+            .expect("read addresses");
+        rows.remove(&EndpointId::new(id)).unwrap_or_default()
+    }
+
     /// A full `Endpoint` struct for the typed write methods.
     fn endpoint_struct(id: i64, host: &str, host_type: HostType, port: u16) -> Endpoint {
         Endpoint {
@@ -1955,7 +2001,6 @@ mod tests {
             ports: Vec::new(),
             last_source: None,
             manual_protocol_override: None,
-            resolved_as: Vec::new(),
             resolved_at: None,
             created_at: ts(0),
             links: Deferred::default(),
@@ -2027,7 +2072,7 @@ mod tests {
         assert_eq!(ep.port, 8443);
 
         // Owned state (resolution cache, manual override) survives re-upserts.
-        db.update_endpoint_resolution(EndpointId::new(1), vec!["1.1.1.1".to_string()], ts(77))
+        db.update_endpoint_resolution(EndpointId::new(1), vec![ip("1.1.1.1")], ts(77))
             .await
             .expect("resolve");
         db.set_manual_override(EndpointId::new(1), Some(ProtocolId::new(99)))
@@ -2043,9 +2088,9 @@ mod tests {
             .expect("read")
             .expect("row");
         assert_eq!(
-            ep.resolved_as,
-            vec!["1.1.1.1".to_string()],
-            "resolution cache preserved"
+            stored_ips(&mut conn, 1).await,
+            vec![ip("1.1.1.1")],
+            "the address set survives a re-upsert of the endpoint row"
         );
         assert_eq!(ep.resolved_at, Some(ts(77)));
         assert_eq!(
@@ -2337,7 +2382,7 @@ mod tests {
 
         db.update_endpoint_resolution(
             EndpointId::new(1),
-            vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()],
+            vec![ip("1.1.1.1"), ip("2.2.2.2")],
             ts(100),
         )
         .await
@@ -2350,8 +2395,9 @@ mod tests {
             .expect("read")
             .expect("row");
         assert_eq!(
-            ep.resolved_as,
-            vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()]
+            stored_ips(&mut conn, 1).await,
+            vec![ip("1.1.1.1"), ip("2.2.2.2")],
+            "key order == address order, not the order the resolver printed"
         );
         assert_eq!(ep.resolved_at, Some(ts(100)));
     }

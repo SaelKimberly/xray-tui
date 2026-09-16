@@ -18,7 +18,7 @@ use crate::security::reality::HelloProvisionerChoice;
 ///
 /// `server` is the proxy server (host/port); `target` is the destination the
 /// proxy should reach. `resolved_ip` lets callers inject a pre-resolved
-/// address (the enrichment pipeline's `resolved_as`) and skip DNS.
+/// address (one of the enrichment pipeline's resolved addresses) and skip DNS.
 #[derive(Debug, Clone)]
 pub struct NativeConnectParams {
     pub protocol: ProtocolConfig,

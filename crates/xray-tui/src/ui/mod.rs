@@ -713,6 +713,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 SortColumn::Traffic,
                 SortColumn::ConfigType,
                 SortColumn::LastSeen,
+                SortColumn::Ip,
             ];
             let current_idx = all
                 .iter()

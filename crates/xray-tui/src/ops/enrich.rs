@@ -269,14 +269,14 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 }
 
 /// One enrichment target: endpoint id, the endpoint, its persisted
-/// `resolved_as` list, the persisted `resolved_at` (unix secs), and the
+/// `endpoint_ip` address set, the persisted `resolved_at` (unix secs), and the
 /// SNI of its active protocol (None for linkless endpoints).
-type EnrichTarget = (i64, Endpoint, Vec<String>, Option<i64>, Option<String>);
+type EnrichTarget = (i64, Endpoint, Vec<IpAddr>, Option<i64>, Option<String>);
 
 /// Startup/refresh pass: seed `endpoint_info` for every endpoint that has no
 ///
 /// entry yet — IP hosts (parse host, no DNS) and DNS hosts with a persisted
-/// `resolved_as` (from the endpoints table; no network). Geo + whitelist
+/// `endpoint_ip` address set (no network). Geo + whitelist
 /// features are filled in the same task.
 pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
     let targets: Vec<EnrichTarget> = state
@@ -284,14 +284,14 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
         .iter()
         .filter(|r| {
             matches!(r.endpoint.host_type, HostType::Ipv4 | HostType::Ipv6)
-                || !r.endpoint.resolved_as.is_empty()
+                || !r.resolved_ips.is_empty()
         })
         .filter(|r| !state.endpoint_info.contains_key(&r.endpoint.id.get()))
         .map(|r| {
             (
                 r.endpoint.id.get(),
                 r.endpoint.clone(),
-                r.endpoint.resolved_as.clone(),
+                r.resolved_ips.clone(),
                 r.endpoint.resolved_at,
                 r.active_protocol().and_then(|(_, p)| extract_sni(p)),
             )
@@ -327,12 +327,10 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                 resolved_at_secs: None,
             }
         } else {
-            // DNS host with a persisted resolution — reuse it, no network.
+            // DNS host with a persisted resolution — reuse it, no network and
+            // no text parse: the stored form is the address itself.
             EndpointInfo {
-                resolved_ips: cached_as
-                    .iter()
-                    .filter_map(|s| s.parse::<IpAddr>().ok())
-                    .collect(),
+                resolved_ips: cached_as,
                 country: None,
                 host_features: HostFeatures::default(),
                 sni_whitelisted: None,

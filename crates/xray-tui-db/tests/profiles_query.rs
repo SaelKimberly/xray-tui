@@ -7,8 +7,8 @@
 use toasty::{Deferred, Json};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    ConfigType, Endpoint, EndpointId, ErrorInfo, HostType, Latency, ProfileStats, Protocol,
-    ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
+    ConfigType, Endpoint, EndpointId, EndpointIp, ErrorInfo, HostType, Latency, ProfileStats,
+    Protocol, ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort};
 use xray_tui_db::{LinkGroups, LinkPatch};
@@ -25,7 +25,7 @@ const fn ts(secs: i64) -> i64 {
 
 const ALL_ENDPOINTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
 
-const ALL_SORTS: [PageSort; 7] = [
+const ALL_SORTS: [PageSort; 8] = [
     PageSort::Test,
     PageSort::Address,
     PageSort::Port,
@@ -33,6 +33,7 @@ const ALL_SORTS: [PageSort; 7] = [
     PageSort::Speed,
     PageSort::Traffic,
     PageSort::ConfigType,
+    PageSort::Ip,
 ];
 
 const fn request(sort: PageSort, ascending: bool, offset: usize, limit: usize) -> PageRequest {
@@ -62,14 +63,22 @@ async fn seed_endpoint(
         host_type,
         port: 443,
         ports: Vec::<u16>::new(),
-        resolved_as: resolved
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect::<Vec<String>>(),
     })
     .exec(&mut *conn)
     .await
     .expect("create endpoint");
+    // The address set is `endpoint_ip`'s: a DNS host with no rows is the
+    // unresolved band's input, and a resolved one carries its addresses there.
+    for ip in resolved {
+        let key = xray_tui_db::endpoint_ip::key_of_str(ip).expect("a real address");
+        toasty::create!(EndpointIp {
+            endpoint_id: EndpointId::new(id),
+            ip_key: key,
+        })
+        .exec(&mut *conn)
+        .await
+        .expect("create address");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,12 +411,12 @@ async fn link_writes_keep_the_stored_keys_current() {
     assert_eq!(page().await, vec![EndpointId::new(1), EndpointId::new(2)]);
 }
 
-/// `resolved_as` is part of the ordering law: a DNS host that resolves moves
+/// The address set is part of the ordering law: a DNS host that resolves moves
 /// out of the unresolved band, and the page must show it there immediately.
 #[tokio::test]
 async fn resolving_a_dns_host_moves_its_stored_key() {
     let db = seed_fixture().await;
-    let unresolved = EndpointId::new(6); // dns host, no `resolved_as`, real 5 ms
+    let unresolved = EndpointId::new(6); // dns host, no address, real 5 ms
     let before = db
         .profiles_page(&request(PageSort::Test, true, 0, 100))
         .await
@@ -415,9 +424,13 @@ async fn resolving_a_dns_host_moves_its_stored_key() {
         .ids;
     assert_eq!(before.last(), Some(&unresolved), "unresolved sinks");
 
-    db.update_endpoint_resolution(unresolved, vec!["203.0.113.6".to_string()], ts(200))
-        .await
-        .expect("resolve");
+    db.update_endpoint_resolution(
+        unresolved,
+        vec!["203.0.113.6".parse().expect("addr")],
+        ts(200),
+    )
+    .await
+    .expect("resolve");
 
     let after = db
         .profiles_page(&request(PageSort::Test, true, 0, 100))
@@ -628,7 +641,7 @@ async fn load_page_rows_preserves_page_and_link_order() {
 // means the SQL is wrong — the oracle is never adjusted to match it.
 
 fn dns_unresolved(row: &xray_tui_db::models::EndpointRow) -> bool {
-    row.endpoint.host_type == HostType::Dns && row.endpoint.resolved_as.is_empty()
+    row.endpoint.host_type == HostType::Dns && row.resolved_ips.is_empty()
 }
 
 /// The DISPLAY link as the spec defines it: the manual override when it names
@@ -672,6 +685,16 @@ const fn config_type_rank(link: &xray_tui_db::models::ProfileStats) -> i32 {
 /// `(tier, latency, -last_seen, protocol_id)` — dropping the recency term makes
 /// the oracle disagree with the law on ties, which is how this test first
 /// failed.
+/// The lowest address key of a row, from its own values; the `x'ff'` sentinel
+/// when it has none — the same value the SQL's `COALESCE` substitutes.
+fn min_address_key(row: &xray_tui_db::models::EndpointRow) -> Vec<u8> {
+    row.resolved_ips
+        .iter()
+        .map(|ip| xray_tui_db::endpoint_ip::key_of(*ip))
+        .min()
+        .unwrap_or_else(|| vec![0xff])
+}
+
 fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> (i64, i64, i64, i64) {
     match sort {
         PageSort::Test => {
@@ -685,7 +708,7 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> (i64, i
                 pid,
             )
         }
-        PageSort::Address => (0, 0, 0, 0),
+        PageSort::Address | PageSort::Ip => (0, 0, 0, 0),
         PageSort::Port => (i64::from(row.endpoint.port), 0, 0, 0),
         PageSort::LastSeen => (
             display_link(row).map_or(i64::MIN, |l| l.last_seen_at),
@@ -735,6 +758,18 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
                     .collect();
                 v.sort_unstable();
                 v.into_iter().map(|(_, id)| id).collect()
+            } else if sort == PageSort::Ip {
+                // The address key, derived from the row's own values through
+                // the production codec: `min` over the keys is what the SQL's
+                // `min(ip_key)` reads, an endpoint with no address takes the
+                // `x'ff'` sentinel (after every real key ascending), and the
+                // DESC direction is the plain reversal.
+                let mut v: Vec<(Vec<u8>, i64)> = rows
+                    .iter()
+                    .map(|r| (min_address_key(r), r.endpoint.id.get()))
+                    .collect();
+                v.sort_unstable();
+                v.into_iter().map(|(_, id)| id).collect()
             } else {
                 let mut v: Vec<((i64, i64, i64, i64), i64)> = rows
                     .iter()
@@ -772,19 +807,32 @@ async fn seed_projection_fixture() -> Database {
     for stmt in [
         // e1: IPv4, multi-port spec, subscription source, override, two links.
         "INSERT INTO endpoints (id, host, host_type, port, ports, last_source, \
-         manual_protocol_override, resolved_as, resolved_at, created_at) VALUES \
-         (1, 'a.example', 'ipv4', 443, '[443,8443]', 'src-hash', 11, '[]', NULL, \
+         manual_protocol_override, resolved_at, created_at) VALUES \
+         (1, 'a.example', 'ipv4', 443, '[443,8443]', 'src-hash', 11, NULL, \
           1788220800)",
         // e2: DNS with a persisted resolution and a name failure.
         "INSERT INTO endpoints (id, host, host_type, port, ports, last_source, \
-         manual_protocol_override, resolved_as, resolved_at, created_at) VALUES \
-         (2, 'b.example', 'dns', 8443, '[]', NULL, NULL, '[\"203.0.113.7\",\"203.0.113.8\"]', \
-          1788352245, 1788220801)",
+         manual_protocol_override, resolved_at, created_at) VALUES \
+         (2, 'b.example', 'dns', 8443, '[]', NULL, NULL, 1788352245, 1788220801)",
         // e3: DNS with no resolution, a link whose protocol row is missing.
         "INSERT INTO endpoints (id, host, host_type, port, ports, last_source, \
-         manual_protocol_override, resolved_as, resolved_at, created_at) VALUES \
-         (3, 'c.example', 'dns', 443, '[]', NULL, NULL, '[]', NULL, \
+         manual_protocol_override, resolved_at, created_at) VALUES \
+         (3, 'c.example', 'dns', 443, '[]', NULL, NULL, NULL, \
           1788220802)",
+        // e1's address: the Ip sort needs more than one endpoint to have a
+        // key, and the fixture's only other DNS host (e3) must stay
+        // unresolved for the tier-5 case above.
+        "INSERT INTO endpoint_ip (endpoint_id, ip_key) VALUES \
+         (1, x'04' || x'c0a80101')",
+        // e2's addresses, written in the REVERSE of address order: the stored
+        // key is what orders them, so a row order that disagrees with it still
+        // reads back sorted (the property the whole `ip_key` design rests on).
+        "INSERT INTO endpoint_ip (endpoint_id, ip_key) VALUES \
+         (2, x'06' || x'20010db8000000000000000000000007')",
+        "INSERT INTO endpoint_ip (endpoint_id, ip_key) VALUES \
+         (2, x'04' || x'cb007108')",
+        "INSERT INTO endpoint_ip (endpoint_id, ip_key) VALUES \
+         (2, x'04' || x'cb007107')",
         // Protocols: ws+tls with every optional pinned, and tcp+reality bare.
         "INSERT INTO protocols (id, sig, proto_kind, transport_type, transport_data, \
          security_type, security_sni, security_fp, security_insecure, security_data, config, \
@@ -912,8 +960,8 @@ async fn page_projection_matches_the_orm_rows() {
             "{ctx}: manual_protocol_override"
         );
         assert_eq!(
-            typed.endpoint.resolved_as, projected.endpoint.resolved_as,
-            "{ctx}: resolved_as"
+            typed.resolved_ips, projected.resolved_ips,
+            "{ctx}: resolved_ips"
         );
         assert_eq!(
             typed.endpoint.resolved_at, projected.endpoint.resolved_at,

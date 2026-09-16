@@ -112,15 +112,20 @@ impl From<&ProfileStats> for RankLink {
 
 /// True when the endpoint is a DNS host whose resolution has not landed —
 /// the flag that collapses its links into one band (decision 16, tier 5).
+///
+/// The second input is "does it have any resolved address", which the
+/// `endpoint_ip` table answers (`EndpointRow::resolved_ips`). A failed lookup
+/// is not a different state: it stamps `resolved_at` and leaves the address
+/// set empty, which is exactly the unresolved band this flag is for.
 #[must_use]
-pub fn dns_unresolved_endpoint(host_type: HostType, resolved_as: &[String]) -> bool {
-    host_type == HostType::Dns && resolved_as.is_empty()
+pub const fn dns_unresolved_endpoint(host_type: HostType, has_address: bool) -> bool {
+    matches!(host_type, HostType::Dns) && !has_address
 }
 
 /// True for an [`EndpointRow`].
 #[must_use]
-pub fn dns_unresolved(row: &EndpointRow) -> bool {
-    dns_unresolved_endpoint(row.endpoint.host_type, &row.endpoint.resolved_as)
+pub const fn dns_unresolved(row: &EndpointRow) -> bool {
+    dns_unresolved_endpoint(row.endpoint.host_type, !row.resolved_ips.is_empty())
 }
 
 /// Index of the endpoint's display link.
@@ -380,6 +385,7 @@ pub(crate) async fn prune(
 pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Result<usize> {
     let endpoints: Vec<Endpoint> = Endpoint::all().exec(conn).await?;
     let links: Vec<ProfileStats> = ProfileStats::all().exec(conn).await?;
+    let resolved = resolved_endpoint_ids(conn).await?;
     let mut by_endpoint: HashMap<EndpointId, Vec<RankLink>> = HashMap::new();
     for link in links {
         by_endpoint
@@ -393,13 +399,36 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
             let links = by_endpoint.remove(&endpoint.id)?;
             compute_rank(
                 endpoint.id,
-                dns_unresolved_endpoint(endpoint.host_type, &endpoint.resolved_as),
+                dns_unresolved_endpoint(endpoint.host_type, resolved.contains(&endpoint.id.get())),
                 endpoint.manual_protocol_override.map(ProtocolId::get),
                 &links,
             )
         })
         .collect();
     write(conn, &ranks).await
+}
+
+/// The endpoints that have at least one resolved address, as a set.
+///
+/// The ordering law's DNS band is the only thing that reads it, and both
+/// readers (the wholesale backfill and the per-window refresh) need the same
+/// answer: "is this endpoint's address set non-empty". One grouped scan for
+/// the backfill, a correlated `EXISTS` for the window refresh.
+async fn resolved_endpoint_ids(
+    conn: &mut impl toasty::Executor,
+) -> crate::Result<std::collections::HashSet<i64>> {
+    let rows = toasty::sql::query("SELECT DISTINCT endpoint_id FROM endpoint_ip")
+        .exec(conn)
+        .await?;
+    let mut out = std::collections::HashSet::new();
+    for row in &rows {
+        if let Value::Record(record) = row
+            && let Some(Value::I64(id)) = record.fields.first()
+        {
+            out.insert(*id);
+        }
+    }
+    Ok(out)
 }
 
 /// Backfill rank rows for endpoints that have links but no row yet.
@@ -510,9 +539,14 @@ async fn load_raw_endpoints(
     conn: &mut impl toasty::Executor,
     id_list: &str,
 ) -> crate::Result<HashMap<i64, RawEndpoint>> {
+    // The DNS band's input is "has a resolved address", which is a question
+    // for `endpoint_ip`, not for the endpoint row — one correlated EXISTS in
+    // the statement that already reads the ids, so the refresh stays a single
+    // round trip.
     let rows = toasty::sql::query(format!(
-        "SELECT id, host_type, resolved_as, manual_protocol_override FROM endpoints \
-         WHERE id IN ({id_list})"
+        "SELECT e.id, e.host_type, \
+         EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id), \
+         e.manual_protocol_override FROM endpoints e WHERE e.id IN ({id_list})"
     ))
     .exec(conn)
     .await?;
@@ -524,14 +558,11 @@ async fn load_raw_endpoints(
             continue;
         };
         let host_type = field(1).and_then(as_text).unwrap_or_default();
-        let resolved_as = field(2)
-            .and_then(as_text)
-            .unwrap_or_else(|| "[]".to_string());
+        let has_address = field(2).and_then(as_i64).unwrap_or(0) != 0;
         out.insert(
             id,
             RawEndpoint {
-                dns_unresolved: host_type == "dns"
-                    && (resolved_as == "[]" || resolved_as.is_empty()),
+                dns_unresolved: host_type == "dns" && !has_address,
                 override_protocol: field(3).and_then(as_i64),
             },
         );

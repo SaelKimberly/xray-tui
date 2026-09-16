@@ -410,21 +410,18 @@ pub(crate) const fn page_sort(column: SortColumn) -> PageSort {
         SortColumn::Speed => PageSort::Speed,
         SortColumn::Traffic => PageSort::Traffic,
         SortColumn::LastSeen => PageSort::LastSeen,
+        SortColumn::Ip => PageSort::Ip,
     }
 }
 
 /// Whether the endpoint's DNS host is currently unresolved (no known IPs).
 ///
-/// Reads the persisted column — the same fact the ordering SQL reads — so the
-/// comparator and the query cannot disagree. `endpoint_info` supplies only the
-/// resolved IP list.
-pub(crate) fn endpoint_dns_unresolved(state: &AppState, row: &EndpointRow) -> bool {
-    use xray_tui_db::models::HostType;
-    row.endpoint.host_type == HostType::Dns
-        && state
-            .endpoint_info
-            .get(&row.endpoint.id.get())
-            .is_none_or(|i| i.resolved_ips.is_empty())
+/// The db crate's ordering law, applied to the loaded row — the same function
+/// the stored rank keys are computed with, so the comparator, the page SQL and
+/// the keys cannot disagree. `state.endpoint_info` is a display cache and is
+/// deliberately not consulted: it can lag the row.
+pub(crate) const fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow) -> bool {
+    xray_tui_db::endpoint_rank::dns_unresolved(row)
 }
 
 /// Resolve which core a profile row should use, considering (in order):
@@ -1295,7 +1292,6 @@ pub(crate) mod test_support {
             ports: Vec::new(),
             last_source: None,
             manual_protocol_override: None,
-            resolved_as: Vec::new(),
             resolved_at: None,
             created_at: ts(0),
             links: Deferred::default(),
@@ -1338,6 +1334,7 @@ pub(crate) mod test_support {
             endpoint,
             links,
             protocols,
+            resolved_ips: Vec::new(),
             selected_protocol: 0,
             expanded: false,
         }

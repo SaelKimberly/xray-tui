@@ -863,7 +863,7 @@ fn render_data_grid(
     // Map sort state to DataTable column indices
     let sort_column = match state.sort_column {
         SortColumn::ConfigType => Some(9),
-        SortColumn::Address | SortColumn::Port => Some(5),
+        SortColumn::Address | SortColumn::Port | SortColumn::Ip => Some(5),
         SortColumn::Test => Some(11),
         SortColumn::LastSeen | SortColumn::Speed | SortColumn::Traffic => None,
     };
@@ -1716,12 +1716,12 @@ mod tests {
                 ports: Vec::new(),
                 last_source: None,
                 manual_protocol_override: None,
-                resolved_as: Vec::new(),
                 resolved_at: None,
                 created_at: crate::ops::profiles::test_support::ts(0),
                 links: toasty::Deferred::default(),
                 group_links: toasty::Deferred::default(),
             },
+            resolved_ips: Vec::new(),
             links: Vec::new(),
             protocols: std::collections::HashMap::new(),
             selected_protocol: 0,

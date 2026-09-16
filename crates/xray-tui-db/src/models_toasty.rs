@@ -220,11 +220,10 @@ pub struct Endpoint {
     pub last_source: Option<String>, // hash of source subscription
     /// Manual protocol override (FK -> protocols.id); NULL = auto-select best.
     pub manual_protocol_override: Option<ProtocolId>,
-    /// Cached DNS resolution of `host` for `host_type == Dns`: the resolved
-    /// IP strings. Empty = not resolved yet or host is an IP. Persisted so
-    /// launches do not re-resolve.
-    pub resolved_as: Vec<String>,
-    /// Timestamp of the `resolved_as` lookup; NULL = never / IP host.
+    /// Timestamp of the DNS lookup that produced this endpoint's addresses;
+    /// NULL = never, or the host is an IP. The addresses themselves live in
+    /// [`EndpointIp`] (one row per address) — this column is the TTL gate, so
+    /// it stays here: an attempt that resolved nothing still has to age out.
     pub resolved_at: Option<i64>, // epoch seconds
     pub created_at: i64, // epoch seconds; writers stamp it (no `#[auto]`: on an
     // integer column toasty's auto strategy is Increment, not "now")
@@ -232,6 +231,45 @@ pub struct Endpoint {
     pub links: Deferred<Vec<ProfileStats>>,
     #[has_many]
     pub group_links: Deferred<Vec<EndpointGroup>>,
+}
+
+/// One resolved address of one DNS endpoint (`endpoint_ip`).
+///
+/// Replaces the JSON-array `endpoints.resolved_as` column: the set is
+/// relational, so an address is stored once (the PK is
+/// `(endpoint_id, ip_key)`) and it is queryable and orderable.
+///
+/// The column IS the address — a packed encoding (`crate::endpoint_ip`): a
+/// family byte (the `IpAddr` discriminant: 4 = IPv4, 6 = IPv6) then the
+/// big-endian octets. Byte order is therefore numeric order, and every IPv4
+/// sorts before every IPv6. There is no second, textual column: the text is
+/// rendered from the bytes on read (`Ipv4Addr`/`Ipv6Addr`), which is an
+/// 8/16-byte copy, not a parse, and one fact cannot disagree with itself.
+///
+/// That is the one thing the engine's own `inet` type cannot do. Turso 0.7.2
+/// declares it `BASE text ENCODE validate_ipaddr(value) DECODE value` — no
+/// `OPERATOR '<'`, so `ORDER BY ip` / `CREATE INDEX … (ip)` are parse errors;
+/// adding the operator makes them legal but orders the TEXT form, i.e.
+/// `10.0.0.1 < 9.0.0.1` (measured 2026-09-15,
+/// `docs/aegis/specs/2026-09-15-endpoint-ip-storage-design.md`).
+///
+/// The rows of one endpoint are a SET keyed by the address, so the displayed
+/// order is canonical (IPv4 by address, then IPv6) rather than whatever order
+/// the resolver happened to return. Nothing else about the value changes.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "endpoint_ip"]
+#[key(endpoint_id, ip_key)]
+pub struct EndpointIp {
+    /// No `#[index]` of its own: it is the FIRST PK column, so the composite
+    /// PK's autoindex `(endpoint_id, ip_key)` already serves the per-endpoint
+    /// reads (`… WHERE endpoint_id IN (…)` seeks that prefix). The `#[index]`
+    /// on `profile_stats.endpoint_id` exists because there it is the SECOND PK
+    /// column — a suffix, which no prefix seek reaches.
+    pub endpoint_id: EndpointId,
+    /// The address, packed; the PK's second half, so duplicates cannot exist.
+    pub ip_key: Vec<u8>,
+    #[belongs_to(key = endpoint_id, references = id)]
+    pub endpoint: Deferred<Option<Endpoint>>,
 }
 
 /// `Protocol`: a protocol configuration.
@@ -444,6 +482,10 @@ pub struct EndpointRow {
     pub endpoint: Endpoint,
     pub links: Vec<ProfileStats>, // per-pair state, sorted by test priority
     pub protocols: HashMap<ProtocolId, Protocol>, // included via links
+    /// The endpoint's resolved addresses, in key order (the display order) —
+    /// read from `endpoint_ip`, the table that owns them. Empty = not a DNS
+    /// host, or not resolved yet (the distinction is `endpoint.host_type`).
+    pub resolved_ips: Vec<std::net::IpAddr>,
     pub selected_protocol: usize, // index into links
     pub expanded: bool,
 }
@@ -559,12 +601,12 @@ mod tests {
                 ports: Vec::new(),
                 last_source: None,
                 manual_protocol_override: None,
-                resolved_as: Vec::new(),
                 resolved_at: None,
                 created_at: 0,
                 links: Deferred::default(),
                 group_links: Deferred::default(),
             },
+            resolved_ips: Vec::new(),
             links: Vec::new(),
             protocols: HashMap::new(),
             selected_protocol: 0,
@@ -1067,7 +1109,6 @@ mod tests {
             host_type: HostType::Ipv4,
             port: 443,
             ports: Vec::<u16>::new(),
-            resolved_as: Vec::<String>::new(),
         })
         .exec(&mut db)
         .await

@@ -8112,7 +8112,6 @@ dependencies = [
  "flate2",
  "futures-util",
  "heed",
- "jiff",
  "libc",
  "postcard",
  "prost",

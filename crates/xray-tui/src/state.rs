@@ -272,7 +272,6 @@ pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
         ports: ep.ports.clone(),
         last_source: None,
         manual_protocol_override: None,
-        resolved_as: Vec::new(),
         resolved_at: None,
         created_at: xray_tui_db::models::now_epoch(),
         links: Deferred::default(),

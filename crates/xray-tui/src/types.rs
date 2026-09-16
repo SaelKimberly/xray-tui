@@ -232,6 +232,8 @@ pub enum SortColumn {
     Speed,
     Traffic,
     LastSeen,
+    /// The endpoint's lowest resolved address (`endpoint_ip`).
+    Ip,
 }
 
 #[derive(Debug, Clone)]

@@ -240,7 +240,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
     // DNS resolutions changed this pass, flushed as ONE spawned task after
     // the drain (see the `persist_batch.push` in the EndpointInfoUpdated arm).
     // `(endpoint, resolved IPs, epoch seconds of the lookup)`.
-    let mut persist_batch: Vec<(EndpointId, Vec<String>, i64)> = Vec::new();
+    let mut persist_batch: Vec<(EndpointId, Vec<std::net::IpAddr>, i64)> = Vec::new();
     while let Some(rx) = state.core_event_rx.as_mut() {
         let event = match rx.try_recv() {
             Ok(event) => event,
@@ -820,7 +820,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // would block the startup seeding pass and make
                 // `should_resolve` treat the endpoint as a never-retried IP
                 // host.
-                let mut persist: Option<(Vec<String>, i64)> = None;
+                let mut persist: Option<(Vec<std::net::IpAddr>, i64)> = None;
                 if !info.resolved_ips.is_empty()
                     || info.sni_whitelisted.is_some()
                     || info.outbound_ip.is_some()
@@ -845,12 +845,11 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         if entry.resolved_at_secs.is_some()
                             && had_resolved_at != entry.resolved_at_secs
                         {
+                            // The addresses go to the database as they are:
+                            // `endpoint_ip` stores the packed address, so
+                            // nothing renders text on the write path.
                             persist = Some((
-                                entry
-                                    .resolved_ips
-                                    .iter()
-                                    .map(std::string::ToString::to_string)
-                                    .collect::<Vec<_>>(),
+                                entry.resolved_ips.clone(),
                                 entry.resolved_at_secs.unwrap_or(0),
                             ));
                         }
@@ -870,11 +869,11 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 }
                 // Persist DNS resolutions (DNS hosts only) so launches don't
                 // re-resolve; the TTL gate applies across restarts.
-                if let Some((resolved_as, resolved_at)) = persist {
+                if let Some((resolved_ips, resolved_at)) = persist {
                     // Batched: one spawned flush per poll instead of one
                     // task per event — an enrichment flood must not create
                     // thousands of concurrent DB write tasks.
-                    persist_batch.push((EndpointId::new(endpoint_id), resolved_as, resolved_at));
+                    persist_batch.push((EndpointId::new(endpoint_id), resolved_ips, resolved_at));
                 }
 
                 // DNS flip (unresolved -> resolved): lift the endpoint's
@@ -908,11 +907,11 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
     if !persist_batch.is_empty() {
         let db = state.db.clone();
         tokio::spawn(async move {
-            for (eid, resolved_as, resolved_at) in persist_batch {
-                // `resolved_as` + `resolved_at` are the ONLY owner of a DNS
-                // endpoint's resolutions (the resolved-IP child rows are gone).
+            for (eid, resolved_ips, resolved_at) in persist_batch {
+                // The address set (`endpoint_ip`) + `resolved_at` are the
+                // ONLY owner of a DNS endpoint's resolutions.
                 if let Err(e) = db
-                    .update_endpoint_resolution(eid, resolved_as, resolved_at)
+                    .update_endpoint_resolution(eid, resolved_ips, resolved_at)
                     .await
                 {
                     tracing::warn!(

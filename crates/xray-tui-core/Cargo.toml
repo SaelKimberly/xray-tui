@@ -68,7 +68,6 @@ xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 	[dev-dependencies]
 	toasty = { workspace = true, features = ["serde"] }
-	jiff.workspace = true
 
 	[package.metadata.cargo-machete]
 	# Deps used only by build.rs / OUT_DIR-generated code (invisible to
