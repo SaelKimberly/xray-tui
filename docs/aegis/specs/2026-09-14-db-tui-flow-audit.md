@@ -165,6 +165,15 @@ Decisions this changed:
 
 **Phase 2 (gate, writes, import, retention)**
 
+> **Superseded 2026-09-16 (ADR 0002 amendment 4):** the per-row `UPDATE` and the `VALUES`-CTE
+> existence probe described in the first bullet are both **retired**. Both link writers now emit one
+> multi-row `INSERT … VALUES (…),(…) ON CONFLICT(protocol_id, endpoint_id) DO UPDATE …` per (400-row
+> statement chunk, `ON CONFLICT` action) — the action bucketed by the patch's column groups with
+> `contains`, `DO NOTHING` when a patch carries none — so the probe's predicate shape and
+> `SQLITE_MAX_EXPR_DEPTH` no longer constrain this path. Measured 29.0 → 10.0 ms per 512-patch window
+> and 360 → 44.3 ms per 2 000 imported links. The bullets below are the record of what phase 2
+> delivered at the time; `docs/database-manual-sql.md` is the current authority for the shapes.
+
 - The gate's persistence seam (`SchedulerDb`) is gone from the batch's hot path: it reads the
   caller's snapshot and its own staged state, so a transition costs a map lookup. The writer's
   drain now coalesces one patch per link (three column groups → one write), and
