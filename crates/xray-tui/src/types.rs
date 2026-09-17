@@ -504,6 +504,11 @@ pub enum CoreEvent {
         speed_bps: Option<u64>,
         ip_info: Option<String>,
         error: Option<String>,
+        /// The purge verdict this failure earns, from the probe's typed
+        /// evidence (`ops::purge::reason_for`). `None` for every path that did
+        /// not classify one — including the batch, which stages its own result
+        /// and never routes the verdict through this event.
+        purge: Option<xray_tui_db::models::PurgeReason>,
     },
     /// Result of a version check for a proxy backend.
     UpdateCheckResult {

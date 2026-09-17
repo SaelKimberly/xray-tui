@@ -9,7 +9,6 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
-use xray_tui_db::LinkGroups;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{
     Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, TaskKind,
@@ -165,6 +164,7 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 speed_bps: None,
                 ip_info: None,
                 error,
+                purge: None,
             },
             "tcp_ping_result",
         );
@@ -241,6 +241,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         speed_bps: None,
                         ip_info: None,
                         error: Some("Protocol row not found for real ping".to_string()),
+                        purge: None,
                     },
                     "real_ping_protocol_missing",
                 );
@@ -257,6 +258,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                         speed_bps: None,
                         ip_info: None,
                         error: Some(format!("Failed to load protocol: {e}")),
+                        purge: None,
                     },
                     "real_ping_protocol_load",
                 );
@@ -278,6 +280,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                     speed_bps: None,
                     ip_info: None,
                     error: Some(untestable_marker_text(reason)),
+                    purge: None,
                 },
                 "real_ping_untestable",
             );
@@ -295,9 +298,17 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
             },
         )
         .await;
-        let (latency_ms, ip_info, error) = match result {
-            Ok(r) => (Some(r.latency_ms), r.ip_info, None),
-            Err(e) => (None, None, Some(e.text)),
+        // The typed evidence the engine reported becomes the purge verdict —
+        // the only place a single ping can earn one (the taxonomy lives in
+        // `ops::purge`, never here).
+        let (latency_ms, ip_info, error, purge) = match result {
+            Ok(r) => (Some(r.latency_ms), r.ip_info, None, None),
+            Err(e) => (
+                None,
+                None,
+                Some(e.text),
+                e.evidence.and_then(crate::ops::purge::reason_for),
+            ),
         };
 
         try_send_or_warn(
@@ -310,6 +321,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 speed_bps: None,
                 ip_info,
                 error,
+                purge,
             },
             "real_ping_result",
         );
@@ -370,6 +382,7 @@ pub fn start_speed_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64
                 speed_bps,
                 ip_info: None,
                 error,
+                purge: None,
             },
             "speed_test_result",
         );
@@ -425,6 +438,7 @@ pub fn start_udp_test(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
                 speed_bps: None,
                 ip_info: None,
                 error,
+                purge: None,
             },
             "udp_test_result",
         );
@@ -540,6 +554,10 @@ enum ProbeOutcome {
         /// phase's probe cannot succeed either. Set only by the fast runner
         /// (see [`classify_fast_failure`]).
         hard: bool,
+        /// What the failure PROVES, when the engine reported it. Set only by
+        /// the real runner: a fast probe's TCP handshake proves nothing about
+        /// the config, which is why no fast path can earn a purge verdict.
+        evidence: Option<xray_tui_native::error::FailureEvidence>,
     },
 }
 
@@ -551,6 +569,10 @@ impl ProbeOutcome {
             text: text.into(),
             class: ProbeClass::Config,
             hard: false,
+            // Never evidence: this constructor is how "not testable by the
+            // native engine" and the batch's own bookkeeping failures arrive,
+            // and neither is a statement about the config's quality.
+            evidence: None,
         }
     }
 }
@@ -648,6 +670,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                         class,
                         hard,
                         text: e.to_string(),
+                        evidence: None,
                     }
                 }
             }
@@ -670,6 +693,7 @@ impl BatchProbeRunner for EngineProbeRunner {
                     text: e.text,
                     class: e.class,
                     hard: false,
+                    evidence: e.evidence,
                 },
             }
         })
@@ -1573,12 +1597,17 @@ impl BatchShared {
     /// import moves every endpoint's ordering keys) used to drop those results
     /// silently. Staging here is what makes "emitted == persisted" hold.
     fn stage_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
-        let (latency_ms, ip_info, error) = match outcome {
+        let (latency_ms, ip_info, error, purge) = match outcome {
             ProbeOutcome::Ok {
                 latency_ms,
                 ip_info,
-            } => (*latency_ms, ip_info.as_deref(), None),
-            ProbeOutcome::Failed { text, .. } => (None, None, Some(text.as_str())),
+            } => (*latency_ms, ip_info.as_deref(), None, None),
+            ProbeOutcome::Failed { text, evidence, .. } => (
+                None,
+                None,
+                Some(text.as_str()),
+                evidence.and_then(crate::ops::purge::reason_for),
+            ),
         };
         let mut row = link.clone();
         if let Some(delay) = self
@@ -1588,10 +1617,12 @@ impl BatchShared {
         {
             row.latency = Some(Latency::Fast { delay: *delay });
         }
-        if crate::ops::events::apply_test_result(
-            &mut row, test_type, latency_ms, None, ip_info, error,
+        // The mapping returns the groups to write: RESULT always, plus PURGE
+        // when the verdict moved.
+        if let Some(groups) = crate::ops::events::apply_test_result(
+            &mut row, test_type, latency_ms, None, ip_info, error, purge,
         ) {
-            self.writer.stage(&row, LinkGroups::RESULT);
+            self.writer.stage(&row, groups);
         }
     }
 
@@ -1651,12 +1682,17 @@ impl BatchShared {
                 bump_class(&self.counters.phase2_fail, *class);
             }
         }
-        let (latency_ms, ip_info, error) = match outcome {
+        let (latency_ms, ip_info, error, purge) = match outcome {
             ProbeOutcome::Ok {
                 latency_ms,
                 ip_info,
-            } => (*latency_ms, ip_info.clone(), None),
-            ProbeOutcome::Failed { text, .. } => (None, None, Some(text.clone())),
+            } => (*latency_ms, ip_info.clone(), None, None),
+            ProbeOutcome::Failed { text, evidence, .. } => (
+                None,
+                None,
+                Some(text.clone()),
+                evidence.and_then(crate::ops::purge::reason_for),
+            ),
         };
         let endpoint_id = link.endpoint_id.get();
         let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
@@ -1674,6 +1710,7 @@ impl BatchShared {
                 speed_bps: None,
                 ip_info,
                 error,
+                purge,
             },
             "batch_ping_result",
         );
@@ -1758,6 +1795,7 @@ impl BatchShared {
                     speed_bps: None,
                     ip_info: None,
                     error: Some(text.clone()),
+                    purge: None,
                 },
                 "untestable_marker",
             );
@@ -2351,6 +2389,7 @@ mod tests {
                     text: "IO: Connection refused (os error 111)".to_string(),
                     class: ProbeClass::Refused,
                     hard: true,
+                    evidence: None,
                 },
             );
             by_addr.insert(
@@ -2691,6 +2730,10 @@ mod tests {
         let error = link.error.as_ref().expect("marker persisted");
         assert!(crate::ops::ping::is_untestable_marker(error), "{error:?}");
         assert!(error.text.contains("no native implementation"), "{error:?}");
+        assert_eq!(
+            link.purge_reason, None,
+            "a capability refusal is not evidence about the config: the              subprocess core may serve it (the marker is a result, not a verdict)"
+        );
     }
 
     #[test]
@@ -2876,6 +2919,7 @@ mod tests {
                 text: "IO: Connection refused (os error 111)".to_string(),
                 class: ProbeClass::Refused,
                 hard: true,
+                evidence: None,
             },
         );
         let plan = plan_from_rows(&rows);

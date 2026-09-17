@@ -7,6 +7,7 @@ pub mod native_connect;
 pub mod ping;
 pub mod ping_native;
 pub mod profiles;
+pub mod purge;
 pub mod scheduler;
 pub mod settings;
 pub mod stream_import;

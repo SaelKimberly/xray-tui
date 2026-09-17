@@ -18,7 +18,7 @@ use std::time::Duration;
 use xray_tui_db::models::Endpoint;
 use xray_tui_native::addr::TargetAddr;
 use xray_tui_native::context::NativeConnectParams;
-use xray_tui_native::error::NativeError;
+use xray_tui_native::error::{FailureEvidence, NativeError};
 use xray_tui_native::probe::{self, ProbeMethod, ProbeRequest};
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
@@ -94,6 +94,10 @@ impl ProbeClass {
 pub struct ProbeFailure {
     pub class: ProbeClass,
     pub text: String,
+    /// What the failure PROVES, when the engine reported it (spec §7). `None`
+    /// for a failure this module raised itself — the probe-URL shape, the
+    /// target request's own status — and for anything transient.
+    pub evidence: Option<FailureEvidence>,
 }
 
 impl ProbeFailure {
@@ -120,15 +124,20 @@ impl ProbeFailure {
         Self {
             class,
             text: err.to_string(),
+            evidence: err.evidence(),
         }
     }
 
     /// A failure this module raised itself (probe-URL shape, HTTP status).
+    ///
+    /// No evidence: the status of the probe's OWN target request says nothing
+    /// about the config, and neither does a malformed probe URL.
     #[must_use]
     pub fn local(class: ProbeClass, text: impl Into<String>) -> Self {
         Self {
             class,
             text: text.into(),
+            evidence: None,
         }
     }
 }

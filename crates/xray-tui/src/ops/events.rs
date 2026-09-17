@@ -6,7 +6,8 @@ use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::LinkGroups;
 use xray_tui_db::models::{
-    EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, ProfileStats, TrafficStats,
+    EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, ProfileStats, PurgeReason,
+    TrafficStats,
 };
 
 use crate::AppState;
@@ -69,17 +70,23 @@ const fn err_kind_for(test_type: TestType) -> ProfileErr {
 }
 
 /// Overlay one probe result onto `row`'s RESULT columns
-/// (`latency*` / `speed_bps` / `error*`).
+/// (`latency*` / `speed_bps` / `error*`) and, when the probe decides it, the
+/// PURGE column.
 ///
 /// The single mapping behind both writers of a result: this module's handler
 /// (which owns the in-memory page) and the batch's own writer staging in
 /// `ops/ping.rs` (which must not depend on the page — a page reload mid-batch
 /// used to drop every result whose row it no longer held, silently).
 ///
-/// Returns whether the row changed. A `Cancelled` error never persists: a
-/// stopped test is not a failure (the stop path emits `error:
-/// Some("Cancelled")` for sessions that never ran, and a marker would paint
-/// `[fast]`/`[real]` on endpoints whose tests were merely abandoned).
+/// Returns the column groups the caller must stage, or `None` when nothing
+/// changed. PURGE is included only when the verdict actually moved: it is the
+/// classifier's own group (ADR 0002), so a fast probe's result cannot rewrite
+/// it from a stale snapshot.
+///
+/// A `Cancelled` error never persists: a stopped test is not a failure (the
+/// stop path emits `error: Some("Cancelled")` for sessions that never ran, and
+/// a marker would paint `[fast]`/`[real]` on endpoints whose tests were merely
+/// abandoned).
 #[must_use]
 pub(crate) fn apply_test_result(
     row: &mut ProfileStats,
@@ -88,10 +95,11 @@ pub(crate) fn apply_test_result(
     speed_bps: Option<u64>,
     ip_info: Option<&str>,
     error: Option<&str>,
-) -> bool {
+    purge: Option<PurgeReason>,
+) -> Option<LinkGroups> {
     if let Some(err) = error {
         if err == "Cancelled" {
-            return false;
+            return None;
         }
         // Persisted failure marker — the profiles Test column renders
         // `[fast]`/`[real]` from `link.error.kind`; the measurement (if any)
@@ -100,7 +108,15 @@ pub(crate) fn apply_test_result(
             kind: err_kind_for(test_type),
             text: err.to_string(),
         });
-        return true;
+        // Only a real probe carries evidence; a fast result can never set a
+        // verdict (a TCP handshake proves nothing about the config).
+        if matches!(test_type, TestType::RealPing)
+            && let Some(reason) = purge
+        {
+            row.purge_reason = Some(reason);
+            return Some(LinkGroups::RESULT.union(LinkGroups::PURGE));
+        }
+        return Some(LinkGroups::RESULT);
     }
     match test_type {
         TestType::RealPing => {
@@ -115,7 +131,15 @@ pub(crate) fn apply_test_result(
         TestType::SpeedTest => row.speed_bps = speed_bps.map(|v| v as i64),
     }
     row.error = None;
-    true
+    // A data-carrying success THROUGH the tunnel proves the config works: a
+    // real probe built the tunnel from this link's own config, a speed test
+    // carried bytes over it. A TCP handshake proves neither, so `TcpPing` and
+    // `UdpTest` leave the verdict alone.
+    if matches!(test_type, TestType::RealPing | TestType::SpeedTest) && row.purge_reason.is_some() {
+        row.purge_reason = None;
+        return Some(LinkGroups::RESULT.union(LinkGroups::PURGE));
+    }
+    Some(LinkGroups::RESULT)
 }
 
 /// The exit IP out of a probe's `"<ip> | <country>"` answer.
@@ -491,6 +515,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 speed_bps,
                 ip_info,
                 error,
+                purge,
             } => {
                 // The test result mutates link latency/speed/error and the
                 // testing_details map — the profiles display cache must
@@ -533,17 +558,19 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                             .find(|l| l.protocol_id.get() == protocol_id)
                         {
                             // Staged, not committed: the flush task batches
-                            // it off the UI task. A stopped test returns
-                            // `false` and stages nothing.
-                            if apply_test_result(
+                            // it off the UI task. A stopped test returns `None`
+                            // and stages nothing, and the returned groups carry
+                            // PURGE only when the verdict moved.
+                            if let Some(groups) = apply_test_result(
                                 link,
                                 test_type,
                                 latency_ms,
                                 speed_bps,
                                 ip_info.as_deref(),
                                 error.as_deref(),
+                                purge,
                             ) {
-                                writer.stage(link, LinkGroups::RESULT);
+                                writer.stage(link, groups);
                             }
                         }
                     } else {
@@ -1090,6 +1117,143 @@ mod tests {
 
     use super::*;
 
+    /// The verdict rule, which is the whole point of the PURGE group: only a
+    /// REAL probe can move it, and only a data-carrying success can clear it.
+    #[test]
+    fn only_a_real_probe_moves_the_purge_verdict() {
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+        assert_eq!(link.purge_reason, None);
+
+        // A fast failure — even one the caller handed a verdict — sets
+        // LATENCY/ERROR only. (The batch never supplies one for a fast probe;
+        // this pins the guard rather than the caller's discipline.)
+        let groups = apply_test_result(
+            &mut link,
+            TestType::TcpPing,
+            None,
+            None,
+            None,
+            Some("timeout after 5s"),
+            Some(PurgeReason::TransportRejected),
+        )
+        .expect("changed");
+        assert_eq!(
+            groups,
+            LinkGroups::RESULT,
+            "no PURGE group for a fast probe"
+        );
+        assert_eq!(link.purge_reason, None, "a TCP handshake proves nothing");
+
+        // A real failure with evidence earns the verdict, in its own group.
+        let groups = apply_test_result(
+            &mut link,
+            TestType::RealPing,
+            None,
+            None,
+            None,
+            Some("REALITY error: received real certificate"),
+            Some(PurgeReason::RealityFallback),
+        )
+        .expect("changed");
+        assert!(groups.contains(LinkGroups::PURGE), "the verdict moved");
+        assert_eq!(link.purge_reason, Some(PurgeReason::RealityFallback));
+
+        // A real failure WITHOUT evidence (a timeout) leaves it alone.
+        let groups = apply_test_result(
+            &mut link,
+            TestType::RealPing,
+            None,
+            None,
+            None,
+            Some("timeout on probe attempt (limit 5s)"),
+            None,
+        )
+        .expect("changed");
+        assert!(!groups.contains(LinkGroups::PURGE));
+        assert_eq!(link.purge_reason, Some(PurgeReason::RealityFallback));
+
+        // A fast SUCCESS must not clear it either.
+        let _ = apply_test_result(
+            &mut link,
+            TestType::TcpPing,
+            Some(42),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(link.purge_reason, Some(PurgeReason::RealityFallback));
+
+        // A real success clears it, and says so.
+        let groups = apply_test_result(
+            &mut link,
+            TestType::RealPing,
+            Some(120),
+            None,
+            Some("198.51.100.9 | DE"),
+            None,
+            None,
+        )
+        .expect("changed");
+        assert!(groups.contains(LinkGroups::PURGE), "the verdict moved back");
+        assert_eq!(link.purge_reason, None);
+
+        // And a Cancelled result is not a result at all.
+        link.purge_reason = Some(PurgeReason::NotTls);
+        assert_eq!(
+            apply_test_result(
+                &mut link,
+                TestType::RealPing,
+                None,
+                None,
+                None,
+                Some("Cancelled"),
+                None,
+            ),
+            None,
+            "a stopped test stages nothing"
+        );
+        assert_eq!(link.purge_reason, Some(PurgeReason::NotTls));
+    }
+
+    /// A speed test rides an established tunnel, so its success is a
+    /// data-carrying proof too — it clears a verdict, and its own failures
+    /// (which carry no evidence) never set one.
+    #[test]
+    fn a_speed_test_success_also_clears_the_verdict() {
+        let mut link = fake_row(1, "h.example", 1).links.remove(0);
+        link.purge_reason = Some(PurgeReason::OriginUnreachable);
+
+        let groups = apply_test_result(
+            &mut link,
+            TestType::SpeedTest,
+            None,
+            Some(9_000_000),
+            None,
+            None,
+            None,
+        )
+        .expect("changed");
+        assert!(groups.contains(LinkGroups::PURGE));
+        assert_eq!(link.purge_reason, None);
+
+        let groups = apply_test_result(
+            &mut link,
+            TestType::SpeedTest,
+            None,
+            None,
+            None,
+            Some("Connection refused"),
+            None,
+        )
+        .expect("changed");
+        assert!(
+            !groups.contains(LinkGroups::PURGE),
+            "no evidence, no verdict"
+        );
+        assert_eq!(link.purge_reason, None);
+    }
+
     /// Multi-protocol endpoint fixture. Protocol ids `[start..start+n]`.
     fn row_with_protocols(endpoint_id: i64, n: usize, start: i64) -> EndpointRow {
         let mut row = fake_row(endpoint_id, &format!("h{endpoint_id}.example"), n);
@@ -1362,6 +1526,7 @@ mod tests {
                 speed_bps: None,
                 ip_info: None,
                 error: None,
+                purge: None,
             })
             .await
             .expect("send");
@@ -1759,6 +1924,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -1800,6 +1966,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -1857,6 +2024,7 @@ mod tests {
             speed_bps: None,
             ip_info: Some("5.6.7.8|US".to_string()),
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -1899,6 +2067,7 @@ mod tests {
             speed_bps: None,
             ip_info: Some("1.2.3.4|US".to_string()),
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -1939,6 +2108,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: Some("timeout".to_string()),
+            purge: None,
         })
         .await
         .unwrap();
@@ -1976,6 +2146,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -2012,6 +2183,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -2052,6 +2224,7 @@ mod tests {
             speed_bps: None,
             ip_info: Some("1.2.3.4|US".to_string()),
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -2086,6 +2259,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: Some("Cancelled".to_string()),
+            purge: None,
         })
         .await
         .unwrap();
@@ -2206,6 +2380,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
@@ -2226,6 +2401,7 @@ mod tests {
             speed_bps: None,
             ip_info: None,
             error: None,
+            purge: None,
         })
         .await
         .unwrap();
