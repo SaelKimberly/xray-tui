@@ -590,10 +590,16 @@ impl EndpointRow {
     /// measured the current selection is kept. A pinned manual override is
     /// unaffected — `active_link()` checks it first.
     pub fn select_best_measured_link(&mut self) {
+        // The purge gate, mirroring `endpoint_rank::display_link_index`: a
+        // purged link never supplies the row's headline delay while a live link
+        // exists, and an all-purged endpoint falls back to its purged links
+        // (the Purgatory view's case).
+        let live = self.links.iter().any(|l| l.purge_reason.is_none());
         let Some((best, _)) = self
             .links
             .iter()
             .enumerate()
+            .filter(|(_, l)| !live || l.purge_reason.is_none())
             .filter_map(|(i, l)| {
                 let (rank, delay) = match l.latency {
                     Some(Latency::Real { delay, .. }) => (0u8, delay),
@@ -704,6 +710,16 @@ mod tests {
         }
     }
 
+    /// Stamp a purge verdict on one link — the classifier's write.
+    fn purge(r: &mut EndpointRow, pid: i64, reason: PurgeReason) {
+        let link = r
+            .links
+            .iter_mut()
+            .find(|l| l.protocol_id.get() == pid)
+            .expect("link exists");
+        link.purge_reason = Some(reason);
+    }
+
     #[test]
     fn select_best_measured_link_prefers_real_ok_lowest_delay() {
         // fast-ok 44 + error marker, real-ok 50, untested — the measured
@@ -747,6 +763,58 @@ mod tests {
         ]);
         r.select_best_measured_link();
         assert_eq!(r.selected_protocol, 0);
+    }
+
+    #[test]
+    fn select_best_measured_link_skips_a_purged_link() {
+        // The purged link has the better delay, and must not supply the row's
+        // headline numbers while a live link exists.
+        let mut r = row(&[(10, 1, Some(fast(10)), None), (11, 2, Some(fast(90)), None)]);
+        purge(&mut r, 10, PurgeReason::NotTls);
+        r.select_best_measured_link();
+        assert_eq!(
+            r.active_link().map(|l| l.protocol_id.get()),
+            Some(11),
+            "a purged link is not the display link"
+        );
+    }
+
+    #[test]
+    fn select_best_measured_link_falls_back_when_every_link_is_purged() {
+        // The Purgatory view's case: nothing live, so the row still shows the
+        // values its links have.
+        let mut r = row(&[(10, 1, Some(fast(10)), None), (11, 2, Some(fast(90)), None)]);
+        purge(&mut r, 10, PurgeReason::NotTls);
+        purge(&mut r, 11, PurgeReason::OriginUnreachable);
+        r.select_best_measured_link();
+        assert_eq!(
+            r.active_link().map(|l| l.protocol_id.get()),
+            Some(10),
+            "all purged: the best measured purged link still shows"
+        );
+    }
+
+    #[test]
+    fn purged_links_sink_below_every_live_tier() {
+        // The purged link carries the best measurement of the three (real-ok
+        // 12ms) and must still sort last: tier 6 is below every live band.
+        let mut r = row(&[
+            (10, 1, Some(real(12)), None),
+            (11, 2, Some(fast(90)), None),
+            (12, 3, None, None),
+        ]);
+        purge(&mut r, 10, PurgeReason::RealityFallback);
+        r.sort_links_by_test_priority(false);
+        assert_eq!(
+            ids(&r),
+            vec![11, 12, 10],
+            "live fast-ok, live untested, then the purged real-ok"
+        );
+        assert_eq!(
+            r.best_test_priority_key(false).expect("key").0,
+            1,
+            "the endpoint's representative key follows a LIVE link"
+        );
     }
 
     #[test]

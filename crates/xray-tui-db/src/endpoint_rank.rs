@@ -48,16 +48,25 @@ pub struct RankLink {
     pub speed: Option<i64>,
     pub traffic: i64,
     pub config: ConfigType,
+    /// The link carries a purge verdict (spec `2026-09-17-purge-reason`). It can
+    /// no longer represent the endpoint while a live link exists.
+    pub purged: bool,
 }
 
 impl RankLink {
     /// Ascending key `(tier, latency, -seen, protocol_id)` — the decision-16
     /// law, mirroring the retired SQL bands:
     /// 0 real-ok, 1 fast-ok, 2 untested, 3 real/name-err, 4 fast-err,
-    /// 5 dns-unresolved. Only success tiers carry a delay.
+    /// 5 dns-unresolved, 6 purged. Only success tiers carry a delay.
+    ///
+    /// Tier 6 sits below every live band, so an endpoint's representative key is
+    /// a live link whenever one exists; an endpoint whose links are all purged
+    /// still gets a deterministic position for the Purgatory/All views.
     #[must_use]
     pub const fn key(&self, dns_unresolved: bool) -> (u8, i32, i64, i64) {
-        let tier = if dns_unresolved {
+        let tier = if self.purged {
+            6
+        } else if dns_unresolved {
             5
         } else if let Some(kind) = &self.error_kind {
             match kind {
@@ -106,6 +115,7 @@ impl From<&ProfileStats> for RankLink {
                 .total_up
                 .saturating_add(link.traffic.total_down),
             config: link.config_type,
+            purged: link.purge_reason.is_some(),
         }
     }
 }
@@ -136,16 +146,29 @@ pub const fn dns_unresolved(row: &EndpointRow) -> bool {
 /// the selected link (the first link when nothing was ever measured), while
 /// the ordering law treats "no measurement" as a sentinel that sorts first
 /// ascending.
+///
+/// The purge gate: a purged link never sources the endpoint's displayed values
+/// while a live link exists — the tier-6 sink applied to the display
+/// preference, and it covers the override branch too (checking `display_rank`
+/// would not: the override early-returns on the protocol id). A pin therefore
+/// cannot resurrect a purged link as the Active row's delay/exit-IP/speed/
+/// traffic/config source. An endpoint whose links are ALL purged falls back to
+/// them, so a Purgatory row still shows the values it has.
 #[must_use]
 pub fn display_link_index(links: &[RankLink], override_protocol: Option<i64>) -> Option<usize> {
+    let live = links.iter().any(|l| !l.purged);
+    let eligible = |l: &RankLink| !live || !l.purged;
     if let Some(pid) = override_protocol
-        && let Some(index) = links.iter().position(|l| l.protocol_id == pid)
+        && let Some(index) = links
+            .iter()
+            .position(|l| l.protocol_id == pid && eligible(l))
     {
         return Some(index);
     }
     links
         .iter()
         .enumerate()
+        .filter(|(_, l)| eligible(l))
         .filter_map(|(i, l)| {
             l.display_rank()
                 .map(|rank| (i, rank, l.delay, l.protocol_id))
@@ -172,7 +195,16 @@ pub fn compute_rank(
 ) -> Option<EndpointRank> {
     let (tier, latency, neg_seen, protocol) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
     let display = display_link_index(links, override_protocol).map(|i| links[i]);
-    let newest_seen = links.iter().map(|l| l.seen_secs).max().unwrap_or(0);
+    // The view windows ask whether any LIVE link falls in the band. A
+    // purged-only endpoint therefore reports `NO_SEEN`, which is below every
+    // window bound — that is exactly "it belongs to Purgatory" (spec §5), and it
+    // is why one index range serves both populations.
+    let newest_seen = links
+        .iter()
+        .filter(|l| !l.purged)
+        .map(|l| l.seen_secs)
+        .max()
+        .unwrap_or(NO_SEEN);
     Some(EndpointRank {
         endpoint_id,
         dns: i64::from(dns_unresolved),
@@ -482,7 +514,8 @@ pub(crate) async fn refresh(
     let mut links: HashMap<i64, Vec<RankLink>> = HashMap::new();
     let rows = toasty::sql::query(format!(
         "SELECT endpoint_id, protocol_id, error_kind, latency, latency_delay, \
-         last_seen_at, speed_bps, traffic_total_up, traffic_total_down, config_type \
+         last_seen_at, speed_bps, traffic_total_up, traffic_total_down, config_type, \
+         purge_reason \
          FROM profile_stats WHERE endpoint_id IN ({id_list})"
     ))
     .exec(conn)
@@ -515,6 +548,9 @@ pub(crate) async fn refresh(
                 Some("form") => ConfigType::Form,
                 _ => ConfigType::ShareUrl,
             },
+            // A NULL column is a live link; any stored spelling is a verdict
+            // (the value itself is the page's business, not the rank law's).
+            purged: field(10).and_then(as_text).is_some(),
         });
     }
 
@@ -590,5 +626,91 @@ fn parse_error_kind(text: &str) -> Option<ProfileErr> {
         "fast" => Some(ProfileErr::Fast),
         "name" => Some(ProfileErr::Name),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn link(protocol_id: i64, measured: Option<bool>, delay: i32, seen: i64) -> RankLink {
+        RankLink {
+            protocol_id,
+            measured,
+            delay,
+            error_kind: None,
+            seen_secs: seen,
+            speed: None,
+            traffic: 0,
+            config: ConfigType::ShareUrl,
+            purged: false,
+        }
+    }
+
+    #[test]
+    fn purged_links_sink_below_every_live_tier_including_dns() {
+        let mut purged = link(1, Some(true), 5, 100);
+        purged.purged = true;
+        assert_eq!(purged.key(false).0, 6, "purged is its own band");
+        assert_eq!(purged.key(true).0, 6, "and it outranks the DNS collapse");
+        assert_eq!(
+            purged.key(false).1,
+            i32::MAX,
+            "a purged link carries no latency into the order"
+        );
+        // Below a fast/real error band: a purged real-ok link must not lead.
+        let fast_err = RankLink {
+            error_kind: Some(ProfileErr::Fast),
+            ..link(2, None, 0, 1)
+        };
+        assert!(fast_err.key(false) < purged.key(false));
+    }
+
+    #[test]
+    fn newest_seen_is_the_live_only_maximum() {
+        let mut purged = link(1, Some(false), 10, 9_000);
+        purged.purged = true;
+        let links = [link(2, None, 0, 100), purged];
+        let rank = compute_rank(EndpointId::new(1), false, None, &links).expect("rank");
+        assert_eq!(
+            rank.newest_seen, 100,
+            "a purged link's recency does not keep the endpoint in the Active window"
+        );
+        assert_eq!(rank.tier, 2, "the live untested link is the representative");
+
+        let all_purged = [purged];
+        let rank = compute_rank(EndpointId::new(1), false, None, &all_purged).expect("rank");
+        assert_eq!(
+            rank.newest_seen, NO_SEEN,
+            "no live link -> below every window bound (Purgatory)"
+        );
+        assert_eq!(rank.tier, 6);
+    }
+
+    #[test]
+    fn a_pin_cannot_resurrect_a_purged_link_as_the_display_link() {
+        let mut purged = link(10, Some(false), 10, 5);
+        purged.purged = true;
+        let links = [purged, link(11, Some(false), 90, 5)];
+        assert_eq!(
+            display_link_index(&links, Some(10)),
+            Some(1),
+            "the pinned purged link yields to the live one"
+        );
+        assert_eq!(
+            display_link_index(&links, Some(11)),
+            Some(1),
+            "a live pin is honoured"
+        );
+        let all_purged = [purged, {
+            let mut l = link(11, Some(false), 90, 5);
+            l.purged = true;
+            l
+        }];
+        assert_eq!(
+            display_link_index(&all_purged, None),
+            Some(0),
+            "all purged: the best measured purged link still displays"
+        );
     }
 }
