@@ -82,10 +82,22 @@ On `ProfileStats`:
     pub purge_reason: Option<PurgeReason>,
 ```
 
-- **Physical shape.** One nullable `TEXT` column `purge_reason` with toasty's
-  derived `CHECK` list, exactly as `core_type`/`error_kind` are stored. The
-  hand-written writers must spell the variants the way toasty does
-  (`purge_reason_str`, an exhaustive `const fn` mirroring `error_kind_str`);
+- **Physical shape (verified by probe, 2026-09-17).** toasty's derive emits
+  `Option<PurgeReason>` as exactly ONE nullable `TEXT` column — no separate
+  flag column — with a `CHECK` list of the variants rendered in snake_case:
+
+  ```sql
+  "purge_reason" TEXT CHECK ("purge_reason" IN ('reality_fallback',
+    'certificate_mismatch', 'certificate_expired', 'not_tls', 'config_invalid',
+    'transport_rejected', 'origin_unreachable'))
+  ```
+
+  Probe: a throwaway `toasty::Model` with `reason: Option<ProbeReason>` pushed
+  through `push_schema` emitted `"reason" TEXT CHECK ("reason" IN ('alpha',
+  'beta_gamma'))`, `Some(BetaGamma)` stored `'beta_gamma'` and `None` stored
+  `NULL` (the probe was removed after the run). The hand-written writers must
+  spell the variants the same way (`purge_reason_str`, an exhaustive `const fn`
+  mirroring `error_kind_str`); a wrong spelling is refused by the `CHECK`, and
   the statement-vs-schema test is what proves the spellings match.
 - **Schema tag 11 → 12.** A column cannot be added to an already-pushed table
   here (decision 4), so this is a **wipe**, not a migration.
@@ -106,7 +118,7 @@ Data Destruction Guard
 - Blocked Destructive Steps: shipping the tag bump without the copy above, and
   re-running the corpus before deciding the taxonomy is final
 - Confirmation Required: yes — the plan's first task takes it as a gate
-- Status: awaiting scoped confirmation at plan time
+- Status: confirmed by the user 2026-09-17 (bump to 12; corpus wipe accepted)
 ```
 
 ## 4. The ordering law (decision 16 amendment)
