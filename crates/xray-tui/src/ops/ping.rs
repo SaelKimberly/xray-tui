@@ -935,6 +935,16 @@ impl BatchShared {
     fn bump(phase: &crate::types::PhaseMeters, slot: &Mutex<(Instant, u32)>) {
         let done = phase.done.fetch_add(1, Ordering::Relaxed) + 1;
         let mut last = slot.lock();
+        if done == 1 {
+            // First result of this level: time the window from HERE. A slot
+            // created with the batch would include the idle stretch before the
+            // level's first settle — the live run of the fast+real pipeline (46
+            // real results in 8 s) sampled 1 result over ~5 s of that idle
+            // stretch, stored 0/s, and pinned the real ETA at `--` because no
+            // later settle crossed a fresh second boundary.
+            *last = (Instant::now(), done);
+            return;
+        }
         let elapsed = last.0.elapsed();
         if elapsed < Duration::from_secs(1) {
             return;
@@ -943,8 +953,10 @@ impl BatchShared {
             .unwrap_or(u64::MAX)
             .max(1);
         let delta = u64::from(done.saturating_sub(last.1));
+        // `rate_milli` is results/s × 1000 (`PhaseMeters::eta_secs` divides by
+        // it), so a delta over `elapsed_ms` scales by 1e6, not 1e3.
         phase.rate_milli.store(
-            u32::try_from(delta * 1000 / elapsed_ms).unwrap_or(u32::MAX),
+            u32::try_from(delta * 1_000_000 / elapsed_ms).unwrap_or(u32::MAX),
             Ordering::Relaxed,
         );
         *last = (Instant::now(), done);
@@ -3015,6 +3027,37 @@ mod tests {
         assert_eq!(m.eta_secs(), Some(50), "100 left at 2/s");
         m.done.store(100, Ordering::Relaxed);
         assert_eq!(m.eta_secs(), None, "complete");
+    }
+
+    /// The rate window starts at the level's FIRST result, not at batch
+    /// construction: otherwise the idle stretch before a level's first settle
+    /// reads as ~0 results/s and pins that level's ETA at `--` (the 2026-09-17
+    /// live run: 46 real results in 8 s, first sample 1 result over ~5 s → 0,
+    /// and no later settle crossed a fresh second boundary).
+    #[test]
+    fn rate_window_starts_at_the_levels_first_result() {
+        let meters = crate::types::PhaseMeters::default();
+        meters.total.store(1000, Ordering::Relaxed);
+        // A slot backdated as if the batch had been running for 5 idle seconds.
+        let backdated = |secs: u64| {
+            Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .expect("backdate")
+        };
+        let slot = Mutex::new((backdated(5), 0));
+        BatchShared::bump(&meters, &slot);
+        assert_eq!(
+            meters.rate_milli.load(Ordering::Relaxed),
+            0,
+            "one result is not a rate"
+        );
+        assert_eq!(meters.eta_secs(), None, "no estimate from a single result");
+
+        // The next window has real activity: 1 s, one more result → 1/s.
+        *slot.lock() = (backdated(1), 1);
+        BatchShared::bump(&meters, &slot);
+        assert_eq!(meters.rate_milli.load(Ordering::Relaxed), 1000);
+        assert_eq!(meters.eta_secs(), Some(998), "998 left at 1/s");
     }
 
     /// One terminal event per batch, and no per-settle progress event: a

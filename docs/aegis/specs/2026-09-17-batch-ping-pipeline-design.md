@@ -418,6 +418,15 @@ Observable, verifiable on the reference feed (18k endpoints / 34k links):
   toasty `slow query` warnings (plan §F9) and the log layer's bounded queue drops
   under flood — so those two lines are pinned by unit tests, not by that run's
   store tail.
+- **Two ETA defects the live run exposed, both fixed before landing**: the Real
+  bar rendered `--` at `46/1193`. (a) `rate_milli` was written as results/s while
+  `eta_secs` reads results/s × 1000, so the estimate was off by 1000× (a fast
+  level showed a numerator with no usable rate); (b) the sampling window began at
+  batch construction, so the level's first sample covered the idle stretch before
+  its first settle (1 result over ~5 s → floor 0) and pinned the ETA at `--`
+  until a later settle crossed a fresh second boundary. Both are pinned by
+  `rate_window_starts_at_the_levels_first_result` and
+  `phase_meters_eta_needs_a_denominator_a_rate_and_work_left`.
 - The spec's own escalation trigger for a purpose-built plan projection
   (> 1 s of walk) is **met but not taken**: the walk no longer delays the first
   probe, overlaps probing, and is reported in the panel, so the cheaper keyset
