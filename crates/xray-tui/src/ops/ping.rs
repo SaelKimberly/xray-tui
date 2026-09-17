@@ -1018,10 +1018,12 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
     );
     tracing::info!(
         target: "tui::ops::ping",
-        "batch: planned {} link(s) over {} page(s) in {} ms",
-        shared.plan_len(),
-        walk.pages_done(),
-        shared.plan_ms.load(Ordering::Relaxed),
+        "{}",
+        plan_line(
+            shared.plan_len(),
+            walk.pages_done(),
+            shared.plan_ms.load(Ordering::Relaxed),
+        ),
     );
     if let Some(e) = &walk_error {
         tracing::warn!(
@@ -1235,6 +1237,14 @@ async fn finish_batch(shared: &BatchShared) {
     // record a reader (and the next investigation) works from.
     tracing::info!(target: "tui::ops::ping", "{}", summary_line(shared));
     let _ = shared.tx.try_send(CoreEvent::BatchEnded);
+}
+
+/// The plan's own record: the pages and links the walk produced and how long it
+/// took. Emitted once, after the walk (a stop or a page error ends it early, and
+/// the line then reports the partial plan — which is why the counts are here and
+/// not derived from the feed).
+fn plan_line(links: u32, pages: u32, plan_ms: u32) -> String {
+    format!("batch: planned {links} link(s) over {pages} page(s) in {plan_ms} ms")
 }
 
 /// The batch's single log record: the planned links and pages, the per-level
@@ -3027,6 +3037,20 @@ mod tests {
         assert_eq!(m.eta_secs(), Some(50), "100 left at 2/s");
         m.done.store(100, Ordering::Relaxed);
         assert_eq!(m.eta_secs(), None, "complete");
+    }
+
+    /// The plan line is the batch's own record of the walk (the store can drop
+    /// it under a log flood, so the shape is pinned here rather than observed).
+    #[test]
+    fn plan_line_names_the_pages_links_and_walk_time() {
+        assert_eq!(
+            plan_line(56140, 136, 5446),
+            "batch: planned 56140 link(s) over 136 page(s) in 5446 ms"
+        );
+        assert_eq!(
+            plan_line(200, 1, 62),
+            "batch: planned 200 link(s) over 1 page(s) in 62 ms"
+        );
     }
 
     /// The rate window starts at the level's FIRST result, not at batch

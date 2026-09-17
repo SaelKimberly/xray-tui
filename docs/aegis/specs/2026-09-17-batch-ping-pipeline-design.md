@@ -412,12 +412,20 @@ Observable, verifiable on the reference feed (18k endpoints / 34k links):
   `📊 …│planning 3/136 pages`, status bar `Testing: F 1572/1576 · R 46/1193` —
   real probes running with the fast level four links from done, the walk still
   three pages in. Items 2 and 3 hold live.
-- Items 4-7 hold by test (`cargo nextest run -p xray-tui`, 1969 workspace tests
-  green). Caveat, stated rather than implied: the live run's own `plan:`/`summary`
-  lines did **not** reach the persistent store — the store was flooded with
-  toasty `slow query` warnings (plan §F9) and the log layer's bounded queue drops
-  under flood — so those two lines are pinned by unit tests, not by that run's
-  store tail.
+- Items 4-7 hold by test (`cargo nextest run -p xray-tui`, 1970 workspace tests
+  green). Caveats, stated rather than implied: (a) the live run's own
+  `plan:`/`summary` lines did **not** reach the persistent store — the store was
+  flooded with toasty `slow query` warnings (plan §F9) and the log layer's bounded
+  queue drops under flood — so `plan_line`'s shape is pinned by
+  `plan_line_names_the_pages_links_and_walk_time` and the summary by its own test
+  instead of by that run's store tail; (b) the store was searched for
+  `plan walk stopped` (the partial-plan warning) and the newest 80,000 entries
+  contain none, so the walk was ended by the stop, not truncated by a page error
+  (the run did log three `toasty::query query failed` warns, unrelated to the
+  walk); (c) the harness's screen capture began failing
+  (`string index out of range`) once the Logs tab was opened, so the evidence
+  frame is the Profiles view captured mid-batch — the panel and the status bar
+  are both visible in it.
 - **Two ETA defects the live run exposed, both fixed before landing**: the Real
   bar rendered `--` at `46/1193`. (a) `rate_milli` was written as results/s while
   `eta_secs` reads results/s × 1000, so the estimate was off by 1000× (a fast
