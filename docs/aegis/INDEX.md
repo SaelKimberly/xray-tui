@@ -22,3 +22,4 @@
 | 2026-09-16 | spec | `specs/2026-09-16-db-claim-verification.md` | Database performance claims: verification and disposition | implemented (two write-path changes shipped; 4 reports + PDF dispositioned) |
 | 2026-09-16 | plan | `plans/2026-09-16-ping-engine-tls-fixes.md` | Ping-run log analysis: engine TLS fixes and batch observability | executed (T1-T11; subscription-retry design, class precision and toasty labels deferred) |
 | 2026-09-17 | plan | `plans/2026-09-17-ping-run-analysis.md` | Ping-run analysis: two malformed extension bodies, phase-2 cost, and a truncated import | executed (P1/P1b/P2/P3/P5/P6 landed; P4/P7/P8/P9/P10 deferred with reasons) |
+| 2026-09-17 | spec | `specs/2026-09-17-batch-ping-pipeline-design.md` | Batch ping: streaming plan, per-link fast→real pipeline, two-level progress | proposed |
