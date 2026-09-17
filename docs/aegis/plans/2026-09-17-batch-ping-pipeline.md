@@ -408,6 +408,12 @@ untestable ordering note), `docs/database.md` (walk + country batch),
    during the fast phase, (c) real results land while fast is still running,
    (d) stop/quit reports the interrupted summary. Screenshot the panel.
 4. One scoped commit per task; the doc commit last.
+5. Evidence recorded (2026-09-17): first plan page 62.2 ms / whole walk 5.45 s on
+   the 27,142-endpoint reference feed (release build); the live TUI run showing
+   `Real … 46/1193` beside `planning 3/136 pages` with `Testing: F 1572/1576 ·
+   R 46/1193`; 1969 workspace tests green. The walk's > 1 s escalation trigger is
+   met but deliberately not taken (the walk no longer delays the first probe) —
+   recorded in the spec §7/§8.
 
 ## Risks
 

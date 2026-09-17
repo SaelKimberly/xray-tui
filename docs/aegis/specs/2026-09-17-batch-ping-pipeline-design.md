@@ -398,6 +398,31 @@ Observable, verifiable on the reference feed (18k endpoints / 34k links):
 8. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
    `cargo nextest run --workspace` clean.
 
+### Verified (2026-09-17)
+
+- **First dial**: measured on the reference feed (27,142 endpoints / 56,140
+  links, release build) — the first plan page (one `COUNT` + the ordered-id
+  SELECT + the page hydration) costs **62.2 ms**, so the first probe starts
+  ~60 ms after the batch does, against ~5.8 s for the buffered loader. The rest of
+  the walk is 135 more pages at ~30 ms (ids) + ~8 ms (hydration) = **5.45 s
+  total**, which now runs *beside* the probing and is visible as
+  `planning p/P pages` rather than blocking the first dial.
+- **Pipeline + bars, live** (TUI at 140×40, `Fast + Real Ping (All Profiles)`,
+  ~10 s in): row 3 `⏱ TCP: 29ms …│Real [>░░…] 3% 46/1193 --`, row 4
+  `📊 …│planning 3/136 pages`, status bar `Testing: F 1572/1576 · R 46/1193` —
+  real probes running with the fast level four links from done, the walk still
+  three pages in. Items 2 and 3 hold live.
+- Items 4-7 hold by test (`cargo nextest run -p xray-tui`, 1969 workspace tests
+  green). Caveat, stated rather than implied: the live run's own `plan:`/`summary`
+  lines did **not** reach the persistent store — the store was flooded with
+  toasty `slow query` warnings (plan §F9) and the log layer's bounded queue drops
+  under flood — so those two lines are pinned by unit tests, not by that run's
+  store tail.
+- The spec's own escalation trigger for a purpose-built plan projection
+  (> 1 s of walk) is **met but not taken**: the walk no longer delays the first
+  probe, overlaps probing, and is reported in the panel, so the cheaper keyset
+  walk stays the documented follow-up (§8).
+
 ## 8. Non-goals
 
 - No probe-policy change: timeouts, retries, classes, `ProbeClass`, the native
