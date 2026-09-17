@@ -91,7 +91,7 @@ Two facts make the restructure cheap:
   six single-`Span` rows painted one full-width 1-line `Paragraph` each
   (`ui/actions_log.rs:235-250`). Rows: 1 status, 2 server, 3 test results,
   4 traffic/memory ("statistics"), 5 core log, 6 TUI log. No row has columns or
-  a separator.
+  a separator — the bars land on rows 3-4 (§3.4).
 - The only batch-progress render site is the status bar
   (`ui/status_bar.rs:28-45`), reading `AppState.batch_progress`, today
   `Arc<(AtomicU32, AtomicU32)>` = `(total, completed)` (`types.rs:570`).
@@ -157,22 +157,46 @@ buffer built before dispatch.
 
 ### 3.2 S2 — per-link fast → real pipeline
 
-At dispatch time the batch queues the link's whole life on the gate: `FastPing`
-first, then `RealPing` (only for a real-phase batch). The gate does the
-sequencing; no phase barrier exists.
+At dispatch time each link gets **one chain that runs its whole life**: the fast
+probe, then — for a real-phase batch — the real probe. The chain (not the gate's
+queue) sequences the two halves, so no phase barrier exists and no queue capacity
+is on the path.
 
-- Promotion path: `run_task_chain` completes the fast task, the gate promotes the
-  queued real id, and the chain's real branch dispatches. `hard_fast` /
-  `untestable` are consulted **there** (per link) — the same three facts the old
-  phase-2 loop consulted globally, evaluated at the only moment they are knowable.
+- The fast half is dispatched per plan page exactly as phase 1 does it today
+  (`schedule(FastPing)` → `Started(id)` → spawn `run_task_chain`). `Queued` stays
+  the defensive case it is today (a live gate left by another chain promotes it);
+  `DnsDeferred` → `defer_retry`; `QueueFull` → counted, as today.
+- **The real half is dispatched by that same chain, after the fast half settles**
+  (`complete` + `note_settled(FastPing)` have already run, so the link's gate is
+  clear and the schedule answers `Started`): `schedule(RealPing)` →
+  `Started(id)` → run the real probe in the same loop iteration. `hard_fast` /
+  `untestable` / sibling-dedup are consulted there — per link, at the only moment
+  they are knowable, with `emit_result` having staged the fast result first
+  (`ops/ping.rs:1443-1447`).
+- Consequence: **the batch never depends on `task_queue_limit`.** A plan-time
+  `schedule(RealPing)` queued behind a live fast task would have been `QueueFull`
+  for every link under the documented `0 = no queueing` setting
+  (`crates/xray-tui-config/src/app_config.rs:367-371`) and would have silently
+  skipped the whole real phase. It would also have been wrong for a deferred
+  link: `TaskScheduler::schedule` answers `DnsDeferred` *before* it touches the
+  gate (`ops/scheduler.rs:155-158`), so the deferred link has no gate entry, the
+  real schedule would return `Started`, and the real probe would fire with no fast
+  result behind it — breaking the hard-fail skip and the untestable-marker
+  ordering. Chain sequencing makes both impossible by construction rather than by
+  handling: the real half is only ever attempted from the fast half's settle.
+- Deferrals re-enter through one `defer_retry(shared, plan, half)` (sleep, then
+  re-dispatch that half); the pair cannot separate because the fast half's
+  re-entry leads to the same chain, and the real half's re-entry is only reachable
+  from a settled fast half. `retry_deferred_fast` and `retry_deferred_real`
+  (`ops/ping.rs:1351-1376`) collapse into it.
 - Untestable markers are emitted per link, after that link's fast result
   (`FACT`: the old single post-phase-1 pass existed exactly to guarantee that
   ordering, `ops/ping.rs:991-994`). Behavior is unchanged for fast-only batches,
   which emit the same markers today (`:994` runs before the `!real_phase` return).
 - `dedup_endpoints` becomes **best-effort** (user decision): before dispatching a
-  promoted real probe, skip it (retire silently, no marker) when the endpoint is
+  link's real half, skip it (retire silently, no marker) when the endpoint is
   already in `completed_endpoints`; a success inserts the endpoint id, so later
-  promotions stop. Sibling probes that are already live are not cancelled — the
+  real halves stop. Sibling probes that are already live are not cancelled — the
   old design guaranteed at most one real probe in flight per endpoint; the new
   one allows as many as siblings whose fast results landed together, which the
   reference feed bounds at 1.74 real candidates per endpoint (§F4 of the plan).
@@ -188,9 +212,9 @@ sequencing; no phase barrier exists.
 - The `per_endpoint: BTreeMap` grouping, the endpoint-group tasks and the
   sequential in-group loop are deleted.
 - Completion: the batch ends when the walk is done, `pending_fast == 0`,
-  `pending_real == 0`, and every DNS-deferred retry has settled. A `DnsDeferred`
-  link re-enters the same per-link schedule (fast, real queued behind it) once
-  the window expires, and its handle is tracked so `finish_batch` stays last.
+  `pending_real == 0`, and every `defer_retry` has settled. A deferred link
+  re-enters through `defer_retry` once the window expires, and its handle is
+  tracked so `finish_batch` stays last.
 - `phase1_ms`/`phase2_ms` become `fast_span_ms` (first fast start → last fast
   settle) and `real_span_ms` (first real start → last real settle); they overlap
   by construction and the summary says so. Total wall time is added.
@@ -233,38 +257,42 @@ sequencing; no phase barrier exists.
   (`R` omitted for a fast-only batch). It keeps working when the panel is
   compact/overlaid, which is why it is not simply removed.
 
-### 3.4 S4 — Actions Log two-row split, static-width cells
+### 3.4 S4 — the statistics rows carry the bars, logs stay full width
 
-Rows 5 and 6 (core log / TUI log) are split horizontally; the panel stays 6 rows
-and 8 lines (user decision, "split rows 5+6"):
+The two statistic rows are split horizontally; the log rows (5 core, 6 TUI) keep
+their full width, and the panel stays 6 rows / 8 lines. This is the better cut:
+rows 3-4 hold short values (`⏱ TCP:…`, `📊 ⬆…`) whose right half is empty anyway,
+while rows 5-6 hold the long lines — splitting those would have truncated the
+logs to buy space the stats rows do not need.
 
 ```
-row 5:  📋 Core: [info] …log text…            │ Real [████████░░░░] 1234/17051 ~12m
-row 6:  📋 TUI:  [info] …log text…            │ Fast [██████░░░░░░░░] 8123/34562 ~3m
+row 3:  ⏱ TCP:  1234ms  RP:  5678ms  SPD: 12Mbps │ Real [████████░░░░░░░░] 1234/17051 ~12m
+row 4:  📊 ⬆   1.2MB  ⬇  34.5MB  💾  123.4MB     │ Fast [██████░░░░░░░░░░░░] 8123/34562 ~3m
+row 5:  📋 Core: [info] …full width…  (unchanged)
+row 6:  📋 TUI:  [info] …full width…  (unchanged)
 ```
 
-- Left region = the existing log line, truncated to its column budget; right
-  region = the bar, fixed width; a vertical rule separates them at a fixed
-  column (`inner_width - BAR_REGION_W`), so bar position never depends on the
-  left content.
-- `BAR_REGION_W = 44` when `inner_width >= 72`; below that the right region
-  renders the numbers/ETA without bar glyphs (the panel is also used in the
-  small-terminal overlay and on the Actions tab, where `chunks[1]` is
-  `Constraint::Min(3)`).
-- Real ping bar on row 5, fast ping on row 6. A fast-only batch puts the fast bar
-  on row 5 and renders row 6 full width (user decision: "when only one progress
-  bar is used, it takes the first row"). With no batch running, both rows render
-  exactly as today.
-- The bar itself is one shared helper hoisted out of `ui/settings.rs` into
+- Real ping bar on row 3, fast ping on row 4. A fast-only batch puts the fast bar
+  on row 3 and renders row 4 with no right region (user decision: "when only one
+  progress bar is used, it takes the first row"). With no batch running, both rows
+  render exactly as today.
+- Static-width statistic cells (user request, and now load-bearing — the bars' x
+  position derives from them): every value is padded to a fixed column budget
+  (`TCP:{v:>6}ms`, `RP:{v:>6}ms`, `SPD:{v:>5}Mbps`, `⬆{up:>9}`, `⬇{down:>9}`,
+  `💾{mem:>8}`). The two rows' left blocks are then constants — `STAT_BLOCK_W = 42`
+  — and the separator column never moves as numbers change.
+- Right region width = `inner_width - STAT_BLOCK_W - 1`, with a degradation ladder
+  so narrow terminals stay readable: `>= 44` → `label [bar 20] done/total ~eta`;
+  `30..44` → glyph width shrinks first; `18..30` → numbers + ETA only, no glyphs;
+  `< 18` → no right region (the status bar keeps the numbers). The panel is also
+  used in the small-terminal overlay and on the Actions tab, where the area is
+  `Constraint::Min(3)`.
+- The bar is one shared helper hoisted out of `ui/settings.rs` into
   `ui/widgets/progress.rs` (`bar_line(label, done, total, eta, width, palette)`),
   and `settings.rs`'s private `progress_bar_line` migrates onto it — one bar
   rendering in the crate, not two. The existing
-  `ThemeStyles::progress_bar`/`progress_fill` styles paint fill and track. No
-  `Gauge`/`LineGauge` (they are full-rect widgets; these bars live inside a
-  `Paragraph` line beside log text).
-- Static-width statistic cells (user request): rows 3 and 4 pad each value to a
-  fixed width (`TCP: {v:>6}ms`, `RP:`, `SPD:`, `⬆{up:>9}`, `⬇{down:>9}`,
-  `💾 {mem:>7}`) so the labels stop shifting as numbers change.
+  `ThemeStyles::progress_bar`/`progress_fill` styles paint track and fill. No
+  `Gauge`/`LineGauge` (full-rect widgets; these bars share a line with text).
 
 ### 3.5 S5 — batched country writes
 
@@ -288,6 +316,12 @@ row 6:  📋 TUI:  [info] …log text…            │ Fast [██████
   one `scheduler.reset()` per batch, task ids runtime-only.
 - Probes run only for ids `schedule`/`complete` hand out; a completion with a
   stale id is a no-op (`ops/scheduler.rs:206-247`).
+- A link's real probe is always gated behind that link's fast probe, by
+  construction: the same chain runs the fast half and then dispatches the real
+  half (§3.2), and a deferral re-enters through the half that was deferred. No
+  real probe can run without the fast result that precedes it, so `hard_fast`,
+  `fast_latency` and the untestable-marker ordering keep their meaning, and
+  `task_queue_limit` is not on the path.
 - Result persistence stays staged through `LinkWriter` (`LinkGroups::RESULT`),
   flushed at batch end, and a phase-2 patch still composes phase 1's measurement
   back in (`ops/ping.rs:1584-1592`) — in the pipelined world the fast result is
@@ -308,6 +342,7 @@ row 6:  📋 TUI:  [info] …log text…            │ Fast [██████
 | `CoreEvent::BatchProgress` | every settle | deleted |
 | `CoreEvent::BatchEnded` | — | new: clear batch state, re-arm stop |
 | `BatchShared.plan` | `Vec<PlanLink>` | removed; `plan_len` + `DashMap`s filled by the walk |
+| `TaskScheduler` gate queue | phase-1 `Queued` is defensive only; phase 2 schedules with a clear gate | unchanged — the batch still never queues; the chain sequences the halves |
 | `Database::profiles_page` usage in the walk | count + ids per page | `profiles_walk_page` (no count) + one `profiles_count` |
 | `Database::set_endpoint_ip_country` | single row, own commit | kept for the gesture path; new `set_endpoint_ip_countries` (one tx) for the page seed |
 | `ui/widgets/progress::bar_line` | private in `settings.rs` | shared widget used by settings + the panel |
@@ -316,6 +351,9 @@ row 6:  📋 TUI:  [info] …log text…            │ Fast [██████
 
 - Page-walk error mid-stream: keep dispatched work, warn with the offset, finish
   the batch, report the truncation in the summary line.
+- DNS deferral: both halves re-enter through `defer_retry` (§3.2), and the
+  retry task's handle is tracked so `finish_batch` (and the terminal `BatchEnded`)
+  cannot land while a retry is still sleeping.
 - Country batch failure: `retry_on_busy` inside the call; on final failure a
   `warn` naming the endpoint count, and the page loop continues with the next
   page (today's per-row behavior, one level up).
@@ -339,11 +377,18 @@ Observable, verifiable on the reference feed (18k endpoints / 34k links):
    settles).
 4. `hard_fast` links and untestable links still get no real probe; untestable
    markers still survive a fast success (ordering test).
-5. The channel carries O(pages + 1) `CoreEvent`s per batch instead of O(links) —
-   counted in a test.
+5. Progress events become O(1) per batch: **zero** per-settle progress events and
+   exactly one `CoreEvent::BatchEnded`, counted in a test. (Per-result
+   `SpeedTestResult`/`TestTypeUpdate` events stay per link — they are what the
+   Profiles tab patches rows and re-sorts from; only the progress event goes.)
 6. Country writes per seed pass = ≤2 commits for any page count (unit test on the
    batched call: one transaction, N rows).
-7. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+7. No real probe runs without its fast probe: a pipeline test with a link deferred
+   at plan time asserts nothing is scheduled until the window expires (then fast,
+   then real from the same chain), and a fast-only batch never schedules a real
+   half at all. A test with `task_queue_limit = 0` completes the real phase —
+   the assertion that the queue is not on the path.
+8. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
    `cargo nextest run --workspace` clean.
 
 ## 8. Non-goals
@@ -359,6 +404,14 @@ Observable, verifiable on the reference feed (18k endpoints / 34k links):
 - Plan §F6/P10 (persist the batch's resolved addresses into `endpoint_ip`) stays
   deferred; this spec only makes the country path cheap once it happens.
 - Compact 1-line Actions bar and the small-terminal overlay keep today's content.
+- Per-result `SpeedTestResult`/`TestTypeUpdate` events stay per link: they drive
+  the Profiles tab's row patch and live re-sort. Only the progress event is
+  removed; batching the result stream is a separate change with its own
+  re-sort-behavior question.
+- `speed_test.task_queue_limit` keeps its meaning and its setting; the batch
+  simply never queues, exactly as today (one task per link per half). Whether the
+  knob still earns its place once nothing queues is a follow-up question, not part
+  of this change.
 - No new gauge widget, no new crate, no new thread/timer.
 
 ## 9. Existence Check
