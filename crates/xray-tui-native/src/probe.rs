@@ -112,6 +112,12 @@ pub async fn fetch_over<S: crate::Stream + 'static>(
 ) -> Result<ProbeResponse, NativeError> {
     let start = Instant::now();
     let stream: BoxStream = if req.https {
+        // The TARGET leg (the probe URL's host), not the proxy leg. It reports
+        // plain `Tls` and must never carry the typed proxy causes: a target
+        // certificate, or a target that answers cleartext, says nothing about
+        // the config being probed. `target_leg_tls_failure_carries_no_evidence`
+        // pins that — an "unify the two TLS mappings" refactor breaks the test
+        // instead of purging healthy configs.
         let tls = client::connect(Box::new(io) as BoxStream, &tls_config(req.host))
             .await
             .map_err(|e| NativeError::Tls(e.to_string()))?;
@@ -353,6 +359,46 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.body, br#"{"query":"203.0.113.7"}"#);
         server.await.unwrap();
+    }
+
+    /// The probe's OWN target leg must not produce purge evidence: a target
+    /// certificate — or a target that answers in cleartext — says nothing about
+    /// the proxy config. The proxy leg types this exact failure as
+    /// `CleartextPeer`; this leg reports plain `Tls`, and a later "unify the
+    /// mappings" refactor must break THIS test rather than purge healthy
+    /// configs.
+    #[tokio::test]
+    async fn target_leg_tls_failure_carries_no_evidence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Answer the ClientHello in cleartext, then hold the socket so the
+            // failure is the cleartext diagnosis and not an EOF.
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut req = request(ProbeMethod::Head, "/generate_204");
+        req.port = addr.port();
+        req.https = true;
+        req.timeout = Duration::from_millis(400);
+        let err = fetch_over(stream, &req)
+            .await
+            .expect_err("a cleartext answer must fail the target TLS handshake");
+        assert!(
+            matches!(err, crate::error::NativeError::Tls(_)),
+            "the target leg keeps the plain variant: {err:?}"
+        );
+        assert_eq!(
+            err.evidence(),
+            None,
+            "a target-leg failure proves nothing about the config"
+        );
+        server.abort();
     }
 
     #[tokio::test]

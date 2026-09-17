@@ -55,7 +55,7 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     }
     let req = builder
         .body(ReqBody::Empty)
-        .map_err(|e| NativeError::Transport(format!("httpupgrade request build: {e}")))?;
+        .map_err(|e| NativeError::Config(format!("httpupgrade request build: {e}")))?;
 
     let limit = timeouts::TRANSPORT;
     let resp = tokio::time::timeout(limit, sender.send_request(req))

@@ -172,7 +172,7 @@ fn build_request(
     }
     builder
         .body(())
-        .map_err(|e| NativeError::Transport(format!("xhttp request build: {e}")))
+        .map_err(|e| NativeError::Config(format!("xhttp request build: {e}")))
 }
 
 /// Request body for the v3 protocol (transport-agnostic). The hyper arms

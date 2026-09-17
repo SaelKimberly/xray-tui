@@ -138,11 +138,16 @@ pub struct RankLink { /* … */ pub purged: bool }
 - `compute_rank`: `newest_seen` is the maximum `seen_secs` over **live** links,
   `NO_SEEN` (`i64::MIN`) when there are none. This is the single fact that makes
   §5's predicate work.
-- `display_link_index`: skips purged links (including a `manual_protocol_override`
-  that names one — a pin must not resurrect a purged link as the representative);
-  falls back to the purged set only when nothing live remains.
-- `EndpointRow::select_best_measured_link`: same rule, so an `All`-view row's
-  displayed delay never comes from a purged link unless the endpoint has no
+- `display_link_index`: **live links own the display while any exists**; an
+  endpoint whose links are ALL purged falls back to its purged links, so a
+  Purgatory row still shows the values it has (the spec's original "fallback"
+  clause, made explicit). The gate covers the `manual_protocol_override` branch
+  too — a pin must not resurrect a purged link as the representative while a
+  live link exists (otherwise the Active view's Speed/Traffic/ConfigType/
+  LastSeen sorts would read a purged link's columns). `display_rank()` itself is
+  unchanged: the eligibility gate lives in the caller, not in the rank.
+- `EndpointRow::select_best_measured_link`: the same gate, so an `All`-view
+  row's headline delay never comes from a purged link unless the endpoint has no
   live link at all.
 
 No new rank column and no new index: tier 6 rides `rank_tier`, and the
@@ -188,6 +193,17 @@ index `endpoint_rank_test` is unchanged.
 | `xray-tui/src/ops/ping.rs` | `ProbeOutcome::Failed { text, class, hard }` | gains `evidence` |
 | `xray-tui/src/types.rs` `CoreEvent::SpeedTestResult` | `error: Option<String>` | gains `purge: Option<PurgeReason>` for the single-ping path |
 
+**The proxy leg only — a guard, not a convention.** The probe has TWO TLS legs:
+the proxy (the tunnel, through `security::wrap` → `map_tls_err`) and the probe's
+own target (`gstatic`) inside `probe.rs::fetch_over`, which reports its failure
+as `NativeError::Tls(e.to_string())` directly (not through `map_tls_err`). That
+asymmetry is load-bearing: a target-certificate failure must never purge a
+config, because it says nothing about the config. The typed variants are
+therefore reachable ONLY from the proxy leg, and
+`probe.rs` keeps plain `Tls` — pinned by a test asserting a target-TLS failure
+yields `evidence() == None`. An implementer "unifying" the two mappings would
+break that test.
+
 The **policy** (evidence → reason) is one new TUI module,
 `crates/xray-tui/src/ops/purge.rs`, with one function:
 
@@ -207,7 +223,7 @@ Product policy lives here (which statuses count), while engine truth stays in
 | cert not valid for the configured name | `CertificateMismatch` | 110 |
 | cert chain verification failed with expiry | `CertificateExpired` | 59 |
 | peer answered cleartext | `NotTls` | 37 |
-| `NativeError::Config` from the engine (missing `pbk`, malformed authority/URI, unknown xhttp mode, unusable PSK) | `ConfigInvalid` | 53 |
+| `NativeError::Config` from the engine (missing `pbk`, unknown xhttp mode, unusable PSK, a request the stored host/path cannot compose) | `ConfigInvalid` | 27 |
 | proxy's own handshake status ∈ {400, 403, 404, 405, 409, 410, 301, 302} | `TransportRejected` | ~1,000 |
 | handshake status ∈ {530, 521, 522, 526} | `OriginUnreachable` | ~270 |
 
@@ -218,17 +234,51 @@ rate-limit / bot-management, not config evidence), protocol framing failures
 failure (timeout / refused / no route / unreachable / DNS — 31,020), and
 `not testable by the native engine` (198 — the subprocess core may serve them).
 
-Measured impact of this table on the corpus: **1,687 links purged, 942 endpoints
-touched, 721 endpoints leave the Active view** (2.7 % of 27,142), 221 keep a
-live sibling. Phase 2 was 27 % done, so the real figure is ~3× larger.
+Measured on the 2026-09-17 corpus snapshot (held at
+`/tmp/xray-tui-tag11-backup/`, with the per-link verdicts beside it in
+`purge-classification.csv`): **739 links purged over 362 endpoints** —
+`TransportRejected` 408, `RealityFallback` 163, `OriginUnreachable` 91,
+`ConfigInvalid` 27, `NotTls` 24, `CertificateMismatch` 23,
+`CertificateExpired` 3. The numbers move with every probe run (a later batch
+overwrites an earlier run's markers: the same taxonomy read 1,687 links on the
+pre-run state), so the table above is the *classification rule* and this
+paragraph is one `SELECT` against one snapshot, not a target. T8 re-measures and
+replaces these numbers.
+
+The mechanism behind the `ConfigInvalid` row matters: a config whose stored
+host/path cannot compose a request (`ws request: HTTP format error: invalid
+authority`, `invalid uri character`) fails at the request-BUILD site, which
+reports `NativeError::Transport` today. Those sites move to `Config` — the row
+cannot dial as stored, which is exactly what `Config` means now — so they carry
+`ConfigDefect`. Without that, 40-odd structurally broken configs would sit in the
+Active view forever. The same honesty pass moved `now_unix_secs` from `Config`
+to `Io`.
 
 ## 8. Write path and lifecycle
 
-- **Purge rides `LinkGroups::RESULT`** — same writer, same probe, one atomic
-  outcome: `link_values_sql` gains the column, `link_patch_conflict_sql` gains
-  `purge_reason = excluded.purge_reason` in its RESULT set, `upsert_link` (the
-  typed full-row writer) round-trips it. `LINK_SOURCE_CONFLICT_SQL` (the import
-  path) never writes it — same reasoning that keeps it off `latency`/`error`.
+- **Purge gets its own `LinkGroups::PURGE` bit** (`0b010`; `ALL` becomes
+  `0b111`) — the classifier is the only producer, and a fast result can neither
+  set nor clear it. The alternative (riding RESULT) is a silent-clobber trap:
+  `link_patch_conflict_sql` writes a FIXED column set from each patch's
+  *snapshot*, so every RESULT patch — including a phase-1 fast half, whose
+  snapshot is the plan-time row — would rewrite `purge_reason` from that
+  snapshot. That is the exact shape ADR 0002's column groups exist to prevent,
+  and today it is only *incidentally* safe (plan/page snapshots happen to be
+  fresh). `apply_test_result` therefore says WHICH groups the outcome decides
+  (`RESULT`, plus `PURGE` when the verdict changes), and the statement's
+  `ON CONFLICT` action follows the group rather than the Rust-side intent:
+  - `link_values_sql` carries the column in the VALUES tuple (every row needs
+    it; a missing row is inserted with the snapshot's value);
+  - `link_patch_conflict_sql` gains a third flag and writes
+    `purge_reason = excluded.purge_reason` only in the PURGE-bearing shapes;
+  - `LinkWriter::stage`/`merge_group`/`drain` treat PURGE like the other flags
+    (one entry per `(link, group)`, coalesced by union);
+  - `upsert_link` (the typed full-row writer) still round-trips it — it writes
+    whole rows by contract;
+  - `LINK_SOURCE_CONFLICT_SQL` (the import path) never writes it on update —
+    same reasoning that keeps it off `latency`/`error`.
+  Pinned by tests: a fast result on a purged link leaves the verdict intact; a
+  RESULT-only patch cannot clear it; a PURGE patch can set and clear it.
 - **Set**: a real probe that fails with `Some(reason)` → `purge_reason = reason`.
   **Cleared** (two owners, both explicit): a successful `RealPing` — a tunnel
   built from this link's own config — or a successful `SpeedTest` — a transfer

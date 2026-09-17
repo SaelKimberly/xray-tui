@@ -28,10 +28,10 @@ pub fn ws_request(cfg: &WebSocketConfig, server_host: &str) -> Result<Request<()
     let host = cfg.host.as_deref().unwrap_or(server_host);
     let mut req = format!("ws://{host}{path}")
         .into_client_request()
-        .map_err(|e| NativeError::Transport(format!("ws request: {e}")))?;
+        .map_err(|e| NativeError::Config(format!("ws request: {e}")))?;
     req.headers_mut().insert(
         HOST,
-        HeaderValue::from_str(host).map_err(|e| NativeError::Transport(format!("ws host: {e}")))?,
+        HeaderValue::from_str(host).map_err(|e| NativeError::Config(format!("ws host: {e}")))?,
     );
     if let Some(headers) = &cfg.headers {
         for (k, v) in headers {

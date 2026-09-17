@@ -296,56 +296,158 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
 }
 ```
 
-8. Same file — `link_patch_conflict_sql`: add one line to the RESULT set, after
-   `"error_text = excluded.error_text",`:
+8. Same file — the **PURGE group**. `LinkGroups`:
 
 ```rust
-            "purge_reason = excluded.purge_reason",
+    /// `latency` + `speed_bps` + `error` (ping results, error TTL sweeps).
+    pub const RESULT: Self = Self(0b001);
+    /// `purge_reason` (the real probe's verdict). Its own bit because
+    /// `link_patch_conflict_sql` writes a FIXED column set from each patch's
+    /// snapshot: riding RESULT would let a phase-1 fast half — whose snapshot
+    /// is the plan-time row — rewrite the verdict it never classified, which is
+    /// the clobber shape ADR 0002's groups exist to prevent.
+    pub const PURGE: Self = Self(0b010);
+    /// `traffic_*` (the gRPC stats poller).
+    pub const TRAFFIC: Self = Self(0b100);
+    /// Every group.
+    pub const ALL: Self = Self(0b111);
 ```
 
-   and extend its doc sentence to say RESULT owns `latency`/`speed`/`error`/`purge`.
+9. Same file — `link_patch_conflict_sql` takes the third flag:
 
-9. Same file — `upsert_link` (the typed full-row writer): add after `.error(...)`:
+```rust
+fn link_patch_conflict_sql(has_result: bool, has_traffic: bool, has_purge: bool) -> String {
+    let mut sets: Vec<&str> = Vec::with_capacity(12);
+    if has_result {
+        sets.extend_from_slice(&[
+            "latency = excluded.latency",
+            "latency_delay = excluded.latency_delay",
+            "latency_ip = excluded.latency_ip",
+            "speed_bps = excluded.speed_bps",
+            "error = excluded.error",
+            "error_kind = excluded.error_kind",
+            "error_text = excluded.error_text",
+        ]);
+    }
+    if has_purge {
+        sets.push("purge_reason = excluded.purge_reason");
+    }
+    if has_traffic {
+        sets.extend_from_slice(&[
+            "traffic_today_up = excluded.traffic_today_up",
+            "traffic_today_down = excluded.traffic_today_down",
+            "traffic_total_up = excluded.traffic_total_up",
+            "traffic_total_down = excluded.traffic_total_down",
+        ]);
+    }
+    /* … unchanged tail: DO NOTHING when `sets` is empty, else updated_at +
+       version = version + 1 … */
+}
+```
+
+   and `apply_link_patches`'s bucket loop becomes the eight shapes:
+
+```rust
+        for (has_result, has_purge, has_traffic) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+            (false, true, true),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            let shape: Vec<&LinkPatch> = patches
+                .iter()
+                .filter(|p| {
+                    p.groups.contains(LinkGroups::RESULT) == has_result
+                        && p.groups.contains(LinkGroups::PURGE) == has_purge
+                        && p.groups.contains(LinkGroups::TRAFFIC) == has_traffic
+                })
+                .collect();
+            if shape.is_empty() {
+                continue;
+            }
+            let conflict = link_patch_conflict_sql(has_result, has_traffic, has_purge);
+            /* … unchanged chunk/write … */
+        }
+```
+
+10. Same file — `upsert_link` (the typed full-row writer): add after `.error(...)`:
 
 ```rust
             .purge_reason(s.purge_reason)
 ```
 
-10. Same file — `LinkGroups` docs: `RESULT` is `latency + speed_bps + error +
-    purge_reason`. `ALL` unchanged (the bitmask is untouched: the column rides
-    RESULT, and no writer owns it alone).
+11. `LinkWriter` (`ops/link_writer.rs`) — three groups instead of two:
 
-11. **Literal sweep** — the compiler lists every site: add `purge_reason: None`
+```rust
+    pub fn stage(&self, link: &ProfileStats, groups: LinkGroups) {
+        for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+            if groups.contains(flag) {
+                self.pending
+                    .insert(((link.protocol_id, link.endpoint_id), flag), link.clone());
+            }
+        }
+        if self.pending.len() >= self.flush_rows {
+            self.wake.notify_one();
+        }
+    }
+```
+
+   and `merge_group`:
+
+```rust
+fn merge_group(base: &mut ProfileStats, flag: LinkGroups, staged: &ProfileStats) {
+    if flag == LinkGroups::RESULT {
+        base.latency.clone_from(&staged.latency);
+        base.speed_bps = staged.speed_bps;
+        base.error.clone_from(&staged.error);
+    } else if flag == LinkGroups::PURGE {
+        base.purge_reason = staged.purge_reason;
+    } else {
+        base.traffic = staged.traffic;
+    }
+}
+```
+
+12. **Literal sweep** — the compiler lists every site: add `purge_reason: None`
     to each `ProfileStats { … }` literal (28 sites; the integration/unit test
     helpers among them). Run
     `cargo check --workspace --all-targets` until clean.
 
-12. Add the round-trip test in `database.rs`'s `#[cfg(test)]` module:
+13. Add the round-trip + group-discipline tests in `database.rs`'s `#[cfg(test)]`
+    module:
 
 ```rust
+    /// The verdict is written ONLY by a PURGE-bearing patch: a RESULT patch
+    /// (which is what a fast probe, a traffic poll and an untestable marker
+    /// produce) can neither set nor clear it, and a stale snapshot cannot
+    /// rewrite it. This is the invariant that made PURGE its own group.
     #[tokio::test]
-    async fn purge_reason_rides_the_result_group_only() {
-        use crate::models_toasty::{ConfigType, PurgeReason};
+    async fn purge_reason_is_written_by_its_own_group_only() {
+        use crate::models_toasty::{ConfigType, Latency, PurgeReason};
 
         let db = Database::in_memory().await.expect("in-memory db");
         let mut conn = db.connection().await.expect("connection");
         seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 10).await;
         drop(conn);
 
-        let link = |reason: Option<PurgeReason>, traffic: i64| ProfileStats {
+        let link = |reason: Option<PurgeReason>, latency: Option<Latency>| ProfileStats {
             protocol_id: ProtocolId::new(1001),
             endpoint_id: EndpointId::new(1),
             core_type: xray_tui_proto::proto_spec::CoreType::Xray,
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(100),
-            latency: None,
+            latency,
             speed_bps: None,
             error: None,
             purge_reason: reason,
             traffic: TrafficStats {
                 today_up: 0,
-                today_down: traffic,
+                today_down: 0,
                 total_up: 0,
                 total_down: 0,
             },
@@ -355,41 +457,47 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
             protocol: toasty::Deferred::default(),
             endpoint: toasty::Deferred::default(),
         };
+        let patch = |link: ProfileStats, groups: LinkGroups| LinkPatch { link, groups };
 
-        // RESULT: the verdict lands (and the SQL spelling passes the CHECK).
-        db.apply_link_patches(&[LinkPatch {
-            link: link(Some(PurgeReason::NotTls), 0),
-            groups: LinkGroups::RESULT,
-        }])
+        // A PURGE patch writes the verdict (and the SQL spelling passes the CHECK).
+        db.apply_link_patches(&[patch(
+            link(Some(PurgeReason::NotTls), None),
+            LinkGroups::PURGE,
+        )])
+        .await
+        .expect("purge patch");
+        assert_eq!(
+            read_purge(&db).await,
+            Some(PurgeReason::NotTls),
+            "a PURGE patch writes the verdict"
+        );
+
+        // A RESULT patch (a fast probe's `None` snapshot, or a traffic write)
+        // must leave it alone.
+        db.apply_link_patches(&[patch(
+            link(None, Some(Latency::Fast { delay: 42 })),
+            LinkGroups::RESULT,
+        )])
         .await
         .expect("result patch");
         assert_eq!(
             read_purge(&db).await,
             Some(PurgeReason::NotTls),
-            "a RESULT patch writes the purge verdict"
+            "a RESULT patch cannot clear a verdict it did not classify"
         );
 
-        // TRAFFIC: a stale `None` snapshot must not clear it.
-        db.apply_link_patches(&[LinkPatch {
-            link: link(None, 55),
-            groups: LinkGroups::TRAFFIC,
-        }])
+        // RESULT|PURGE (what a real probe stages) carries both.
+        db.apply_link_patches(&[patch(
+            link(None, None),
+            LinkGroups::RESULT.union(LinkGroups::PURGE),
+        )])
         .await
-        .expect("traffic patch");
+        .expect("result+purge patch");
         assert_eq!(
             read_purge(&db).await,
-            Some(PurgeReason::NotTls),
-            "the traffic writer cannot touch the purge verdict"
+            None,
+            "a real success clears the verdict"
         );
-
-        // RESULT again: a success clears it.
-        db.apply_link_patches(&[LinkPatch {
-            link: link(None, 0),
-            groups: LinkGroups::RESULT,
-        }])
-        .await
-        .expect("clear patch");
-        assert_eq!(read_purge(&db).await, None, "a RESULT patch can clear it");
     }
 
     async fn read_purge(db: &Database) -> Option<crate::models_toasty::PurgeReason> {
@@ -407,9 +515,9 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
     }
 ```
 
-13. Extend `bulk_upserts_are_idempotent_and_preserve_owned_fields` in
+14. Extend `bulk_upserts_are_idempotent_and_preserve_owned_fields` in
     `crates/xray-tui-db/tests/integration.rs`: before the refresh block, stamp a
-    verdict through a RESULT patch; after the refresh block's assertions, add
+    verdict through a PURGE patch; after the refresh block's assertions, add
 
 ```rust
     assert_eq!(
@@ -473,8 +581,50 @@ column, no new index.
     }
 ```
 
-3. `display_rank` returns `None` for a purged link (so `display_link_index`
-   skips it, including a `manual_protocol_override` naming one).
+3. `display_link_index`: live links own the display while any exists. `display_rank`
+   itself is NOT changed — the eligibility gate lives in this function, and it
+   must cover the `manual_protocol_override` branch too (`display_rank -> None`
+   would not: the override branch early-returns on the protocol id before ever
+   consulting the rank, so a pinned purged link would still source
+   `rank_display_seen`/`rank_speed`/`rank_traffic`/`rank_config` — i.e. the
+   Active view's Speed/Traffic/ConfigType/LastSeen sorts would read a purged
+   link). Allocation-free, two passes:
+
+```rust
+    /// Index of the endpoint's display link.
+    ///
+    /// The rule the retired SQL used (manual override, else the best measured
+    /// link), plus the purge gate: a purged link never sources the endpoint's
+    /// displayed values while a live link exists — the tier-6 sink applied to
+    /// the display preference, including a manual override that names one. An
+    /// endpoint whose links are ALL purged falls back to them, so a Purgatory
+    /// row still shows the values it has.
+    #[must_use]
+    pub fn display_link_index(links: &[RankLink], override_protocol: Option<i64>) -> Option<usize> {
+        let live = links.iter().any(|l| !l.purged);
+        let eligible = |l: &RankLink| !live || !l.purged;
+        if let Some(pid) = override_protocol
+            && let Some(index) = links
+                .iter()
+                .position(|l| l.protocol_id == pid && eligible(l))
+        {
+            return Some(index);
+        }
+        links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| eligible(l))
+            .filter_map(|(i, l)| {
+                l.display_rank()
+                    .map(|rank| (i, rank, l.delay, l.protocol_id))
+            })
+            .min_by_key(|&(_, rank, delay, protocol)| (rank, delay, protocol))
+            .map(|(i, _, _, _)| i)
+    }
+```
+
+   `EndpointRow::select_best_measured_link` takes the same `live` gate, so the
+   row's headline delay follows the same rule.
 
 4. `impl From<&ProfileStats> for RankLink`: `purged: link.purge_reason.is_some()`.
 
@@ -514,9 +664,14 @@ column, no new index.
    `models_toasty.rs`'s `EndpointRow` tests):
    - a purged link with the best measurement does NOT become the representative
      key or the display link while a live sibling exists;
-   - an all-purged endpoint sorts at tier 6 and reports `newest_seen == NO_SEEN`;
+   - **a `manual_protocol_override` naming a purged link is not the display link
+     while a live sibling exists** (the branch that `display_rank -> None` could
+     not cover);
+   - an all-purged endpoint: tier 6, `newest_seen == NO_SEEN`, and its display
+     link IS one of its purged links (the fallback);
    - `sort_links_by_test_priority` sinks purged links below a fast-error sibling;
-   - `select_best_measured_link` ignores a purged link's delay.
+   - `select_best_measured_link` ignores a purged link's delay while a live link
+     exists, and takes it when none does.
 
 **Verification**: `cargo nextest run -p xray-tui-db` (the existing
 `page_order_matches_the_rust_oracle_for_every_sort` must stay green — it pins the
@@ -785,13 +940,28 @@ fn map_tls_err(e: TlsError) -> NativeError {
    (`xhttp.rs:1388`, `xhttp.rs:2312`, `httpupgrade.rs:198`) move to the new
    variant — the compiler lists every site.
 
+7b. **Honesty pass the taxonomy forces** (done in the follow-up commit, with
+   T4): the request-BUILD sites report `NativeError::Transport` for a config
+   that cannot compose a request — `ws.rs` (`ws request:`, `ws host:`),
+   `v2rayhttp.rs` (`uri build`, `request build`), `httpupgrade.rs` (request
+   build), `xhttp.rs` (`xhttp request build`). Those move to `Config`: the row
+   cannot dial as stored, which is what `Config` now means, and the approved
+   taxonomy (D2) includes malformed Host/URI configs. Without it, ~40
+   structurally broken configs would sit in the Active view forever.
+   `now_unix_secs` moves the other way (`Config` → `Io`) — a broken clock is not
+   a row defect.
+
 8. Tests: `xray-tui-tls` — a name-mismatch handshake yields
    `TlsError::CertNotValidForName`, an expired chain yields `CertExpired`, a
    cleartext peer yields `CleartextPeer` (extend the existing verify/record
    suites, which already build those fixtures).
    `xray-tui-native` — `NativeError::evidence()` over every variant, including
    the `None` set (`Timeout`, `Dial`, `Io`, `Protocol`, `NotImplemented`,
-   `Tls`, `Transport`).
+   `Tls`, `Transport`). **Plus the target-leg guard**: a probe-target TLS failure
+   (the `gstatic` leg inside `probe.rs::fetch_over`, which reports plain
+   `NativeError::Tls`) must yield `evidence() == None` — otherwise an
+   implementer "unifying" that mapping with `map_tls_err` would purge a healthy
+   config for the probe target's certificate.
 
 **Impact**: no behavior change; the only visible difference is the removed
 doubled prefix on TLS messages (listed in Compatibility Boundary).

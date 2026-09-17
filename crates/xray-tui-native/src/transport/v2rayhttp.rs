@@ -77,12 +77,12 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         .authority(authority.as_str())
         .path_and_query(&path)
         .build()
-        .map_err(|e| NativeError::Transport(format!("v2rayhttp uri build: {e}")))?;
+        .map_err(|e| NativeError::Config(format!("v2rayhttp uri build: {e}")))?;
     let req = http::Request::builder()
         .method(method.as_str())
         .uri(uri)
         .body(body)
-        .map_err(|e| NativeError::Transport(format!("v2rayhttp request build: {e}")))?;
+        .map_err(|e| NativeError::Config(format!("v2rayhttp request build: {e}")))?;
 
     let limit = timeouts::TRANSPORT;
     let resp = tokio::time::timeout(limit, sender.send_request(req))
