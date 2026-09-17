@@ -74,6 +74,7 @@ erDiagram
         BOOLEAN error "failure marker flag"
         TEXT error_kind "real|fast|name"
         TEXT error_text
+        TEXT purge_reason "reality_fallback|certificate_mismatch|…, NULL = live (ADR 0006)"
         BIGINT traffic_today_up
         BIGINT traffic_today_down
         BIGINT traffic_total_up
@@ -200,7 +201,11 @@ projections the page reads without touching the JSON. Changing what the identity
 covers re-keys every row — it is a data reset, never a migration (decision 11).
 
 **`profile_stats`** — the per-`(protocol, endpoint)` pair state: everything a
-test measures and everything traffic counts. The three embeds are flattened
+test measures and everything traffic counts, plus the one durable VERDICT
+(`purge_reason`, ADR 0006). The verdict is not a measurement marker: `error` is
+swept by `error_ttl_hours`, `purge_reason` only moves when a real probe earns one
+or a data-carrying success clears one, and it is written by its own column group
+so no other writer can rewrite it from a stale snapshot. The three embeds are flattened
 into columns, so one "row" in mermaid is `latency`+`latency_delay`+`latency_ip`,
 `error`+`error_kind`+`error_text`, and the four `traffic_*` counters.
 `#[version]` makes typed single-row updates optimistic-concurrency safe; the
@@ -239,7 +244,7 @@ page's default order is an index scan of `endpoint_rank_test`, which is why the
 Profiles tab stays fast at any offset. The values are computed **in Rust** by
 `endpoint_rank::RankLink::key` — the single implementation of the law, shared
 with the panel's link order — and never re-derived in SQL. `rank_dns` is the
-"DNS host with no address" flag; `rank_newest_seen` answers the Active/Stale
+"DNS host with no address" flag; `rank_newest_seen` answers the Active/Purgatory
 window.
 
 ## Indexes
@@ -258,7 +263,7 @@ window.
 | `index_endpoint_groups_by_group_id` | `endpoint_groups(group_id)` | a group's endpoints (the query) |
 | *(PK autoindex)* | `endpoint_rank(endpoint_id)` | rank-row writes/lookups |
 | `endpoint_rank_test` *(raw)* | `endpoint_rank(rank_dns, rank_tier, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)` | the default page order — a covering index, so the page is an index scan (~8.6 ms at 7,672 endpoints, ADR 0003) |
-| `endpoint_rank_window` *(raw)* | `endpoint_rank(rank_newest_seen)` | the Active/Stale window and the count |
+| `endpoint_rank_window` *(raw)* | `endpoint_rank(rank_newest_seen)` | the Active/Purgatory window and the count |
 
 The two raw sets exist because toasty's `#[index]` is single-column and cannot
 express a mixed-direction composite. They are created with

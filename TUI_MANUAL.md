@@ -297,7 +297,10 @@ engine cannot test (a protocol kind or config it has no implementation for)
 is marked `[real]` with the reason, and that marker outranks a stored delay —
 it says something about the profile, not about a failed attempt. Such rows
 are never removed by **Remove Bad Servers** (they are fine, just untestable
-here). Markers persist across restarts;
+here). A second exception, same precedence: a link carrying a **purge verdict**
+shows the verdict instead of its delay (`[mitm]`, `[cert]`, `[expired]`,
+`[notls]`, `[cfg]`, `[http]`, `[origin]` — see **Purgatory** below). Markers
+persist across restarts;
 `error_ttl_hours` (empty = never) clears them automatically on profile reload
 and at batch finish. The preferred link is the best measured one (real-ok
 lowest delay, else fast-ok lowest): auto-selected after every fast/real
@@ -443,7 +446,7 @@ appended when updates are available for installed backends.
 | `g`              | Open Subscriptions (Settings → Subscriptions) |
 | `t`              | Open speed test menu                |
 | `x`              | Resolve DNS of selected endpoint    |
-| `p`              | Cycle view: Active → Stale → All (purgatory) |
+| `p`              | Cycle view: Active → Purgatory → All |
 | `o`              | Cycle sort column (8 columns)       |
 | `/`              | Focus search/filter input           |
 | `Ctrl+V`         | Import share URL                    |
@@ -601,7 +604,7 @@ appended when updates are available for installed backends.
 5. **Delete:** select a group, press `d`, confirm with `y`, cancel with `n`/`Esc`
 6. Press `Esc` twice to return to the profile list, or `Ctrl+C` to quit the app
 
-Group filtering on the Profiles tab is done with `p` (cycle Active → Stale →
+Group filtering on the Profiles tab is done with `p` (cycle Active → Purgatory →
 All views) and `/` (search); the per-group filter keys were removed.
 
 ---
@@ -884,3 +887,31 @@ close_session(session_id: "speed-test")
 - For delete confirmation dialogs: `y`/`n` are plain key presses, use
   `send_keys("y")` or `send_keys("n")`
 - Check `get_session_info` for quick debugging: PID, uptime, dimensions
+
+## Purgatory (view `p`)
+
+`p` cycles **Active → Purgatory → All**.
+
+- **Active** is the effective-profiles list: it shows profiles confirmed live
+  and recent (newest live link within `purgatory.ttl_days`, default 7), and it
+  does not load purged links at all — a profile whose every link is purged is
+  simply absent.
+- **Purgatory** is everything else: links whose newest live link aged past the
+  TTL, plus every profile whose links all carry a purge verdict — including one
+  confirmed by its subscription *today*. This is where a purged link can be
+  re-proved by hand.
+- **All** shows every profile and every link.
+
+**Purge verdicts.** A real (Real Ping) probe that returns permanent evidence
+retires its link: a REALITY server answering with a real certificate
+(`[mitm]`), a certificate the configured name cannot match (`[cert]`) or that
+has expired (`[expired]`), a port answering cleartext (`[notls]`), a config
+that can never dial (`[cfg]`), the proxy's own handshake answering 4xx/3xx
+(`[http]`), or a CDN origin error 530/521/522/526 (`[origin]`). Timeouts, TLS
+alerts, framing failures, rate limits and the client-side `not testable by the
+native engine` marker are deliberately **not** verdicts.
+
+Run **Real Test** on a purged row in Purgatory and a success clears the verdict,
+returning the link to Active. The verdict outlives the error-marker TTL
+(`error_ttl_hours` never clears it) and the sweep deletes the profile only after
+`purgatory.retention_days` (default 30) with no upstream confirmation.

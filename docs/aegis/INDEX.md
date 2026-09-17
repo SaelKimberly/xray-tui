@@ -24,5 +24,6 @@
 | 2026-09-17 | plan | `plans/2026-09-17-ping-run-analysis.md` | Ping-run analysis: two malformed extension bodies, phase-2 cost, and a truncated import | executed (P1/P1b/P2/P3/P5/P6 landed; P4/P7/P8/P9/P10 deferred with reasons) |
 | 2026-09-17 | spec | `specs/2026-09-17-batch-ping-pipeline-design.md` | Batch ping: streaming plan, per-link fast→real pipeline, two-level progress | proposed |
 | 2026-09-17 | plan | `plans/2026-09-17-batch-ping-pipeline.md` | Batch ping pipeline — implementation | executing |
-| 2026-09-17 | spec | `specs/2026-09-17-purge-reason-design.md` | Purge reasons: evidence-based permanent moves to Purgatory | proposed |
-| 2026-09-17 | plan | `plans/2026-09-17-purge-reason.md` | Purge reasons — implementation | executing (T4 landed 0314b3b; T1-T3/T5-T6 wait on the batch-ping plan landing + a clean tree) |
+| 2026-09-17 | spec | `specs/2026-09-17-purge-reason-design.md` | Purge reasons: evidence-based permanent moves to Purgatory | implemented (schema tag 12) |
+| 2026-09-17 | adr | `adr/0006-purge-evidence.md` | Purge evidence is persisted per link; Purgatory is "not confirmed live and recent" | accepted |
+| 2026-09-17 | plan | `plans/2026-09-17-purge-reason.md` | Purge reasons — implementation | executed (T1-T7 green; T8 is the live re-run) |
