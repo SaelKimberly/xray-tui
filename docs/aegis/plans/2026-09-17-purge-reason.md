@@ -417,103 +417,14 @@ fn merge_group(base: &mut ProfileStats, flag: LinkGroups, staged: &ProfileStats)
     helpers among them). Run
     `cargo check --workspace --all-targets` until clean.
 
-13. Add the round-trip + group-discipline tests in `database.rs`'s `#[cfg(test)]`
-    module:
-
-```rust
-    /// The verdict is written ONLY by a PURGE-bearing patch: a RESULT patch
-    /// (which is what a fast probe, a traffic poll and an untestable marker
-    /// produce) can neither set nor clear it, and a stale snapshot cannot
-    /// rewrite it. This is the invariant that made PURGE its own group.
-    #[tokio::test]
-    async fn purge_reason_is_written_by_its_own_group_only() {
-        use crate::models_toasty::{ConfigType, Latency, PurgeReason};
-
-        let db = Database::in_memory().await.expect("in-memory db");
-        let mut conn = db.connection().await.expect("connection");
-        seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, 10).await;
-        drop(conn);
-
-        let link = |reason: Option<PurgeReason>, latency: Option<Latency>| ProfileStats {
-            protocol_id: ProtocolId::new(1001),
-            endpoint_id: EndpointId::new(1),
-            core_type: xray_tui_proto::proto_spec::CoreType::Xray,
-            config_type: ConfigType::ShareUrl,
-            last_used_at: None,
-            last_seen_at: ts(100),
-            latency,
-            speed_bps: None,
-            error: None,
-            purge_reason: reason,
-            traffic: TrafficStats {
-                today_up: 0,
-                today_down: 0,
-                total_up: 0,
-                total_down: 0,
-            },
-            created_at: ts(100),
-            updated_at: ts(100),
-            version: 1,
-            protocol: toasty::Deferred::default(),
-            endpoint: toasty::Deferred::default(),
-        };
-        let patch = |link: ProfileStats, groups: LinkGroups| LinkPatch { link, groups };
-
-        // A PURGE patch writes the verdict (and the SQL spelling passes the CHECK).
-        db.apply_link_patches(&[patch(
-            link(Some(PurgeReason::NotTls), None),
-            LinkGroups::PURGE,
-        )])
-        .await
-        .expect("purge patch");
-        assert_eq!(
-            read_purge(&db).await,
-            Some(PurgeReason::NotTls),
-            "a PURGE patch writes the verdict"
-        );
-
-        // A RESULT patch (a fast probe's `None` snapshot, or a traffic write)
-        // must leave it alone.
-        db.apply_link_patches(&[patch(
-            link(None, Some(Latency::Fast { delay: 42 })),
-            LinkGroups::RESULT,
-        )])
-        .await
-        .expect("result patch");
-        assert_eq!(
-            read_purge(&db).await,
-            Some(PurgeReason::NotTls),
-            "a RESULT patch cannot clear a verdict it did not classify"
-        );
-
-        // RESULT|PURGE (what a real probe stages) carries both.
-        db.apply_link_patches(&[patch(
-            link(None, None),
-            LinkGroups::RESULT.union(LinkGroups::PURGE),
-        )])
-        .await
-        .expect("result+purge patch");
-        assert_eq!(
-            read_purge(&db).await,
-            None,
-            "a real success clears the verdict"
-        );
-    }
-
-    async fn read_purge(db: &Database) -> Option<crate::models_toasty::PurgeReason> {
-        let mut conn = db.connection().await.expect("connection");
-        ProfileStats::filter_by_protocol_id_and_endpoint_id(
-            ProtocolId::new(1001),
-            EndpointId::new(1),
-        )
-        .first()
-        .exec(&mut conn)
-        .await
-        .expect("read")
-        .expect("row")
-        .purge_reason
-    }
-```
+13. **Delivered as**: the group-discipline proof is an EXTENSION of
+    `apply_link_patches_isolates_column_groups` in `tests/integration.rs`, not a
+    new `database.rs` unit test — it already seeds every group
+    (`LinkGroups::ALL`), and it runs the real multi-row statement rather than a
+    second hand-built patch. It now seeds a verdict, then asserts a stale
+    RESULT-only patch (`purge_reason: None` in the snapshot) leaves it intact,
+    then that a PURGE-only patch moves it while latency and traffic stay put.
+    `docs/database-manual-sql.md` §3/§6 name that test as the statement's pin.
 
 14. Extend `bulk_upserts_are_idempotent_and_preserve_owned_fields` in
     `crates/xray-tui-db/tests/integration.rs`: before the refresh block, stamp a
@@ -1256,10 +1167,16 @@ SELECT purge_reason, COUNT(*) FROM profile_stats GROUP BY 1 ORDER BY 2 DESC;
 SELECT COUNT(*) FROM endpoint_rank WHERE rank_tier = 6;
 ```
 
-   Expected: `reality_fallback` ≈ 234, `certificate_mismatch` ≈ 110,
-   `certificate_expired` ≈ 59, `not_tls` ≈ 37, `config_invalid` ≈ 53,
-   `transport_rejected` ≈ 1,000, `origin_unreachable` ≈ 270 — scaled by however
-   far phase 2 gets (the reference run stopped at 27 %).
+   Compare against **spec §7's measured snapshot**, not against a restated
+   projection: the spec holds the rule and one measured `SELECT` (739 links over
+   362 endpoints on the validated 2026-09-17 snapshot, with
+   `transport_rejected` 408, `reality_fallback` 163, `origin_unreachable` 91,
+   `config_invalid` 27, `not_tls` 24, `certificate_mismatch` 23,
+   `certificate_expired` 3). Every number moves with every probe run — a later
+   batch overwrites an earlier run's markers — so what matters is that the
+   reasons are populated and that the classes match the code, not that a count
+   reproduces.
+
 4. Verify the acceptance list by hand: the Active tab shows no purged-only
    endpoint; the Purgatory view lists them with reason labels; a real test on
    one of them that succeeds removes the label and returns the row to Active.

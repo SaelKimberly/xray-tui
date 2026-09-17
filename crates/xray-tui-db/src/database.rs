@@ -541,7 +541,8 @@ const fn error_kind_str(kind: crate::models_toasty::ProfileErr) -> &'static str 
 /// The `CHECK`-constrained storage text of a [`PurgeReason`] variant, spelled
 /// the way toasty's derive renders it (`snake_case`, verified by the column-shape
 /// probe of 2026-09-17). A wrong spelling is refused by the column CHECK, and
-/// `purge_reason_is_written_by_its_own_group_only` executes this statement.
+/// `apply_link_patches_isolates_column_groups` (tests/integration.rs) executes
+/// this statement and proves the group it belongs to.
 const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static str {
     use crate::models_toasty::PurgeReason;
     match reason {
