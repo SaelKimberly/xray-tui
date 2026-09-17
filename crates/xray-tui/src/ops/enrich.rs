@@ -13,6 +13,7 @@ use xray_tui_db::models::{Endpoint, EndpointId, HostType, Protocol};
 use xray_tui_host_features::HostFeatures;
 
 use crate::AppState;
+use crate::ops::profiles::PROFILES_PAGE_SIZE;
 use crate::types::{CoreEvent, EndpointInfo};
 
 /// SNI from a typed protocol row: the `security.sni` column, populated at
@@ -391,6 +392,30 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
+        // Countries land one transaction per page, not one commit per address:
+        // `set_endpoint_ip_country` paid a full commit each (~4.2 ms,
+        // `docs/database.md`) and those commits contended with the import's
+        // 500-URL chunk transactions (`database is locked`). A failed batch
+        // logs once and the pass carries on — the next page still writes.
+        async fn flush_countries(
+            db: &xray_tui_db::Database,
+            pending: &mut Vec<(EndpointId, IpAddr, String)>,
+            flushes: &mut usize,
+        ) {
+            let rows = std::mem::take(pending);
+            if rows.is_empty() {
+                return; // the tail call is unconditional; an empty one writes nothing
+            }
+            *flushes += 1;
+            if let Err(e) = db.set_endpoint_ip_countries(&rows).await {
+                tracing::warn!(
+                    target: "tui::ops::enrich",
+                    "country persist failed for {} rows: {e}",
+                    rows.len()
+                );
+            }
+        }
+
         // The countries already stored for this page's addresses: one read,
         // and every address that has one skips the mmdb entirely (a second
         // launch needs no `geo_ip` at all). Read here rather than in the
@@ -407,7 +432,13 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                 std::collections::HashMap::new()
             }
         };
+        let mut pending: Vec<(EndpointId, IpAddr, String)> =
+            Vec::with_capacity(PROFILES_PAGE_SIZE);
+        let mut scanned = 0usize;
+        let mut countries = 0usize;
+        let mut flushes = 0usize;
         for (endpoint_id, mut info, sni) in feature_targets {
+            scanned += 1;
             if info.country.is_none() {
                 info.country = stored
                     .get(&EndpointId::new(endpoint_id))
@@ -415,17 +446,23 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
             }
             let fresh =
                 fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await;
-            if let Some((ip, iso)) = fresh
-                && let Err(e) = db
-                    .set_endpoint_ip_country(EndpointId::new(endpoint_id), ip, &iso)
-                    .await
-            {
-                tracing::warn!(target: "tui::ops::enrich", "country persist failed: {e}");
+            if let Some((ip, iso)) = fresh {
+                countries += 1;
+                pending.push((EndpointId::new(endpoint_id), ip, iso));
             }
             if let Some(t) = tx.as_ref() {
                 let _ = t.try_send(CoreEvent::EndpointInfoUpdated { endpoint_id, info });
             }
+            if pending.len() >= PROFILES_PAGE_SIZE {
+                flush_countries(&db, &mut pending, &mut flushes).await;
+            }
         }
+        // The tail: the last partial page still has to land.
+        flush_countries(&db, &mut pending, &mut flushes).await;
+        tracing::debug!(
+            target: "tui::ops::enrich",
+            "geo seed: scanned={scanned} countries={countries} flushes={flushes}"
+        );
     });
 }
 

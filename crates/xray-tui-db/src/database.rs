@@ -1070,6 +1070,39 @@ impl Database {
         .await
     }
 
+    /// Persist resolved-address countries for a whole page in ONE transaction.
+    ///
+    /// `set_endpoint_ip_country` takes its own connection and commit per call
+    /// (~4.2 ms per FULL commit, `docs/database.md`), and the import's 500-URL
+    /// chunk commits contend with it (`database is locked` → `retry_on_busy`).
+    /// The page seed writes a page at a time instead.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] when the write fails.
+    pub async fn set_endpoint_ip_countries(
+        &self,
+        rows: &[(EndpointId, std::net::IpAddr, String)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let mut conn = db.conn().await?;
+                let mut tx = conn.transaction().await?;
+                for (endpoint_id, ip, iso) in rows {
+                    crate::endpoint_ip::set_country(&mut tx, *endpoint_id, *ip, iso).await?;
+                }
+                tx.commit().await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
+    }
+
     /// Set or clear (`None`) the manual protocol override of an endpoint — the old `set_protocol_override` + `clear_protocol_override` merged.
     pub async fn set_manual_override(
         &self,
@@ -2554,6 +2587,104 @@ mod tests {
                 .cloned()
                 .unwrap_or_default(),
             vec![(ip("9.9.9.9"), Some("DE".to_string()))],
+        );
+    }
+
+    #[tokio::test]
+    async fn country_batch_writes_every_row() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+        db.update_endpoint_resolution(
+            EndpointId::new(1),
+            vec![ip("1.1.1.1"), ip("2.2.2.2"), ip("3.3.3.3")],
+            ts(100),
+        )
+        .await
+        .expect("resolve");
+
+        db.set_endpoint_ip_countries(&[
+            (EndpointId::new(1), ip("1.1.1.1"), "US".to_string()),
+            (EndpointId::new(1), ip("2.2.2.2"), "DE".to_string()),
+            (EndpointId::new(1), ip("3.3.3.3"), "JP".to_string()),
+        ])
+        .await
+        .expect("batch");
+
+        let resolved = db
+            .endpoint_resolutions(&[EndpointId::new(1)])
+            .await
+            .expect("read");
+        assert_eq!(
+            resolved
+                .get(&EndpointId::new(1))
+                .cloned()
+                .unwrap_or_default(),
+            vec![
+                (ip("1.1.1.1"), Some("US".to_string())),
+                (ip("2.2.2.2"), Some("DE".to_string())),
+                (ip("3.3.3.3"), Some("JP".to_string())),
+            ],
+            "every row of the batch landed, and none overwrote another"
+        );
+    }
+
+    #[tokio::test]
+    async fn country_batch_empty_changes_nothing() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+        db.set_endpoint_ip_country(EndpointId::new(1), ip("1.1.1.1"), "US")
+            .await
+            .expect("country");
+
+        db.set_endpoint_ip_countries(&[]).await.expect("empty batch");
+
+        let resolved = db
+            .endpoint_resolutions(&[EndpointId::new(1)])
+            .await
+            .expect("read");
+        assert_eq!(
+            resolved
+                .get(&EndpointId::new(1))
+                .cloned()
+                .unwrap_or_default(),
+            vec![(ip("1.1.1.1"), Some("US".to_string()))],
+        );
+    }
+
+    #[tokio::test]
+    async fn country_batch_creates_missing_address_rows() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+
+        // The geo step can finish before the resolution event's write lands
+        // (they are separate tasks): a country in the batch must create its
+        // row, and the later resolution write must keep it.
+        db.set_endpoint_ip_countries(&[
+            (EndpointId::new(1), ip("9.9.9.9"), "DE".to_string()),
+            (EndpointId::new(1), ip("1.1.1.1"), "US".to_string()),
+        ])
+        .await
+        .expect("batch first");
+        db.update_endpoint_resolution(EndpointId::new(1), vec![ip("9.9.9.9"), ip("1.1.1.1")], ts(100))
+            .await
+            .expect("resolve second");
+
+        let resolved = db
+            .endpoint_resolutions(&[EndpointId::new(1)])
+            .await
+            .expect("read");
+        assert_eq!(
+            resolved
+                .get(&EndpointId::new(1))
+                .cloned()
+                .unwrap_or_default(),
+            vec![
+                (ip("1.1.1.1"), Some("US".to_string())),
+                (ip("9.9.9.9"), Some("DE".to_string())),
+            ],
         );
     }
 
