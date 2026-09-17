@@ -410,6 +410,13 @@ fn compute_test_cell(
     // A "not testable by the native engine" marker is a STATUS, not a failed
     // measurement, so it outranks a stored delay (see `test_cell_content`).
     let untestable = active_error.is_some_and(crate::ops::ping::is_untestable_marker);
+    // A purge verdict is a STATUS too, and the same precedence applies: the
+    // delay a purged link still carries is the phase-1 result of a row the
+    // classifier has already judged (spec §9).
+    let purged = row
+        .active_link()
+        .and_then(|l| l.purge_reason)
+        .map(purge_label);
     let failure = match active_error.map(|e| e.kind) {
         Some(ProfileErr::Real | ProfileErr::Name) => Some(TestFailure::Real),
         Some(ProfileErr::Fast) => Some(TestFailure::Fast),
@@ -426,10 +433,30 @@ fn compute_test_cell(
         row.endpoint.host_type == xray_tui_db::models::HostType::Dns,
         resolved,
         untestable,
+        purged,
         failure,
         active_delay,
         palette,
     )
+}
+
+/// The short name a purged link shows in place of its Test-cell content.
+///
+/// A purge is a statement about the row, so it outranks the delay the link
+/// still carries from phase 1 — exactly as the untestable marker does. Exact
+/// strings are presentation; the precedence rule is not.
+#[must_use]
+const fn purge_label(reason: xray_tui_db::models::PurgeReason) -> &'static str {
+    use xray_tui_db::models::PurgeReason;
+    match reason {
+        PurgeReason::RealityFallback => "mitm",
+        PurgeReason::CertificateMismatch => "cert",
+        PurgeReason::CertificateExpired => "expired",
+        PurgeReason::NotTls => "notls",
+        PurgeReason::ConfigInvalid => "cfg",
+        PurgeReason::TransportRejected => "http",
+        PurgeReason::OriginUnreachable => "origin",
+    }
 }
 
 /// Test-failure tier for one row. Real outranks fast in the label
@@ -447,6 +474,7 @@ fn test_cell_content(
     host_is_dns: bool,
     resolved: bool,
     untestable: bool,
+    purged: Option<&str>,
     failure: Option<TestFailure>,
     active_delay: Option<i32>,
     palette: &ratatui_cheese::theme::Palette,
@@ -462,6 +490,12 @@ fn test_cell_content(
         // `ProfileErr::Real` — the frozen `error_kind` CHECK leaves no other
         // kind to store).
         return (format!("[{}]", center_cell("real", 4)), bad);
+    }
+    if let Some(label) = purged {
+        // Only reachable when every link of the endpoint is purged (the Active
+        // view does not load a purged link beside a live one), so this is the
+        // Purgatory/All row: the verdict is what the row IS.
+        return (format!("[{}]", center_cell(label, 4)), bad);
     }
     // A measured delay wins over a failure marker: a link that carries both a
     // successful measurement and a later failure (e.g. a batch probe that
@@ -729,12 +763,18 @@ fn build_display_rows(
                 .iter()
                 .map(|link| {
                     let proto = row.protocols.get(&link.protocol_id);
-                    let delay = match link.latency {
-                        Some(
-                            xray_tui_db::models::Latency::Real { delay, .. }
-                            | xray_tui_db::models::Latency::Fast { delay },
+                    let delay = match (link.purge_reason, &link.latency) {
+                        // The verdict replaces the numbers: the delay is
+                        // phase 1's, on a link the classifier has retired.
+                        (Some(reason), _) => format!("[{}]", purge_label(reason)),
+                        (
+                            None,
+                            Some(
+                                xray_tui_db::models::Latency::Real { delay, .. }
+                                | xray_tui_db::models::Latency::Fast { delay },
+                            ),
                         ) => format!("{delay}ms"),
-                        None => "-".to_string(),
+                        (None, None) => "-".to_string(),
                     };
                     let speed = link
                         .speed_bps
@@ -1093,7 +1133,7 @@ fn render_filter_strip(
 ) {
     let view_label = match state.purgatory_view {
         xray_tui_db::models::PurgatoryView::Active => "Active",
-        xray_tui_db::models::PurgatoryView::Purgatory => "Stale",
+        xray_tui_db::models::PurgatoryView::Purgatory => "Purgatory",
         xray_tui_db::models::PurgatoryView::All => "All",
     };
     let view_text = format!(" View: {view_label} [P]");
@@ -1757,16 +1797,31 @@ mod tests {
         crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight)
     }
 
+    /// The purge verdict outranks the delay the link still carries from phase 1
+    /// — the row is retired, and its only reachable position is Purgatory/All.
+    #[test]
+    fn test_cell_shows_the_purge_label_over_a_delay() {
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let (text, _) =
+            test_cell_content(false, true, false, Some("mitm"), None, Some(12), &palette);
+        assert_eq!(text, "[mitm]", "the verdict replaces the delay");
+
+        // A row with no verdict is unchanged by the new slot.
+        let (text, _) = test_cell_content(false, true, false, None, None, Some(12), &palette);
+        assert_eq!(text, "[ 12 ]");
+    }
+
     #[test]
     fn test_cell_colors_delay_by_threshold() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(false, true, false, None, Some(12), &palette);
+        let (t, s) = test_cell_content(false, true, false, None, None, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
         assert_eq!(s.fg, Some(palette.success));
-        let (t, s) = test_cell_content(false, true, false, None, Some(612), &palette);
+        let (t, s) = test_cell_content(false, true, false, None, None, Some(612), &palette);
         assert_eq!(t, "[ 612]");
         assert_eq!(s.fg, Some(ratatui::style::Color::Yellow));
-        let (t, s) = test_cell_content(false, true, false, None, Some(1234), &palette);
+        let (t, s) = test_cell_content(false, true, false, None, None, Some(1234), &palette);
         assert_eq!(t, "[1234]");
         assert_eq!(s.fg, Some(palette.error));
     }
@@ -1774,18 +1829,18 @@ mod tests {
     #[test]
     fn test_cell_blank_without_measurement() {
         let palette = test_palette();
-        let (t, _) = test_cell_content(false, true, false, None, None, &palette);
+        let (t, _) = test_cell_content(false, true, false, None, None, None, &palette);
         assert_eq!(t, "      ");
     }
 
     #[test]
     fn test_cell_shows_name_when_dns_unresolved() {
         let palette = test_palette();
-        let (t, s) = test_cell_content(true, false, false, None, Some(12), &palette);
+        let (t, s) = test_cell_content(true, false, false, None, None, Some(12), &palette);
         assert_eq!(t, "[name]");
         assert_eq!(s.fg, Some(palette.error));
         // Resolved DNS name behaves like a normal host.
-        let (t, _) = test_cell_content(true, true, false, None, Some(12), &palette);
+        let (t, _) = test_cell_content(true, true, false, None, None, Some(12), &palette);
         assert_eq!(t, "[ 12 ]");
     }
 
@@ -1799,6 +1854,7 @@ mod tests {
             false,
             true,
             false,
+            None,
             Some(TestFailure::Real),
             Some(12),
             &palette,
@@ -1808,6 +1864,7 @@ mod tests {
             false,
             true,
             false,
+            None,
             Some(TestFailure::Fast),
             Some(12),
             &palette,
@@ -1816,14 +1873,30 @@ mod tests {
         // Both marker classes present with no delay → [real]: real-err
         // (tier 3) ranks above fast-err (tier 4), the real check being the
         // deeper probe (T20 flip).
-        let (t, s) = test_cell_content(false, true, false, Some(TestFailure::Real), None, &palette);
+        let (t, s) = test_cell_content(
+            false,
+            true,
+            false,
+            None,
+            Some(TestFailure::Real),
+            None,
+            &palette,
+        );
         assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(palette.error));
         // Only a fast-class failure marker with no delay → [fast].
-        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Fast), None, &palette);
+        let (t, _) = test_cell_content(
+            false,
+            true,
+            false,
+            None,
+            Some(TestFailure::Fast),
+            None,
+            &palette,
+        );
         assert_eq!(t, "[fast]");
         // No failure markers → the delay shows even when untested links exist.
-        let (t, _) = test_cell_content(false, true, false, None, Some(30), &palette);
+        let (t, _) = test_cell_content(false, true, false, None, None, Some(30), &palette);
         assert_eq!(t, "[ 30 ]");
     }
 
@@ -1831,19 +1904,51 @@ mod tests {
     fn test_cell_label_precedence_matrix() {
         let palette = test_palette();
         // (a) only real markers → [real]
-        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Real), None, &palette);
+        let (t, _) = test_cell_content(
+            false,
+            true,
+            false,
+            None,
+            Some(TestFailure::Real),
+            None,
+            &palette,
+        );
         assert_eq!(t, "[real]");
         // (b) only fast markers → [fast]
-        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Fast), None, &palette);
+        let (t, _) = test_cell_content(
+            false,
+            true,
+            false,
+            None,
+            Some(TestFailure::Fast),
+            None,
+            &palette,
+        );
         assert_eq!(t, "[fast]");
         // (c) both real and fast markers → [real] (tier-consistent)
-        let (t, _) = test_cell_content(false, true, false, Some(TestFailure::Real), None, &palette);
+        let (t, _) = test_cell_content(
+            false,
+            true,
+            false,
+            None,
+            Some(TestFailure::Real),
+            None,
+            &palette,
+        );
         assert_eq!(t, "[real]");
         // (d) DNS-unresolved + fast marker → [name] (DNS tier 5 is deepest)
-        let (t, _) = test_cell_content(true, false, false, Some(TestFailure::Fast), None, &palette);
+        let (t, _) = test_cell_content(
+            true,
+            false,
+            false,
+            None,
+            Some(TestFailure::Fast),
+            None,
+            &palette,
+        );
         assert_eq!(t, "[name]");
         // (e) no markers, no measurement → blank
-        let (t, _) = test_cell_content(false, true, false, None, None, &palette);
+        let (t, _) = test_cell_content(false, true, false, None, None, None, &palette);
         assert_eq!(t, "      ");
     }
 
@@ -1852,7 +1957,7 @@ mod tests {
         let palette = test_palette();
         // A stored (fast) delay must not hide the "cannot be tested" status —
         // that is the whole point of the marker.
-        let (t, s) = test_cell_content(false, true, true, None, Some(12), &palette);
+        let (t, s) = test_cell_content(false, true, true, None, None, Some(12), &palette);
         assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(palette.error));
         // A genuine failure marker still lets a measured delay win.
@@ -1860,13 +1965,14 @@ mod tests {
             false,
             true,
             false,
+            None,
             Some(TestFailure::Real),
             Some(12),
             &palette,
         );
         assert_eq!(t, "[ 12 ]");
         // DNS-unresolved stays the deepest state.
-        let (t, _) = test_cell_content(true, false, true, None, None, &palette);
+        let (t, _) = test_cell_content(true, false, true, None, None, None, &palette);
         assert_eq!(t, "[name]");
     }
 }

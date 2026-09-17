@@ -1883,7 +1883,12 @@ async fn load_feed_plan(
             break;
         }
         offset += meta.ids.len();
-        let rows = db.load_page_projection(&meta.ids, true).await?;
+        // Purged links are skipped by a feed-wide sweep: phase 2 is the long
+        // pole (2.6 results/s), and re-proving a link the classifier already
+        // judged is the one thing the purge exists to stop doing. The
+        // selected-endpoint entry points read the loaded page instead, so a
+        // real test on a Purgatory row still probes it (spec §8, D3).
+        let rows = db.load_page_projection(&meta.ids, false).await?;
         plan.extend(rows.iter().flat_map(plan_row_links));
         if offset as u64 >= meta.total {
             break;
@@ -2128,6 +2133,41 @@ mod tests {
         state: AppState,
         tx: mpsc::Sender<CoreEvent>,
         runner: Arc<StubRunner>,
+    }
+
+    /// D3: the "test all" entry point plans the FEED, and the feed sweep skips
+    /// purged links. Phase 2 is the long pole (2.6 results/s), and re-proving a
+    /// row the classifier already judged is the one thing the purge exists to
+    /// stop. The selected-endpoint entry points read the loaded page instead,
+    /// so a Purgatory row is still testable by hand.
+    #[tokio::test]
+    async fn a_feed_sweep_plans_no_purged_links() {
+        let mut rows = vec![fake_row(1, "10.0.0.1", 2), fake_row(2, "10.0.0.2", 1)];
+        rows[0].links[0].purge_reason = Some(xray_tui_db::models::PurgeReason::NotTls);
+        let h = harness(rows).await;
+
+        let plan = load_feed_plan(&h.state.db, 100).await.expect("plan");
+
+        assert_eq!(plan.len(), 2, "three links minus the purged one");
+        assert!(
+            plan.iter().all(|p| p.link.purge_reason.is_none()),
+            "no purged link reaches the plan"
+        );
+    }
+
+    /// The selected-endpoint plan keeps them: it reads the loaded page, and the
+    /// Purgatory view is where a purged link gets re-proved.
+    #[tokio::test]
+    async fn a_selected_endpoint_plan_keeps_purged_links() {
+        let mut rows = vec![fake_row(1, "10.0.0.1", 2)];
+        rows[0].links[0].purge_reason = Some(xray_tui_db::models::PurgeReason::NotTls);
+        let mut h = harness(rows).await;
+        h.state.purgatory_view = xray_tui_db::models::PurgatoryView::Purgatory;
+        crate::ops::profiles::reload_profiles(&mut h.state).await;
+
+        let plan = plan_selected_endpoint(&h.state);
+
+        assert_eq!(plan.len(), 2, "both links are offered for a manual test");
     }
 
     async fn harness(rows: Vec<EndpointRow>) -> Harness {
