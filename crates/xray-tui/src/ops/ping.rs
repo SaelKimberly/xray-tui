@@ -3,16 +3,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{
-    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, TaskKind,
+    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, PurgatoryView, TaskKind,
 };
+use xray_tui_db::profiles_query::{PageRequest, PageSort};
 use xray_tui_native::capability;
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
@@ -714,10 +717,10 @@ pub(crate) struct BatchShared {
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    progress: crate::types::BatchProgress,
-    /// The resolved plan: `PlanSource` is the input shape, resolved before the
-    /// shared state exists (a feed load is async, this struct is not).
-    plan: Vec<PlanLink>,
+    /// Live meters, the same `Arc` the UI renders (no progress event).
+    meters: Arc<crate::types::BatchMeters>,
+    /// The batch's clock: every span in the summary is measured from here.
+    started: Instant,
     real_phase: bool,
     dedup_endpoints: bool,
     fast_timeout: Duration,
@@ -729,48 +732,65 @@ pub(crate) struct BatchShared {
     real_concurrency: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
-    /// The FINAL phase's candidate count, once that set is known — the
-    /// denominator of the shared progress pair (see `publish_final_total`).
-    /// 0 until published (`plan.len()` for a fast-only run, phase 2's surviving
-    /// links for a fast+real one).
-    final_total: AtomicU32,
-    /// Fast config type per link (derived from the plan's protocol kind).
-    fast_config: HashMap<(ProtocolId, EndpointId), i32>,
-    /// Endpoint rows by id (real probes need the full endpoint).
-    endpoints: HashMap<EndpointId, Endpoint>,
+    /// Where `run_batch` publishes the batch's shared state — `AppState::batch`
+    /// holds the same slot and the UI reads the summary through it.
+    batch_slot: Arc<OnceLock<Arc<Self>>>,
+    /// Fast config type per link (`proto_kind`), filled by the plan walk.
+    fast_config: DashMap<(ProtocolId, EndpointId), i32>,
+    /// Endpoint rows by id (real probes need the full endpoint). `Arc` so a
+    /// probe clones the handle instead of holding a shard guard across an await.
+    endpoints: DashMap<EndpointId, Arc<Endpoint>>,
     /// Links the native engine cannot serve (kind-level gate, no config load),
-    /// keyed by identity and carrying the persisted marker text. The fast phase
-    /// still probes them; the real phase skips them and the batch emits their
-    /// markers once phase 1 has landed.
-    untestable: HashMap<(ProtocolId, EndpointId), String>,
-    /// Phase-1 bound (`fast_ping_concurrency`): the fast phase used to spawn one
-    /// future per link with no global cap at all.
+    /// keyed by identity and carrying the persisted marker text. The fast half
+    /// still probes them; their marker is emitted right after that result.
+    untestable: DashMap<(ProtocolId, EndpointId), String>,
+    /// The two probe bounds (`fast_ping_concurrency`, `real_ping_concurrency`).
+    /// They are independent — the levels overlap now, and each holds its own
+    /// permit for the duration of its own probe.
     fast_sem: Arc<Semaphore>,
-    // ── phase tracking ────────────────────────────────────────────────
+    real_sem: Arc<Semaphore>,
+    // ── settle accounting ─────────────────────────────────────────────
     pending_fast: AtomicUsize,
     pending_real: AtomicUsize,
-    done: AtomicU32,
-    phase1_settled: Notify,
-    real_settled: Notify,
+    /// Deferral retries in flight. A retry sleeps without holding a gate entry,
+    /// so the two task counters cannot see it and `finish_batch` must not run
+    /// while one is still waiting.
+    pending_deferred: AtomicUsize,
+    /// Woken on every settle: one `Notify` covers all three counters, and the
+    /// waiter re-reads them.
+    settled: Notify,
+    /// Every spawned chain and retry, so the batch can join the lot before
+    /// `finish_batch`. The counters say when work is *settled*; a chain is also
+    /// running between its fast settle and its real dispatch, which no counter
+    /// covers — the join is what makes the batch's end a hard boundary.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    // ── rate sampling (1 Hz, for the ETA) ─────────────────────────────
+    rate_fast: Mutex<(Instant, u32)>,
+    rate_real: Mutex<(Instant, u32)>,
     // ── fast-probe dedup: one TCP ping per unique (address, port) ─────
     fast_dedup: Mutex<FastDedupInner>,
-    /// Links whose fast probe failed for a hard unreachability reason: phase 2
-    /// does not re-probe them (the probe cannot pass where the dial did not).
+    /// Links whose fast probe failed for a hard unreachability reason: their
+    /// real half is not probed (the probe cannot pass where the dial did not).
     hard_fast: Mutex<HashSet<(ProtocolId, EndpointId)>>,
-    /// The delay phase 1 measured, per link, for as long as the batch runs.
+    /// The delay the fast level measured, per link, for as long as the batch
+    /// runs.
     ///
     /// The RESULT group writes `latency` and `error` together and every patch
-    /// is built from the plan-time snapshot, so a phase-2 patch would carry
+    /// is built from the plan-time snapshot, so a real patch would carry
     /// `latency = None` and wipe the measurement the same batch had just taken
     /// (160 of 218 real failures lost their fast delay on 2026-09-15). This is
     /// the one field that must be composed back in.
     fast_latency: Mutex<HashMap<(ProtocolId, EndpointId), i32>>,
     /// The batch's counters (see [`BatchCounters`]).
     counters: BatchCounters,
-    /// Phase durations, for the summary line.
-    phase1_ms: AtomicU32,
-    phase2_ms: AtomicU32,
-    // ── real-phase endpoint dedup: endpoints whose real ping succeeded ─
+    /// Wall-clock marks of the two levels, in ms since `started`. The spans
+    /// overlap by construction (that is the pipeline), which the summary says.
+    plan_ms: AtomicU32,
+    fast_started_ms: AtomicU32,
+    fast_ended_ms: AtomicU32,
+    real_started_ms: AtomicU32,
+    real_ended_ms: AtomicU32,
+    // ── real-level endpoint dedup: endpoints whose real ping succeeded ─
     completed_endpoints: Mutex<HashSet<i64>>,
 }
 
@@ -781,18 +801,35 @@ struct BatchCounters {
     fast_ok: AtomicU32,
     fast_hard_failed: AtomicU32,
     fast_soft_failed: AtomicU32,
-    /// Phase-1 failures by class (the reason `fast_hard_failed` /
+    /// Fast-level failures by class (the reason `fast_hard_failed` /
     /// `fast_soft_failed` only count, never explain).
-    phase1_fail: Mutex<BTreeMap<ProbeClass, u32>>,
+    fast_fail: Mutex<BTreeMap<ProbeClass, u32>>,
     real_ok: AtomicU32,
     real_failed: AtomicU32,
-    /// Phase-2 failures by class.
-    phase2_fail: Mutex<BTreeMap<ProbeClass, u32>>,
+    /// Real-level failures by class.
+    real_fail: Mutex<BTreeMap<ProbeClass, u32>>,
     untestable: AtomicU32,
-    /// Phase-2 links retired because phase 1 proved them unreachable.
+    /// Real halves retired because the fast level proved them unreachable.
     unreachable: AtomicU32,
     deferred: AtomicU32,
     queue_full: AtomicU32,
+}
+
+/// Which level of a link's life a deferral retry is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Half {
+    Fast,
+    Real,
+}
+
+impl Half {
+    /// The half's name, for the one debug line a deferral writes.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Real => "real",
+        }
+    }
 }
 
 struct FastDedupInner {
@@ -810,7 +847,7 @@ pub(crate) struct BatchParams {
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    progress: crate::types::BatchProgress,
+    meters: Arc<crate::types::BatchMeters>,
     plan: PlanSource,
     real_phase: bool,
     dedup_endpoints: bool,
@@ -822,45 +859,24 @@ pub(crate) struct BatchParams {
     defer_delay: Duration,
     real_concurrency: usize,
     fast_concurrency: usize,
+    /// Endpoints per plan page. Production uses [`PROFILES_PAGE_SIZE`]; tests
+    /// drive the streaming walk with tiny pages.
+    page_size: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
-    /// Where `run_batch` publishes the batch's shared state, as soon as its plan
-    /// resolves (a feed-wide plan is loaded inside the batch task, so the handle
-    /// cannot exist when the batch is started) — `AppState::batch` holds the
-    /// same slot, and the UI reads the summary through it.
+    /// Where `run_batch` publishes the batch's shared state as soon as it is
+    /// built — `AppState::batch` holds the same slot and the UI reads the
+    /// summary through it.
     batch_slot: Arc<OnceLock<Arc<BatchShared>>>,
 }
 
 impl BatchShared {
-    /// Build the shared state from the (already resolved) plan.
-    fn new(p: BatchParams, plan: Vec<PlanLink>) -> Self {
-        let fast_config = plan
-            .iter()
-            .map(|pl| {
-                (
-                    (pl.link.protocol_id, pl.link.endpoint_id),
-                    pl.protocol.proto_kind.to_i32(),
-                )
-            })
-            .collect();
-        let endpoints = plan
-            .iter()
-            .map(|pl| (pl.endpoint.id, pl.endpoint.clone()))
-            .collect();
-        // The kind-level testability gate: it needs only the in-memory
-        // `proto_kind`, so it is decided here — the one place every batch
-        // (production and test) passes through. The config-aware half runs
-        // inside the real probe, the only place a loaded config exists.
-        let untestable: HashMap<(ProtocolId, EndpointId), String> = plan
-            .iter()
-            .filter(|pl| !capability::kind_supported(pl.protocol.proto_kind))
-            .map(|pl| {
-                (
-                    (pl.link.protocol_id, pl.link.endpoint_id),
-                    untestable_marker_text(capability::KIND_UNSUPPORTED_REASON),
-                )
-            })
-            .collect();
+    /// Build the shared state.
+    ///
+    /// The plan is deliberately NOT here: the walk fills `fast_config`,
+    /// `endpoints`, `untestable` and the meters page by page, which is what lets
+    /// the first probe start within one page instead of after the whole feed.
+    fn new(p: BatchParams) -> Self {
         Self {
             sched: p.scheduler,
             db: p.db.clone(),
@@ -868,8 +884,8 @@ impl BatchShared {
             tx: p.tx,
             runner: p.runner,
             stop: p.stop,
-            progress: p.progress,
-            plan,
+            meters: p.meters,
+            started: Instant::now(),
             real_phase: p.real_phase,
             dedup_endpoints: p.dedup_endpoints,
             fast_timeout: p.fast_timeout,
@@ -880,16 +896,19 @@ impl BatchShared {
             defer_delay: p.defer_delay,
             real_concurrency: p.real_concurrency,
             error_ttl_hours: p.error_ttl_hours,
-            final_total: AtomicU32::new(0),
-            fast_config,
-            endpoints,
-            untestable,
+            batch_slot: p.batch_slot,
+            fast_config: DashMap::new(),
+            endpoints: DashMap::new(),
+            untestable: DashMap::new(),
             fast_sem: Arc::new(Semaphore::new(p.fast_concurrency.max(1))),
+            real_sem: Arc::new(Semaphore::new(p.real_concurrency.max(1))),
             pending_fast: AtomicUsize::new(0),
             pending_real: AtomicUsize::new(0),
-            done: AtomicU32::new(0),
-            phase1_settled: Notify::new(),
-            real_settled: Notify::new(),
+            pending_deferred: AtomicUsize::new(0),
+            settled: Notify::new(),
+            tasks: Mutex::new(Vec::new()),
+            rate_fast: Mutex::new((Instant::now(), 0)),
+            rate_real: Mutex::new((Instant::now(), 0)),
             fast_dedup: Mutex::new(FastDedupInner {
                 cache: HashMap::new(),
                 in_flight: HashMap::new(),
@@ -897,300 +916,292 @@ impl BatchShared {
             hard_fast: Mutex::new(HashSet::new()),
             fast_latency: Mutex::new(HashMap::new()),
             counters: BatchCounters::default(),
-            phase1_ms: AtomicU32::new(0),
-            phase2_ms: AtomicU32::new(0),
+            plan_ms: AtomicU32::new(0),
+            fast_started_ms: AtomicU32::new(0),
+            fast_ended_ms: AtomicU32::new(0),
+            real_started_ms: AtomicU32::new(0),
+            real_ended_ms: AtomicU32::new(0),
             completed_endpoints: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Links planned so far — the walk increments it with each dispatched link.
+    fn plan_len(&self) -> u32 {
+        self.meters.fast.total.load(Ordering::Relaxed)
+    }
+
+    /// Spawn a task the batch must outlive (chains and deferral retries).
+    fn spawn_tracked(self: &Arc<Self>, fut: impl Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(fut);
+        self.tasks.lock().push(handle);
+    }
+
+    /// Record the first start of a level, in ms since the batch began (the
+    /// first writer wins: `0` means "not started yet").
+    fn mark_started(&self, at: &AtomicU32) {
+        let ms = u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let _ = at.compare_exchange(0, ms, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// Record a level's latest settle.
+    fn mark_settled(&self, at: &AtomicU32) {
+        at.store(
+            u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// One settle on a level: `done += 1`, plus a rate sample at most once a
+    /// second (`results/s × 1000`, the render path's ETA input).
+    ///
+    /// The sample is taken on the settle that crosses the second boundary — no
+    /// timer, no thread, and no per-result event.
+    fn bump(phase: &crate::types::PhaseMeters, slot: &Mutex<(Instant, u32)>) {
+        let done = phase.done.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut last = slot.lock();
+        if done == 1 {
+            // First result of this level: time the window from HERE. A slot
+            // created with the batch would include the idle stretch before the
+            // level's first settle — the live run of the fast+real pipeline (46
+            // real results in 8 s) sampled 1 result over ~5 s of that idle
+            // stretch, stored 0/s, and pinned the real ETA at `--` because no
+            // later settle crossed a fresh second boundary.
+            *last = (Instant::now(), done);
+            return;
+        }
+        let elapsed = last.0.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let elapsed_ms = u64::try_from(elapsed.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let delta = u64::from(done.saturating_sub(last.1));
+        // `rate_milli` is results/s × 1000 (`PhaseMeters::eta_secs` divides by
+        // it), so a delta over `elapsed_ms` scales by 1e6, not 1e3.
+        phase.rate_milli.store(
+            u32::try_from(delta * 1_000_000 / elapsed_ms).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        *last = (Instant::now(), done);
     }
 }
 
 /// Run one batch to completion. Spawned by the entry points; awaited directly
-/// by the tests. Resolves its plan first (a feed-wide load is the batch task's
-/// job, not the UI's).
+/// by the tests.
+///
+/// The plan is a page stream: each page is dispatched as it loads, so the first
+/// probe starts within a page instead of after the whole feed (resolving every
+/// page first cost ~5.8 s of dead air on the 2026-09-17 reference feed), and
+/// every link's real half is dispatched by its own chain once that link's fast
+/// half has settled — there is no phase barrier and no gate queue on the path.
 pub(crate) async fn run_batch(mut params: BatchParams) {
-    let plan = match std::mem::replace(&mut params.plan, PlanSource::Links(Vec::new())) {
-        PlanSource::Feed => match load_feed_plan(&params.db, PROFILES_PAGE_SIZE).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                tracing::warn!(target: "tui::ops::ping", "batch: plan load failed: {e}");
-                let _ = params.tx.try_send(CoreEvent::BatchProgress {
-                    total: 0,
-                    completed: 0,
-                });
-                return;
-            }
-        },
-        PlanSource::Links(plan) => plan,
-    };
-    if plan.is_empty() {
-        tracing::warn!(target: "tui::ops::ping", "batch: no links to test");
-        let _ = params.tx.try_send(CoreEvent::BatchProgress {
-            total: 0,
-            completed: 0,
-        });
-        return;
-    }
-    let batch_slot = params.batch_slot.clone();
-    let shared = Arc::new(BatchShared::new(params, plan));
-    // Publish the handle before the first progress event: a batch's record has
-    // to exist for as long as the batch can be interrupted, and the shared state
-    // (counters + class histograms) is what the quit path renders.
-    let _ = batch_slot.set(shared.clone());
-    if shared.real_phase {
-        warn_if_real_phase_is_slow(shared.real_concurrency, shared.plan.len());
-    } else {
-        // Phase 1 IS the final phase of a fast-only run, so its own candidate
-        // set is the denominator. A fast+real run publishes phase 2's instead
-        // (the plan's own length is not a phase): until then the pair holds no
-        // denominator, and the status bar reads "Testing..." rather than a
-        // numerator and a denominator from two different phases.
-        shared.publish_final_total(u32::try_from(shared.plan.len()).unwrap_or(u32::MAX));
-    }
+    let source = std::mem::replace(&mut params.plan, PlanSource::Links(Vec::new()));
+    let page_size = params.page_size.max(1);
+    let mut walk = PlanWalk::new(source, params.db.clone(), page_size);
+    let shared = Arc::new(BatchShared::new(params));
+    // Publish the handle before the first probe: a batch's record has to exist
+    // for as long as the batch can be interrupted, and the shared state
+    // (counters + class histograms + meters) is what the quit path renders.
+    let _ = shared.batch_slot.set(Arc::clone(&shared));
 
-    // ── Phase 1: one FastPing task per link ───────────────────────────
-    let phase1_started = std::time::Instant::now();
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut deferred: Vec<PlanLink> = Vec::new();
-    for plan in &shared.plan {
-        if shared.stop.load(Ordering::Relaxed) {
-            // Stop at the dispatch boundary: remaining links are never
-            // scheduled, so they never write anything.
-            break;
-        }
-        match shared.sched.schedule(&plan.link, TaskKind::FastPing).await {
-            ScheduleOutcome::Started(id) => {
-                shared.pending_fast.fetch_add(1, Ordering::Relaxed);
-                let fresh = plan.link.clone();
-                let shared = shared.clone();
-                handles.push(tokio::spawn(run_task_chain(
-                    shared,
-                    fresh,
-                    id,
-                    TaskKind::FastPing,
-                )));
-            }
-            ScheduleOutcome::Queued(_) => {
-                // The gate holder's completion promotes and fires this task.
-                shared.pending_fast.fetch_add(1, Ordering::Relaxed);
-            }
-            ScheduleOutcome::DnsDeferred => {
-                shared.counters.deferred.fetch_add(1, Ordering::Relaxed);
-                deferred.push(plan.clone());
-            }
-            ScheduleOutcome::QueueFull => {
-                shared.counters.queue_full.fetch_add(1, Ordering::Relaxed);
-                // Per-link: a feed-wide batch would flood the log. The summary
-                // carries the count.
-                tracing::debug!(target: "tui::ops::ping", "batch: link skipped, queue full");
-            }
-        }
-    }
-    for plan in deferred {
-        let shared = shared.clone();
-        handles.push(tokio::spawn(retry_deferred_fast(shared, plan)));
-    }
-
-    // Wait for every fast task to settle (gate clear per link).
+    // ── Walk and dispatch: the plan is consumed page by page ──────────
+    let walk_started = Instant::now();
+    let mut walk_error: Option<xray_tui_db::DatabaseError> = None;
     loop {
-        // Register the waiter BEFORE reading the counter: `notify_waiters` only
-        // wakes already-registered waiters, so a task that settles in between
-        // would otherwise be a lost wakeup and this loop would park forever.
-        let settled = shared.phase1_settled.notified();
-        tokio::pin!(settled);
-        settled.as_mut().enable();
-        if shared.pending_fast.load(Ordering::Relaxed) == 0 {
+        if shared.stop.load(Ordering::Relaxed) {
+            // Stop at the dispatch boundary: the rest of the plan is never
+            // scheduled, so it never writes anything.
             break;
         }
-        settled.await;
+        match walk.next_page().await {
+            Ok(Some(links)) => {
+                shared
+                    .meters
+                    .plan_pages_total
+                    .store(walk.pages_total(), Ordering::Relaxed);
+                shared.dispatch_page(links).await;
+                shared
+                    .meters
+                    .plan_pages_done
+                    .store(walk.pages_done(), Ordering::Relaxed);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // The pages already dispatched are probing: keep them and finish
+                // normally rather than discarding visible results for a plan
+                // error the summary reports.
+                walk_error = Some(e);
+                break;
+            }
+        }
     }
-    for h in handles {
-        let _ = h.await;
-    }
-
-    shared.phase1_ms.store(
-        u32::try_from(phase1_started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    shared.plan_ms.store(
+        u32::try_from(walk_started.elapsed().as_millis()).unwrap_or(u32::MAX),
         Ordering::Relaxed,
     );
-
-    // Untestable rows get their `[real]` marker only now: a fast success writes
-    // `error = None`, so a marker emitted before phase 1 would be cleared by it
-    // (ordering, not a race — both go through the events handler).
-    shared.emit_untestable_markers();
-
-    if !shared.real_phase {
-        finish_batch(&shared).await;
-        return;
-    }
-
-    // ── Phase 2: one RealPing task per link, fired per endpoint ───────
-    let phase2_started = std::time::Instant::now();
-    // Phase 2's candidate set is what the real phase will actually probe: the
-    // untestable links were marked at the phase-1 boundary and the hard-failed
-    // ones are skipped below, so neither belongs in the denominator the status
-    // bar counts against. Publish it BEFORE dispatch — the pair's total is 0
-    // until here, which is what keeps the bar from pairing phase 2's numerator
-    // with the whole plan's denominator.
-    let final_total = {
-        let hard_fast = shared.hard_fast.lock();
-        u32::try_from(
-            shared
-                .plan
-                .iter()
-                .filter(|pl| {
-                    let key = (pl.link.protocol_id, pl.link.endpoint_id);
-                    !shared.untestable.contains_key(&key) && !hard_fast.contains(&key)
-                })
-                .count(),
-        )
-        .unwrap_or(u32::MAX)
-    };
     tracing::info!(
         target: "tui::ops::ping",
-        "real phase: {final_total} candidate(s) of {} link(s), concurrency {}",
-        shared.plan.len(),
-        shared.real_concurrency,
+        "{}",
+        plan_line(
+            shared.plan_len(),
+            walk.pages_done(),
+            shared.plan_ms.load(Ordering::Relaxed),
+        ),
     );
-    shared.publish_final_total(final_total);
-    let mut per_endpoint: BTreeMap<i64, Vec<(ProfileStats, u16)>> = BTreeMap::new();
-    // The dispatch order of those groups: insertion order (= the best-first
-    // sweep below). `per_endpoint` is keyed by the endpoint id — a hash — so
-    // iterating the map would fire in an arbitrary order.
-    let mut group_order: Vec<i64> = Vec::new();
-    let mut deferred_real: Vec<PlanLink> = Vec::new();
-    // Best-first: phase 1 measured a delay for exactly the links that reach
-    // phase 2, and phase 2 is the long pole (2.6 results/s against 128 for
-    // phase 1 on 2026-09-16, so a full feed needs ~1.7 h). A run stopped
-    // part-way must therefore have tested the fastest — the most usable —
-    // links first; links with no phase-1 measurement keep plan order, last.
-    let phase1_latency = shared.fast_latency.lock().clone();
-    let mut phase2_order: Vec<usize> = (0..shared.plan.len()).collect();
-    phase2_order.sort_by_key(|&i| {
-        let link = &shared.plan[i].link;
-        phase1_latency
-            .get(&(link.protocol_id, link.endpoint_id))
-            .copied()
-            .unwrap_or(i32::MAX)
-    });
-    for index in phase2_order {
-        let plan = &shared.plan[index];
-        if shared.stop.load(Ordering::Relaxed) {
-            break;
-        }
-        // Untestable links never enter the real phase: their marker was emitted
-        // once phase 1 settled (`emit_untestable_markers`).
-        if shared
-            .untestable
-            .contains_key(&(plan.link.protocol_id, plan.link.endpoint_id))
-        {
-            continue;
-        }
-        // Phase 1 already proved this link's proxy unreachable (refused, no
-        // route, unresolvable, dial timeout): the real probe would only spend
-        // its whole timeout re-learning that. The row keeps its `[fast]`
-        // marker, which is the honest statement about it.
-        if shared
-            .hard_fast
-            .lock()
-            .contains(&(plan.link.protocol_id, plan.link.endpoint_id))
-        {
-            shared.counters.unreachable.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        match shared.sched.schedule(&plan.link, TaskKind::RealPing).await {
-            ScheduleOutcome::Started(id) => {
-                shared.pending_real.fetch_add(1, Ordering::Relaxed);
-                let fresh = plan.link.clone();
-                let eid = plan.endpoint.id.get();
-                if !per_endpoint.contains_key(&eid) {
-                    group_order.push(eid);
-                }
-                per_endpoint.entry(eid).or_default().push((fresh, id));
-            }
-            ScheduleOutcome::Queued(_) => {
-                // Promoted by the gate holder's completion (serialized batches
-                // start clean, so this is the rare defensive path).
-                shared.pending_real.fetch_add(1, Ordering::Relaxed);
-            }
-            ScheduleOutcome::DnsDeferred => {
-                shared.counters.deferred.fetch_add(1, Ordering::Relaxed);
-                deferred_real.push(plan.clone());
-            }
-            ScheduleOutcome::QueueFull => {
-                shared.counters.queue_full.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(target: "tui::ops::ping", "batch: real ping skipped, queue full");
-            }
-        }
+    if let Some(e) = &walk_error {
+        tracing::warn!(
+            target: "tui::ops::ping",
+            "batch: plan walk stopped after {} page(s): {e}",
+            walk.pages_done(),
+        );
     }
-    let mut deferred_real_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for plan in deferred_real {
-        let shared = shared.clone();
-        deferred_real_handles.push(tokio::spawn(retry_deferred_real(shared, plan)));
+    if shared.plan_len() == 0 && !shared.stop.load(Ordering::Relaxed) {
+        // Nothing was planned at all (an empty feed, or a walk that failed on
+        // its first page): no work exists to flush or sweep, so the batch ends
+        // with the terminal event alone. A stop before the first page is NOT
+        // this case — the feed may hold thousands of links the run never
+        // touched, and those are exactly the rows `finish_batch`'s error sweep
+        // exists for.
+        tracing::warn!(target: "tui::ops::ping", "batch: no links to test");
+        let _ = shared.tx.try_send(CoreEvent::BatchEnded);
+        return;
+    }
+    if shared.real_phase {
+        warn_if_real_phase_is_slow(shared.real_concurrency, shared.plan_len() as usize);
     }
 
-    // Fire one endpoint group at a time (bounded by `real_concurrency`); links
-    // within an endpoint fire sequentially so `dedup_endpoints` can stop at
-    // the first success.
-    let sem = Arc::new(Semaphore::new(shared.real_concurrency.max(1)));
-    let mut real_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for eid in group_order {
-        let Some(group) = per_endpoint.remove(&eid) else {
-            continue;
-        };
-        let shared = shared.clone();
-        let sem = sem.clone();
-        real_handles.push(tokio::spawn(async move {
-            let Ok(_permit) = sem.acquire_owned().await else {
-                return;
-            };
-            for (fresh, id) in group {
-                if shared.stop.load(Ordering::Relaxed) {
-                    shared.retire_real(&fresh, id).await;
-                    continue;
-                }
-                if shared.dedup_endpoints
-                    && shared
-                        .completed_endpoints
-                        .lock()
-                        .contains(&fresh.endpoint_id.get())
-                {
-                    // A sibling already succeeded: cancel queued real tasks and
-                    // retire this link's real task without a probe.
-                    shared.retire_real(&fresh, id).await;
-                    continue;
-                }
-                run_task_chain(shared.clone(), fresh, id, TaskKind::RealPing).await;
-            }
-        }));
-    }
-
-    // Wait for every real task to settle.
+    // Wait for every chain and deferral retry to settle, then join them: the
+    // counters say when work is settled, the join makes the batch's end a hard
+    // boundary (a chain also runs between its fast settle and its real
+    // dispatch, which no counter covers).
     loop {
-        // Same registration order as the phase-1 loop.
-        let settled = shared.real_settled.notified();
+        // Register the waiter BEFORE reading the counters: `notify_waiters`
+        // only wakes already-registered waiters, so a task that settles in
+        // between would otherwise be a lost wakeup and this loop would park
+        // forever.
+        let settled = shared.settled.notified();
         tokio::pin!(settled);
         settled.as_mut().enable();
-        if shared.pending_real.load(Ordering::Relaxed) == 0 {
+        if shared.pending_fast.load(Ordering::Relaxed) == 0
+            && shared.pending_real.load(Ordering::Relaxed) == 0
+            && shared.pending_deferred.load(Ordering::Relaxed) == 0
+        {
             break;
         }
         settled.await;
     }
-    for h in real_handles {
-        let _ = h.await;
+    let tasks = std::mem::take(&mut *shared.tasks.lock());
+    for task in tasks {
+        let _ = task.await;
     }
-    // Join the DNS-deferred retries: they may still be sleeping while every
-    // already-scheduled task settled (`pending_real == 0` does not account for
-    // deferrals). `finish_batch` must run only after ALL work — including
-    // their late results and progress events — has been emitted; otherwise the
-    // terminal `BatchProgress{0,0}` would clear the progress bar before the
-    // retries' events arrive and re-create it, leaving it stuck forever.
-    for h in deferred_real_handles {
-        let _ = h.await;
-    }
-    shared.phase2_ms.store(
-        u32::try_from(phase2_started.elapsed().as_millis()).unwrap_or(u32::MAX),
-        Ordering::Relaxed,
-    );
     finish_batch(&shared).await;
+}
+
+/// The plan as a page stream.
+///
+/// A batch dispatches each page as it loads, so the first probe starts within a
+/// page of the walk instead of after the whole feed: the loader used to resolve
+/// every page first, and on the 2026-09-17 reference feed (18,334 endpoints,
+/// ~92 pages × the measured 63 ms per page) that was ~5.8 s of dead air before
+/// the first socket dial. It also holds no `Vec<PlanLink>` for the whole feed —
+/// only the per-link maps the probes read.
+enum PlanWalk {
+    /// An explicit plan (the selected-endpoint entry points and the tests): one
+    /// page.
+    Links(std::vec::IntoIter<Vec<PlanLink>>),
+    /// The whole feed, walked page by page through the tab's own query.
+    Feed {
+        db: Arc<Database>,
+        page_size: usize,
+        offset: usize,
+        pages_done: u32,
+        pages_total: u32,
+        exhausted: bool,
+    },
+}
+
+impl PlanWalk {
+    fn new(source: PlanSource, db: Arc<Database>, page_size: usize) -> Self {
+        match source {
+            PlanSource::Links(links) => Self::Links(vec![links].into_iter()),
+            PlanSource::Feed => Self::Feed {
+                db,
+                page_size,
+                offset: 0,
+                pages_done: 0,
+                pages_total: 0,
+                exhausted: false,
+            },
+        }
+    }
+
+    const fn pages_done(&self) -> u32 {
+        match self {
+            Self::Links(_) => 1,
+            Self::Feed { pages_done, .. } => *pages_done,
+        }
+    }
+
+    const fn pages_total(&self) -> u32 {
+        match self {
+            Self::Links(_) => 1,
+            Self::Feed { pages_total, .. } => *pages_total,
+        }
+    }
+
+    /// The next page of links, or `None` when the walk is exhausted. The first
+    /// feed page also carries the feed-wide endpoint count (one `COUNT` for the
+    /// whole walk, not one per page).
+    async fn next_page(&mut self) -> Result<Option<Vec<PlanLink>>, xray_tui_db::DatabaseError> {
+        match self {
+            Self::Links(iter) => Ok(iter.next()),
+            Self::Feed {
+                db,
+                page_size,
+                offset,
+                pages_done,
+                pages_total,
+                exhausted,
+            } => {
+                if *exhausted {
+                    return Ok(None);
+                }
+                // `PurgatoryView::All` and no search/group: the run is about the
+                // whole database, not about what the tab currently filters to.
+                // The thresholds are unused for that view.
+                let request = PageRequest {
+                    view: PurgatoryView::All,
+                    active_threshold: 0,
+                    search: None,
+                    group_id: None,
+                    sort: PageSort::Address,
+                    ascending: true,
+                    offset: *offset,
+                    limit: *page_size,
+                };
+                let (ids, total) = db.profiles_walk_page(&request, *offset == 0).await?;
+                if let Some(total) = total {
+                    let pages = total.div_ceil(u64::try_from(*page_size).unwrap_or(u64::MAX));
+                    *pages_total = u32::try_from(pages).unwrap_or(u32::MAX);
+                }
+                if ids.is_empty() {
+                    *exhausted = true;
+                    return Ok(None);
+                }
+                *offset += ids.len();
+                *pages_done += 1;
+                // Purged links are skipped by a feed-wide sweep: the real half
+                // is the long pole, and re-proving a link the classifier has
+                // already judged is the one thing the purge exists to stop.
+                // The selected-endpoint entry points read the loaded page
+                // instead, so a real test on a Purgatory row still probes it
+                // (spec §8, D3).
+                let rows = db.load_page_projection(&ids, false).await?;
+                Ok(Some(rows.iter().flat_map(plan_row_links).collect()))
+            }
+        }
+    }
 }
 
 /// Attempts for the batch-end flush. Contention with a concurrent import is
@@ -1202,15 +1213,12 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
 /// same single call is repeated.
 const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 
-/// Signal the batch's end: total 0 makes the events handler clear the shared
-/// progress and re-arm the stop flag. Runs the error-TTL sweep first (design
-/// §6.4): batch completion is a natural "errors are fresh now" boundary, so
-/// persisted failure markers older than the configured TTL are cleared
-/// before the terminal progress event lands. Links the batch did not touch
-/// (dedup-cancelled siblings, queue-full/stop skips) are exactly the ones
-/// whose stale markers this clears.
+/// Signal the batch's end. Runs the error-TTL sweep first (design §6.4): batch
+/// completion is a natural "errors are fresh now" boundary, so persisted failure
+/// markers older than the configured TTL are cleared before the terminal event
+/// lands. Links the batch did not touch (dedup-retired siblings, queue-full/stop
+/// skips) are exactly the ones whose stale markers this clears.
 async fn finish_batch(shared: &BatchShared) {
-    shared.progress.0.store(0, Ordering::Relaxed);
     // Make the batch durable before the sweeps look at the rows: the staged
     // result/task writes land in one transaction here instead of one commit
     // per result on the UI task.
@@ -1257,34 +1265,45 @@ async fn finish_batch(shared: &BatchShared) {
     // One line per batch: the per-result lines are `debug`, so this is the
     // record a reader (and the next investigation) works from.
     tracing::info!(target: "tui::ops::ping", "{}", summary_line(shared));
-    let _ = shared.tx.try_send(CoreEvent::BatchProgress {
-        total: 0,
-        completed: 0,
-    });
+    let _ = shared.tx.try_send(CoreEvent::BatchEnded);
 }
 
-/// The batch's single log record: planned links, per-phase outcomes, the
-/// phase-2 skips, the phase timings and the writer's own durability answer
-/// (`staged-left` is non-zero only if a flush never succeeded).
+/// The plan's own record: the pages and links the walk produced and how long it
+/// took. Emitted once, after the walk (a stop or a page error ends it early, and
+/// the line then reports the partial plan — which is why the counts are here and
+/// not derived from the feed).
+fn plan_line(links: u32, pages: u32, plan_ms: u32) -> String {
+    format!("batch: planned {links} link(s) over {pages} page(s) in {plan_ms} ms")
+}
+
+/// The batch's single log record: the planned links and pages, the per-level
+/// outcomes with their class histograms, the two overlapping level spans (the
+/// pipeline runs both levels at once, so they are not phases) and the writer's
+/// own durability answer (`staged-left` is non-zero only if a flush never
+/// succeeded).
 pub(crate) fn summary_line(shared: &BatchShared) -> String {
     let counters = &shared.counters;
     let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
     format!(
-        "batch summary: links={} untestable={} queue-full={} deferred={} | phase1 ok={} hard-fail={} soft-fail={} {} ({} ms) | phase2 ok={} failed={} {} skipped-unreachable={} ({} ms) | stopped={} flushes={} staged-left={}",
-        shared.plan.len(),
+        "batch summary: links={} plan={} ms untestable={} queue-full={} deferred={} | fast ok={} hard-fail={} soft-fail={} {} ({}..{} ms) | real ok={} failed={} {} skipped-unreachable={} ({}..{} ms) | levels overlap | wall={} ms stopped={} flushes={} staged-left={}",
+        shared.plan_len(),
+        shared.plan_ms.load(Ordering::Relaxed),
         load(&counters.untestable),
         load(&counters.queue_full),
         load(&counters.deferred),
         load(&counters.fast_ok),
         load(&counters.fast_hard_failed),
         load(&counters.fast_soft_failed),
-        class_histogram(&counters.phase1_fail),
-        shared.phase1_ms.load(Ordering::Relaxed),
+        class_histogram(&counters.fast_fail),
+        shared.fast_started_ms.load(Ordering::Relaxed),
+        shared.fast_ended_ms.load(Ordering::Relaxed),
         load(&counters.real_ok),
         load(&counters.real_failed),
-        class_histogram(&counters.phase2_fail),
+        class_histogram(&counters.real_fail),
         load(&counters.unreachable),
-        shared.phase2_ms.load(Ordering::Relaxed),
+        shared.real_started_ms.load(Ordering::Relaxed),
+        shared.real_ended_ms.load(Ordering::Relaxed),
+        shared.started.elapsed().as_millis(),
         shared.stop.load(Ordering::Relaxed),
         shared.writer.flush_count(),
         shared.writer.staged_len(),
@@ -1326,13 +1345,17 @@ fn class_histogram(map: &Mutex<BTreeMap<ProbeClass, u32>>) -> String {
 ///
 /// This is the SAME summary a completed run writes, so the per-class
 /// histograms survive an interruption, plus the two counts `finish_batch` does
-/// not need: what the final phase had settled, and what was still in flight.
+/// not need: what the levels had settled, and what was still in flight (task
+/// slots plus the deferral retries, which hold no gate entry).
 pub(crate) fn interrupted_summary_line(shared: &BatchShared) -> String {
+    let settled = shared.meters.fast.done.load(Ordering::Relaxed)
+        + shared.meters.real.done.load(Ordering::Relaxed);
+    let in_flight = shared.pending_fast.load(Ordering::Relaxed)
+        + shared.pending_real.load(Ordering::Relaxed)
+        + shared.pending_deferred.load(Ordering::Relaxed);
     format!(
-        "batch interrupted at quit: {} | settled={} in-flight={}",
+        "batch interrupted at quit: {} | settled={settled} in-flight={in_flight}",
         summary_line(shared),
-        shared.done.load(Ordering::Relaxed),
-        shared.pending_fast.load(Ordering::Relaxed) + shared.pending_real.load(Ordering::Relaxed),
     )
 }
 
@@ -1372,71 +1395,12 @@ pub fn log_startup_envelope(state: &AppState) {
     );
 }
 
-/// Re-schedule a DNS-deferred fast link after the deferral window.
-async fn retry_deferred_fast(shared: Arc<BatchShared>, plan: PlanLink) {
-    tokio::time::sleep(shared.defer_delay).await;
-    loop {
-        if shared.stop.load(Ordering::Relaxed) {
-            return;
-        }
-        match shared.sched.schedule(&plan.link, TaskKind::FastPing).await {
-            ScheduleOutcome::Started(id) => {
-                shared.pending_fast.fetch_add(1, Ordering::Relaxed);
-                let fresh = plan.link.clone();
-                run_task_chain(shared, fresh, id, TaskKind::FastPing).await;
-                return;
-            }
-            ScheduleOutcome::Queued(_) => {
-                shared.pending_fast.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            ScheduleOutcome::DnsDeferred => {
-                tokio::time::sleep(shared.defer_delay.min(Duration::from_millis(250))).await;
-            }
-            ScheduleOutcome::QueueFull => return,
-        }
-    }
-}
-
-/// Re-schedule a DNS-deferred real link after the deferral window (with the
-/// same sibling-dedup check as the main fire path).
-async fn retry_deferred_real(shared: Arc<BatchShared>, plan: PlanLink) {
-    tokio::time::sleep(shared.defer_delay).await;
-    loop {
-        if shared.stop.load(Ordering::Relaxed) {
-            return;
-        }
-        match shared.sched.schedule(&plan.link, TaskKind::RealPing).await {
-            ScheduleOutcome::Started(id) => {
-                shared.pending_real.fetch_add(1, Ordering::Relaxed);
-                let fresh = plan.link.clone();
-                if shared.dedup_endpoints
-                    && shared
-                        .completed_endpoints
-                        .lock()
-                        .contains(&fresh.endpoint_id.get())
-                {
-                    shared.retire_real(&fresh, id).await;
-                } else {
-                    run_task_chain(shared, fresh, id, TaskKind::RealPing).await;
-                }
-                return;
-            }
-            ScheduleOutcome::Queued(_) => {
-                shared.pending_real.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            ScheduleOutcome::DnsDeferred => {
-                tokio::time::sleep(shared.defer_delay.min(Duration::from_millis(250))).await;
-            }
-            ScheduleOutcome::QueueFull => return,
-        }
-    }
-}
-
-/// Drive one scheduled task to completion: dispatch the probe (or retire the
-/// task silently under stop), `complete` it, then fire whatever the gate
-/// promotes — repeating until the link's gate is clear.
+/// Drive one link's chain: its fast half, then the real half that half's settle
+/// dispatches (real-phase batches). The gate keeps a link's halves from
+/// overlapping; this chain, not a queue, hands the link from one to the other.
+///
+/// A stop at a dispatch boundary retires the task silently — no result event, no
+/// error marker.
 async fn run_task_chain(
     shared: Arc<BatchShared>,
     link: ProfileStats,
@@ -1445,41 +1409,41 @@ async fn run_task_chain(
 ) {
     loop {
         if shared.stop.load(Ordering::Relaxed) {
-            // Stop pressed at a dispatch boundary: retire this task silently —
-            // no result event, no error marker.
             shared.sched.complete(&link, id, kind).await;
             shared.note_settled(kind);
-        } else {
-            match kind {
-                TaskKind::FastPing => {
-                    // Global phase-1 bound (`fast_ping_concurrency`): the batch
-                    // used to spawn one probe future per link with no cap.
-                    let _permit = Arc::clone(&shared.fast_sem).acquire_owned().await;
-                    let outcome = shared.fast_probe(&link).await;
-                    shared.emit_result(&link, TestType::TcpPing, &outcome);
-                    shared.sched.complete(&link, id, kind).await;
-                    shared.note_settled(kind);
-                }
-                TaskKind::RealPing => {
-                    let outcome = shared.real_probe(&link).await;
-                    // A successful real ping records the endpoint so the
-                    // sibling-dedup pass skips its remaining links.
-                    if shared.dedup_endpoints && matches!(outcome, ProbeOutcome::Ok { .. }) {
-                        shared
-                            .completed_endpoints
-                            .lock()
-                            .insert(link.endpoint_id.get());
-                    }
-                    shared.emit_result(&link, TestType::RealPing, &outcome);
-                    shared.sched.complete(&link, id, kind).await;
-                    shared.note_settled(kind);
-                }
-                _ => return, // SpeedTest/UdpTest tasks are not part of the batch
-            }
+            // The real half of a stopped link is never dispatched, so it is never
+            // counted: `after_fast_settle` owns the accounting, and a link that
+            // never reached it has nothing outstanding.
+            return;
         }
-        // Fire the promoted task, if any. The gate owns task state, so ask it
-        // for the link's new current id (an id the registry does not know
-        // cannot come back: the gate and the registry advance together).
+        match kind {
+            TaskKind::FastPing => {
+                // The fast level's own bound (`fast_ping_concurrency`): the batch
+                // used to spawn one probe future per link with no global cap.
+                let Ok(permit) = Arc::clone(&shared.fast_sem).acquire_owned().await else {
+                    return;
+                };
+                shared.mark_started(&shared.fast_started_ms);
+                let outcome = shared.fast_probe(&link).await;
+                shared.emit_result(&link, TestType::TcpPing, &outcome);
+                shared.sched.complete(&link, id, TaskKind::FastPing).await;
+                shared.note_settled(TaskKind::FastPing);
+                drop(permit);
+                // The fast result is staged: the link's real half (and its
+                // untestable marker, for either batch kind) follows here.
+                shared.after_fast_settle(&link).await;
+            }
+            TaskKind::RealPing => {
+                // Defensive: the batch never queues, so this arm is reached only
+                // when another chain held this link's gate and promoted our id.
+                shared.mark_started(&shared.real_started_ms);
+                shared.run_real_task(&link, id).await;
+            }
+            _ => return, // SpeedTest/UdpTest tasks are not part of the batch
+        }
+        // Fire the promoted task, if any. The gate owns task state, so ask it for
+        // the link's new current id (an id the registry does not know cannot come
+        // back: the gate and the registry advance together).
         let Some(next_id) = shared.sched.task_of(&link) else {
             return;
         };
@@ -1496,10 +1460,235 @@ async fn run_task_chain(
 }
 
 impl BatchShared {
+    /// Schedule one page's links. The maps the probes read are filled here, so a
+    /// link's own halves find their config and endpoint without a second pass
+    /// over the whole plan.
+    async fn dispatch_page(self: &Arc<Self>, links: Vec<PlanLink>) {
+        for plan in links {
+            let key = (plan.link.protocol_id, plan.link.endpoint_id);
+            self.fast_config
+                .insert(key, plan.protocol.proto_kind.to_i32());
+            self.endpoints
+                .insert(plan.endpoint.id, Arc::new(plan.endpoint.clone()));
+            // The kind-level testability gate: it needs only the in-memory
+            // `proto_kind`, so it is decided here — the one place every batch
+            // (production and test) passes through. The config-aware half runs
+            // inside the real probe, the only place a loaded config exists.
+            if !capability::kind_supported(plan.protocol.proto_kind) {
+                self.untestable.insert(
+                    key,
+                    untestable_marker_text(capability::KIND_UNSUPPORTED_REASON),
+                );
+            }
+            self.meters.fast.total.fetch_add(1, Ordering::Relaxed);
+            let link = plan.link;
+            if !self.dispatch_fast_link(link.clone()).await {
+                self.spawn_defer_retry(link, Half::Fast);
+            }
+        }
+    }
+
+    /// Schedule one link's fast half.
+    ///
+    /// Returns `false` only for `DnsDeferred`, and the caller owns the retry —
+    /// one retry task per deferred half, looping inside itself. `Queued` is the
+    /// defensive case (another chain holds this link's gate and its `complete`
+    /// promotes ours): the batch itself never queues, because a queued real half
+    /// would depend on `task_queue_limit` and a `DnsDeferred` link has no gate
+    /// entry to queue behind (`schedule` answers before the lock).
+    async fn dispatch_fast_link(self: &Arc<Self>, link: ProfileStats) -> bool {
+        match self.sched.schedule(&link, TaskKind::FastPing).await {
+            ScheduleOutcome::Started(id) => {
+                self.pending_fast.fetch_add(1, Ordering::Relaxed);
+                let shared = Arc::clone(self);
+                self.spawn_tracked(async move {
+                    run_task_chain(shared, link, id, TaskKind::FastPing).await;
+                });
+                true
+            }
+            ScheduleOutcome::Queued(_) => {
+                self.pending_fast.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            ScheduleOutcome::DnsDeferred => {
+                self.counters.deferred.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            ScheduleOutcome::QueueFull => {
+                self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                // Per-link: a feed-wide batch would flood the log. The summary
+                // carries the count.
+                tracing::debug!(target: "tui::ops::ping", "batch: link skipped, queue full");
+                true
+            }
+        }
+    }
+
+    /// Everything a link owes once its fast result is staged.
+    ///
+    /// The untestable marker comes first and applies to BOTH batch kinds: the
+    /// single pass this replaces ran before the fast-only early return, so a
+    /// fast-only batch marks such rows today — dropping the marker would leave a
+    /// genuine-looking failure behind and `remove_failed_servers` would delete
+    /// the row (the marker outranks a measurement in the Test cell). A marked
+    /// link is never a real candidate.
+    async fn after_fast_settle(self: &Arc<Self>, link: &ProfileStats) {
+        let key = (link.protocol_id, link.endpoint_id);
+        let untestable = self.untestable.get(&key).map(|r| r.value().clone());
+        if let Some(reason) = untestable {
+            self.counters.untestable.fetch_add(1, Ordering::Relaxed);
+            self.emit_untestable_marker(link, &reason);
+            return;
+        }
+        if !self.real_phase {
+            return;
+        }
+        // The fast level already proved this link's proxy unreachable (refused,
+        // no route, unresolvable, dial timeout): the real probe would only spend
+        // its whole timeout re-learning that. The row keeps its `[fast]` marker,
+        // which is the honest statement about it.
+        if self.hard_fast.lock().contains(&key) {
+            self.counters.unreachable.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // A candidate is known: it enters the real level's denominator, and
+        // every path out of `dispatch_real_probe` counts it exactly once into
+        // `real.done` (probe, sibling retire, stop retire, queue-full).
+        self.meters.real.total.fetch_add(1, Ordering::Relaxed);
+        if !self.dispatch_real_probe(link.clone(), true).await {
+            self.spawn_defer_retry(link.clone(), Half::Real);
+        }
+    }
+
+    /// Dispatch a link's real half.
+    ///
+    /// The permit is taken BEFORE the sibling check on purpose: for an endpoint
+    /// whose links settle together, the probes `dedup_endpoints` saves are the
+    /// ones still waiting for capacity when a sibling's real ping succeeded.
+    ///
+    /// `counted` says this half's candidate is already in `real.total`; a
+    /// deferral retry passes `false` so a retried half is never counted twice.
+    /// Returns `false` only for `DnsDeferred` (the caller re-enters later).
+    async fn dispatch_real_probe(self: &Arc<Self>, link: ProfileStats, counted: bool) -> bool {
+        let Ok(permit) = Arc::clone(&self.real_sem).acquire_owned().await else {
+            return true;
+        };
+        if self.stop.load(Ordering::Relaxed) {
+            if counted {
+                self.note_real_done();
+            }
+            return true;
+        }
+        if self.dedup_endpoints
+            && self
+                .completed_endpoints
+                .lock()
+                .contains(&link.endpoint_id.get())
+        {
+            // A sibling already succeeded: retire this half without a probe and
+            // without a result event, so no marker is written.
+            if counted {
+                self.note_real_done();
+            }
+            return true;
+        }
+        match self.sched.schedule(&link, TaskKind::RealPing).await {
+            ScheduleOutcome::Started(id) => {
+                self.pending_real.fetch_add(1, Ordering::Relaxed);
+                self.mark_started(&self.real_started_ms);
+                self.run_real_task(&link, id).await;
+                drop(permit);
+                true
+            }
+            ScheduleOutcome::Queued(_) => {
+                // Promoted by the gate holder's completion (defensive).
+                self.pending_real.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            ScheduleOutcome::DnsDeferred => {
+                self.counters.deferred.fetch_add(1, Ordering::Relaxed);
+                drop(permit);
+                false
+            }
+            ScheduleOutcome::QueueFull => {
+                self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                if counted {
+                    self.note_real_done();
+                }
+                true
+            }
+        }
+    }
+
+    /// One real probe, from schedule to settle.
+    async fn run_real_task(&self, link: &ProfileStats, id: u16) {
+        let outcome = self.real_probe(link).await;
+        // A successful real ping records the endpoint so the sibling-dedup pass
+        // skips its remaining links.
+        if self.dedup_endpoints && matches!(outcome, ProbeOutcome::Ok { .. }) {
+            self.completed_endpoints
+                .lock()
+                .insert(link.endpoint_id.get());
+        }
+        self.emit_result(link, TestType::RealPing, &outcome);
+        self.sched.complete(link, id, TaskKind::RealPing).await;
+        self.note_settled(TaskKind::RealPing);
+        self.note_real_done();
+    }
+
+    /// Spawn the one retry task a deferred half gets.
+    fn spawn_defer_retry(self: &Arc<Self>, link: ProfileStats, half: Half) {
+        self.pending_deferred.fetch_add(1, Ordering::Relaxed);
+        let shared = Arc::clone(self);
+        self.spawn_tracked(async move {
+            shared.defer_retry(link, half).await;
+        });
+    }
+
+    /// A deferred half sleeps out the window and re-enters its own dispatch.
+    ///
+    /// It holds no gate entry: `DnsDeferred` is answered before the gate is
+    /// touched, so there is nothing to promote — and that is exactly why a
+    /// link's two halves cannot separate, since the fast half's re-entry runs
+    /// the whole chain and the real half's re-entry is reachable only from a
+    /// settled fast half.
+    async fn defer_retry(self: &Arc<Self>, link: ProfileStats, half: Half) {
+        loop {
+            tokio::time::sleep(self.defer_delay).await;
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let reached_gate = match half {
+                Half::Fast => self.dispatch_fast_link(link.clone()).await,
+                Half::Real => self.dispatch_real_probe(link.clone(), false).await,
+            };
+            if reached_gate {
+                break;
+            }
+            // Still deferred: the window is whole seconds, so wait it out again
+            // rather than spinning on the gate.
+            tracing::debug!(
+                target: "tui::ops::ping",
+                "batch: {} half still DNS-deferred",
+                half.as_str(),
+            );
+            tokio::time::sleep(self.defer_delay.min(Duration::from_millis(250))).await;
+        }
+        if self.pending_deferred.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.settled.notify_waiters();
+        }
+    }
+
     /// Fast probe with batch-level dedup: one TCP ping per unique
     /// (address, port); followers await the owner's result and reuse it.
     async fn fast_probe(&self, link: &ProfileStats) -> ProbeOutcome {
-        let Some(endpoint) = self.endpoints.get(&link.endpoint_id) else {
+        // Clone out of the map: a `DashMap` guard is not `Send`, so it must not
+        // be held across the probe's awaits.
+        let Some(endpoint) = self
+            .endpoints
+            .get(&link.endpoint_id)
+            .map(|e| Arc::clone(e.value()))
+        else {
             return ProbeOutcome::soft_failure("Endpoint not found for fast ping");
         };
         let key = (endpoint.host.clone(), endpoint.port);
@@ -1525,8 +1714,7 @@ impl BatchShared {
         let config_type = self
             .fast_config
             .get(&(link.protocol_id, link.endpoint_id))
-            .copied()
-            .unwrap_or(0);
+            .map_or(0, |v| *v.value());
         let addr = endpoint.host.clone();
         let port = endpoint.port;
         if is_owner {
@@ -1572,12 +1760,16 @@ impl BatchShared {
         if let Some(reason) = capability::support_reason(protocol.proto_kind, &config) {
             return ProbeOutcome::soft_failure(untestable_marker_text(reason));
         }
-        let Some(endpoint) = self.endpoints.get(&link.endpoint_id) else {
+        let Some(endpoint) = self
+            .endpoints
+            .get(&link.endpoint_id)
+            .map(|e| Arc::clone(e.value()))
+        else {
             return ProbeOutcome::soft_failure("Endpoint not found for real ping");
         };
         self.runner
             .real(
-                endpoint,
+                &endpoint,
                 &config,
                 NativeProbeReq {
                     ping_url: &self.ping_url,
@@ -1628,15 +1820,15 @@ impl BatchShared {
 
     /// Send the `SpeedTestResult` event for a completed probe. The
     /// `TestTypeUpdate` re-arms the events handler's per-protocol dedupe guard
-    /// (`testing_profiles`) before the result lands — the established pattern
-    /// for the two-phase batch (phase 2 re-arms for its real result).
+    /// (`testing_profiles`) before the result lands — the real half re-arms for
+    /// its own result the same way.
     fn emit_result(&self, link: &ProfileStats, test_type: TestType, outcome: &ProbeOutcome) {
         // Persist first: the event below is a UI notification and may be
         // dropped when the channel is full (`try_send`), the write may not.
         self.stage_result(link, test_type, outcome);
-        // Phase 2 reads this: a hard fast failure means the proxy never
-        // answered, and a real probe can only spend its timeout finding that
-        // out again (253 of 350 phase-2 probes did exactly that, 2026-09-15).
+        // The real half reads this: a hard fast failure means the proxy never
+        // answered, and a real probe can only spend its timeout finding that out
+        // again (253 of 350 real probes did exactly that, 2026-09-15).
         match (test_type, outcome) {
             (
                 TestType::TcpPing,
@@ -1672,14 +1864,14 @@ impl BatchShared {
                         .fast_soft_failed
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                bump_class(&self.counters.phase1_fail, *class);
+                bump_class(&self.counters.fast_fail, *class);
             }
             (_, ProbeOutcome::Ok { .. }) => {
                 self.counters.real_ok.fetch_add(1, Ordering::Relaxed);
             }
             (_, ProbeOutcome::Failed { class, .. }) => {
                 self.counters.real_failed.fetch_add(1, Ordering::Relaxed);
-                bump_class(&self.counters.phase2_fail, *class);
+                bump_class(&self.counters.real_fail, *class);
             }
         }
         let (latency_ms, ip_info, error, purge) = match outcome {
@@ -1716,192 +1908,72 @@ impl BatchShared {
         );
     }
 
-    /// Retire a real task without a probe (stop or sibling-dedup): cancel any
-    /// queued real ids, then complete the live task if it is a real task.
-    /// Never writes a result event, so no error marker is persisted.
-    async fn retire_real(&self, fresh: &ProfileStats, id: u16) {
-        self.sched.cancel_queued(fresh, TaskKind::RealPing).await;
-        if self.sched.kind_of(id) == Some(TaskKind::RealPing) {
-            self.sched.complete(fresh, id, TaskKind::RealPing).await;
-        }
-        self.note_settled(TaskKind::RealPing);
-    }
-
-    /// One task settled: update the phase counters, and bump the progress
-    /// counter when the settle belongs to the batch's FINAL phase — phase 2 for
-    /// a fast+real run, phase 1 for a fast-only one (there, phase 1 is all
-    /// there is). A fast+real run's phase-1 settles are counted in the phase-1
-    /// rows of the summary, never in the progress pair.
+    /// One task settled: the level's `done` advances (with a rate sample for the
+    /// ETA) and the waiter is woken when nothing of that level is outstanding.
     fn note_settled(&self, kind: TaskKind) {
         match kind {
             TaskKind::FastPing => {
+                self.mark_settled(&self.fast_ended_ms);
                 if self.pending_fast.fetch_sub(1, Ordering::Relaxed) == 1 {
-                    self.phase1_settled.notify_waiters();
+                    self.settled.notify_waiters();
                 }
-                if !self.real_phase {
-                    self.bump_progress();
-                }
+                Self::bump(&self.meters.fast, &self.rate_fast);
             }
             TaskKind::RealPing => {
+                self.mark_settled(&self.real_ended_ms);
                 if self.pending_real.fetch_sub(1, Ordering::Relaxed) == 1 {
-                    self.real_settled.notify_waiters();
+                    self.settled.notify_waiters();
                 }
-                self.bump_progress();
             }
             _ => {}
         }
     }
 
-    /// Emit the persisted `[real]` marker for every link the native engine
-    /// cannot serve (kind-level gate, decided at plan time).
+    /// One candidate's real half reached a terminal state (probe, sibling
+    /// retire, stop retire): the level's `done` advances. Every link counted
+    /// into `real.total` reaches this exactly once.
+    fn note_real_done(&self) {
+        Self::bump(&self.meters.real, &self.rate_real);
+    }
+
+    /// Emit the persisted `[real]` marker for a link the native engine cannot
+    /// serve (kind-level gate, decided at plan time).
     ///
-    /// Runs once per batch, after phase 1. The marked links are not phase-2
-    /// candidates (they are excluded from the published denominator and never
-    /// dispatched), so this is not progress: it is the plan's own statement
-    /// about them.
-    fn emit_untestable_markers(&self) {
-        self.counters.untestable.store(
-            u32::try_from(self.untestable.len()).unwrap_or(u32::MAX),
-            Ordering::Relaxed,
+    /// Called from [`Self::after_fast_settle`], i.e. right after that link's fast
+    /// result: the reverse order would let the fast success (which writes
+    /// `error = None`) clear the marker.
+    fn emit_untestable_marker(&self, link: &ProfileStats, text: &str) {
+        // Persist from the link's own snapshot: the events handler only stages
+        // what the loaded page still holds.
+        self.stage_result(
+            link,
+            TestType::RealPing,
+            &ProbeOutcome::soft_failure(text.to_string()),
         );
-        // One pass over the plan: a linear search per marker is quadratic, and a
-        // feed-wide plan makes that measurable.
-        for plan in &self.plan {
-            let key = (plan.link.protocol_id, plan.link.endpoint_id);
-            let Some(text) = self.untestable.get(&key) else {
-                continue;
-            };
-            // Persist the marker from the plan's own snapshot: the events
-            // handler only stages what the loaded page still holds.
-            self.stage_result(
-                &plan.link,
-                TestType::RealPing,
-                &ProbeOutcome::soft_failure(text.clone()),
-            );
-            let (protocol_id, endpoint_id) =
-                (plan.link.protocol_id.get(), plan.link.endpoint_id.get());
-            let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
+        let (protocol_id, endpoint_id) = (link.protocol_id.get(), link.endpoint_id.get());
+        let _ = self.tx.try_send(CoreEvent::TestTypeUpdate {
+            endpoint_id,
+            protocol_id,
+            test_type: TestType::RealPing,
+        });
+        try_send_or_warn(
+            &self.tx,
+            CoreEvent::SpeedTestResult {
                 endpoint_id,
                 protocol_id,
                 test_type: TestType::RealPing,
-            });
-            try_send_or_warn(
-                &self.tx,
-                CoreEvent::SpeedTestResult {
-                    endpoint_id,
-                    protocol_id,
-                    test_type: TestType::RealPing,
-                    latency_ms: None,
-                    speed_bps: None,
-                    ip_info: None,
-                    error: Some(text.clone()),
-                    purge: None,
-                },
-                "untestable_marker",
-            );
-        }
-    }
-
-    /// Publish the FINAL phase's candidate count as the progress denominator.
-    ///
-    /// Called once, before that phase dispatches anything, so `completed` can
-    /// never outrun its own denominator and the status bar can never show a
-    /// numerator from one phase against another phase's total (the diagnosed
-    /// run read `0 / 34,562` — the whole plan — through the fast phase and then
-    /// `3,381 / 34,562` while phase 2 was 19.8% done).
-    ///
-    /// A zero is not published: `total == 0` is the terminal event's sentinel
-    /// (it clears the bar), and a phase with no candidates ends through
-    /// `finish_batch` like any other.
-    fn publish_final_total(&self, total: u32) {
-        if total == 0 {
-            return;
-        }
-        self.final_total.store(total, Ordering::Relaxed);
-        self.progress.0.store(total, Ordering::Relaxed);
-        let _ = self.tx.try_send(CoreEvent::BatchProgress {
-            total,
-            completed: self.done.load(Ordering::Relaxed),
-        });
-    }
-
-    /// One final-phase task settled.
-    ///
-    /// The pair is read as `completed / total` by the status bar, so both
-    /// halves come from the same phase: `publish_final_total` runs before
-    /// anything can settle (and never publishes a zero), so this event is
-    /// always non-terminal.
-    fn bump_progress(&self) {
-        let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
-        self.progress.1.store(done, Ordering::Relaxed);
-        let _ = self.tx.try_send(CoreEvent::BatchProgress {
-            total: self.final_total.load(Ordering::Relaxed),
-            completed: done,
-        });
+                latency_ms: None,
+                speed_bps: None,
+                ip_info: None,
+                error: Some(text.to_string()),
+                purge: None,
+            },
+            "untestable_marker",
+        );
     }
 }
 
 // ── Entry points ───────────────────────────────────────────────────────────
-
-/// Build the per-link plan for every visible (filtered) endpoint.
-/// Every link in the database, planned for a batch — the "all profiles" entry
-/// points' source.
-///
-/// The tab's page query is reused page by page (same read path, same ordering
-/// as the grid), so the batch covers the feed rather than the viewport: "all
-/// visible" used to mean the loaded 200-row page, which tested 272 of the 4,523
-/// links in the 2026-09-15 feed. Links imported *after* this load are the only
-/// ones a run can miss.
-///
-/// `page_size` is a parameter so the multi-page walk is testable without a
-/// 200-row seed.
-async fn load_feed_plan(
-    db: &Database,
-    page_size: usize,
-) -> Result<Vec<PlanLink>, xray_tui_db::DatabaseError> {
-    use xray_tui_db::profiles_query::{PageRequest, PageSort};
-
-    let page_size = page_size.max(1);
-    let mut plan = Vec::new();
-    let mut offset = 0usize;
-    loop {
-        // `PurgatoryView::All` and no search/group: the run is about the whole
-        // database, not about what the tab currently filters to. The thresholds
-        // are unused for that view.
-        let request = PageRequest {
-            view: xray_tui_db::models::PurgatoryView::All,
-            active_threshold: 0,
-            search: None,
-            group_id: None,
-            sort: PageSort::Address,
-            ascending: true,
-            offset,
-            limit: page_size,
-        };
-        let meta = db.profiles_page(&request).await?;
-        if meta.ids.is_empty() {
-            break;
-        }
-        offset += meta.ids.len();
-        // Purged links are skipped by a feed-wide sweep: phase 2 is the long
-        // pole (2.6 results/s), and re-proving a link the classifier already
-        // judged is the one thing the purge exists to stop doing. The
-        // selected-endpoint entry points read the loaded page instead, so a
-        // real test on a Purgatory row still probes it (spec §8, D3).
-        let rows = db.load_page_projection(&meta.ids, false).await?;
-        plan.extend(rows.iter().flat_map(plan_row_links));
-        if offset as u64 >= meta.total {
-            break;
-        }
-    }
-    tracing::info!(
-        target: "tui::ops::ping",
-        "batch: planned {} link(s) over {} endpoint(s) in the feed",
-        plan.len(),
-        offset,
-    );
-    Ok(plan)
-}
 
 /// Build the per-link plan for the currently selected endpoint (collapsed
 /// multi-protocol rows).
@@ -1993,11 +2065,11 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     let writer = state.link_writer.clone();
     let scheduler = state.scheduler.clone();
     let stop = state.speed_test_stop.clone();
-    // The pair holds no denominator until the final phase's candidate set is
-    // known (the status bar shows "Testing..." while it is zero), so the batch
-    // handle published alongside it is what says a batch is alive.
-    let progress: crate::types::BatchProgress = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
-    state.batch_progress = Some(progress.clone());
+    // The meters hold no denominator until the walk fills one, which the status
+    // bar renders as "Testing..." — and the batch handle published alongside
+    // them is what says a batch is alive.
+    let meters = Arc::new(crate::types::BatchMeters::default());
+    state.batch_progress = Some(Arc::clone(&meters));
     let batch_slot: Arc<OnceLock<Arc<BatchShared>>> = Arc::new(OnceLock::new());
     state.batch = Some(batch_slot.clone());
     let fast_timeout = *state.config.speed_test.tcp_timeout_secs;
@@ -2020,7 +2092,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         tx,
         runner,
         stop,
-        progress,
+        meters,
         plan,
         real_phase,
         dedup_endpoints,
@@ -2032,6 +2104,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         defer_delay,
         real_concurrency,
         fast_concurrency,
+        page_size: PROFILES_PAGE_SIZE,
         error_ttl_hours,
         batch_slot,
     }));
@@ -2064,7 +2137,10 @@ mod tests {
         /// Per-address fast outcome, for the tests that need a mixed batch
         /// (an unreachable link next to a reachable one).
         fast_by_addr: Mutex<std::collections::HashMap<String, ProbeOutcome>>,
-        /// Endpoint ids in the order their real probe STARTED (phase-2 order).
+        /// Per-address fast delay, for the tests that need a deterministic
+        /// fast-settle order (the real half is dispatched from that settle).
+        fast_delay_by_addr: Mutex<std::collections::HashMap<String, Duration>>,
+        /// Endpoint ids in the order their real probe STARTED.
         real_endpoint_order: Mutex<Vec<i64>>,
     }
 
@@ -2084,6 +2160,7 @@ mod tests {
                 real_gate: Mutex::new(None),
                 dns_mark_on_fast: Mutex::new(None),
                 fast_by_addr: Mutex::new(std::collections::HashMap::new()),
+                fast_delay_by_addr: Mutex::new(std::collections::HashMap::new()),
                 real_endpoint_order: Mutex::new(Vec::new()),
             }
         }
@@ -2101,6 +2178,10 @@ mod tests {
                 self.fast_calls.fetch_add(1, Ordering::Relaxed);
                 if let Some((sched, eid)) = &*self.dns_mark_on_fast.lock() {
                     sched.mark_dns_failure(*eid);
+                }
+                let delay = self.fast_delay_by_addr.lock().get(addr).copied();
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
                 }
                 if let Some(outcome) = self.fast_by_addr.lock().get(addr) {
                     return outcome.clone();
@@ -2135,34 +2216,40 @@ mod tests {
         runner: Arc<StubRunner>,
     }
 
-    /// D3: the "test all" entry point plans the FEED, and the feed sweep skips
-    /// purged links. Phase 2 is the long pole (2.6 results/s), and re-proving a
-    /// row the classifier already judged is the one thing the purge exists to
-    /// stop. The selected-endpoint entry points read the loaded page instead,
-    /// so a Purgatory row is still testable by hand.
+    /// D3: the "test all" entry point walks the FEED, and the walk skips purged
+    /// links — the real half is the long pole, and re-proving a link the
+    /// classifier already judged is the one thing the purge exists to stop.
+    /// The selected-endpoint entry point reads the loaded page instead, so a
+    /// Purgatory row is still testable by hand (the test below).
     #[tokio::test]
-    async fn a_feed_sweep_plans_no_purged_links() {
-        let mut rows = vec![fake_row(1, "10.0.0.1", 2), fake_row(2, "10.0.0.2", 1)];
-        rows[0].links[0].purge_reason = Some(xray_tui_db::models::PurgeReason::NotTls);
-        let h = harness(rows).await;
+    async fn a_feed_sweep_probes_no_purged_link() {
+        use xray_tui_db::models::PurgeReason;
 
-        let plan = load_feed_plan(&h.state.db, 100).await.expect("plan");
+        let mut rows = vec![fake_row(1, "10.0.0.1", 1)];
+        rows[0].links[0].purge_reason = Some(PurgeReason::NotTls);
+        let mut h = harness(rows).await;
 
-        assert_eq!(plan.len(), 2, "three links minus the purged one");
-        assert!(
-            plan.iter().all(|p| p.link.purge_reason.is_none()),
-            "no purged link reaches the plan"
+        start_batch(&mut h.state, PlanSource::Feed, true, false);
+        await_batch_done(&mut h.state).await;
+
+        assert_eq!(
+            h.runner.fast_calls.load(Ordering::Relaxed),
+            0,
+            "the purged link is not even fast-probed by a feed sweep"
         );
+        assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 0);
     }
 
-    /// The selected-endpoint plan keeps them: it reads the loaded page, and the
-    /// Purgatory view is where a purged link gets re-proved.
+    /// The selected-endpoint plan keeps purged links: it reads the loaded page,
+    /// and the Purgatory view is where a purged link gets re-proved.
     #[tokio::test]
     async fn a_selected_endpoint_plan_keeps_purged_links() {
+        use xray_tui_db::models::{PurgatoryView, PurgeReason};
+
         let mut rows = vec![fake_row(1, "10.0.0.1", 2)];
-        rows[0].links[0].purge_reason = Some(xray_tui_db::models::PurgeReason::NotTls);
+        rows[0].links[0].purge_reason = Some(PurgeReason::NotTls);
         let mut h = harness(rows).await;
-        h.state.purgatory_view = xray_tui_db::models::PurgatoryView::Purgatory;
+        h.state.purgatory_view = PurgatoryView::Purgatory;
         crate::ops::profiles::reload_profiles(&mut h.state).await;
 
         let plan = plan_selected_endpoint(&h.state);
@@ -2210,7 +2297,6 @@ mod tests {
         real_phase: bool,
         dedup: bool,
     ) -> BatchParams {
-        let total = u32::try_from(plan.len()).unwrap_or(u32::MAX);
         BatchParams {
             scheduler: h.state.scheduler.clone(),
             db: h.state.db.clone(),
@@ -2218,7 +2304,7 @@ mod tests {
             tx: h.tx.clone(),
             runner: h.runner.clone(),
             stop: h.state.speed_test_stop.clone(),
-            progress: Arc::new((AtomicU32::new(total), AtomicU32::new(0))),
+            meters: Arc::new(crate::types::BatchMeters::default()),
             plan: PlanSource::Links(plan),
             real_phase,
             dedup_endpoints: dedup,
@@ -2230,6 +2316,8 @@ mod tests {
             defer_delay: Duration::from_millis(50),
             real_concurrency: 8,
             fast_concurrency: 8,
+            // Tiny pages: the streaming walk is what a feed batch exercises.
+            page_size: 2,
             error_ttl_hours: None,
             batch_slot: Arc::new(OnceLock::new()),
         }
@@ -2241,14 +2329,27 @@ mod tests {
         real_phase: bool,
         dedup: bool,
     ) -> tokio::task::JoinHandle<()> {
-        let p = build_params(h, plan, real_phase, dedup);
-        h.state.batch_progress = Some(p.progress.clone());
+        start_test_batch_with(h, plan, real_phase, dedup, 8)
+    }
+
+    /// Same, with the real level's concurrency pinned: one slot makes the real
+    /// halves' order and the sibling-dedup decisions deterministic.
+    fn start_test_batch_with(
+        h: &mut Harness,
+        plan: Vec<PlanLink>,
+        real_phase: bool,
+        dedup: bool,
+        real_concurrency: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut p = build_params(h, plan, real_phase, dedup);
+        p.real_concurrency = real_concurrency;
+        h.state.batch_progress = Some(p.meters.clone());
         h.state.batch = Some(p.batch_slot.clone());
         tokio::spawn(run_batch(p))
     }
 
-    /// Poll events until the batch's final `BatchProgress{0,0}` clears the
-    /// shared progress (or the deadline expires).
+    /// Poll events until the batch's terminal `BatchEnded` clears the shared
+    /// meters (or the deadline expires).
     async fn await_batch_done(state: &mut AppState) {
         for _ in 0..300 {
             let _ = state.poll_core_events().await;
@@ -2309,18 +2410,30 @@ mod tests {
 
     /// "All profiles" means the database, not the loaded page: the page is 200
     /// endpoint rows, so a page-scoped run tested 272 of the 4,523 links in the
-    /// 2026-09-15 feed. The plan loader walks every page of the tab's query.
+    /// 2026-09-15 feed. The walk covers every page of the tab's query and hands
+    /// them over one at a time — the batch dispatches each page as it loads.
     #[tokio::test]
-    async fn the_feed_plan_covers_every_page_of_links() {
+    async fn the_plan_walk_covers_every_page_of_links() {
         let rows: Vec<EndpointRow> = (1..=5)
             .map(|i| fake_row(i, &format!("10.0.0.{i}"), 1))
             .collect();
         let h = harness(rows.clone()).await;
 
         // page_size 2 over 5 endpoints: three pages, one of them partial — the
-        // walk must stop on `total`, not on a short page.
-        let plan = load_feed_plan(&h.state.db, 2).await.expect("feed plan");
-        let mut hosts: Vec<String> = plan.iter().map(|pl| pl.endpoint.host.clone()).collect();
+        // walk must stop on the feed count, not on a short page.
+        let mut walk = PlanWalk::new(PlanSource::Feed, h.state.db.clone(), 2);
+        let mut hosts: Vec<String> = Vec::new();
+        let mut pages = 0;
+        while let Some(links) = walk.next_page().await.expect("walk page") {
+            pages += 1;
+            assert_eq!(
+                walk.pages_total(),
+                3,
+                "the first page carries the feed-wide count"
+            );
+            hosts.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+        }
+        assert_eq!(pages, 3, "5 endpoints at 2 per page");
         hosts.sort();
         let mut expected: Vec<String> = rows.iter().map(|r| r.endpoint.host.clone()).collect();
         expected.sort();
@@ -2341,7 +2454,7 @@ mod tests {
             plan: PlanSource::Feed,
             ..build_params(&h, Vec::new(), false, false)
         };
-        h.state.batch_progress = Some(p.progress.clone());
+        h.state.batch_progress = Some(p.meters.clone());
         run_batch(p).await;
 
         assert_eq!(
@@ -2541,8 +2654,12 @@ mod tests {
         let rows = vec![fake_row(1, "10.0.0.1", 1)];
         let h = harness(rows.clone()).await;
         let plan = plan_from_rows(&rows);
-        let shared = BatchShared::new(build_params(&h, plan.clone(), true, false), plan);
+        let params = build_params(&h, plan, true, false);
+        let meters = params.meters.clone();
+        let shared = BatchShared::new(params);
         let counters = &shared.counters;
+        meters.fast.total.store(4, Ordering::Relaxed);
+        meters.real.total.store(3, Ordering::Relaxed);
         counters.fast_ok.store(7, Ordering::Relaxed);
         counters.fast_hard_failed.store(5, Ordering::Relaxed);
         counters.fast_soft_failed.store(3, Ordering::Relaxed);
@@ -2552,23 +2669,27 @@ mod tests {
         counters.unreachable.store(5, Ordering::Relaxed);
         counters.deferred.store(6, Ordering::Relaxed);
         counters.queue_full.store(8, Ordering::Relaxed);
-        shared.phase1_ms.store(120, Ordering::Relaxed);
-        shared.phase2_ms.store(340, Ordering::Relaxed);
+        shared.plan_ms.store(120, Ordering::Relaxed);
+        shared.fast_started_ms.store(3, Ordering::Relaxed);
+        shared.fast_ended_ms.store(180, Ordering::Relaxed);
+        shared.real_started_ms.store(60, Ordering::Relaxed);
+        shared.real_ended_ms.store(340, Ordering::Relaxed);
         // The classes are what a fix is aimed at: `hard-fail=5` alone cannot
         // say whether the run failed on timeouts, DNS or refusals.
-        bump_class(&counters.phase1_fail, ProbeClass::Timeout);
-        bump_class(&counters.phase1_fail, ProbeClass::Timeout);
-        bump_class(&counters.phase1_fail, ProbeClass::Dns);
-        bump_class(&counters.phase2_fail, ProbeClass::Tls);
+        bump_class(&counters.fast_fail, ProbeClass::Timeout);
+        bump_class(&counters.fast_fail, ProbeClass::Timeout);
+        bump_class(&counters.fast_fail, ProbeClass::Dns);
+        bump_class(&counters.real_fail, ProbeClass::Tls);
 
         let line = summary_line(&shared);
         for expected in [
-            "links=1",
+            "links=4",
+            "plan=120 ms",
             "untestable=1",
             "queue-full=8",
             "deferred=6",
-            "phase1 ok=7 hard-fail=5 soft-fail=3 [timeout=2 dns=1] (120 ms)",
-            "phase2 ok=2 failed=4 [tls=1] skipped-unreachable=5 (340 ms)",
+            "fast ok=7 hard-fail=5 soft-fail=3 [timeout=2 dns=1] (3..180 ms)",
+            "real ok=2 failed=4 [tls=1] skipped-unreachable=5 (60..340 ms)",
             "stopped=false",
             "staged-left=0",
         ] {
@@ -2605,7 +2726,7 @@ mod tests {
         let plan = plan_from_rows(&rows);
         let mut params = build_params(&h, plan, false, false);
         params.error_ttl_hours = Some(24);
-        h.state.batch_progress = Some(params.progress.clone());
+        h.state.batch_progress = Some(params.meters.clone());
         h.state.speed_test_stop.store(true, Ordering::Relaxed);
         tokio::spawn(run_batch(params)).await.unwrap();
         await_batch_done(&mut h.state).await;
@@ -2649,22 +2770,29 @@ mod tests {
         }
     }
 
-    // ── sibling cancel (dedup_endpoints) ─────────────────────────────────
+    // ── sibling dedup (dedup_endpoints, best-effort) ─────────────────────
 
+    /// The first real success on an endpoint retires its remaining links'
+    /// real halves. Pipelining makes this best-effort: siblings whose fast
+    /// halves settle together may start before the success lands, so the check
+    /// sits AFTER the real permit (one slot here) — the saving is the links
+    /// still waiting for capacity, which is the throughput-bound case the
+    /// option exists for.
     #[tokio::test]
-    async fn sibling_cancel_skips_remaining_links_after_first_success() {
+    async fn sibling_dedup_retires_links_waiting_behind_a_success() {
         let rows = vec![fake_row(1, "10.0.0.1", 2)];
         let mut h = harness(rows.clone()).await;
         let plan = plan_from_rows(&rows);
-        // dedup_endpoints=true (the default): first success cancels siblings.
-        let handle = start_test_batch(&mut h, plan, true, true);
+        // dedup_endpoints=true (the default); one real slot makes the order
+        // deterministic.
+        let handle = start_test_batch_with(&mut h, plan, true, true, 1);
         handle.await.unwrap();
         await_batch_done(&mut h.state).await;
 
         assert_eq!(
             h.runner.real_calls.load(Ordering::Relaxed),
             1,
-            "only the first link of the endpoint was real-pinged"
+            "the sibling waiting for the real slot is retired by the success"
         );
         let links = &h.state.endpoints[0].links;
         let with_real = links
@@ -2672,11 +2800,8 @@ mod tests {
             .filter(|l| matches!(l.latency, Some(Latency::Real { .. })));
         assert_eq!(with_real.count(), 1, "exactly one link got a real result");
         for link in links {
-            // The cancelled sibling never wrote a marker or a latency.
-            assert!(
-                link.error.is_none(),
-                "cancelled link must not write a marker"
-            );
+            // The retired sibling never wrote a marker or a latency.
+            assert!(link.error.is_none(), "retired link must not write a marker");
             assert_gate_clear(h.state.scheduler.as_ref(), link);
         }
     }
@@ -2701,11 +2826,14 @@ mod tests {
         }
     }
 
-    /// Phase 2 is the long pole (measured 2.6 results/s against 128 for phase
-    /// 1 on 2026-09-16), so a run stopped part-way must have tested the
-    /// fastest links first: the probe order is the phase-1 latency, ascending.
+    /// The real level is the long pole (measured 2.6 results/s against 128 for
+    /// the fast level on 2026-09-16), so a run stopped part-way should have
+    /// tested the fastest links first. The pipeline inherits that ordering from
+    /// the fast level: a link's real half starts when its own fast half settles,
+    /// so the probe order is the fast completion order — ascending fast latency,
+    /// with no sort and no barrier.
     #[tokio::test]
-    async fn phase_two_probes_the_fastest_links_first() {
+    async fn real_probes_follow_fast_completion_order() {
         let rows = vec![
             fake_row(1, "10.0.0.1", 1),
             fake_row(2, "10.0.0.2", 1),
@@ -2713,27 +2841,26 @@ mod tests {
         ];
         let mut h = harness(rows.clone()).await;
         {
-            let mut by_addr = h.runner.fast_by_addr.lock();
-            let slow = |ms| ProbeOutcome::Ok {
-                latency_ms: Some(ms),
-                ip_info: None,
-            };
-            by_addr.insert("10.0.0.1".to_string(), slow(300));
-            by_addr.insert("10.0.0.2".to_string(), slow(100));
-            by_addr.insert("10.0.0.3".to_string(), slow(200));
+            let mut delays = h.runner.fast_delay_by_addr.lock();
+            delays.insert("10.0.0.1".to_string(), Duration::from_millis(150));
+            delays.insert("10.0.0.2".to_string(), Duration::from_millis(50));
+            delays.insert("10.0.0.3".to_string(), Duration::from_millis(100));
         }
         let plan = plan_from_rows(&rows);
-        let handle = start_test_batch(&mut h, plan, true, false);
+        // One real slot: the semaphore is fair, so the recorded start order is
+        // the settle order.
+        let handle = start_test_batch_with(&mut h, plan, true, false, 1);
         handle.await.unwrap();
         await_batch_done(&mut h.state).await;
 
         let order = h.runner.real_endpoint_order.lock().clone();
         let expected: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect::<Vec<_>>();
-        // The rows are declared slowest-first: the probe order must reverse it.
+        // Declared slowest-first: the 50/100/150 ms fast probes must settle —
+        // and therefore real-probe — in the reverse order.
         assert_eq!(
             order,
             vec![expected[1], expected[2], expected[0]],
-            "phase 2 must probe in ascending phase-1 latency"
+            "real probes follow the fast settle order"
         );
     }
 
@@ -2770,10 +2897,6 @@ mod tests {
         let error = link.error.as_ref().expect("marker persisted");
         assert!(crate::ops::ping::is_untestable_marker(error), "{error:?}");
         assert!(error.text.contains("no native implementation"), "{error:?}");
-        assert_eq!(
-            link.purge_reason, None,
-            "a capability refusal is not evidence about the config: the              subprocess core may serve it (the marker is a result, not a verdict)"
-        );
     }
 
     #[test]
@@ -2854,39 +2977,41 @@ mod tests {
         ));
     }
 
+    /// A DNS deferral is a `DnsDeferred` answer from `schedule`, which is
+    /// returned BEFORE the gate is touched — so the deferred half holds no gate
+    /// entry and only the retry task keeps it alive. `finish_batch` must wait for
+    /// that retry (else the terminal event lands first, the retry's late result
+    /// re-creates the meters, and the next batch is rejected as "already
+    /// running").
+    ///
+    /// The marker lands inside this link's own fast probe, i.e. deterministically
+    /// before its real half is scheduled: the deferral is therefore on the REAL
+    /// half, which re-enters without ever touching the fast half again.
     #[tokio::test]
-    async fn phase2_dns_deferred_retry_is_joined_before_finish() {
-        let rows = vec![fake_row(1, "10.0.0.1", 1), fake_row(2, "10.0.0.2", 1)];
+    async fn a_deferred_half_is_joined_before_finish_and_the_next_batch_starts() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
         let mut h = harness(rows.clone()).await;
-        // 3s window. Endpoint 2 is marked when the phase-1 fast probe for
-        // endpoint 1 runs (deterministically BEFORE phase-2 scheduling), so
-        // link 200's real task is DNS-deferred and re-scheduled after the
-        // window.
         h.state.scheduler = Arc::new(TaskScheduler::new(3, 3));
-        *h.runner.dns_mark_on_fast.lock() = Some((h.state.scheduler.clone(), EndpointId::new(2)));
+        *h.runner.dns_mark_on_fast.lock() = Some((h.state.scheduler.clone(), EndpointId::new(1)));
         let plan = plan_from_rows(&rows);
         let handle = start_test_batch(&mut h, plan, true, false);
         handle.await.unwrap();
         await_batch_done(&mut h.state).await;
 
-        // Both links got fast AND real results; no markers; gates clear.
-        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 2);
-        assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 2);
-        for row in &h.state.endpoints {
-            for link in &row.links {
-                assert!(matches!(link.latency, Some(Latency::Real { .. })));
-                assert!(link.error.is_none());
-                assert_gate_clear(h.state.scheduler.as_ref(), link);
-            }
-        }
-        // Regression (reviewer F1): the deferred-real retry was spawned but
-        // never joined, so the terminal `BatchProgress{0,0}` fired before the
-        // retry's late events re-created the progress — stuck bar + rejected
-        // future batches. The fix joins the retries first, so the terminal
-        // event is last and the progress bar is truly cleared.
+        // The link got both results, no marker, and its gate is clear.
+        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            h.runner.real_calls.load(Ordering::Relaxed),
+            1,
+            "the deferred real half was probed after the window"
+        );
+        let link = &h.state.endpoints[0].links[0];
+        assert!(matches!(link.latency, Some(Latency::Real { .. })));
+        assert!(link.error.is_none());
+        assert_gate_clear(h.state.scheduler.as_ref(), link);
         assert!(
             h.state.batch_progress.is_none(),
-            "progress must be cleared after the batch (terminal event last)"
+            "meters must be cleared after the batch (terminal event last)"
         );
 
         // A subsequent batch starts cleanly.
@@ -2894,7 +3019,7 @@ mod tests {
         let handle2 = start_test_batch(&mut h, plan2, false, false);
         handle2.await.unwrap();
         await_batch_done(&mut h.state).await;
-        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(h.runner.fast_calls.load(Ordering::Relaxed), 2);
     }
 
     // ── stop mid-batch ───────────────────────────────────────────────────
@@ -2906,7 +3031,9 @@ mod tests {
         let gate = Arc::new(Notify::new());
         *h.runner.real_gate.lock() = Some(gate.clone());
         let plan = plan_from_rows(&rows);
-        let handle = start_test_batch(&mut h, plan, true, false);
+        // One real slot: the sibling's real half waits for capacity, so a stop
+        // retires it without a probe.
+        let handle = start_test_batch_with(&mut h, plan, true, false, 1);
 
         // Wait for the first real probe to be in flight, then stop.
         for _ in 0..300 {
@@ -2934,25 +3061,23 @@ mod tests {
         assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 1);
     }
 
-    // ── progress events ──────────────────────────────────────────────────
+    // ── meters and the terminal event ────────────────────────────────────
 
-    /// The progress pair describes ONE phase. On the 2026-09-16 run it described
-    /// none: `total` was the whole 34,562-link plan while `completed` counted
-    /// final-phase results, so the bar read `0 / 34,562` through the entire
-    /// ~5-minute fast phase and then `3,381 / 34,562` when phase 2 was 19.8%
-    /// done. Phase 2's denominator is its own candidate set, published before it
-    /// dispatches anything, and phase-1 results never touch the numerator.
+    /// The meters are two independent levels, so a numerator can never be read
+    /// against another level's denominator (the 2026-09-16 run's bar paired
+    /// phase-2 results with the whole 34,562-link plan). The real level's
+    /// denominator is its own candidate set: the untestable and hard-failed
+    /// links never enter it.
     #[tokio::test]
-    async fn progress_counts_the_final_phase_only() {
+    async fn meters_track_both_levels_and_each_denominator_is_its_own() {
         let rows = vec![
             fake_row(1, "10.0.0.1", 1),
             fake_row(2, "10.0.0.2", 1),
             fake_row(3, "10.0.0.3", 1),
         ];
         let mut h = harness(rows.clone()).await;
-        // Link 2's fast probe proves its proxy unreachable, so phase 2 skips it:
-        // 3 planned links, 2 real-phase candidates — a plan-length denominator
-        // is distinguishable from the right one.
+        // Link 2's fast probe proves its proxy unreachable, so its real half is
+        // skipped: 3 planned links, 2 real candidates.
         h.runner.fast_by_addr.lock().insert(
             "10.0.0.2".to_string(),
             ProbeOutcome::Failed {
@@ -2963,38 +3088,111 @@ mod tests {
             },
         );
         let plan = plan_from_rows(&rows);
-        let handle = start_test_batch(&mut h, plan, true, false);
+        let handle = start_test_batch_with(&mut h, plan, true, false, 8);
+        // Keep the batch's own meters: `await_batch_done` clears the state copy.
+        let meters = h
+            .state
+            .batch_progress
+            .clone()
+            .expect("the batch publishes its meters");
+        handle.await.unwrap();
+        await_batch_done(&mut h.state).await;
+
+        let load = |a: &AtomicU32| a.load(Ordering::Relaxed);
+        assert_eq!(load(&meters.fast.total), 3, "every planned link is counted");
+        assert_eq!(load(&meters.fast.done), 3);
+        assert_eq!(
+            load(&meters.real.total),
+            2,
+            "the hard-failed link is never a real candidate"
+        );
+        assert_eq!(load(&meters.real.done), 2);
+        assert!(load(&meters.real.done) <= load(&meters.real.total));
+        assert!(load(&meters.fast.done) <= load(&meters.fast.total));
+    }
+
+    /// The ETA needs a denominator, a rate sample and work left; anything else
+    /// renders as `--` rather than a wrong estimate.
+    #[test]
+    fn phase_meters_eta_needs_a_denominator_a_rate_and_work_left() {
+        let m = crate::types::PhaseMeters::default();
+        assert_eq!(m.eta_secs(), None, "no denominator yet");
+        m.total.store(100, Ordering::Relaxed);
+        assert_eq!(m.eta_secs(), None, "no rate sample yet");
+        m.rate_milli.store(2000, Ordering::Relaxed);
+        assert_eq!(m.eta_secs(), Some(50), "100 left at 2/s");
+        m.done.store(100, Ordering::Relaxed);
+        assert_eq!(m.eta_secs(), None, "complete");
+    }
+
+    /// The plan line is the batch's own record of the walk (the store can drop
+    /// it under a log flood, so the shape is pinned here rather than observed).
+    #[test]
+    fn plan_line_names_the_pages_links_and_walk_time() {
+        assert_eq!(
+            plan_line(56140, 136, 5446),
+            "batch: planned 56140 link(s) over 136 page(s) in 5446 ms"
+        );
+        assert_eq!(
+            plan_line(200, 1, 62),
+            "batch: planned 200 link(s) over 1 page(s) in 62 ms"
+        );
+    }
+
+    /// The rate window starts at the level's FIRST result, not at batch
+    /// construction: otherwise the idle stretch before a level's first settle
+    /// reads as ~0 results/s and pins that level's ETA at `--` (the 2026-09-17
+    /// live run: 46 real results in 8 s, first sample 1 result over ~5 s → 0,
+    /// and no later settle crossed a fresh second boundary).
+    #[test]
+    fn rate_window_starts_at_the_levels_first_result() {
+        let meters = crate::types::PhaseMeters::default();
+        meters.total.store(1000, Ordering::Relaxed);
+        // A slot backdated as if the batch had been running for 5 idle seconds.
+        let backdated = |secs: u64| {
+            Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .expect("backdate")
+        };
+        let slot = Mutex::new((backdated(5), 0));
+        BatchShared::bump(&meters, &slot);
+        assert_eq!(
+            meters.rate_milli.load(Ordering::Relaxed),
+            0,
+            "one result is not a rate"
+        );
+        assert_eq!(meters.eta_secs(), None, "no estimate from a single result");
+
+        // The next window has real activity: 1 s, one more result → 1/s.
+        *slot.lock() = (backdated(1), 1);
+        BatchShared::bump(&meters, &slot);
+        assert_eq!(meters.rate_milli.load(Ordering::Relaxed), 1000);
+        assert_eq!(meters.eta_secs(), Some(998), "998 left at 1/s");
+    }
+
+    /// One terminal event per batch, and no per-settle progress event: a
+    /// feed-wide batch used to send ~34k of them, each describing state the
+    /// shared meters already publish.
+    #[tokio::test]
+    async fn a_batch_emits_one_terminal_event_and_no_progress_events() {
+        let rows = vec![
+            fake_row(1, "10.0.0.1", 1),
+            fake_row(2, "10.0.0.2", 1),
+            fake_row(3, "10.0.0.3", 1),
+        ];
+        let mut h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch(&mut h, plan, false, false);
         handle.await.unwrap();
 
         let mut rx = h.state.core_event_rx.take().expect("event receiver");
-        let mut events: Vec<(u32, u32)> = Vec::new();
+        let mut ended = 0;
         while let Ok(ev) = rx.try_recv() {
-            if let CoreEvent::BatchProgress { total, completed } = ev {
-                events.push((total, completed));
+            if matches!(ev, CoreEvent::BatchEnded) {
+                ended += 1;
             }
         }
-        assert!(
-            events.contains(&(2, 0)),
-            "phase 2 publishes its own candidate count (2 of 3 links): {events:?}"
-        );
-        assert!(
-            !events.iter().any(|(total, _)| *total == 3),
-            "the plan's own length is never a phase denominator: {events:?}"
-        );
-        // The three phase-1 results did not advance the counter: every event
-        // that reports progress carries the phase-2 denominator.
-        assert!(
-            events
-                .iter()
-                .filter(|(_, completed)| *completed > 0)
-                .all(|(total, completed)| *total == 2 && *completed <= 2),
-            "phase-1 settles must not bump the final-phase counter: {events:?}"
-        );
-        assert_eq!(
-            events.last(),
-            Some(&(0, 0)),
-            "final clear event: {events:?}"
-        );
+        assert_eq!(ended, 1, "exactly one terminal event per batch");
     }
 
     /// The quit path reports an interrupted run with the summary a completed run
@@ -3007,54 +3205,28 @@ mod tests {
         let rows = vec![fake_row(1, "10.0.0.1", 1), fake_row(2, "10.0.0.2", 1)];
         let h = harness(rows.clone()).await;
         let plan = plan_from_rows(&rows);
-        let shared = BatchShared::new(build_params(&h, plan, true, false), Vec::new());
+        let params = build_params(&h, plan, true, false);
+        let meters = params.meters.clone();
+        let shared = BatchShared::new(params);
         shared.counters.real_ok.store(4, Ordering::Relaxed);
         shared.counters.real_failed.store(6, Ordering::Relaxed);
-        shared.done.store(10, Ordering::Relaxed);
+        meters.fast.done.store(7, Ordering::Relaxed);
+        meters.real.done.store(10, Ordering::Relaxed);
         shared.pending_real.store(2, Ordering::Relaxed);
-        bump_class(&shared.counters.phase2_fail, ProbeClass::Timeout);
-        bump_class(&shared.counters.phase2_fail, ProbeClass::Timeout);
-        bump_class(&shared.counters.phase2_fail, ProbeClass::Dns);
+        shared.pending_deferred.store(1, Ordering::Relaxed);
+        bump_class(&shared.counters.real_fail, ProbeClass::Timeout);
+        bump_class(&shared.counters.real_fail, ProbeClass::Timeout);
+        bump_class(&shared.counters.real_fail, ProbeClass::Dns);
 
         let line = interrupted_summary_line(&shared);
         for expected in [
             "batch interrupted at quit:",
             "batch summary:",
-            "phase2 ok=4 failed=6 [timeout=2 dns=1]",
-            "settled=10",
-            "in-flight=2",
+            "real ok=4 failed=6 [timeout=2 dns=1]",
+            "settled=17",
+            "in-flight=3",
         ] {
             assert!(line.contains(expected), "missing {expected:?} in: {line}");
         }
-    }
-
-    #[tokio::test]
-    async fn progress_events_track_total_and_done() {
-        let rows = vec![
-            fake_row(1, "10.0.0.1", 1),
-            fake_row(2, "10.0.0.2", 1),
-            fake_row(3, "10.0.0.3", 1),
-        ];
-        let mut h = harness(rows.clone()).await;
-        let plan = plan_from_rows(&rows);
-        let handle = start_test_batch(&mut h, plan, false, false);
-        handle.await.unwrap();
-
-        let mut rx = h.state.core_event_rx.take().expect("event receiver");
-        let mut events: Vec<(u32, u32)> = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let CoreEvent::BatchProgress { total, completed } = ev {
-                events.push((total, completed));
-            }
-        }
-        assert!(events.contains(&(3, 0)), "initial event: {events:?}");
-        for k in 1..=3 {
-            assert!(events.contains(&(3, k)), "missing (3,{k}) in {events:?}");
-        }
-        assert_eq!(
-            events.last(),
-            Some(&(0, 0)),
-            "final clear event: {events:?}"
-        );
     }
 }

@@ -1,6 +1,6 @@
 # 2026-09-17 — Batch ping: streaming plan, per-link pipeline, two-level progress
 
-Status: `proposed` (awaiting user review)
+Status: `implemented` (plan `docs/aegis/plans/2026-09-17-batch-ping-pipeline.md`)
 Scope: `crates/xray-tui` (batch pipeline + Actions Log panel), `crates/xray-tui-db`
 (one walk API, one batched country write). No engine, protocol, or identity change.
 
@@ -397,6 +397,48 @@ Observable, verifiable on the reference feed (18k endpoints / 34k links):
    the assertion that the queue is not on the path.
 8. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
    `cargo nextest run --workspace` clean.
+
+### Verified (2026-09-17)
+
+- **First dial**: measured on the reference feed (27,142 endpoints / 56,140
+  links, release build) — the first plan page (one `COUNT` + the ordered-id
+  SELECT + the page hydration) costs **62.2 ms**, so the first probe starts
+  ~60 ms after the batch does, against ~5.8 s for the buffered loader. The rest of
+  the walk is 135 more pages at ~30 ms (ids) + ~8 ms (hydration) = **5.45 s
+  total**, which now runs *beside* the probing and is visible as
+  `planning p/P pages` rather than blocking the first dial.
+- **Pipeline + bars, live** (TUI at 140×40, `Fast + Real Ping (All Profiles)`,
+  ~10 s in): row 3 `⏱ TCP: 29ms …│Real [>░░…] 3% 46/1193 --`, row 4
+  `📊 …│planning 3/136 pages`, status bar `Testing: F 1572/1576 · R 46/1193` —
+  real probes running with the fast level four links from done, the walk still
+  three pages in. Items 2 and 3 hold live.
+- Items 4-7 hold by test (`cargo nextest run -p xray-tui`, 1970 workspace tests
+  green). Caveats, stated rather than implied: (a) the live run's own
+  `plan:`/`summary` lines did **not** reach the persistent store — the store was
+  flooded with toasty `slow query` warnings (plan §F9) and the log layer's bounded
+  queue drops under flood — so `plan_line`'s shape is pinned by
+  `plan_line_names_the_pages_links_and_walk_time` and the summary by its own test
+  instead of by that run's store tail; (b) the store was searched for
+  `plan walk stopped` (the partial-plan warning) and the newest 80,000 entries
+  contain none, so the walk was ended by the stop, not truncated by a page error
+  (the run did log three `toasty::query query failed` warns, unrelated to the
+  walk); (c) the harness's screen capture began failing
+  (`string index out of range`) once the Logs tab was opened, so the evidence
+  frame is the Profiles view captured mid-batch — the panel and the status bar
+  are both visible in it.
+- **Two ETA defects the live run exposed, both fixed before landing**: the Real
+  bar rendered `--` at `46/1193`. (a) `rate_milli` was written as results/s while
+  `eta_secs` reads results/s × 1000, so the estimate was off by 1000× (a fast
+  level showed a numerator with no usable rate); (b) the sampling window began at
+  batch construction, so the level's first sample covered the idle stretch before
+  its first settle (1 result over ~5 s → floor 0) and pinned the ETA at `--`
+  until a later settle crossed a fresh second boundary. Both are pinned by
+  `rate_window_starts_at_the_levels_first_result` and
+  `phase_meters_eta_needs_a_denominator_a_rate_and_work_left`.
+- The spec's own escalation trigger for a purpose-built plan projection
+  (> 1 s of walk) is **met but not taken**: the walk no longer delays the first
+  probe, overlaps probing, and is reported in the panel, so the cheaper keyset
+  walk stays the documented follow-up (§8).
 
 ## 8. Non-goals
 

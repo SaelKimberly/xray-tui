@@ -133,7 +133,11 @@ impl LinkWriter {
         let mut patches = Vec::with_capacity(order.len());
         for link_key in order {
             let mut merged: Option<ProfileStats> = None;
-            for flag in [LinkGroups::RESULT, LinkGroups::TRAFFIC] {
+            // EVERY flag: a group this loop skips is never removed from
+            // `pending`, so its entry leaks and re-adds its bit to the next
+            // drain's union — a PURGE-only entry would then write a verdict
+            // from whatever snapshot the patch happened to carry.
+            for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
                 let Some((_, staged)) = self.pending.remove(&(link_key, flag)) else {
                     continue;
                 };
@@ -179,12 +183,20 @@ impl LinkWriter {
                     for pending in patches.chunks(self.flush_rows).skip(index).flatten() {
                         // A newer staged entry (a result that landed while this
                         // flush was writing) wins over the snapshot it replaced.
-                        self.pending
-                            .entry((
-                                (pending.link.protocol_id, pending.link.endpoint_id),
-                                pending.groups,
-                            ))
-                            .or_insert_with(|| pending.link.clone());
+                        //
+                        // ONE KEY PER GROUP: `stage` and `drain` both address
+                        // entries by a single flag, so re-staging under the
+                        // union (`pending.groups`) inserts keys neither ever
+                        // matches — the retry writes nothing and those results
+                        // are lost with `staged-left` as the only hint.
+                        for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+                            if !pending.groups.contains(flag) {
+                                continue;
+                            }
+                            self.pending
+                                .entry(((pending.link.protocol_id, pending.link.endpoint_id), flag))
+                                .or_insert_with(|| pending.link.clone());
+                        }
                     }
                     return Err(err);
                 }
@@ -405,6 +417,54 @@ mod tests {
         assert_eq!(writer.flush_count(), 3, "one transaction per chunk");
     }
 
+    /// The re-staged remainder must be findable by the next drain.
+    ///
+    /// A real result stages `RESULT | PURGE`, and the error arm used to re-stage
+    /// the coalesced patch under that UNION key — a key neither `stage` nor
+    /// `drain` ever matches, so the retry wrote nothing and the results were
+    /// lost (the pre-PURGE code had the same hole for `ALL`-staged patches).
+    #[tokio::test]
+    async fn a_failed_window_restages_a_multi_group_patch_so_the_retry_lands() {
+        use xray_tui_db::models::PurgeReason;
+
+        let (db, _) = seeded().await;
+        let base = persisted(&db).await;
+        let writer = LinkWriter::new(Arc::clone(&db), 1, DEFAULT_FLUSH_INTERVAL);
+
+        let mut blocker = db.connection().await.expect("blocker connection");
+        let mut lock = blocker.transaction().await.expect("lock transaction");
+        toasty::sql::statement("UPDATE profile_stats SET version = version + 0")
+            .exec(&mut lock)
+            .await
+            .expect("take the write lock");
+
+        // One patch carrying TWO groups — the shape every real probe produces.
+        let mut result = with_latency(&base, 33);
+        result.purge_reason = Some(PurgeReason::RealityFallback);
+        writer.stage(&result, LinkGroups::RESULT.union(LinkGroups::PURGE));
+        assert!(
+            writer.flush().await.is_err(),
+            "the write lock fails the flush"
+        );
+
+        lock.rollback().await.expect("release the lock");
+        drop(blocker);
+
+        assert_eq!(
+            writer.flush().await.expect("retry after contention"),
+            1,
+            "the re-staged patch is found and written by the retry"
+        );
+        assert_eq!(writer.staged_len(), 0);
+        let stored = persisted(&db).await;
+        assert_eq!(stored.latency, Some(Latency::Fast { delay: 33 }));
+        assert_eq!(
+            stored.purge_reason,
+            Some(PurgeReason::RealityFallback),
+            "both groups land, not just the first"
+        );
+    }
+
     /// A failed window must not take the windows after it down with it: the
     /// drain already removed them from the pending map, so only re-staging the
     /// failing window would silently drop the rest of the batch.
@@ -455,6 +515,38 @@ mod tests {
             "the re-staged remainder lands on the next flush"
         );
         assert_eq!(writer.staged_len(), 0);
+    }
+
+    /// Every staged group must leave `pending` when the window is drained.
+    ///
+    /// A group the fold loop skipped was never removed, so its entry leaked and
+    /// re-added its bit to the next drain's union — which is how a PURGE-only
+    /// entry could write a verdict from a snapshot that never classified one.
+    #[tokio::test]
+    async fn a_purge_verdict_survives_the_drain_and_empties_the_window() {
+        use xray_tui_db::models::PurgeReason;
+
+        let (db, writer) = seeded().await;
+        let base = persisted(&db).await;
+        let mut result = with_latency(&base, 44);
+        result.purge_reason = Some(PurgeReason::NotTls);
+        writer.stage(&result, LinkGroups::RESULT.union(LinkGroups::PURGE));
+        assert_eq!(writer.staged_len(), 2, "one entry per group");
+
+        writer.flush().await.expect("flush");
+        assert_eq!(
+            writer.staged_len(),
+            0,
+            "the drain removes EVERY group's entry, not just the ones it folds"
+        );
+
+        let stored = persisted(&db).await;
+        assert_eq!(stored.purge_reason, Some(PurgeReason::NotTls));
+        assert_eq!(
+            stored.latency,
+            Some(Latency::Fast { delay: 44 }),
+            "and the result half landed too"
+        );
     }
 
     /// The drain removes: a stage landing while the drained snapshot is being

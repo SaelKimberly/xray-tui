@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
@@ -240,20 +240,13 @@ const EVENT_DRAIN_BUDGET: usize = 256;
 /// batch-progress bar cleared), so the caller can trigger an immediate redraw
 /// instead of waiting for the idle refresh cadence.
 pub async fn poll_core_events(state: &mut AppState) -> bool {
-    // Clear a bar left behind by a batch that never reported its end. The pair
-    // alone cannot answer "is a batch alive?": its total stays 0 until the final
-    // phase's candidate set is known (minutes, for a fast+real run), which is a
-    // legitimate running state the status bar renders as "Testing...". The
-    // handle published at batch start is the liveness fact, and it clears with
-    // the pair on the terminal event.
+    // Clear meters left behind by a batch that never reported its end: the
+    // handle published at batch start is the liveness fact (the meters
+    // themselves cannot answer it — a running batch with no denominator yet is
+    // a legitimate state), and the two clear together on the terminal event.
     let mut handled = if state.batch.is_none()
         && state.batch_progress.is_some()
         && state.testing_profiles.is_empty()
-        && state
-            .batch_progress
-            .as_ref()
-            .map(|p| p.0.load(Ordering::Relaxed))
-            == Some(0)
     {
         state.batch_progress = None;
         true
@@ -816,26 +809,15 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         .unwrap_or_default();
                 }
             }
-            CoreEvent::BatchProgress { total, completed } => {
-                if total == 0 {
-                    // Batch finished: clear the shared progress and re-arm the
-                    // stop flag (the batch pipeline retired everything; a
-                    // stopped batch must not leave the status bar stuck). The
-                    // handle goes with the bar — `finish_batch` is the batch's
-                    // only end signal, and it flushes before sending this.
-                    state.batch_progress = None;
-                    state.batch = None;
-                    state.speed_test_stop.store(false, Ordering::Relaxed);
-                } else {
-                    // Keep the shared pair in sync with the event stream (the
-                    // status bar reads the atomics directly; the batch task
-                    // also updates them in place).
-                    let entry = state.batch_progress.get_or_insert_with(|| {
-                        Arc::new((AtomicU32::new(total), AtomicU32::new(0)))
-                    });
-                    entry.0.store(total, Ordering::Relaxed);
-                    entry.1.store(completed, Ordering::Relaxed);
-                }
+            CoreEvent::BatchEnded => {
+                // Batch finished: clear the shared meters and re-arm the stop
+                // flag (the pipeline retired everything; a stopped batch must not
+                // leave the status bar stuck). The handle goes with them —
+                // `finish_batch` is the batch's only end signal, and it flushes
+                // and sweeps before sending this.
+                state.batch_progress = None;
+                state.batch = None;
+                state.speed_test_stop.store(false, Ordering::Relaxed);
             }
             CoreEvent::HostFeaturesLoaded(checker) => {
                 state.host_features = Some(checker);
@@ -1107,7 +1089,7 @@ pub(crate) fn drain_pending_stats_updates(state: &mut AppState) -> Vec<ProfileSt
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::Ordering;
 
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{EndpointRow, HostType, Latency};
@@ -2316,46 +2298,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_progress_event_updates_shared_pair_and_clears_on_zero() {
+    async fn batch_ended_clears_the_meters_and_rearms_the_stop_flag() {
         let (mut state, tx) = event_state().await;
 
-        tx.send(CoreEvent::BatchProgress {
-            total: 5,
-            completed: 2,
-        })
-        .await
-        .unwrap();
-        assert!(state.poll_core_events().await);
-        let p = state.batch_progress.as_ref().expect("batch progress set");
-        assert_eq!(p.0.load(Ordering::Relaxed), 5);
-        assert_eq!(p.1.load(Ordering::Relaxed), 2);
-
-        // A later event with the same total refreshes the shared pair.
-        tx.send(CoreEvent::BatchProgress {
-            total: 5,
-            completed: 4,
-        })
-        .await
-        .unwrap();
-        assert!(state.poll_core_events().await);
-        assert_eq!(
-            state
-                .batch_progress
-                .as_ref()
-                .unwrap()
-                .1
-                .load(Ordering::Relaxed),
-            4
-        );
-
-        // total == 0 ends the batch: progress cleared, stop flag re-armed.
+        // The batch task publishes the meters itself (they are shared, not
+        // event-carried); the event only closes the batch.
+        state.batch_progress = Some(Arc::new(crate::types::BatchMeters::default()));
         state.speed_test_stop.store(true, Ordering::Relaxed);
-        tx.send(CoreEvent::BatchProgress {
-            total: 0,
-            completed: 0,
-        })
-        .await
-        .unwrap();
+
+        tx.send(CoreEvent::BatchEnded).await.unwrap();
         assert!(state.poll_core_events().await);
         assert!(state.batch_progress.is_none());
         assert!(!state.speed_test_stop.load(Ordering::Relaxed));
@@ -2368,7 +2319,7 @@ mod tests {
         // pressed mid-batch). Only after the batch's progress is gone does a
         // drained result re-arm the flag.
         let (mut state, tx) = event_state().await;
-        state.batch_progress = Some(Arc::new((AtomicU32::new(2), AtomicU32::new(0))));
+        state.batch_progress = Some(Arc::new(crate::types::BatchMeters::default()));
         state.speed_test_stop.store(true, Ordering::Relaxed);
         state.testing_profiles.insert((0, 8));
 

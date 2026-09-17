@@ -36,11 +36,11 @@ fn runs(done: u64, total: u64, width: usize) -> (String, String) {
 
 /// The ` 42%` suffix; empty while the total is unknown.
 fn pct_text(done: u64, total: u64) -> String {
-    if total == 0 {
-        String::new()
-    } else {
-        format!(" {}%", done.min(total) * 100 / total)
-    }
+    // `None` covers both an unknown total (0) and an impossible one.
+    done.min(total)
+        .checked_mul(100)
+        .and_then(|n| n.checked_div(total))
+        .map_or_else(String::new, |pct| format!(" {pct}%"))
 }
 
 /// The bar cells for a counter pair, width-adapted: `[███>░░] 42%`.
@@ -130,18 +130,28 @@ mod tests {
 
     /// The rendered text of a line — what the terminal actually shows.
     fn plain(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     #[test]
     fn bar_cells_matches_the_settings_shape() {
         let empty = format!("[>{}]", "░".repeat(20));
-        assert_eq!(bar_cells(0, 0, 20), empty, "no total: empty bar, no percent");
+        assert_eq!(
+            bar_cells(0, 0, 20),
+            empty,
+            "no total: empty bar, no percent"
+        );
         assert_eq!(
             bar_cells(1, 2, 20),
             format!("[{}>{}] 50%", "█".repeat(10), "░".repeat(10))
         );
-        assert_eq!(bar_cells(1, 4, 8), format!("[{}>{}] 25%", "█".repeat(2), "░".repeat(6)));
+        assert_eq!(
+            bar_cells(1, 4, 8),
+            format!("[{}>{}] 25%", "█".repeat(2), "░".repeat(6))
+        );
         assert_eq!(
             bar_cells(2, 2, 20),
             format!("[{}>] 100%", "█".repeat(20)),
@@ -179,19 +189,13 @@ mod tests {
             "Fast [>░░░░░░] 3% 1234/34562 ~3m",
             "30..=43 shrinks the bar"
         );
-        assert_eq!(
-            row(43),
-            "Fast [>░░░░░░░░░░░░░░░░] 3% 1234/34562 ~3m"
-        );
+        assert_eq!(row(43), "Fast [>░░░░░░░░░░░░░░░░░] 3% 1234/34562 ~3m");
         assert_eq!(
             row(44),
             "Fast [>░░░░░░░░░░░░░░░░░░░░] 3% 1234/34562 ~3m",
             "44 and up get the full 20-cell bar"
         );
-        assert_eq!(
-            row(60),
-            "Fast [>░░░░░░░░░░░░░░░░░░░░] 3% 1234/34562 ~3m"
-        );
+        assert_eq!(row(60), "Fast [>░░░░░░░░░░░░░░░░░░░░] 3% 1234/34562 ~3m");
         assert_eq!(row(16), "", "16 columns is under the floor too");
     }
 
@@ -201,7 +205,7 @@ mod tests {
         let line = bar_line("Fast", 1, 2, None, 60, &palette);
         let area = Rect::new(0, 0, u16::try_from(line.width()).unwrap(), 1);
         let mut buf = Buffer::empty(area);
-        line.render(area, &mut buf);
+        (&line).render(area, &mut buf);
         // Glyphs are multi-byte, so a match's offset is counted in characters.
         let col = |needle: &str| {
             let text = plain(&line);
@@ -217,7 +221,10 @@ mod tests {
             "the head belongs to the fill"
         );
         let bracket = &buf[(col("["), 0)];
-        assert_eq!((bracket.fg, bracket.bg), (palette.foreground, palette.surface));
+        assert_eq!(
+            (bracket.fg, bracket.bg),
+            (palette.foreground, palette.surface)
+        );
         let track = &buf[(col("░"), 0)];
         assert_eq!((track.fg, track.bg), (palette.foreground, palette.surface));
         let counters = &buf[(col("1/2"), 0)];
