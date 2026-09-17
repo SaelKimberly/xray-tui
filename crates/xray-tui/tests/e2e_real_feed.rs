@@ -28,7 +28,7 @@ async fn streaming_import_real_feed_completes() {
         resp.status()
     );
 
-    let (count, summary) = xray_tui::ops::stream_import::import_http_subscription(
+    let outcome = xray_tui::ops::stream_import::import_http_subscription(
         FEED,
         "xray-tui-e2e",
         &db,
@@ -37,6 +37,13 @@ async fn streaming_import_real_feed_completes() {
     )
     .await;
     let t_all = t0.elapsed();
+    assert!(
+        outcome.ended_early.is_none(),
+        "real feed ended early: {:?}",
+        outcome.ended_early
+    );
+    let count = outcome.links;
+    let summary = outcome.summary;
     println!(
         "links={count} errors={} fetch={t_fetch:?} total={t_all:?}",
         summary.total_errors

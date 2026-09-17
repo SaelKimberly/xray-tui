@@ -237,20 +237,30 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     // A batch that was still running when the user quit never reaches its own
     // `batch summary` line (the runtime drop cancels the task), which is how
     // the 2026-09-16 run left 31k persisted results with no record of the run
-    // in the log. Say what is true at exit: the progress counter's semantics
-    // (the FINAL phase — phase 1 of a fast+real batch is not counted, so this
-    // can read 0/N while phase 1 is running), and that the staged writes above
-    // were flushed.
+    // in the log — and the per-class histograms only the summary carries were
+    // lost with it. The handle published at batch start is reachable here, so
+    // the interrupted run reports the SAME line a completed run writes, plus
+    // what has settled and what is still in flight. The pair alone cannot: its
+    // total is the FINAL phase's candidate count (0 until that set is known),
+    // so it must not be phrased as "N of M probes".
     if let Some(progress) = &state.batch_progress {
-        let (total, completed) = (
-            progress.0.load(Ordering::Relaxed),
-            progress.1.load(Ordering::Relaxed),
-        );
-        tracing::info!(
-            target: "tui::ops::ping",
-            "batch interrupted at quit: {completed} of {total} final-phase probe(s) reported, no batch summary; staged writes flushed, {} left staged",
-            state.link_writer.staged_len(),
-        );
+        if let Some(shared) = state.batch.as_ref().and_then(|slot| slot.get()) {
+            tracing::info!(
+                target: "tui::ops::ping",
+                "{}",
+                crate::ops::ping::interrupted_summary_line(shared),
+            );
+        } else {
+            let (total, completed) = (
+                progress.0.load(Ordering::Relaxed),
+                progress.1.load(Ordering::Relaxed),
+            );
+            tracing::info!(
+                target: "tui::ops::ping",
+                "batch interrupted at quit: {completed} of {total} final-phase probe(s) reported, no batch summary; staged writes flushed, {} left staged",
+                state.link_writer.staged_len(),
+            );
+        }
     }
 
     disable_raw_mode()?;

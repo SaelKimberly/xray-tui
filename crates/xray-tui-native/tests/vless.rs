@@ -76,6 +76,15 @@ fn vless_udp_tls(mode: PacketMode, tls: Box<dyn TlsVariant>) -> CaseSpec {
 #[rstest]
 #[case::tcp_plain(vless("tcp"))]
 #[case::tcp_chrome(vless_tls("tcp", fp("chrome")))]
+// The 2026-09-17 roster fix: `chrome` resolves to the hand-declared,
+// unchanged `chrome_130`, so these three are the presets whose generated
+// hellos carried the malformed `encrypted_client_hello` /
+// `compress_certificate` / `delegated_credentials` bodies. Each runs against
+// real xray-core and sing-box, which is the interop proof the tier-1 sweep
+// and the tier-2 strict-peer test cannot give.
+#[case::tcp_firefox(vless_tls("tcp", fp("firefox")))]
+#[case::tcp_safari(vless_tls("tcp", fp("safari")))]
+#[case::tcp_ios(vless_tls("tcp", fp("ios")))]
 #[case::tcp_reality(vless_tls("tcp", reality()))]
 #[case::tcp_reality_wrong_pbk(vless_tls("tcp", reality_wrong_pbk()))]
 #[case::tcp_reality_wrong_sid(vless_tls("tcp", reality_wrong_sid()))]

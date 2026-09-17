@@ -129,6 +129,12 @@ pub(crate) async fn replace(
     endpoint_id: EndpointId,
     ips: &[IpAddr],
 ) -> Result<()> {
+    // Carry the countries of the addresses that are still present: a
+    // re-resolution must not throw away a lookup that already happened (the
+    // whole point of storing them), and the set is small enough that one
+    // per-endpoint read is cheaper than re-walking the mmdb.
+    let known = countries_of(conn, &[endpoint_id]).await?;
+    let known = known.get(&endpoint_id);
     EndpointIp::filter_by_endpoint_id(endpoint_id)
         .delete()
         .exec(conn)
@@ -141,14 +147,111 @@ pub(crate) async fn replace(
     for key in keys {
         // The set was just emptied, so this is a plain insert — there is no
         // value to update on conflict (`upsert` refuses a key-only model).
+        let country = known
+            .and_then(|map| map.get(&key).cloned())
+            .filter(|iso| !iso.is_empty());
         toasty::create!(EndpointIp {
             endpoint_id,
             ip_key: key,
+            country,
         })
         .exec(conn)
         .await?;
     }
     Ok(())
+}
+
+/// The persisted countries of `ids`, keyed by endpoint and address key.
+///
+/// One statement for the whole set, ids inlined for the same reason [`load`]
+/// inlines them (the engine charges per bound parameter).
+async fn countries_of(
+    conn: &mut impl toasty::Executor,
+    ids: &[EndpointId],
+) -> Result<HashMap<EndpointId, HashMap<Vec<u8>, String>>> {
+    let mut out: HashMap<EndpointId, HashMap<Vec<u8>, String>> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let id_list = id_list(ids);
+    let rows = toasty::sql::query(format!(
+        "SELECT endpoint_id, ip_key, country FROM endpoint_ip \
+         WHERE endpoint_id IN ({id_list}) AND country IS NOT NULL"
+    ))
+    .exec(conn)
+    .await?;
+    for row in &rows {
+        let Value::Record(record) = row else {
+            continue;
+        };
+        let id = record.fields.first().and_then(|v| match v {
+            Value::I64(n) => Some(*n),
+            _ => None,
+        });
+        let key = record.fields.get(1).and_then(|v| match v {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        });
+        let country = record.fields.get(2).and_then(|v| match v {
+            Value::String(text) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        });
+        if let (Some(id), Some(key), Some(country)) = (id, key, country) {
+            out.entry(EndpointId::new(id))
+                .or_default()
+                .insert(key, country);
+        }
+    }
+    Ok(out)
+}
+
+/// Record the country of one resolved address.
+///
+/// The write the geo lookup makes once per address; `replace` keeps it
+/// afterwards. The row is created when it is missing: the lookup and the
+/// address write race by design (the geo step runs after the resolution
+/// event was already queued), and a country that arrives first must not be
+/// dropped.
+pub(crate) async fn set_country(
+    conn: &mut impl toasty::Executor,
+    endpoint_id: EndpointId,
+    ip: IpAddr,
+    iso: &str,
+) -> Result<()> {
+    let key = key_of(ip);
+    let existing = EndpointIp::filter_by_endpoint_id(endpoint_id)
+        .filter_by_ip_key(key.clone())
+        .first()
+        .exec(conn)
+        .await?;
+    match existing {
+        Some(_) => {
+            EndpointIp::filter_by_endpoint_id(endpoint_id)
+                .filter_by_ip_key(key)
+                .update()
+                .country(Some(iso.to_string()))
+                .exec(conn)
+                .await?;
+        }
+        None => {
+            toasty::create!(EndpointIp {
+                endpoint_id,
+                ip_key: key,
+                country: Some(iso.to_string()),
+            })
+            .exec(conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The id list form every raw statement here inlines.
+fn id_list(ids: &[EndpointId]) -> String {
+    ids.iter()
+        .map(|id| id.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The resolved addresses of `ids`, key-ordered (the display order).
@@ -161,17 +264,29 @@ pub(crate) async fn load(
     conn: &mut impl toasty::Executor,
     ids: &[EndpointId],
 ) -> Result<HashMap<EndpointId, Vec<IpAddr>>> {
-    let mut out: HashMap<EndpointId, Vec<IpAddr>> = HashMap::new();
+    let resolved = load_resolved(conn, ids).await?;
+    Ok(resolved
+        .into_iter()
+        .map(|(id, addrs)| (id, addrs.into_iter().map(|(ip, _)| ip).collect()))
+        .collect())
+}
+
+/// The resolved addresses of `ids` with the country each one carries.
+///
+/// The enrichment seed reads this one: an address whose country is already
+/// stored needs no mmdb walk (and a launch whose addresses are all stored
+/// needs no mmdb at all), while `None` is exactly the set worth looking up.
+pub(crate) async fn load_resolved(
+    conn: &mut impl toasty::Executor,
+    ids: &[EndpointId],
+) -> Result<HashMap<EndpointId, Vec<(IpAddr, Option<String>)>>> {
+    let mut out: HashMap<EndpointId, Vec<(IpAddr, Option<String>)>> = HashMap::new();
     if ids.is_empty() {
         return Ok(out);
     }
-    let id_list = ids
-        .iter()
-        .map(|id| id.get().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+    let id_list = id_list(ids);
     let rows = toasty::sql::query(format!(
-        "SELECT endpoint_id, ip_key FROM endpoint_ip WHERE endpoint_id IN ({id_list}) \
+        "SELECT endpoint_id, ip_key, country FROM endpoint_ip WHERE endpoint_id IN ({id_list}) \
          ORDER BY endpoint_id, ip_key"
     ))
     .exec(conn)
@@ -192,8 +307,14 @@ pub(crate) async fn load(
                 _ => None,
             })
             .and_then(ip_of);
+        let country = record.fields.get(2).and_then(|v| match v {
+            Value::String(text) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        });
         if let (Some(id), Some(ip)) = (id, ip) {
-            out.entry(EndpointId::new(id)).or_default().push(ip);
+            out.entry(EndpointId::new(id))
+                .or_default()
+                .push((ip, country));
         }
     }
     Ok(out)

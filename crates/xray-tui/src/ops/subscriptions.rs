@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use dashmap::DashSet;
 use xray_tui_config::import_export::{ValidationSettings, ValidationSummary};
 use xray_tui_db::Database;
 use xray_tui_db::models::{Group, GroupCoreType, GroupStatus};
 
 use crate::AppState;
+use crate::ops::stream_import::ImportOutcome;
 
 use crate::types::{CoreEvent, SplitRightPane};
 use crate::{get_field, try_send_or_warn};
@@ -246,6 +249,45 @@ pub async fn clear_group(state: &mut AppState, group_id: &str) {
     state.reload_profiles().await;
 }
 
+/// The ONE exclusion authority for group fetches.
+///
+/// `AppState::updating_groups` stays the UI's display projection — it drives
+/// the group-row spinner and is cleared by the `SubscriptionsUpdated` handler
+/// — and is deliberately NOT the exclusion gate: the auto-update loop never
+/// consulted it, so an auto fetch and a manual refresh of the same group ran
+/// concurrently against one row set. Every fetch path claims a slot here.
+///
+/// A slot lives exactly as long as its [`InFlightGuard`]: the guard removes
+/// the id on drop, so an early return or a panic inside a fetch cannot wedge
+/// a group out of future updates.
+static IN_FLIGHT_IMPORTS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// RAII claim on one group's fetch slot; dropping it releases the slot.
+struct InFlightGuard {
+    group_id: String,
+}
+
+impl InFlightGuard {
+    /// Claim `group_id` for this fetch; `None` when a fetch already holds it.
+    fn acquire(group_id: &str) -> Option<Self> {
+        IN_FLIGHT_IMPORTS.insert(group_id.to_owned()).then(|| Self {
+            group_id: group_id.to_owned(),
+        })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT_IMPORTS.remove(&self.group_id);
+    }
+}
+
+/// Whether a fetch for `group_id` is in flight right now (the skip predicate
+/// of the batch updater and the auto-update loop).
+fn import_in_flight(group_id: &str) -> bool {
+    IN_FLIGHT_IMPORTS.contains(group_id)
+}
+
 pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     if state.updating_groups.contains(group_id) {
         return;
@@ -292,9 +334,20 @@ async fn update_one_group(
     validation: ValidationSettings,
     tx: Option<tokio::sync::mpsc::Sender<CoreEvent>>,
 ) {
+    let Some(flight) = InFlightGuard::acquire(&gid) else {
+        // Another path (the auto-update loop) already fetches this group. It
+        // delivers its own `SubscriptionsUpdated`, which clears this group's
+        // `updating_groups` spinner entry, so returning here is not a wedge —
+        // but a user-requested refresh that was skipped must be visible.
+        tracing::info!(
+            target: "tui::ops::subscriptions",
+            "Fetch already in flight for group {gid}; skipping duplicate fetch"
+        );
+        return;
+    };
     let result = tokio::time::timeout(
         std::time::Duration::from_mins(30),
-        do_update_subscription(url, user_agent, gid.clone(), db, validation),
+        do_update_subscription(url, user_agent, gid.clone(), db, validation, &flight),
     )
     .await;
     if let Ok(inner) = result {
@@ -327,12 +380,15 @@ async fn update_one_group(
     }
 }
 
+/// One group's fetch. The caller holds the [`InFlightGuard`] — the exclusion
+/// claim is a parameter, not a lookup, so no path can fetch without one.
 async fn do_update_subscription(
     url: String,
     user_agent: String,
     group_id: String,
     db: Arc<Database>,
     validation: ValidationSettings,
+    _flight: &InFlightGuard,
 ) -> (String, usize, ValidationSummary, Option<String>) {
     // Warn on HTTP (non-HTTPS) subscription URLs
     if url.starts_with("http://") {
@@ -341,7 +397,7 @@ async fn do_update_subscription(
             "Subscription URL uses HTTP, traffic is not encrypted"
         );
     }
-    let (count, summary) = crate::ops::stream_import::import_http_subscription(
+    let outcome = crate::ops::stream_import::import_http_subscription(
         &url,
         &user_agent,
         &db,
@@ -349,19 +405,44 @@ async fn do_update_subscription(
         &validation,
     )
     .await;
-    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded: {count} links, {} errors, {} insecure-profile warnings", summary.total_errors, summary.security_warning_count);
+    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded: {} links, {} errors, {} insecure-profile warnings", outcome.links, outcome.summary.total_errors, outcome.summary.security_warning_count);
 
-    // Update group metadata (last_refreshed, status)
+    record_import_result(&db, &group_id, &outcome).await;
+
+    let error = partial_import_message(&outcome);
+    (group_id, outcome.links, outcome.summary, error)
+}
+
+/// The user-facing statement of a truncated import: that it was cut short and
+/// how many links survived. One owner, so the group row's `error_message` and
+/// the `SubscriptionsUpdated` log line cannot drift apart.
+fn partial_import_message(outcome: &ImportOutcome) -> Option<String> {
+    outcome.ended_early.as_ref().map(|reason| {
+        format!(
+            "subscription import ended early after {} link(s) stored — the feed is incomplete, stored rows were kept: {reason}",
+            outcome.links
+        )
+    })
+}
+
+/// Record one finished import on the group row. `last_refreshed` always moves
+/// (a partial import still refreshed what it stored), but a truncated run is
+/// written as [`GroupStatus::Error`] with the partial message — it used to be
+/// recorded as a clean `Ok`, which made half a feed look like a full one.
+async fn record_import_result(db: &Arc<Database>, group_id: &str, outcome: &ImportOutcome) {
     if let Ok(groups) = db.get_all_groups().await
         && let Some(mut grp) = groups.into_iter().find(|g| g.id == group_id)
     {
         grp.last_refreshed = Some(xray_tui_db::models::now_epoch());
-        grp.status = Some(GroupStatus::Ok);
-        grp.error_message = None;
+        if let Some(message) = partial_import_message(outcome) {
+            grp.status = Some(GroupStatus::Error);
+            grp.error_message = Some(message);
+        } else {
+            grp.status = Some(GroupStatus::Ok);
+            grp.error_message = None;
+        }
         let _ = db.upsert_group(&grp).await;
     }
-
-    (group_id, count, summary, None)
 }
 
 /// URLs per parse+persist batch (one DB transaction per batch).
@@ -493,13 +574,16 @@ pub async fn persist_parsed_urls(
 pub fn update_all_subscriptions(state: &mut AppState) {
     // One shared pipeline: a group with a URL runs sequentially. Parallel
     // group herds multiplied write contention (each group previously spawned
-    // its own upsert task burst); the per-group `updating_groups` guard still
-    // prevents double-updates of the same group.
+    // its own upsert task burst); the in-flight registry is the exclusion
+    // authority for a group already being fetched by another path, and the
+    // per-group `updating_groups` guard still prevents double-updates of the
+    // same group from this path.
     let groups: Vec<(String, String, Option<String>)> = state
         .groups
         .iter()
         .filter(|g| g.url.as_deref().is_some_and(|u| !u.is_empty()))
         .filter(|g| !state.updating_groups.contains(&g.id))
+        .filter(|g| !import_in_flight(&g.id))
         .map(|g| {
             (
                 g.id.clone(),
@@ -572,9 +656,27 @@ pub fn spawn_auto_update(state: &mut AppState) {
                     .clone()
                     .unwrap_or_else(|| "xray-tui/0.1".into());
                 let gid = group.id.clone();
-                let result =
-                    do_update_subscription(url, ua, gid.clone(), db.clone(), validation.clone())
-                        .await;
+                let Some(flight) = InFlightGuard::acquire(&gid) else {
+                    // A manual refresh or a batch update owns this group and
+                    // will report its own outcome — a second concurrent fetch
+                    // of the same URL is exactly the defect this registry
+                    // exists to prevent.
+                    tracing::debug!(
+                        target: "tui::ops::subscriptions",
+                        "Skipping auto-update of group {gid}: fetch already in flight"
+                    );
+                    continue;
+                };
+                let result = do_update_subscription(
+                    url,
+                    ua,
+                    gid.clone(),
+                    db.clone(),
+                    validation.clone(),
+                    &flight,
+                )
+                .await;
+                drop(flight);
                 try_send_or_warn(
                     &tx,
                     CoreEvent::SubscriptionsUpdated {
@@ -647,6 +749,114 @@ mod tests {
         });
         let b64 = base64_simd::STANDARD.encode_to_string(serde_json::to_string(&qr).unwrap());
         format!("vmess://{b64}")
+    }
+
+    #[test]
+    fn in_flight_guard_refuses_second_fetch_and_releases_on_drop() {
+        let gid = "guard-drop-test";
+        let first = InFlightGuard::acquire(gid).expect("first claim wins");
+        assert!(import_in_flight(gid), "a claimed group is visible");
+        assert!(
+            InFlightGuard::acquire(gid).is_none(),
+            "a second fetch of the same group is refused"
+        );
+        drop(first);
+        assert!(!import_in_flight(gid), "drop releases the slot");
+        let second = InFlightGuard::acquire(gid).expect("released group is claimable again");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn in_flight_guard_releases_on_early_return() {
+        // The real shape: a fetch path claims the slot, then leaves through an
+        // early return (no URL / already in flight elsewhere). Only the
+        // guard's Drop can free the group, so a bail-out must not wedge it.
+        fn fetch_that_bails(group_id: &str) -> bool {
+            let Some(_guard) = InFlightGuard::acquire(group_id) else {
+                return false;
+            };
+            false
+        }
+
+        let gid = "guard-early-return-test";
+        assert!(!fetch_that_bails(gid));
+        assert!(
+            !import_in_flight(gid),
+            "an early return must not leave the group wedged"
+        );
+        assert!(
+            InFlightGuard::acquire(gid).is_some(),
+            "the group is fetchable again after the bail-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_import_records_error_status_and_keeps_last_refreshed() {
+        let db = Arc::new(Database::in_memory().await.expect("in-memory db"));
+        db.upsert_group(&Group {
+            id: "g-partial".to_string(),
+            name: Some("partial".to_string()),
+            url: Some("https://example.invalid/sub".to_string()),
+            enabled: true,
+            user_agent: None,
+            convert_target: None,
+            core_type: None,
+            sort_order: None,
+            refresh_interval: Some(60),
+            last_refreshed: None,
+            status: Some(GroupStatus::Ok),
+            error_message: None,
+        })
+        .await
+        .expect("seed group");
+
+        // A source that died mid-stream after 3381 links: the group must NOT
+        // be recorded as a clean refresh.
+        let truncated = ImportOutcome {
+            links: 3381,
+            summary: ValidationSummary::default(),
+            ended_early: Some("error decoding response body".to_string()),
+        };
+        record_import_result(&db, "g-partial", &truncated).await;
+
+        let group = db
+            .get_all_groups()
+            .await
+            .expect("groups")
+            .into_iter()
+            .find(|g| g.id == "g-partial")
+            .expect("group row");
+        assert_eq!(group.status, Some(GroupStatus::Error));
+        let message = group.error_message.expect("partial import message");
+        assert!(
+            message.contains("3381") && message.contains("incomplete"),
+            "message states the feed was cut short and how much stored: {message}"
+        );
+        assert!(
+            group.last_refreshed.is_some(),
+            "a partial import still refreshed what it stored"
+        );
+
+        // A clean run still lands on Ok with no message.
+        record_import_result(
+            &db,
+            "g-partial",
+            &ImportOutcome {
+                links: 9,
+                summary: ValidationSummary::default(),
+                ended_early: None,
+            },
+        )
+        .await;
+        let group = db
+            .get_all_groups()
+            .await
+            .expect("groups")
+            .into_iter()
+            .find(|g| g.id == "g-partial")
+            .expect("group row");
+        assert_eq!(group.status, Some(GroupStatus::Ok));
+        assert_eq!(group.error_message, None);
     }
 
     /// A page request filtered to one group (the retired

@@ -23,6 +23,9 @@ pub struct RuntimeValues {
     pub grease_a: u16,
     pub grease_b: u16,
     pub padding_len: usize,
+    /// GREASE `encrypted_client_hello` material, drawn per connection when
+    /// the spec carries [`ExtensionSpec::EchGrease`].
+    pub ech: EchGrease,
 }
 
 impl Default for RuntimeValues {
@@ -34,6 +37,56 @@ impl Default for RuntimeValues {
             grease_a: 0x0A0A,
             grease_b: 0x1A1A,
             padding_len: 0,
+            ech: EchGrease::default(),
+        }
+    }
+}
+
+/// The opaque bytes of a GREASE `encrypted_client_hello` extension.
+///
+/// Chrome and Firefox advertise ECH in every hello; with no ECH config to
+/// use they send a **GREASE** one — a structurally valid `ECHClientHello`
+/// whose `enc`/`payload` are random (RFC 9849 §6.2, Chrome's
+/// `MakeGreaseEncryptedClientHello`). The values are opaque to every peer
+/// that does not hold the matching config, so the only requirements are
+/// shape and length: an empty body is not a parseable extension, and
+/// `BoringSSL` answers `decode_error` for it.
+///
+/// `Default` carries zeroed bytes of the right LENGTHS, so a spec built
+/// without an RNG still emits a parseable extension; the lengths are what
+/// the wire format constrains, never the contents.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EchGrease {
+    /// `config_id` — a client-chosen key id with no matching config here.
+    pub config_id: u8,
+    /// `enc` — an opaque HPKE-encapsulated key, 32 bytes on the wire.
+    pub enc: [u8; ECH_ENC_LEN],
+    /// `payload` — the outer `ClientHelloOuterAAD` slot. RFC 9849 requires
+    /// at least one byte.
+    pub payload: Vec<u8>,
+}
+
+/// `enc` length: a 32-byte (X25519-shaped) encapsulated key.
+pub const ECH_ENC_LEN: usize = 32;
+/// `payload` length.
+///
+/// Chrome's GREASE payload is the serialized `ClientHelloOuterAAD`, a
+/// hello-sized blob; 144 bytes matches the captured browser profiles' shape
+/// without pinning a constant that a real AAD would not have.
+pub const ECH_PAYLOAD_LEN: usize = 144;
+
+/// The `HpkeSymmetricCipherSuite` a GREASE hello advertises: HKDF-SHA256
+/// with AES-128-GCM, the first pair in RFC 9180's registry.
+pub const ECH_KDF_ID: u16 = 0x0001;
+/// See [`ECH_KDF_ID`].
+pub const ECH_AEAD_ID: u16 = 0x0001;
+
+impl Default for EchGrease {
+    fn default() -> Self {
+        Self {
+            config_id: 0,
+            enc: [0; ECH_ENC_LEN],
+            payload: vec![0; ECH_PAYLOAD_LEN],
         }
     }
 }
@@ -70,7 +123,16 @@ pub enum ExtensionSpec {
     RecordSizeLimit(u16),
     Padding,
     Grease,
-    Raw { ty: u16, data: Vec<u8> },
+    /// `encrypted_client_hello` (RFC 9849) with GREASE contents: the hello
+    /// claims ECH support with a valid `ECHClientHello` whose `enc`/`payload`
+    /// are random, so it parses everywhere and decrypts nowhere. Every
+    /// Firefox/Safari/Chrome-family profile carries it; omitting it would
+    /// change the JA4 extension set.
+    EchGrease,
+    Raw {
+        ty: u16,
+        data: Vec<u8>,
+    },
 }
 
 /// One key-share entry in the `key_share` extension.
@@ -168,6 +230,17 @@ impl ExtensionSpec {
     pub fn encode_body_into(&self, rt: &RuntimeValues, out: &mut Vec<u8>) -> Result<(), TlsError> {
         match self {
             Self::ServerName => {
+                // RFC 6066 §3: "Literal IPv4 and IPv6 addresses are not
+                // permitted in HostName". A client whose only name is an
+                // address sends no `server_name` extension at all — that is
+                // what Go's `hostnameInSNI` does, and therefore what
+                // xray-core and sing-box put on the wire. Sending the
+                // literal instead makes CDN fronts answer
+                // `unrecognized_name`/`handshake_failure` (alert 2 112 /
+                // 2 40) to an otherwise valid hello.
+                if is_ip_literal(&rt.server_name) {
+                    return Ok(());
+                }
                 let host = rt.server_name.as_bytes();
                 let host_len = u16::try_from(host.len()).map_err(|_| {
                     TlsError::Spec("server_name host exceeds u16 length".to_string())
@@ -279,7 +352,17 @@ impl ExtensionSpec {
                 out.push(0x00);
             }
             Self::CompressCertificate(algos) => {
-                // RFC 8871: 1-byte length counts BYTES + algos, no count field.
+                // RFC 8879 §4: `CompressionAlgorithm algorithms<2..2^8-2>` —
+                // the vector carries at least one algorithm. An empty list
+                // frames as a 0-byte body, which BoringSSL answers with
+                // `decode_error`; the shape is refused rather than emitted.
+                if algos.is_empty() {
+                    return Err(TlsError::Spec(
+                        "compress_certificate needs at least one algorithm (RFC 8879 §4)"
+                            .to_string(),
+                    ));
+                }
+                // RFC 8879: 1-byte length counts BYTES + algos, no count field.
                 let byte_len = u8::try_from(algos.len() * 2).map_err(|_| {
                     TlsError::Spec("compress_certificate exceeds 255 bytes".to_string())
                 })?;
@@ -315,6 +398,9 @@ impl ExtensionSpec {
                 write_ext_header(out, rt.grease_b, 1)?;
                 out.push(0x00);
             }
+            Self::EchGrease => {
+                encode_ech_grease_into(&rt.ech, out)?;
+            }
             Self::Raw { ty, data } => {
                 write_ext_header(out, *ty, data.len())?;
                 out.extend_from_slice(data);
@@ -322,6 +408,51 @@ impl ExtensionSpec {
         }
         Ok(())
     }
+}
+
+/// True when `name` is an IPv4/IPv6 literal (bracketed IPv6 included) —
+/// the names RFC 6066 forbids in `server_name` and Go's `hostnameInSNI`
+/// strips.
+#[must_use]
+pub fn is_ip_literal(name: &str) -> bool {
+    name.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<core::net::IpAddr>()
+        .is_ok()
+}
+
+/// Encodes the COMPLETE `encrypted_client_hello` extension (type + length)
+/// with GREASE contents — RFC 9849 §5.1 `ECHClientHello`, outer variant:
+///
+/// ```text
+/// type(1) || cipher_suite(kdf_id u16, aead_id u16) || config_id(1)
+///   || enc<0..2^16-1> || payload<1..2^16-1>
+/// ```
+///
+/// The `payload` bound is the reason an empty body cannot be expressed: the
+/// encoder refuses one instead of emitting the unparseable extension the
+/// roster used to carry.
+fn encode_ech_grease_into(ech: &EchGrease, out: &mut Vec<u8>) -> Result<(), TlsError> {
+    if ech.payload.is_empty() {
+        return Err(TlsError::Spec(
+            "encrypted_client_hello payload must be at least one byte (RFC 9849 §5.1)".to_string(),
+        ));
+    }
+    let body_len = 1 + 4 + 1 + 2 + ech.enc.len() + 2 + ech.payload.len();
+    write_ext_header(out, 0xfe0d, body_len)?;
+    out.push(0x00); // outer: the client hello itself carries the config id
+    out.extend_from_slice(&ECH_KDF_ID.to_be_bytes());
+    out.extend_from_slice(&ECH_AEAD_ID.to_be_bytes());
+    out.push(ech.config_id);
+    let enc_len = u16::try_from(ech.enc.len())
+        .map_err(|_| TlsError::Spec("ECH enc exceeds u16 length".to_string()))?;
+    out.extend_from_slice(&enc_len.to_be_bytes());
+    out.extend_from_slice(&ech.enc);
+    let payload_len = u16::try_from(ech.payload.len())
+        .map_err(|_| TlsError::Spec("ECH payload exceeds u16 length".to_string()))?;
+    out.extend_from_slice(&payload_len.to_be_bytes());
+    out.extend_from_slice(&ech.payload);
+    Ok(())
 }
 
 /// Writes an extension type + u16 length prefix into `out`.
@@ -448,6 +579,103 @@ mod tests {
     fn grease_detection() {
         assert!(is_grease(0x0A0A) && is_grease(0xCACA) && is_grease(0xFAFA));
         assert!(!is_grease(0x1301) && !is_grease(0x1516) && !is_grease(0x0000));
+    }
+
+    /// The GREASE ECH extension frames RFC 9849 §5.1's outer
+    /// `ECHClientHello`: an empty body is what every strict parser
+    /// (`BoringSSL` — Cloudflare, Google) answers `decode_error` to, and the
+    /// 36 generated roster rows that used to carry it were unprobeable.
+    #[test]
+    fn ech_grease_frames_a_parseable_outer_client_hello() {
+        let ech = EchGrease {
+            config_id: 0x38,
+            enc: [0xAB; ECH_ENC_LEN],
+            payload: vec![0xCD; ECH_PAYLOAD_LEN],
+        };
+        let body = ExtensionSpec::EchGrease
+            .encode_body(&RuntimeValues {
+                ech,
+                ..RuntimeValues::default()
+            })
+            .expect("encode");
+
+        assert_eq!(&body[..2], &[0xfe, 0x0d], "extension type");
+        let body_len = usize::from(u16::from_be_bytes([body[2], body[3]]));
+        assert_eq!(body_len, body.len() - 4, "declared length counts the body");
+        let b = &body[4..];
+        assert_eq!(b[0], 0x00, "outer variant");
+        assert_eq!(&b[1..3], &ECH_KDF_ID.to_be_bytes());
+        assert_eq!(&b[3..5], &ECH_AEAD_ID.to_be_bytes());
+        assert_eq!(b[5], 0x38, "config id");
+        assert_eq!(&b[6..8], &32u16.to_be_bytes(), "enc length");
+        assert_eq!(&b[8..40], &[0xAB; 32], "enc bytes");
+        assert_eq!(
+            &b[40..42],
+            &u16::try_from(ECH_PAYLOAD_LEN).unwrap().to_be_bytes(),
+            "payload length"
+        );
+        assert_eq!(b[42..], [0xCD; ECH_PAYLOAD_LEN]);
+        // The minimum an `ECHClientHello` can be: 1 + 4 + 1 + 2 + 2 + 1.
+        assert!(body_len >= 38, "ECH body must be at least 38 bytes");
+    }
+
+    #[test]
+    fn ech_grease_refuses_an_empty_payload() {
+        let err = ExtensionSpec::EchGrease
+            .encode_body(&RuntimeValues {
+                ech: EchGrease {
+                    payload: Vec::new(),
+                    ..EchGrease::default()
+                },
+                ..RuntimeValues::default()
+            })
+            .expect_err("an empty payload is not a valid ECHClientHello");
+        assert!(matches!(err, TlsError::Spec(_)), "{err:?}");
+        // The default carries the right LENGTHS, so a spec built without an
+        // RNG still encodes.
+        assert_eq!(EchGrease::default().payload.len(), ECH_PAYLOAD_LEN);
+    }
+
+    #[test]
+    fn compress_certificate_refuses_an_empty_algorithm_list() {
+        // RFC 8879 §4: `algorithms<2..2^8-2>` — a 0-byte body is what the
+        // Safari/Chrome-Android roster rows used to emit, and BoringSSL
+        // answers `decode_error` to it.
+        let err = ExtensionSpec::CompressCertificate(Vec::new())
+            .encode_body(&RuntimeValues::default())
+            .expect_err("the vector carries at least one algorithm");
+        assert!(matches!(err, TlsError::Spec(_)), "{err:?}");
+        assert!(
+            ExtensionSpec::CompressCertificate(vec![2])
+                .encode_body(&RuntimeValues::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn server_name_is_omitted_for_ip_literals() {
+        // RFC 6066 §3 forbids literals; Go's `hostnameInSNI` (and therefore
+        // xray-core) sends no extension at all for an address.
+        for literal in ["1.2.3.4", "::1", "[::1]", "[2001:db8::1]"] {
+            assert!(is_ip_literal(literal), "{literal}");
+            let encoded = ExtensionSpec::ServerName
+                .encode_body(&RuntimeValues {
+                    server_name: literal.to_string(),
+                    ..RuntimeValues::default()
+                })
+                .expect("skip");
+            assert!(encoded.is_empty(), "{literal} must emit no SNI");
+        }
+        for name in ["example.com", "1.2.3.4.example", "x"] {
+            assert!(!is_ip_literal(name), "{name}");
+            let encoded = ExtensionSpec::ServerName
+                .encode_body(&RuntimeValues {
+                    server_name: name.to_string(),
+                    ..RuntimeValues::default()
+                })
+                .expect("encode");
+            assert!(!encoded.is_empty(), "{name} keeps its SNI");
+        }
     }
 
     /// A minimal spec carrying the two curve-bearing extensions.

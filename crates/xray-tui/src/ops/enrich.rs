@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use xray_tui_db::models::{Endpoint, HostType, Protocol};
+use xray_tui_db::models::{Endpoint, EndpointId, HostType, Protocol};
 use xray_tui_host_features::HostFeatures;
 
 use crate::AppState;
@@ -85,22 +85,36 @@ fn unix_now() -> i64 {
 
 /// Fill `country` (mmdb) and `host_features`/`sni_whitelisted` (whitelist
 /// checker) for an entry. Selected IP = first IPv4, else first entry.
+///
+/// Returns the `(address, ISO)` the mmdb just produced, `None` when the
+/// country was already known or no database is loaded. The caller persists
+/// it — this function never writes, so the two call sites (the DNS resolve
+/// and the page seed) own their own durability.
 async fn fill_features(
     info: &mut EndpointInfo,
     geo: Option<&Arc<xray_tui_geoip::GeoIp>>,
     checker: Option<&Arc<xray_tui_host_features::HostFeaturesChecker>>,
     sni: Option<&str>,
-) {
+) -> Option<(IpAddr, String)> {
     let selected = info
         .resolved_ips
         .iter()
         .find(|ip| ip.is_ipv4())
         .or_else(|| info.resolved_ips.first())
         .copied();
+    let mut fresh = None;
     if let Some(ip) = selected {
-        if let Some(geo) = geo {
+        // A country that came from `endpoint_ip` (or from this session's
+        // earlier lookup) needs no mmdb walk — the store is the cache.
+        if info.country.is_none()
+            && let Some(geo) = geo
+        {
             match geo.location_by_ip(ip).await {
-                Ok(Some(loc)) => info.country = Some(loc.country.to_string()),
+                Ok(Some(loc)) => {
+                    let iso = loc.country.to_string();
+                    info.country = Some(iso.clone());
+                    fresh = Some((ip, iso));
+                }
                 Ok(None) => {}
                 Err(e) => tracing::warn!(target: "tui::ops::enrich", "geo lookup failed: {e}"),
             }
@@ -114,6 +128,18 @@ async fn fill_features(
     {
         info.sni_whitelisted = checker.sni_features(sni_str);
     }
+    fresh
+}
+
+/// The stored country a feature pass would use for an endpoint: the
+/// selection rule [`fill_features`] applies (first IPv4, else the first
+/// entry), with the country that address carries.
+fn stored_country(addrs: &[(IpAddr, Option<String>)]) -> Option<String> {
+    addrs
+        .iter()
+        .find(|(ip, _)| ip.is_ipv4())
+        .or_else(|| addrs.first())
+        .and_then(|(_, country)| country.clone())
 }
 
 /// Resolve (or re-resolve) one endpoint's inbound host in the background.
@@ -142,6 +168,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
     let scheduler = state.scheduler.clone();
+    let db = state.db.clone();
     let host = row.endpoint.host.clone();
     let host_type = row.endpoint.host_type;
     let sni = row.active_protocol().and_then(|(_, p)| extract_sni(p));
@@ -235,7 +262,7 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
         // Feed the scheduler's DNS-failure gate: a failed resolution marks
         // the endpoint so the batch scheduler skips it for the deferral
         // window; a successful one clears the marker (resolvable again).
-        let scheduler_endpoint = xray_tui_db::models::EndpointId::new(endpoint_id);
+        let scheduler_endpoint = EndpointId::new(endpoint_id);
         if resolved_ok {
             scheduler.clear_dns_failure(scheduler_endpoint);
         } else {
@@ -261,7 +288,17 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
         }
         // Phase 2: country + whitelist features. Bounded by the geo crate's
         // own download deadline; a timeout here still degrades to `🏴`.
-        fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await;
+        // A country the mmdb just produced is written to `endpoint_ip` (the
+        // table owns the address's flag; `replace` keeps it across
+        // re-resolutions), so the next launch renders it without a lookup.
+        if let Some((ip, iso)) =
+            fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await
+            && let Err(e) = db
+                .set_endpoint_ip_country(EndpointId::new(endpoint_id), ip, &iso)
+                .await
+        {
+            tracing::warn!(target: "tui::ops::enrich", "country persist failed: {e}");
+        }
         if let Some(t) = tx {
             let _ = t.try_send(CoreEvent::EndpointInfoUpdated { endpoint_id, info });
         }
@@ -350,11 +387,41 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
     // equals the incoming value.
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
+    let db = state.db.clone();
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
+        // The countries already stored for this page's addresses: one read,
+        // and every address that has one skips the mmdb entirely (a second
+        // launch needs no `geo_ip` at all). Read here rather than in the
+        // synchronous seed above so the seed stays callable from a
+        // non-async caller.
+        let ids: Vec<EndpointId> = feature_targets
+            .iter()
+            .map(|(id, ..)| EndpointId::new(*id))
+            .collect();
+        let stored = match db.endpoint_resolutions(&ids).await {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(target: "tui::ops::enrich", "stored countries read failed: {e}");
+                std::collections::HashMap::new()
+            }
+        };
         for (endpoint_id, mut info, sni) in feature_targets {
-            fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await;
+            if info.country.is_none() {
+                info.country = stored
+                    .get(&EndpointId::new(endpoint_id))
+                    .and_then(|addrs| stored_country(addrs));
+            }
+            let fresh =
+                fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await;
+            if let Some((ip, iso)) = fresh
+                && let Err(e) = db
+                    .set_endpoint_ip_country(EndpointId::new(endpoint_id), ip, &iso)
+                    .await
+            {
+                tracing::warn!(target: "tui::ops::enrich", "country persist failed: {e}");
+            }
             if let Some(t) = tx.as_ref() {
                 let _ = t.try_send(CoreEvent::EndpointInfoUpdated { endpoint_id, info });
             }
@@ -510,6 +577,49 @@ pub fn spawn_outbound_enrich(state: &mut AppState, endpoint_id: i64, ip_info: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flag a DNS endpoint shows must come from `endpoint_ip` when it is
+    /// already stored: the seed reads it back and the mmdb is never asked.
+    /// (The state's `geo_ip` is whatever the fixture config built — the
+    /// assertion holds because the stored country short-circuits the
+    /// lookup, not because a database happened to be present.)
+    #[tokio::test]
+    async fn stored_country_reaches_the_ui_without_the_mmdb() {
+        use crate::ops::profiles::test_support::{fake_row, test_state};
+        let mut row = fake_row(7, "dns.example", 1);
+        row.endpoint.host_type = HostType::Dns;
+        row.endpoint.resolved_at = Some(60);
+        row.resolved_ips = vec!["1.1.1.1".parse().expect("ip")];
+        let mut state = test_state(vec![row]).await;
+        state
+            .db
+            .set_endpoint_ip_country(EndpointId::new(7), "1.1.1.1".parse().expect("ip"), "US")
+            .await
+            .expect("stored country");
+
+        spawn_enrich_ip_hosts(&mut state);
+        for _ in 0..100 {
+            let _ = state.poll_core_events().await;
+            if state
+                .endpoint_info
+                .get(&7)
+                .and_then(|i| i.country.clone())
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state
+                .endpoint_info
+                .get(&7)
+                .and_then(|i| i.country.clone())
+                .as_deref(),
+            Some("US"),
+            "the stored country is the one the row renders"
+        );
+    }
 
     #[test]
     fn resolvable_hostname_accepts_valid_domains() {

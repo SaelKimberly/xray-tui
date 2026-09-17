@@ -133,10 +133,40 @@ roster **excludes PSK by construction** (`select_roster` drops `0x0029`
 carriers), so no kept entry can hit this rejection — the sweep's zero-failure
 runs confirm it. The sampled test keeps its PSK filter as a harmless guard.
 
-### Finding 2 — ECH `0xfe0d` empty-Raw entries: accepted
+### Finding 2 — empty bodies: the 2026-08-25 sweep's "accepted" verdict was wrong (fixed 2026-09-17)
 
-36 kept entries carry the empty ECH GREASE outer (`fe0d`); all connect and
-grade cleanly (the server treats it as an unknown extension, RFC 8446 §4.2).
+36 kept entries carried the empty ECH GREASE outer (`fe0d`) and 28 carried an
+empty `compress_certificate` list. Both connected and graded cleanly against
+**tls.peet.ws**, and the sweep concluded they were fine because "the server
+treats it as an unknown extension (RFC 8446 §4.2)" — true of that Go peer, and
+false where it matters: `BoringSSL` (Cloudflare, Google — and the proxy hosts a
+real batch talks to) parses `encrypted_client_hello` and `compress_certificate`,
+and answers `alert 2 50 (decode_error)` to a body its RFC forbids.
+
+Measured 2026-09-17: `alert 2 50` appeared on exactly the fingerprint ids that
+resolve to those rows (firefox 37, ios 6, safari 4 of 3,380 phase-2 failures),
+and an A/B on one link config with only `security.fp` swapped — same host, SNI,
+ALPN — had `chrome`/`edge`/`randomized` complete the handshake while
+`firefox`/`ios`/`safari` got `decode_error` in 0.1 s; six Cloudflare-fronted
+hosts repeated it 6/6. Removing the extension from the resolved row made the
+probe pass; removing the empty `compress[]` did the same for Safari.
+
+The class is one emitter mistake repeated (`gen_specs.py` synthesizes bodies
+from an id-only corpus): ALPS' body length (fixed 2026-09-16), ECH, the
+compression list, `delegated_credentials`' sig-alg vector. Now:
+`build_extension` names ECH to the engine's `EchGrease` variant (a body drawn
+per connection — a constant body would give every connection of an identity
+identical bytes), synthesizes the two sig-alg vectors like
+`signature_algorithms_cert`, and substitutes `brotli` for an empty
+`compress_certificate`; `_ext_token` **refuses** to emit a bodyless extension
+whose id is in `EMPTY_BODY_ILLEGAL`, and
+`profiles::tests::every_roster_hello_has_rfc_minimal_extension_bodies` sweeps
+every emitted hello for each extension's RFC minimum. Tier 2's
+`tests/strict_peer_presets.rs` is the live oracle for the class this doc's own
+sweep could not see: a lenient peer grades a malformed body as clean.
+
+(`pre_shared_key` `0x0029` is in `EMPTY_BODY_ILLEGAL` too — Finding 1 is
+enforced at emit time now instead of relying on `select_roster` alone.)
 
 ### Finding 3 — `http/1.1`-only and no-ALPN entries (3 + 14)
 

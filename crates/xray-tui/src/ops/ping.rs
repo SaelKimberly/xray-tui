@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -29,6 +30,18 @@ use crate::types::CoreEvent;
 /// paths already gate through their own semaphore/JoinSet.
 static SINGLE_TEST_SEMAPHORE: std::sync::LazyLock<Semaphore> =
     std::sync::LazyLock::new(|| Semaphore::new(16));
+
+/// The code default for `speed_test.real_ping_concurrency`
+/// (`default_real_ping_concurrency` in `xray-tui-config`), repeated because the
+/// warning below is only actionable against it — the config file's own value is
+/// what a stale override silently replaces.
+const REAL_CONCURRENCY_DEFAULT: u32 = 100;
+
+/// Below this, a real phase is throughput-bound rather than feed-bound. A real
+/// probe holds one slot for a dial plus (on failure) the whole timeout, so the
+/// rate is roughly `concurrency / timeout`: the 2026-09-16 run measured 2.45
+/// results/s at 5 (3,381 results in 23 min), i.e. ~4 h for a 34k-link plan.
+const REAL_CONCURRENCY_WARN_BELOW: u32 = 50;
 
 /// Prefix of the persisted marker text for a row the native engine cannot test.
 ///
@@ -664,7 +677,12 @@ impl BatchProbeRunner for EngineProbeRunner {
 }
 
 /// Shared per-batch state, cloned into every spawned probe task.
-struct BatchShared {
+///
+/// `pub(crate)` because the quit path (`ui/mod.rs`) has to render the run's
+/// summary: a batch cancelled by the runtime drop never reaches `finish_batch`,
+/// which is how the 2026-09-16 run left 31k persisted results with no record of
+/// the run.
+pub(crate) struct BatchShared {
     sched: Arc<TaskScheduler>,
     db: Arc<Database>,
     /// Gate persistence seam: staged transitions, never a commit per call.
@@ -687,7 +705,11 @@ struct BatchShared {
     real_concurrency: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
-    total: u32,
+    /// The FINAL phase's candidate count, once that set is known — the
+    /// denominator of the shared progress pair (see `publish_final_total`).
+    /// 0 until published (`plan.len()` for a fast-only run, phase 2's surviving
+    /// links for a fast+real one).
+    final_total: AtomicU32,
     /// Fast config type per link (derived from the plan's protocol kind).
     fast_config: HashMap<(ProtocolId, EndpointId), i32>,
     /// Endpoint rows by id (real probes need the full endpoint).
@@ -778,12 +800,16 @@ pub(crate) struct BatchParams {
     fast_concurrency: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
+    /// Where `run_batch` publishes the batch's shared state, as soon as its plan
+    /// resolves (a feed-wide plan is loaded inside the batch task, so the handle
+    /// cannot exist when the batch is started) — `AppState::batch` holds the
+    /// same slot, and the UI reads the summary through it.
+    batch_slot: Arc<OnceLock<Arc<BatchShared>>>,
 }
 
 impl BatchShared {
     /// Build the shared state from the (already resolved) plan.
     fn new(p: BatchParams, plan: Vec<PlanLink>) -> Self {
-        let total = u32::try_from(plan.len()).unwrap_or(u32::MAX);
         let fast_config = plan
             .iter()
             .map(|pl| {
@@ -830,7 +856,7 @@ impl BatchShared {
             defer_delay: p.defer_delay,
             real_concurrency: p.real_concurrency,
             error_ttl_hours: p.error_ttl_hours,
-            total,
+            final_total: AtomicU32::new(0),
             fast_config,
             endpoints,
             untestable,
@@ -880,15 +906,22 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
         });
         return;
     }
-    params.progress.0.store(
-        u32::try_from(plan.len()).unwrap_or(u32::MAX),
-        Ordering::Relaxed,
-    );
+    let batch_slot = params.batch_slot.clone();
     let shared = Arc::new(BatchShared::new(params, plan));
-    let _ = shared.tx.try_send(CoreEvent::BatchProgress {
-        total: shared.total,
-        completed: 0,
-    });
+    // Publish the handle before the first progress event: a batch's record has
+    // to exist for as long as the batch can be interrupted, and the shared state
+    // (counters + class histograms) is what the quit path renders.
+    let _ = batch_slot.set(shared.clone());
+    if shared.real_phase {
+        warn_if_real_phase_is_slow(shared.real_concurrency, shared.plan.len());
+    } else {
+        // Phase 1 IS the final phase of a fast-only run, so its own candidate
+        // set is the denominator. A fast+real run publishes phase 2's instead
+        // (the plan's own length is not a phase): until then the pair holds no
+        // denominator, and the status bar reads "Testing..." rather than a
+        // numerator and a denominator from two different phases.
+        shared.publish_final_total(u32::try_from(shared.plan.len()).unwrap_or(u32::MAX));
+    }
 
     // ── Phase 1: one FastPing task per link ───────────────────────────
     let phase1_started = std::time::Instant::now();
@@ -967,6 +1000,33 @@ pub(crate) async fn run_batch(mut params: BatchParams) {
 
     // ── Phase 2: one RealPing task per link, fired per endpoint ───────
     let phase2_started = std::time::Instant::now();
+    // Phase 2's candidate set is what the real phase will actually probe: the
+    // untestable links were marked at the phase-1 boundary and the hard-failed
+    // ones are skipped below, so neither belongs in the denominator the status
+    // bar counts against. Publish it BEFORE dispatch — the pair's total is 0
+    // until here, which is what keeps the bar from pairing phase 2's numerator
+    // with the whole plan's denominator.
+    let final_total = {
+        let hard_fast = shared.hard_fast.lock();
+        u32::try_from(
+            shared
+                .plan
+                .iter()
+                .filter(|pl| {
+                    let key = (pl.link.protocol_id, pl.link.endpoint_id);
+                    !shared.untestable.contains_key(&key) && !hard_fast.contains(&key)
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    };
+    tracing::info!(
+        target: "tui::ops::ping",
+        "real phase: {final_total} candidate(s) of {} link(s), concurrency {}",
+        shared.plan.len(),
+        shared.real_concurrency,
+    );
+    shared.publish_final_total(final_total);
     let mut per_endpoint: BTreeMap<i64, Vec<(ProfileStats, u16)>> = BTreeMap::new();
     // The dispatch order of those groups: insertion order (= the best-first
     // sweep below). `per_endpoint` is keyed by the endpoint id — a hash — so
@@ -1182,7 +1242,7 @@ async fn finish_batch(shared: &BatchShared) {
 /// The batch's single log record: planned links, per-phase outcomes, the
 /// phase-2 skips, the phase timings and the writer's own durability answer
 /// (`staged-left` is non-zero only if a flush never succeeded).
-fn summary_line(shared: &BatchShared) -> String {
+pub(crate) fn summary_line(shared: &BatchShared) -> String {
     let counters = &shared.counters;
     let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
     format!(
@@ -1233,6 +1293,39 @@ fn class_histogram(map: &Mutex<BTreeMap<ProbeClass, u32>>) -> String {
     }
     out.push(']');
     out
+}
+
+/// The record of a batch that never reached its own summary — the quit path
+/// renders this after flushing, because the runtime drop cancels the batch task
+/// (`finish_batch`'s line is how the 2026-09-16 run ended with 31k persisted
+/// results and nothing in the log describing the run).
+///
+/// This is the SAME summary a completed run writes, so the per-class
+/// histograms survive an interruption, plus the two counts `finish_batch` does
+/// not need: what the final phase had settled, and what was still in flight.
+pub(crate) fn interrupted_summary_line(shared: &BatchShared) -> String {
+    format!(
+        "batch interrupted at quit: {} | settled={} in-flight={}",
+        summary_line(shared),
+        shared.done.load(Ordering::Relaxed),
+        shared.pending_fast.load(Ordering::Relaxed) + shared.pending_real.load(Ordering::Relaxed),
+    )
+}
+
+/// Warn once per real-phase batch whose concurrency is below
+/// [`REAL_CONCURRENCY_WARN_BELOW`]: a real probe holds its slot for a dial plus
+/// (on failure) the whole timeout, so the phase's rate is roughly
+/// `concurrency / timeout` — the measured run held a 34,562-link plan at 2.45
+/// results/s with a saved override of 5 (default [`REAL_CONCURRENCY_DEFAULT`]),
+/// which is ~4 h. The value is the user's to set; this only says what it costs.
+fn warn_if_real_phase_is_slow(real_concurrency: usize, plan_len: usize) {
+    if real_concurrency >= REAL_CONCURRENCY_WARN_BELOW as usize {
+        return;
+    }
+    tracing::warn!(
+        target: "tui::ops::ping",
+        "real ping concurrency {real_concurrency} is below {REAL_CONCURRENCY_WARN_BELOW} (code default {REAL_CONCURRENCY_DEFAULT}): a real probe holds its slot for a dial plus the full timeout, so the real phase is throughput-bound (~2.45 results/s at 5 on the 2026-09-16 run) and this {plan_len}-link plan will not finish in a session — raise speed_test.real_ping_concurrency"
+    );
 }
 
 /// One startup line naming the values a batch's behaviour depends on: the
@@ -1597,15 +1690,17 @@ impl BatchShared {
         self.note_settled(TaskKind::RealPing);
     }
 
-    /// One task settled: update the phase counters, and for a final-phase
-    /// settle bump the progress counter + emit a `BatchProgress` event.
+    /// One task settled: update the phase counters, and bump the progress
+    /// counter when the settle belongs to the batch's FINAL phase — phase 2 for
+    /// a fast+real run, phase 1 for a fast-only one (there, phase 1 is all
+    /// there is). A fast+real run's phase-1 settles are counted in the phase-1
+    /// rows of the summary, never in the progress pair.
     fn note_settled(&self, kind: TaskKind) {
         match kind {
             TaskKind::FastPing => {
                 if self.pending_fast.fetch_sub(1, Ordering::Relaxed) == 1 {
                     self.phase1_settled.notify_waiters();
                 }
-                // Fast-only batches count fast settles as progress.
                 if !self.real_phase {
                     self.bump_progress();
                 }
@@ -1623,9 +1718,10 @@ impl BatchShared {
     /// Emit the persisted `[real]` marker for every link the native engine
     /// cannot serve (kind-level gate, decided at plan time).
     ///
-    /// Runs once per batch, after phase 1; for a real batch each retired link
-    /// also counts as a settled real task so the progress bar still reaches the
-    /// total.
+    /// Runs once per batch, after phase 1. The marked links are not phase-2
+    /// candidates (they are excluded from the published denominator and never
+    /// dispatched), so this is not progress: it is the plan's own statement
+    /// about them.
     fn emit_untestable_markers(&self) {
         self.counters.untestable.store(
             u32::try_from(self.untestable.len()).unwrap_or(u32::MAX),
@@ -1665,17 +1761,43 @@ impl BatchShared {
                 },
                 "untestable_marker",
             );
-            if self.real_phase {
-                self.bump_progress();
-            }
         }
     }
 
+    /// Publish the FINAL phase's candidate count as the progress denominator.
+    ///
+    /// Called once, before that phase dispatches anything, so `completed` can
+    /// never outrun its own denominator and the status bar can never show a
+    /// numerator from one phase against another phase's total (the diagnosed
+    /// run read `0 / 34,562` — the whole plan — through the fast phase and then
+    /// `3,381 / 34,562` while phase 2 was 19.8% done).
+    ///
+    /// A zero is not published: `total == 0` is the terminal event's sentinel
+    /// (it clears the bar), and a phase with no candidates ends through
+    /// `finish_batch` like any other.
+    fn publish_final_total(&self, total: u32) {
+        if total == 0 {
+            return;
+        }
+        self.final_total.store(total, Ordering::Relaxed);
+        self.progress.0.store(total, Ordering::Relaxed);
+        let _ = self.tx.try_send(CoreEvent::BatchProgress {
+            total,
+            completed: self.done.load(Ordering::Relaxed),
+        });
+    }
+
+    /// One final-phase task settled.
+    ///
+    /// The pair is read as `completed / total` by the status bar, so both
+    /// halves come from the same phase: `publish_final_total` runs before
+    /// anything can settle (and never publishes a zero), so this event is
+    /// always non-terminal.
     fn bump_progress(&self) {
         let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
         self.progress.1.store(done, Ordering::Relaxed);
         let _ = self.tx.try_send(CoreEvent::BatchProgress {
-            total: self.total,
+            total: self.final_total.load(Ordering::Relaxed),
             completed: done,
         });
     }
@@ -1829,10 +1951,13 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     let writer = state.link_writer.clone();
     let scheduler = state.scheduler.clone();
     let stop = state.speed_test_stop.clone();
-    // The total is filled in once the plan is resolved (the status bar shows
-    // "Testing..." while it is still zero).
+    // The pair holds no denominator until the final phase's candidate set is
+    // known (the status bar shows "Testing..." while it is zero), so the batch
+    // handle published alongside it is what says a batch is alive.
     let progress: crate::types::BatchProgress = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
     state.batch_progress = Some(progress.clone());
+    let batch_slot: Arc<OnceLock<Arc<BatchShared>>> = Arc::new(OnceLock::new());
+    state.batch = Some(batch_slot.clone());
     let fast_timeout = *state.config.speed_test.tcp_timeout_secs;
     let real_timeout = *state.config.speed_test.real_ping_timeout_secs;
     let real_retries = state.config.speed_test.real_ping_retries;
@@ -1866,6 +1991,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         real_concurrency,
         fast_concurrency,
         error_ttl_hours,
+        batch_slot,
     }));
 }
 
@@ -2028,6 +2154,7 @@ mod tests {
             real_concurrency: 8,
             fast_concurrency: 8,
             error_ttl_hours: None,
+            batch_slot: Arc::new(OnceLock::new()),
         }
     }
 
@@ -2039,6 +2166,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         let p = build_params(h, plan, real_phase, dedup);
         h.state.batch_progress = Some(p.progress.clone());
+        h.state.batch = Some(p.batch_slot.clone());
         tokio::spawn(run_batch(p))
     }
 
@@ -2725,6 +2853,97 @@ mod tests {
     }
 
     // ── progress events ──────────────────────────────────────────────────
+
+    /// The progress pair describes ONE phase. On the 2026-09-16 run it described
+    /// none: `total` was the whole 34,562-link plan while `completed` counted
+    /// final-phase results, so the bar read `0 / 34,562` through the entire
+    /// ~5-minute fast phase and then `3,381 / 34,562` when phase 2 was 19.8%
+    /// done. Phase 2's denominator is its own candidate set, published before it
+    /// dispatches anything, and phase-1 results never touch the numerator.
+    #[tokio::test]
+    async fn progress_counts_the_final_phase_only() {
+        let rows = vec![
+            fake_row(1, "10.0.0.1", 1),
+            fake_row(2, "10.0.0.2", 1),
+            fake_row(3, "10.0.0.3", 1),
+        ];
+        let mut h = harness(rows.clone()).await;
+        // Link 2's fast probe proves its proxy unreachable, so phase 2 skips it:
+        // 3 planned links, 2 real-phase candidates — a plan-length denominator
+        // is distinguishable from the right one.
+        h.runner.fast_by_addr.lock().insert(
+            "10.0.0.2".to_string(),
+            ProbeOutcome::Failed {
+                text: "IO: Connection refused (os error 111)".to_string(),
+                class: ProbeClass::Refused,
+                hard: true,
+            },
+        );
+        let plan = plan_from_rows(&rows);
+        let handle = start_test_batch(&mut h, plan, true, false);
+        handle.await.unwrap();
+
+        let mut rx = h.state.core_event_rx.take().expect("event receiver");
+        let mut events: Vec<(u32, u32)> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::BatchProgress { total, completed } = ev {
+                events.push((total, completed));
+            }
+        }
+        assert!(
+            events.contains(&(2, 0)),
+            "phase 2 publishes its own candidate count (2 of 3 links): {events:?}"
+        );
+        assert!(
+            !events.iter().any(|(total, _)| *total == 3),
+            "the plan's own length is never a phase denominator: {events:?}"
+        );
+        // The three phase-1 results did not advance the counter: every event
+        // that reports progress carries the phase-2 denominator.
+        assert!(
+            events
+                .iter()
+                .filter(|(_, completed)| *completed > 0)
+                .all(|(total, completed)| *total == 2 && *completed <= 2),
+            "phase-1 settles must not bump the final-phase counter: {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&(0, 0)),
+            "final clear event: {events:?}"
+        );
+    }
+
+    /// The quit path reports an interrupted run with the summary a completed run
+    /// writes. Before this, quitting mid-batch printed `3381 of 34562
+    /// final-phase probe(s) reported, no batch summary` — the per-class
+    /// histograms only `summary_line` renders died with the batch task (the
+    /// runtime drop cancels it before `finish_batch`).
+    #[tokio::test]
+    async fn an_interrupted_run_renders_the_batch_summary() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1), fake_row(2, "10.0.0.2", 1)];
+        let h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        let shared = BatchShared::new(build_params(&h, plan, true, false), Vec::new());
+        shared.counters.real_ok.store(4, Ordering::Relaxed);
+        shared.counters.real_failed.store(6, Ordering::Relaxed);
+        shared.done.store(10, Ordering::Relaxed);
+        shared.pending_real.store(2, Ordering::Relaxed);
+        bump_class(&shared.counters.phase2_fail, ProbeClass::Timeout);
+        bump_class(&shared.counters.phase2_fail, ProbeClass::Timeout);
+        bump_class(&shared.counters.phase2_fail, ProbeClass::Dns);
+
+        let line = interrupted_summary_line(&shared);
+        for expected in [
+            "batch interrupted at quit:",
+            "batch summary:",
+            "phase2 ok=4 failed=6 [timeout=2 dns=1]",
+            "settled=10",
+            "in-flight=2",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in: {line}");
+        }
+    }
 
     #[tokio::test]
     async fn progress_events_track_total_and_done() {

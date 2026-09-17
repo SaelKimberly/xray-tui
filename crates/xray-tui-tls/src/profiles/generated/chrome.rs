@@ -254,7 +254,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17196
@@ -268,7 +268,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17180
@@ -282,7 +282,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17173
@@ -296,7 +296,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17173
@@ -310,7 +310,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17173
@@ -324,7 +324,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35850
@@ -338,7 +338,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35854
@@ -352,7 +352,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35851
@@ -366,7 +366,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35870
@@ -380,7 +380,7 @@ spec! {
           alpn["h2", "http/1.1"], status,
           sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], sct,
           keyshare[mlkem768, x25519], psk, versions[0x0304, 0x0303], compress[brotli, zstd],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d3012h2_1d37bd780c83_b26ce05bbdd6 obs=28320

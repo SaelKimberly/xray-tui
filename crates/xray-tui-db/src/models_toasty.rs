@@ -268,6 +268,14 @@ pub struct EndpointIp {
     pub endpoint_id: EndpointId,
     /// The address, packed; the PK's second half, so duplicates cannot exist.
     pub ip_key: Vec<u8>,
+    /// ISO-3166 alpha-2 of this address (`country.iso_code` from the mmdb).
+    ///
+    /// Written once, when the geo lookup for the address succeeds, and read
+    /// back by the enrichment seed — the flag a row shows on a later launch
+    /// then needs no mmdb walk (and no 60 MB database download) at all.
+    /// `None` = not looked up yet, or the database has no entry for the
+    /// address: those are the only addresses worth a lookup.
+    pub country: Option<String>,
     #[belongs_to(key = endpoint_id, references = id)]
     pub endpoint: Deferred<Option<Endpoint>>,
 }

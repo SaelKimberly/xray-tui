@@ -44,6 +44,7 @@ erDiagram
     endpoint_ip {
         BIGINT endpoint_id PK
         BLOB ip_key PK "packed address, sortable"
+        TEXT country "ISO-3166 alpha-2, NULL until looked up"
     }
     protocols {
         BIGINT id PK "uid = sig ^ cred_hash"
@@ -172,7 +173,11 @@ is why `host` can be empty). `host_type` decides how the row is dialled: an
 single `port` is the whole spec).
 
 **`endpoint_ip`** — a DNS endpoint's resolved addresses, **one row per address**
-(ADR 0005). The PK `(endpoint_id, ip_key)` makes the set deduped; `ip_key` is
+(ADR 0005). `country` is the address's ISO-3166 alpha-2 code (`country.iso_code`
+from the mmdb), written once by the geo step and read back by the enrichment
+seed — a launch whose addresses all carry one renders the flags without an mmdb
+walk (or the 60 MB download). It is the *only* persisted geo fact; the
+whitelist features and the exit-IP country stay per-launch (decision 13). The PK `(endpoint_id, ip_key)` makes the set deduped; `ip_key` is
 the address itself in a sortable packed encoding — a family byte (`4` = IPv4,
 `6` = IPv6, the `IpAddr` discriminant) then the big-endian octets, 5 or 17
 bytes, so B-tree byte order *is* address order with IPv4 first. The text form
@@ -277,7 +282,11 @@ them, or the page silently lists a stale position:
   deletion transactions.
 - `endpoint_ip` is rewritten as a set by its single writer,
   `update_endpoint_resolution` (delete-then-insert, deduped by key), in the
-  same transaction as the endpoint's `resolved_at` and the rank refresh.
+  same transaction as the endpoint's `resolved_at` and the rank refresh. The
+  rewrite **carries the countries of the addresses that survive it** — a
+  re-resolution must not discard a lookup that already happened.
+  `set_endpoint_ip_country` is the geo step's write: it updates the row, or
+  creates it when the lookup won the race against the address write.
   Deletions go through `endpoint_ip::delete_for` inside the same transaction as
   the endpoint rows.
 
@@ -306,8 +315,8 @@ flowchart TD
     E -- yes --> F[delete the file, rebuild]
     E -- no --> G[read PRAGMA user_version]
     F --> G
-    G --> H{tag == 10?}
-    H -- no --> I[push_schema + set tag 10]
+    G --> H{tag == 11?}
+    H -- no --> I[push_schema + set tag 11]
     H -- yes --> J[skip push_schema]
     I --> K[PRAGMAs: WAL, busy_timeout, NORMAL, foreign_keys]
     J --> K

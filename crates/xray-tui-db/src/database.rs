@@ -109,7 +109,12 @@ impl Database {
         // per address with a sortable key. A v9 file is WIPED (the addresses it
         // holds cannot be moved: the old column is gone, and the enrichment
         // pipeline re-resolves on the next pass).
-        const SCHEMA_VERSION: i64 = 10;
+        //
+        // 11 = `endpoint_ip` carries the address's ISO-3166 country, written
+        // once by the mmdb lookup, so a later launch renders the flag without
+        // the database. A v10 file is WIPED (a column cannot be added to a
+        // pushed table here; the countries are re-derived on the next pass).
+        const SCHEMA_VERSION: i64 = 11;
 
         let path_str = path
             .as_ref()
@@ -1020,8 +1025,52 @@ impl Database {
         .await
     }
 
-    /// Set or clear (`None`) the manual protocol override of an endpoint —
-    /// the old `set_protocol_override` + `clear_protocol_override` merged.
+    /// The persisted resolved addresses of `ids` with their stored countries.
+    ///
+    /// The enrichment seed's read: an address that already carries a country
+    /// needs no mmdb walk.
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] when the read fails.
+    pub async fn endpoint_resolutions(
+        &self,
+        ids: &[EndpointId],
+    ) -> Result<HashMap<EndpointId, Vec<(std::net::IpAddr, Option<String>)>>> {
+        let mut conn = self.conn().await?;
+        crate::endpoint_ip::load_resolved(&mut conn, ids).await
+    }
+
+    /// Record the country of one resolved address (the mmdb lookup's write).
+    ///
+    /// # Errors
+    ///
+    /// [`DatabaseError`] when the write fails.
+    pub async fn set_endpoint_ip_country(
+        &self,
+        endpoint_id: EndpointId,
+        ip: std::net::IpAddr,
+        iso: &str,
+    ) -> Result<()> {
+        let db = self;
+        let iso = iso.to_string();
+        retry_on_busy(
+            move || {
+                let iso = iso.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    let mut tx = conn.transaction().await?;
+                    crate::endpoint_ip::set_country(&mut tx, endpoint_id, ip, &iso).await?;
+                    tx.commit().await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
+    }
+
+    /// Set or clear (`None`) the manual protocol override of an endpoint — the old `set_protocol_override` + `clear_protocol_override` merged.
     pub async fn set_manual_override(
         &self,
         endpoint_id: EndpointId,
@@ -2433,6 +2482,79 @@ mod tests {
             "key order == address order, not the order the resolver printed"
         );
         assert_eq!(ep.resolved_at, Some(ts(100)));
+    }
+
+    #[tokio::test]
+    async fn stored_country_survives_re_resolution() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+
+        db.update_endpoint_resolution(
+            EndpointId::new(1),
+            vec![ip("1.1.1.1"), ip("2.2.2.2")],
+            ts(100),
+        )
+        .await
+        .expect("resolve");
+        db.set_endpoint_ip_country(EndpointId::new(1), ip("1.1.1.1"), "US")
+            .await
+            .expect("country");
+
+        // A re-resolution keeps the country of an address that is still
+        // present — the whole point of storing it — and drops the address
+        // that is gone.
+        db.update_endpoint_resolution(
+            EndpointId::new(1),
+            vec![ip("1.1.1.1"), ip("3.3.3.3")],
+            ts(200),
+        )
+        .await
+        .expect("re-resolve");
+
+        let resolved = db
+            .endpoint_resolutions(&[EndpointId::new(1)])
+            .await
+            .expect("read");
+        assert_eq!(
+            resolved
+                .get(&EndpointId::new(1))
+                .cloned()
+                .unwrap_or_default(),
+            vec![
+                (ip("1.1.1.1"), Some("US".to_string())),
+                (ip("3.3.3.3"), None)
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn country_writes_before_the_address_row_exists() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "dns.example", HostType::Dns, 443, 10).await;
+
+        // The geo step can finish before the resolution event's write lands
+        // (they are separate tasks): the country must create the row rather
+        // than be dropped.
+        db.set_endpoint_ip_country(EndpointId::new(1), ip("9.9.9.9"), "DE")
+            .await
+            .expect("country first");
+        db.update_endpoint_resolution(EndpointId::new(1), vec![ip("9.9.9.9")], ts(100))
+            .await
+            .expect("resolve second");
+
+        let resolved = db
+            .endpoint_resolutions(&[EndpointId::new(1)])
+            .await
+            .expect("read");
+        assert_eq!(
+            resolved
+                .get(&EndpointId::new(1))
+                .cloned()
+                .unwrap_or_default(),
+            vec![(ip("9.9.9.9"), Some("DE".to_string()))],
+        );
     }
 
     #[tokio::test]

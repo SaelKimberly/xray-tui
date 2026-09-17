@@ -34,6 +34,9 @@ Generator usage:
   (attribution/join/dedup; stats printed).
 - `--emit` — render `profiles/generated/*.rs` from the manifest
   (byte-deterministic; `--selftest` verifies committed == fresh render).
+  **Run `--manifest` first and commit both**: the manifest caches the
+  synthesized wire bodies, so `--emit` alone re-renders the OLD bodies and
+  silently reverts a body fix made here (it did exactly that on 2026-09-17).
 - `--selftest` — parse/hash round-trip + emitter determinism checks.
 
 Output: a 69-entry kept JA4-faithful roster (the deterministic
@@ -306,6 +309,8 @@ _CHROME_CIPHERS = [
 _CHROME_SIG = [0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601]
 # Extension type constants (spec/mod.rs construction sites).
 EMS = 0x0017           # extended_master_secret -> Raw (no dedicated variant)
+PRE_SHARED_KEY = 0x0029  # pre_shared_key -> Raw; the corpus carries it from
+                         # resumed captures, the engine has no ticket store
 RENEG = 0xFF01
 GROUPS = 0x000A
 ECPF = 0x000B
@@ -323,8 +328,40 @@ VERSIONS = 0x002B
 COMPRESS_CERT = 0x001B
 ALPS_OLD = 0x4469      # ApplicationSettings draft form
 ALPS_NEW = 0x44CD      # ALPS u8-length form (engine emits it via Raw)
-ECH_GREASE = 0xFE0D    # ECH GREASE outer; emitted as empty Raw (see
-                       # chrome.rs: a valid ECH outer is not emittable)
+ECH_GREASE = 0xFE0D    # encrypted_client_hello; the engine emits a GREASE
+                       # ECHClientHello whose body is drawn per connection
+                       # (spec/mod.rs `EchGrease`), so the emitter only has to
+                       # name the variant — an empty Raw body here was
+                       # unparseable (BoringSSL: alert 2 50, the 2026-09-17
+                       # run's firefox/safari/ios failures)
+DELEGATED_CREDENTIALS = 0x0022  # delegated_credentials -> Raw; body is a
+                                # u16-prefixed SignatureScheme list (RFC 9345
+                                # §3), synthesized from the sigalgs list
+                                # (mirrors SIGALGS_CERT) — empty is malformed
+# Ids whose body MAY legally be empty (RFC 8446 §4.2 / RFC 7366): the corpus
+# string export carries ids only, so a bodyless `Raw` is CORRECT for these and
+# an approximation anywhere else (it flags the entry low-fidelity).
+EMPTY_BODY_OK = {
+    0x0016,  # encrypt_then_mac
+    0x0017,  # extended_master_secret
+    0x0023,  # session_ticket
+    0x0031,  # post_handshake_auth
+}
+# Ids whose body may NOT be empty: each has a length-prefixed vector (or more)
+# as its whole body, so a bodyless emission is unparseable and a strict peer
+# answers `decode_error` (BoringSSL — Cloudflare, Google: alert 2 50, the
+# 2026-09-17 run). Every one is either synthesized here (SIGALGS_CERT,
+# DELEGATED_CREDENTIALS), named to its own engine variant (ECH), or simply must
+# not appear bodyless (pre_shared_key, whose body needs a ticket our client
+# does not have). Unknown ids (0x3374-style drafts) are NOT here: a peer must
+# ignore an extension it does not know, so an opaque empty body is legal.
+EMPTY_BODY_ILLEGAL = {
+    COMPRESS_CERT,            # 0x001b: algorithms<2..2^8-2>
+    DELEGATED_CREDENTIALS,    # 0x0022: SignatureScheme ...<2..2^16-2>
+    PRE_SHARED_KEY,           # 0x0029: OfferedPsks (needs a ticket)
+    SIGALGS_CERT,             # 0x0032: SignatureScheme ...<2..2^16-2>
+    ECH_GREASE,               # 0xfe0d: ECHClientHello, >= 38 bytes
+}
 RECORD_SIZE_LIMIT = 0x001C
 STATUS_REQ = 0x0005
 
@@ -473,16 +510,30 @@ def build_extension(ty, tmpl, protocols, sig_algos):
     if ty == RENEG:
         return {"ty": ty, "kind": "RenegotiationInfo"}
     if ty == COMPRESS_CERT:
-        return {"ty": ty, "kind": "CompressCertificate",
-                "args": [list(tmpl["compress_cert"])]}
+        # RFC 8879 §4: `algorithms<2..2^8-2>` — at least one algorithm, so a
+        # template without one must still offer what the engine can
+        # decompress (brotli, decision 17) rather than frame a 0-byte body
+        # (BoringSSL: alert 2 50; the safari/safari_ios rows).
+        algos = list(tmpl["compress_cert"]) or [0x0002]
+        return {"ty": ty, "kind": "CompressCertificate", "args": [algos]}
     if ty == RECORD_SIZE_LIMIT:
         return {"ty": ty, "kind": "RecordSizeLimit", "args": [16385]}
     if ty == ALPS_OLD:
         return {"ty": ty, "kind": "ApplicationSettings", "args": [protocols]}
     if ty == ALPS_NEW:
         return {"ty": ty, "kind": "Raw", "args": [_alps_new_body(protocols)]}
-    if ty == EMS:  # extended_master_secret
-        return {"ty": ty, "kind": "Raw", "args": [[]]}
+    if ty == ECH_GREASE:
+        # The engine draws the whole outer ECHClientHello per connection
+        # (config_id, enc, payload) — a constant body would give every
+        # connection of an identity identical bytes.
+        return {"ty": ty, "kind": "EchGrease"}
+    if ty == DELEGATED_CREDENTIALS:
+        # RFC 9345 §3: `SignatureScheme ...<2..2^16-2>`. Same reasoning as
+        # signature_algorithms_cert below: the corpus carries the id but no
+        # body, and an empty one is malformed (the firefox/safari rows).
+        payload = b"".join(a.to_bytes(2, "big") for a in sig_algos)
+        return {"ty": ty, "kind": "Raw",
+                "args": [list(len(payload).to_bytes(2, "big")) + list(payload)]}
     if ty == SIGALGS_CERT:
         # signature_algorithms_cert: u16 length + sig-alg ids. The corpus
         # string export carries the id but no body; RFC 8446 §4.2.3 makes
@@ -492,6 +543,12 @@ def build_extension(ty, tmpl, protocols, sig_algos):
         payload = b"".join(a.to_bytes(2, "big") for a in sig_algos)
         return {"ty": ty, "kind": "Raw",
                 "args": [list(len(payload).to_bytes(2, "big")) + list(payload)]}
+    if ty == EMS:  # extended_master_secret
+        return {"ty": ty, "kind": "Raw", "args": [[]]}
+    # Anything else falls through with no body. That is an approximation the
+    # manifest must be able to REPRESENT (the corpus carries ids like
+    # pre_shared_key, whose body needs a ticket; `select_roster` drops those
+    # rows), but it may never be EMITTED: `_render_extension` refuses it.
     return {"ty": ty, "kind": "Raw", "args": [[]]}
 
 
@@ -536,17 +593,20 @@ def synthesize_wire(entry):
             ext = build_extension(slot, tmpl, protocols, sig_algos)
             extensions.append(ext)
             placed.add(slot)
-            # The empty ECH-GREASE outer is a wire approximation even when
-            # it comes from the canonical order.
-            if slot == ECH_GREASE and ext["kind"] == "Raw":
+            # An empty body outside EMPTY_BODY_OK is a wire approximation
+            # even when it comes from the canonical order (ECH used to land
+            # here; it now names its own variant).
+            if ext["kind"] == "Raw" and not ext["args"][0] and (
+                    slot not in EMPTY_BODY_OK):
                 low_fidelity = True
     for ty in sorted(offered - placed):  # ids outside the canonical order
         ext = build_extension(ty, tmpl, protocols, sig_algos)
         extensions.append(ext)
-        # Deliberate Raw forms (extended_master_secret, new-codepoint ALPS)
-        # carry real bodies; anything else falling through to an empty Raw
-        # is a genuine approximation.
-        if ext["kind"] == "Raw" and ty not in (EMS, ALPS_NEW):
+        # A Raw form with a real body is deliberate (new-codepoint ALPS, the
+        # synthesized signature_algorithms_cert / delegated_credentials
+        # lists); an empty body outside EMPTY_BODY_OK is an approximation.
+        if ext["kind"] == "Raw" and not ext["args"][0] and (
+                ty not in EMPTY_BODY_OK):
             low_fidelity = True
 
     wire = {
@@ -897,6 +957,7 @@ _BARE_EXT_TOKENS = {
     "EcPointFormats": "ecpf", "SessionTicket": "ticket",
     "PskKeyExchangeModes": "psk", "SignedCertificateTimestamp": "sct",
     "RenegotiationInfo": "reneg", "Padding": "padding",
+    "EchGrease": "ech",
 }
 
 
@@ -959,6 +1020,13 @@ def _ext_token(ext):
     if kind == "RecordSizeLimit":
         return f"rslimit[{args[0]}]"
     if kind == "Raw":
+        if not args[0] and ext["ty"] in EMPTY_BODY_ILLEGAL:
+            raise ValueError(
+                f"extension 0x{ext['ty']:04x} would be emitted with an empty "
+                f"body, but its body is a length-prefixed vector "
+                f"(EMPTY_BODY_ILLEGAL) — synthesize it (SIGALGS_CERT / "
+                f"DELEGATED_CREDENTIALS) or give it an engine variant "
+                f"(EchGrease)")
         return f"raw[0x{ext['ty']:04x}, \"{bytes(args[0]).hex()}\"]"
     raise ValueError(f"extension kind {kind!r} is not an ExtensionSpec "
                      f"variant (spec/mod.rs)")
@@ -1236,7 +1304,7 @@ def _selftest() -> int:
         "SignatureAlgorithms", "Alpn", "EcPointFormats", "SessionTicket",
         "PskKeyExchangeModes", "StatusRequest", "SignedCertificateTimestamp",
         "RenegotiationInfo", "CompressCertificate", "ApplicationSettings",
-        "RecordSizeLimit", "Padding", "Grease", "Raw",
+        "RecordSizeLimit", "Padding", "Grease", "Raw", "EchGrease",
     }
     man = build_manifest(csv_dir)
     tmpl_dist: dict[str, int] = {}

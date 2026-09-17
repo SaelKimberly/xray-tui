@@ -61,6 +61,7 @@ const fn extension_codepoint(ext: &crate::spec::ExtensionSpec) -> u16 {
         E::RecordSizeLimit(_) => 0x001C,
         E::Padding => 0x0015,
         E::Grease => 0x0A0A,
+        E::EchGrease => 0xFE0D,
         E::Raw { ty, .. } => *ty,
     }
 }

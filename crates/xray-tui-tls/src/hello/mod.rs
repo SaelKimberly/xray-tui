@@ -11,7 +11,7 @@ use std::ops::Range;
 use crate::error::TlsError;
 use crate::spec::grease::GREASE_PLACEHOLDER;
 use crate::spec::{
-    ClientHelloSpec, ExtensionSpec, KeyShareGroup, RuntimeValues, SessionIdSpec,
+    ClientHelloSpec, EchGrease, ExtensionSpec, KeyShareGroup, RuntimeValues, SessionIdSpec,
     encode_alpn_override_into, encode_supported_groups_into, encode_supported_versions_into,
 };
 
@@ -83,7 +83,30 @@ pub fn build_hello(spec: &ClientHelloSpec, params: &BuildParams) -> Result<Built
         grease_a,
         grease_b,
         padding_len: 0,
+        ech: EchGrease::default(),
     };
+
+    // GREASE ECH material, drawn only when the spec asks for it (a spec
+    // without `EchGrease` must not consume RNG bytes — the fixtures in the
+    // hello tests and the JA4 gate pin the draw sequence).
+    if spec
+        .extensions
+        .iter()
+        .any(|e| matches!(e, ExtensionSpec::EchGrease))
+    {
+        params
+            .rng
+            .fill(core::slice::from_mut(&mut rt.ech.config_id))
+            .map_err(|_| TlsError::Crypto("ECH config id failed".to_string()))?;
+        params
+            .rng
+            .fill(&mut rt.ech.enc)
+            .map_err(|_| TlsError::Crypto("ECH enc failed".to_string()))?;
+        params
+            .rng
+            .fill(&mut rt.ech.payload)
+            .map_err(|_| TlsError::Crypto("ECH payload failed".to_string()))?;
+    }
 
     // Client random (RFC 8446 §4.1.2).
     let mut random = [0u8; 32];

@@ -130,8 +130,20 @@ pub struct AppState {
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
     pub last_test_tcp: Option<u64>,
-    /// Shared batch progress (total, completed) displayed in status bar.
+    /// Shared batch progress (total, completed) displayed in status bar: the
+    /// FINAL phase's candidate count over that phase's settles (0/0 until the
+    /// count is known, which the status bar renders as "Testing...").
     pub batch_progress: Option<crate::types::BatchProgress>,
+    /// The running batch's shared state (counters, class histograms, phase
+    /// timings), published by `run_batch` once its plan resolves — the value
+    /// comes from the batch task, hence `OnceLock` over `LazyLock`/`Mutex`.
+    ///
+    /// Set and cleared together with `batch_progress`, and read at quit: a batch
+    /// cancelled by the runtime drop never reaches its own summary line, so this
+    /// is the only way the interrupted run's classification is reported
+    /// (`crate::ops::ping::interrupted_summary_line`). `pub(crate)` because its
+    /// type is the batch internals, not state anyone outside the crate may hold.
+    pub(crate) batch: Option<Arc<std::sync::OnceLock<Arc<crate::ops::ping::BatchShared>>>>,
     pub last_test_real: Option<u64>,
     pub last_test_speed: Option<u64>,
     pub current_traffic_up: i64,
@@ -504,6 +516,7 @@ impl AppState {
             shutdown_token: Arc::new(AtomicBool::new(false)),
             speed_test_stop: Arc::new(AtomicBool::new(false)),
             batch_progress: None,
+            batch: None,
             term_height: Cell::new(80),
             heed_storage: None,
             last_seen_log_ns: 0,

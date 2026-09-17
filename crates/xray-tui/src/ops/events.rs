@@ -216,9 +216,14 @@ const EVENT_DRAIN_BUDGET: usize = 256;
 /// batch-progress bar cleared), so the caller can trigger an immediate redraw
 /// instead of waiting for the idle refresh cadence.
 pub async fn poll_core_events(state: &mut AppState) -> bool {
-    // Clean up stale batch_progress when a batch task has finished silently
-    // (the batch pipeline is removed in T17; T19 rebuilds it).
-    let mut handled = if state.batch_progress.is_some()
+    // Clear a bar left behind by a batch that never reported its end. The pair
+    // alone cannot answer "is a batch alive?": its total stays 0 until the final
+    // phase's candidate set is known (minutes, for a fast+real run), which is a
+    // legitimate running state the status bar renders as "Testing...". The
+    // handle published at batch start is the liveness fact, and it clears with
+    // the pair on the terminal event.
+    let mut handled = if state.batch.is_none()
+        && state.batch_progress.is_some()
         && state.testing_profiles.is_empty()
         && state
             .batch_progress
@@ -788,8 +793,11 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 if total == 0 {
                     // Batch finished: clear the shared progress and re-arm the
                     // stop flag (the batch pipeline retired everything; a
-                    // stopped batch must not leave the status bar stuck).
+                    // stopped batch must not leave the status bar stuck). The
+                    // handle goes with the bar — `finish_batch` is the batch's
+                    // only end signal, and it flushes before sending this.
                     state.batch_progress = None;
+                    state.batch = None;
                     state.speed_test_stop.store(false, Ordering::Relaxed);
                 } else {
                     // Keep the shared pair in sync with the event stream (the

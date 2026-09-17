@@ -176,8 +176,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17173
@@ -189,8 +189,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17173
@@ -202,8 +202,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17177
@@ -215,8 +215,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_02713d6af862 obs=17173
@@ -228,8 +228,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          appsettings["h2", "http/1.1"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          appsettings["h2", "http/1.1"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35851
@@ -241,8 +241,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35850
@@ -254,8 +254,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35852
@@ -267,8 +267,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35850
@@ -280,8 +280,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35861
@@ -293,8 +293,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d1516h2_8daaf6152771_d8a2da3f94cd obs=35866
@@ -306,8 +306,8 @@ spec! {
     session: random32,
     exts: sni, raw[0x0017, ""], reneg, groups[x25519, p256, p384], ecpf, ticket,
           alpn["h2", "http/1.1"], status, sct, keyshare[x25519], psk, versions[0x0304, 0x0303],
-          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[],
-          raw[0x44cd, "000c02683208687474702f312e31"], raw[0xfe0d, ""],
+          sigalgs[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601], compress[brotli],
+          raw[0x44cd, "000c02683208687474702f312e31"], ech,
 }
 
 // ja4=t13d170900_5b57614c22b0_97f8aa674fd9 obs=8606

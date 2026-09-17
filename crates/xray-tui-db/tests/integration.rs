@@ -1400,7 +1400,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     let db = Database::open(&path).await.expect("fresh open");
     let mut conn = db.connection().await.expect("connection");
 
-    // Fresh open writes the typed schema AND tags it `user_version=10` so a
+    // Fresh open writes the typed schema AND tags it `user_version=11` so a
     // reopen can skip push_schema.
     let rows = toasty::sql::query("PRAGMA user_version")
         .exec(&mut conn)
@@ -1408,8 +1408,8 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .expect("read version");
     assert_eq!(
         first_i64(&rows),
-        Some(10),
-        "fresh open must tag the schema user_version=10"
+        Some(11),
+        "fresh open must tag the schema user_version=11"
     );
     let rows = toasty::sql::query(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
@@ -1447,7 +1447,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .exec(&mut conn)
         .await
         .expect("read version");
-    assert_eq!(first_i64(&rows), Some(10), "reopen keeps the schema tag");
+    assert_eq!(first_i64(&rows), Some(11), "reopen keeps the schema tag");
     assert!(
         Endpoint::filter_by_id(EndpointId::new(9))
             .first()
@@ -1497,7 +1497,7 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         .expect("version");
     assert_eq!(
         first_i64(&rows),
-        Some(10),
+        Some(11),
         "the file is rebuilt at the new tag"
     );
     let rows = toasty::sql::query(

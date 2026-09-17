@@ -186,6 +186,7 @@ macro_rules! ext_token {
     (sct) => { $crate::spec::ExtensionSpec::SignedCertificateTimestamp };
     (psk) => { $crate::spec::ExtensionSpec::PskKeyExchangeModes };
     (padding) => { $crate::spec::ExtensionSpec::Padding };
+    (ech) => { $crate::spec::ExtensionSpec::EchGrease };
     (groups[$($g:tt),*]) => {
         $crate::spec::ExtensionSpec::SupportedGroups(vec![$(group_token!($g)),*])
     };
@@ -244,7 +245,11 @@ macro_rules! ext_token {
 ///
 /// `exts:` — extension tokens in profile order:
 /// - bare ids (unit variants): `grease`, `sni`, `reneg`, `ecpf`,
-///   `ticket`, `status`, `sct`, `psk`, `padding`;
+///   `ticket`, `status`, `sct`, `psk`, `padding`, `ech`;
+/// - `ech` — `encrypted_client_hello`, emitted as a GREASE
+///   `ECHClientHello` whose `config_id`/`enc`/`payload` come from the build
+///   RNG (RFC 9849 §5.1; never a bodyless `raw[0xfe0d, ""]`, which every
+///   strict parser answers `decode_error` to);
 /// - `groups[..]` — `supported_groups`: u16 literals or named group ids
 ///   (`grease`, `x25519`, `mlkem768`, `p256`, `p384`, `p521`);
 /// - `keyshare[..]` — `key_share`: `grease`, `x25519`, `mlkem768` only;
@@ -256,7 +261,11 @@ macro_rules! ext_token {
 /// - `compress[..]` — `zlib` | `brotli` | `zstd` or u16 literals;
 /// - `rslimit[N]` — `record_size_limit`;
 /// - `raw[ty, "hex"]` — arbitrary extension: u16 `ty` and the body as a
-///   hex string (`""` for an empty body).
+///   hex string. `""` is legal only for an id whose whole body may be empty
+///   (`0x0016`/`0x0017`/`0x0023`/`0x0031`); an id with a length-prefixed
+///   vector body (ECH, `compress_certificate`, `delegated_credentials`,
+///   `signature_algorithms_cert`) must carry it — the roster emitter refuses
+///   the bodyless form.
 ///
 /// A comma must follow the last cipher and the session value (they separate
 /// the three sections); a trailing comma after the last extension is
@@ -406,6 +415,81 @@ mod tests {
             }
             assert!(!ja3_hash(&fields).is_empty(), "{name} JA3");
             assert!(ja4_a(&fields).starts_with("t13d"), "{name} JA4-A prefix");
+        }
+    }
+
+    /// Every roster hello must carry RFC-minimal extension bodies.
+    ///
+    /// The 2026-09-17 run exposed two shapes that every other check missed:
+    /// `encrypted_client_hello` with a 0-byte body (36 generated rows) and
+    /// `compress_certificate` with an empty algorithm list (28 rows). Both
+    /// parse fine with this crate's own decoder and with tls.peet.ws (a
+    /// lenient Go peer), and both are `decode_error` on `BoringSSL` — so the
+    /// sieve has to be the RFC's minimum body size, not a peer.
+    #[test]
+    fn every_roster_hello_has_rfc_minimal_extension_bodies() {
+        /// Extension id → minimum body length, from its RFC's vector bound.
+        /// `None` minimum means "any length, including zero".
+        const MIN_BODY: &[(u16, usize, &str)] = &[
+            (0x0000, 5, "server_name (RFC 6066 §3)"),
+            (0x000a, 2, "supported_groups (RFC 8446 §4.2.7)"),
+            (0x000d, 2, "signature_algorithms (RFC 8446 §4.2.3)"),
+            (0x0010, 2, "alpn (RFC 7301)"),
+            (0x001b, 3, "compress_certificate (RFC 8879 §4)"),
+            (0x0022, 2, "delegated_credentials (RFC 9345 §3)"),
+            (0x002b, 3, "supported_versions (RFC 8446 §4.2.1)"),
+            (0x0033, 2, "key_share (RFC 8446 §4.2.8)"),
+            (0x4469, 3, "application_settings (draft-vvv-tls-alps §4)"),
+            (0xfe0d, 38, "encrypted_client_hello (RFC 9849 §5.1)"),
+        ];
+
+        let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
+        for (name, spec_fn) in all_specs() {
+            let spec = spec_fn();
+            let rng = FixedRandom {
+                bytes: vec![0x5A; 256],
+                pos: AtomicUsize::new(0),
+            };
+            let hello = build_hello(
+                &spec,
+                &BuildParams {
+                    server_name: "tls.peet.ws",
+                    alpn: None,
+                    x25519_pub: &[0xAB; 32],
+                    mlkem768_pub: Some(mlkem_pk.as_bytes()),
+                    rng: &rng,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: build_hello failed: {e}"));
+            let parsed = parse_hello(&hello.handshake_bytes)
+                .unwrap_or_else(|e| panic!("{name}: parse_hello failed: {e}"));
+
+            // Frames must consume their declared length exactly: a mismatch
+            // is what a strict peer rejects, and the parser tolerates
+            // trailing bytes by design.
+            for (ty, body) in &parsed.extensions {
+                if let Some((_, min, what)) = MIN_BODY.iter().find(|(id, _, _)| id == ty) {
+                    assert!(
+                        body.len() >= *min,
+                        "{name}: {what} body is {} bytes, needs >= {min}",
+                        body.len()
+                    );
+                }
+            }
+            let ids: Vec<u16> = parsed
+                .extensions
+                .iter()
+                .map(|(ty, _)| *ty)
+                .filter(|ty| !crate::spec::grease::is_grease(*ty))
+                .collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                ids.len(),
+                "{name}: duplicate extension id (the constant-RNG fixture can collide two GREASE slots — that is the fixture, not the spec)"
+            );
         }
     }
 

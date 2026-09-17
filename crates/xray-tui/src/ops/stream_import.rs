@@ -24,6 +24,33 @@ use crate::ops::subscriptions::PERSIST_CHUNK;
 /// finishes with partial results instead of being discarded.
 pub type SourceBatch = Result<bytes::Bytes, String>;
 
+/// Dial deadline for a subscription fetch.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle deadline for ONE body read, reset by every frame the source yields.
+///
+/// The body outlives any total deadline worth setting (a 26 MB / 170k-URL
+/// feed), and this loop persists a batch between two reads, so a total
+/// deadline would also bill the consumer's own DB work to the network
+/// budget. Kept BELOW the loop's `CHUNK_TIMEOUT` so a stalled body surfaces
+/// as the HTTP error (status + context), not as the loop's generic stall
+/// warning.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Result of one streaming import run.
+///
+/// `ended_early` carries the source's failure text when the stream died
+/// before its natural end. The rows already stored are KEPT (partial-load
+/// semantics), but the run was NOT clean and the caller must say so — a
+/// truncated import used to be indistinguishable from a complete one.
+#[derive(Debug, Default)]
+#[must_use]
+pub struct ImportOutcome {
+    pub links: usize,
+    pub summary: ValidationSummary,
+    pub ended_early: Option<String>,
+}
+
 /// Streaming byte source — the seam every source kind normalizes to.
 ///
 /// HTTP subscriptions wrap `Response::chunk()`; a Telegram-channel source
@@ -119,7 +146,9 @@ impl UrlBatcher {
 
 /// Run a full streaming import: gather URL batches off `source`, parse +
 /// persist each batch immediately, deliver progress through `on_progress`.
-/// Returns `(links persisted, whole-run summary)`.
+///
+/// Returns the links persisted, the whole-run summary, and — when the source
+/// died before its natural end — the failure text.
 ///
 /// Partial-load semantics: a source error mid-stream ends the run with
 /// everything already committed; only a failure INSIDE a batch persist is
@@ -131,7 +160,7 @@ pub async fn run_streaming_import<F>(
     validation: &ValidationSettings,
     batch_size: usize,
     on_progress: Option<&F>,
-) -> (usize, ValidationSummary)
+) -> ImportOutcome
 where
     F: Fn(usize) + Send + Sync,
 {
@@ -141,6 +170,10 @@ where
     let mut batcher = UrlBatcher::new(batch_size);
     let mut summary = ValidationSummary::default();
     let mut count = 0usize;
+    // Set by every non-natural end of the stream (stall, source error,
+    // undecodable bytes): the loop still drains what it has, but the caller
+    // learns the run was cut short.
+    let mut ended_early: Option<String> = None;
     // Deterministic-id dedup across the WHOLE run (protocol rows are shared
     // across endpoints; feeds repeat one protocol config over many servers).
     let mut seen_protocols = std::collections::HashSet::new();
@@ -159,6 +192,7 @@ where
                     target: "tui::ops::subscriptions",
                     "Source chunk timed out after {CHUNK_TIMEOUT:?} — finishing import with partial results"
                 );
+                ended_early = Some(format!("source stalled: no chunk within {CHUNK_TIMEOUT:?}"));
                 break None;
             };
             match next {
@@ -168,6 +202,7 @@ where
                         target: "tui::ops::subscriptions",
                         "Source ended early: {e} — keeping already-stored batches"
                     );
+                    ended_early = Some(e);
                     break None;
                 }
                 Some(Ok(chunk)) => {
@@ -176,6 +211,7 @@ where
                             target: "tui::ops::subscriptions",
                             "Source data could not be decoded: {e} — keeping already-stored batches"
                         );
+                        ended_early = Some(format!("undecodable source data: {e}"));
                         break None;
                     }
                 }
@@ -227,7 +263,11 @@ where
         tokio::task::yield_now().await;
     }
 
-    (count, summary)
+    ImportOutcome {
+        links: count,
+        summary,
+        ended_early,
+    }
 }
 
 /// Parse one URL batch and persist it via the bulk upserts (the exact body of
@@ -331,23 +371,33 @@ pub async fn import_http_subscription(
     db: &Arc<Database>,
     group_id: Option<&str>,
     validation: &ValidationSettings,
-) -> (usize, ValidationSummary) {
+) -> ImportOutcome {
+    // Two budgets, never one total deadline: the total deadline used to cover
+    // the whole body AND the consumer's persist work between reads, so a
+    // large feed was killed mid-stream and looked like a clean run.
     let client = match reqwest::Client::builder()
         .user_agent(user_agent)
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
     {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(target: "tui::ops::subscriptions", "HTTP client build failed: {e}");
-            return (0, ValidationSummary::default());
+            return ImportOutcome {
+                ended_early: Some(format!("HTTP client build failed: {e}")),
+                ..ImportOutcome::default()
+            };
         }
     };
     let response = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "tui::ops::subscriptions", "HTTP fetch failed: {e}");
-            return (0, ValidationSummary::default());
+            return ImportOutcome {
+                ended_early: Some(format!("HTTP fetch failed: {e}")),
+                ..ImportOutcome::default()
+            };
         }
     };
     run_streaming_import(
@@ -424,7 +474,7 @@ mod tests {
                 .map(|c| Ok(bytes::Bytes::copy_from_slice(c))),
         };
 
-        let (count, summary) = run_streaming_import(
+        let outcome = run_streaming_import(
             &mut source,
             &db,
             Some("g1"),
@@ -433,8 +483,9 @@ mod tests {
             None::<&fn(usize)>,
         )
         .await;
-        assert_eq!(count, 4, "one link per unique host");
-        assert_eq!(summary.total_errors, 0);
+        assert_eq!(outcome.links, 4, "one link per unique host");
+        assert_eq!(outcome.summary.total_errors, 0);
+        assert_eq!(outcome.ended_early, None, "clean end-of-stream");
         let meta = db
             .profiles_page(&group_page_request("g1"))
             .await
@@ -443,11 +494,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_import_keeps_batches_when_source_dies_midway() {
+    async fn streaming_import_reports_early_end_and_keeps_stored_links() {
         let db = Arc::new(Database::in_memory().await.expect("db"));
         let validation = ValidationSettings::default();
         // Batch size 2 with 4 URL-sized chunks: first TWO URLs persist, then
-        // the source errors. Partial-load semantics keep the stored batch.
+        // the source errors. Partial-load semantics keep the stored batch —
+        // and the run must REPORT the truncation instead of looking clean.
         let mut source = ScriptedSource {
             chunks: vec![
                 Ok(bytes::Bytes::from(valid_vmess_url("21.22.23.24"))),
@@ -458,7 +510,7 @@ mod tests {
             .into_iter(),
         };
 
-        let (count, _) = run_streaming_import(
+        let outcome = run_streaming_import(
             &mut source,
             &db,
             Some("g1"),
@@ -467,7 +519,15 @@ mod tests {
             None::<&fn(usize)>,
         )
         .await;
-        assert_eq!(count, 2, "exactly the two URLs before the failure persist");
+        assert_eq!(
+            outcome.links, 2,
+            "exactly the two URLs before the failure persist"
+        );
+        assert_eq!(
+            outcome.ended_early.as_deref(),
+            Some("connection reset"),
+            "the source's own error text reaches the caller"
+        );
         let meta = db
             .profiles_page(&group_page_request("g1"))
             .await
