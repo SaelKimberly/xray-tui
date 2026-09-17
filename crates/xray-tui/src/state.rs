@@ -130,10 +130,10 @@ pub struct AppState {
     /// Shared stop flag for batch speed tests.
     pub speed_test_stop: Arc<AtomicBool>,
     pub last_test_tcp: Option<u64>,
-    /// Shared batch progress (total, completed) displayed in status bar: the
-    /// FINAL phase's candidate count over that phase's settles (0/0 until the
-    /// count is known, which the status bar renders as "Testing...").
-    pub batch_progress: Option<crate::types::BatchProgress>,
+    /// Live batch meters (plan pages + the two probe levels), displayed in the
+    /// status bar and the Actions Log panel: shared with the batch task, which
+    /// writes them in place.
+    pub batch_progress: Option<Arc<crate::types::BatchMeters>>,
     /// The running batch's shared state (counters, class histograms, phase
     /// timings), published by `run_batch` once its plan resolves — the value
     /// comes from the batch task, hence `OnceLock` over `LazyLock`/`Mutex`.

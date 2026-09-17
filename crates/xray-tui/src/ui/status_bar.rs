@@ -28,13 +28,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     } else if state.batch_progress.is_some() || !state.testing_profiles.is_empty() {
         let progress_text = state.batch_progress.as_ref().map_or_else(
             || " Testing...".to_string(),
-            |p| {
-                let total = p.0.load(Ordering::Relaxed);
-                let done = p.1.load(Ordering::Relaxed);
-                if total > 0 {
-                    format!(" Testing: {done}/{total}")
-                } else {
-                    " Testing...".to_string()
+            |m| {
+                let fast_done = m.fast.done.load(Ordering::Relaxed);
+                let fast_total = m.fast.total.load(Ordering::Relaxed);
+                let real_done = m.real.done.load(Ordering::Relaxed);
+                let real_total = m.real.total.load(Ordering::Relaxed);
+                match (fast_total, real_total) {
+                    (0, _) => " Testing...".to_string(),
+                    // Both levels, the fast one first: they run at the same time,
+                    // so the pair is `F done/total · R done/total`. The compact
+                    // panel bar and the Actions Log bars carry the ETAs.
+                    (fast_total, real_total) if real_total > 0 => {
+                        format!(" Testing: F {fast_done}/{fast_total} · R {real_done}/{real_total}")
+                    }
+                    (fast_total, _) => format!(" Testing: F {fast_done}/{fast_total}"),
                 }
             },
         );

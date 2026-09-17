@@ -1,6 +1,6 @@
 # 2026-09-17 — Batch ping: streaming plan, per-link pipeline, two-level progress
 
-Status: `proposed` (awaiting user review)
+Status: `implemented` (plan `docs/aegis/plans/2026-09-17-batch-ping-pipeline.md`)
 Scope: `crates/xray-tui` (batch pipeline + Actions Log panel), `crates/xray-tui-db`
 (one walk API, one batched country write). No engine, protocol, or identity change.
 
@@ -72,16 +72,21 @@ All anchors `path:line`; `FACT` = observed in code or docs, `INFERENCE` = derive
 Two facts make the restructure cheap:
 
 - `run_task_chain` is kind-agnostic: after `complete` it asks `task_of`/`kind_of`
-  and fires whatever the gate promoted, looping until the gate is clear
-  (`ops/ping.rs:1416-1469`). Cross-kind promotion already works.
+  and fires whatever the gate promotes, looping until the gate is clear
+  (`ops/ping.rs:1416-1469`). The restructure reuses that shape for a different
+  purpose — the chain runs the link's real half directly (§3.2) — so the loop
+  itself needs no new machinery.
 - The gate is **per `(ProtocolId, EndpointId)`** (`ops/scheduler.rs:73-76`,
-  key at `:164`), so a RealPing queued behind a live FastPing on the same link is
-  `Queued` and promoted by that fast task's `complete` (`:171-190`). Default
-  `task_queue_limit = 3` (`crates/xray-tui-config/src/app_config.rs:574-576`), so
-  one queued real per link never hits `QueueFull`.
+  key at `:164`): one live task per link, independent links in parallel. That is
+  the property the pipeline relies on (a link's two halves cannot overlap).
+  **The gate's FIFO queue and `task_queue_limit` are deliberately NOT used** —
+  queuing the real half behind a live fast half is the rejected mechanism, for two
+  reasons recorded in §3.2 (`DnsDeferred` links have no gate entry at all, and
+  `task_queue_limit = 0` would skip every real probe). A plan must not
+  reintroduce it.
 - `emit_result` runs **before** `complete` in the chain (`:1443-1447`), so
-  `hard_fast`, `fast_latency` and the staged fast result are all visible at the
-  moment a promoted real task dispatches. The per-link phase decision needs no
+  `hard_fast`, `fast_latency` and the staged fast result are all visible when the
+  chain dispatches the link's real half. The per-link phase decision needs no
   barrier.
 
 ### 2.3 Progress surface
@@ -189,10 +194,12 @@ is on the path.
   re-entry leads to the same chain, and the real half's re-entry is only reachable
   from a settled fast half. `retry_deferred_fast` and `retry_deferred_real`
   (`ops/ping.rs:1351-1376`) collapse into it.
-- Untestable markers are emitted per link, after that link's fast result
-  (`FACT`: the old single post-phase-1 pass existed exactly to guarantee that
-  ordering, `ops/ping.rs:991-994`). Behavior is unchanged for fast-only batches,
-  which emit the same markers today (`:994` runs before the `!real_phase` return).
+- Untestable markers are emitted per link, after that link's fast result, **for
+  both batch kinds** (`FACT`: today's single pass runs unconditionally before the
+  `!real_phase` return, `ops/ping.rs:994-1003` — a fast-only batch marks such rows
+  today, and dropping the marker would let `remove_failed_servers` delete them as
+  genuine failures). The marker decision therefore precedes the real-half
+  decision: a marked link is never a real candidate.
 - `dedup_endpoints` becomes **best-effort** (user decision): before dispatching a
   link's real half, skip it (retire silently, no marker) when the endpoint is
   already in `completed_endpoints`; a success inserts the endpoint id, so later

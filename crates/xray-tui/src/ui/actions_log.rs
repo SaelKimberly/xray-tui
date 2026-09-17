@@ -144,6 +144,11 @@ pub fn render_compact(frame: &mut Frame, area: Rect, state: &AppState) {
 
 // ── Full render (bordered panel) ───────────────────────────────────────
 
+/// Columns rows 3-4 reserve for their statistics cells. The bars' separator
+/// derives from it, so it and the padded formats below must agree — that fixed
+/// block is what keeps the bars' column from moving as numbers change.
+const STAT_BLOCK_W: u16 = 42;
+
 pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     let palette = state.current_palette();
     let (icon, icon_style) = connection_icon(state);
@@ -176,7 +181,9 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         ThemeStyles::footer_value(&palette),
     ));
 
-    // Row 3: Test results
+    // Row 3: Test results — every value padded to a fixed width (the bar's
+    // separator column is a constant, so a changing digit count must not move
+    // it).
     let tcp_str = state
         .last_test_tcp
         .map_or_else(|| "-".to_string(), |v| format!("{v}ms"));
@@ -196,7 +203,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         },
     );
     let row3 = Line::from(Span::styled(
-        format!("⏱ TCP:{tcp_str}  RP:{rp_str}  SPD:{spd_str}"),
+        format!("⏱ TCP:{tcp_str:>8}  RP:{rp_str:>8}  SPD:{spd_str:>9}"),
         ThemeStyles::footer_label(&palette),
     ));
 
@@ -209,7 +216,7 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
         "-".to_string()
     };
     let row4 = Line::from(Span::styled(
-        format!("📊 ⬆{traffic_up}  ⬇{traffic_down}    💾 {mem_mb}"),
+        format!("📊 ⬆{traffic_up:>9}  ⬇{traffic_down:>9}  💾{mem_mb:>8}"),
         ThemeStyles::footer_value(&palette),
     ));
     // Row 5: Core log (scan log_cache backwards for non-tui entry)
@@ -238,14 +245,215 @@ pub fn render_full(frame: &mut Frame, area: Rect, state: &AppState) {
     let inner_area = fieldset.inner(area);
     frame.render_widget(fieldset, area);
     let available = inner_area.height as usize;
-    let mut all_rows = vec![row1, row2, row3, row4, row5, row6];
-    all_rows.truncate(available);
 
-    for (i, row) in all_rows.into_iter().enumerate() {
+    // The batch's two levels share rows 3-4 with the statistics cells: the log
+    // rows keep their full width, and the bars sit in space the short stat
+    // values were already wasting. Below the ladder's minimum the rows render
+    // full width (the status bar carries the numbers there).
+    let bar_w = inner_area.width.saturating_sub(STAT_BLOCK_W + 1) as usize;
+    let (real_bar, fast_bar) = if bar_w >= 18 {
+        batch_bars(state, &palette, bar_w)
+    } else {
+        (None, None)
+    };
+
+    let mut panel_rows: Vec<(Line, Option<Line>)> = vec![
+        (row1, None),
+        (row2, None),
+        (row3, real_bar),
+        (row4, fast_bar),
+        (row5, None),
+        (row6, None),
+    ];
+    panel_rows.truncate(available);
+
+    for (i, (left, right)) in panel_rows.into_iter().enumerate() {
         let y = inner_area.y + i as u16;
-        if y < inner_area.y + inner_area.height {
-            let r = Rect::new(inner_area.x, y, inner_area.width, 1);
-            frame.render_widget(Paragraph::new(row), r);
+        if y >= inner_area.y + inner_area.height {
+            break;
         }
+        let Some(right) = right else {
+            let r = Rect::new(inner_area.x, y, inner_area.width, 1);
+            frame.render_widget(Paragraph::new(left), r);
+            continue;
+        };
+        let left_rect = Rect::new(inner_area.x, y, STAT_BLOCK_W, 1);
+        let sep_rect = Rect::new(inner_area.x + STAT_BLOCK_W, y, 1, 1);
+        let right_rect = Rect::new(
+            inner_area.x + STAT_BLOCK_W + 1,
+            y,
+            inner_area.width.saturating_sub(STAT_BLOCK_W + 1),
+            1,
+        );
+        frame.render_widget(Paragraph::new(left), left_rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "│",
+                ThemeStyles::container_border(&palette),
+            ))),
+            sep_rect,
+        );
+        frame.render_widget(Paragraph::new(right), right_rect);
+    }
+}
+
+/// The two level bars for rows 3 (real) and 4 (fast).
+///
+/// A fast-only batch keeps its single bar on the first row and leaves the second
+/// full width; the fast row shows the walk's page count while the plan is still
+/// loading, because that is where the batch's own time goes before any probe
+/// exists to report.
+fn batch_bars(
+    state: &AppState,
+    palette: &ratatui_cheese::theme::Palette,
+    width: usize,
+) -> (Option<Line<'static>>, Option<Line<'static>>) {
+    use std::sync::atomic::Ordering;
+
+    use crate::ui::widgets::progress;
+
+    let Some(meters) = &state.batch_progress else {
+        return (None, None);
+    };
+    let fast = || {
+        let (done, total) = (
+            meters.fast.done.load(Ordering::Relaxed),
+            meters.fast.total.load(Ordering::Relaxed),
+        );
+        progress::bar_line("Fast", done, total, meters.fast.eta_secs(), width, palette)
+    };
+    let pages = (
+        meters.plan_pages_done.load(Ordering::Relaxed),
+        meters.plan_pages_total.load(Ordering::Relaxed),
+    );
+    let fast_line = if pages.1 > 0 && pages.0 < pages.1 {
+        Line::from(Span::styled(
+            format!("planning {}/{} pages", pages.0, pages.1),
+            ThemeStyles::footer_label(palette),
+        ))
+    } else {
+        fast()
+    };
+    let real_total = meters.real.total.load(Ordering::Relaxed);
+    if real_total == 0 {
+        // Nothing real to report (a fast-only batch, or no candidate yet): the
+        // single bar takes the first row.
+        return (Some(fast_line), None);
+    }
+    let real = progress::bar_line(
+        "Real",
+        meters.real.done.load(Ordering::Relaxed),
+        real_total,
+        meters.real.eta_secs(),
+        width,
+        palette,
+    );
+    (Some(real), Some(fast_line))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::AppState;
+    use crate::types::BatchMeters;
+
+    use super::render_full;
+
+    /// The 6 content rows of the panel, plus the border lines, at a width wide
+    /// enough for the full bar shape.
+    fn render_panel(state: &AppState) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        terminal
+            .draw(|frame| render_full(frame, frame.area(), state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    async fn state_with_meters(meters: BatchMeters) -> AppState {
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        state.batch_progress = Some(Arc::new(meters));
+        state
+    }
+
+    #[tokio::test]
+    async fn without_a_batch_the_statistics_rows_keep_the_full_width() {
+        let state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        let lines = render_panel(&state);
+        for line in &lines {
+            assert!(
+                !line.contains('│'),
+                "no separator without a batch: {line:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fast_only_batch_puts_its_bar_on_the_first_row() {
+        let meters = BatchMeters::default();
+        meters.fast.total.store(100, Ordering::Relaxed);
+        meters.fast.done.store(25, Ordering::Relaxed);
+        let state = state_with_meters(meters).await;
+        let lines = render_panel(&state);
+        // The fieldset's top rule is line 0, so content row N is line N:
+        // row 3 = line 3, row 4 = line 4.
+        assert!(lines[3].contains("Fast"), "bar on row 3: {:?}", lines[3]);
+        assert!(lines[3].contains("25/100"), "counters: {:?}", lines[3]);
+        assert!(lines[3].contains('│'), "separator: {:?}", lines[3]);
+        assert!(
+            !lines[4].contains('│'),
+            "the second bar row stays full width: {:?}",
+            lines[4]
+        );
+    }
+
+    #[tokio::test]
+    async fn real_and_fast_bars_stack_with_real_first() {
+        let meters = BatchMeters::default();
+        meters.fast.total.store(34562, Ordering::Relaxed);
+        meters.fast.done.store(8123, Ordering::Relaxed);
+        meters.real.total.store(17051, Ordering::Relaxed);
+        meters.real.done.store(1234, Ordering::Relaxed);
+        let state = state_with_meters(meters).await;
+        let lines = render_panel(&state);
+        assert!(
+            lines[3].contains("Real") && lines[3].contains("1234/17051"),
+            "real bar on row 3: {:?}",
+            lines[3]
+        );
+        assert!(
+            lines[4].contains("Fast") && lines[4].contains("8123/34562"),
+            "fast bar on row 4: {:?}",
+            lines[4]
+        );
+        // The stat cells keep their own columns beside the bars.
+        assert!(lines[3].contains("TCP:"), "stat cells kept: {:?}", lines[3]);
+        assert!(lines[4].contains("📊"), "stat cells kept: {:?}", lines[4]);
+    }
+
+    #[tokio::test]
+    async fn the_fast_row_reports_the_plan_walk_while_it_loads() {
+        let meters = BatchMeters::default();
+        meters.plan_pages_done.store(1, Ordering::Relaxed);
+        meters.plan_pages_total.store(92, Ordering::Relaxed);
+        meters.fast.total.store(200, Ordering::Relaxed);
+        let state = state_with_meters(meters).await;
+        let lines = render_panel(&state);
+        assert!(
+            lines[3].contains("planning 1/92 pages"),
+            "the first bar row reports the walk: {:?}",
+            lines[3]
+        );
     }
 }

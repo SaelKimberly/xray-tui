@@ -287,6 +287,50 @@ async fn paging_visits_every_endpoint_exactly_once() {
     }
 }
 
+/// The walk page is the page query minus its per-page count: same ids in the
+/// same order at every offset, and the total is returned only when the walk asks
+/// for it — once, not once per page (the `O(feed²/200)` the batch plan loader
+/// used to pay).
+#[tokio::test]
+async fn walk_pages_match_the_page_ids_and_count_once() {
+    let db = seed_fixture().await;
+    for sort in ALL_SORTS {
+        for ascending in [true, false] {
+            for limit in [1_usize, 3, 100] {
+                let mut walked = Vec::new();
+                let mut totals = Vec::new();
+                let mut offset = 0;
+                loop {
+                    let (ids, total) = db
+                        .profiles_walk_page(&request(sort, ascending, offset, limit), offset == 0)
+                        .await
+                        .expect("walk page");
+                    totals.push(total);
+                    if ids.is_empty() {
+                        break;
+                    }
+                    walked.extend(ids.iter().map(|id| id.get()));
+                    offset += limit;
+                }
+                let page = db
+                    .profiles_page(&request(sort, ascending, 0, 100))
+                    .await
+                    .expect("page");
+                assert_eq!(
+                    walked,
+                    page.ids.iter().map(|id| id.get()).collect::<Vec<_>>(),
+                    "sort {sort:?} asc {ascending} limit {limit}"
+                );
+                assert_eq!(totals.first().copied().flatten(), Some(page.total));
+                assert!(
+                    totals[1..].iter().all(Option::is_none),
+                    "only the first walk page pays the count"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn count_narrows_with_search_and_group_filters() {
     let db = seed_fixture().await;

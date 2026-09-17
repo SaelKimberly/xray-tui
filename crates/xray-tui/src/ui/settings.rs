@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ui::theme::ThemeStyles;
+use crate::ui::widgets::progress::bar_cells;
 use crate::{
     AppMode, AppState, BackendUpdateStatus, SettingsMode, SettingsSection, SplitFocus,
     SplitRightPane, Tab,
@@ -2091,20 +2092,7 @@ fn format_bytes(n: u64) -> String {
 
 /// Build a text-based progress bar line for download progress.
 fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static> {
-    const BAR_WIDTH: usize = 20;
-    let filled = if total > 0 {
-        let ratio = downloaded as f64 / total as f64;
-        (ratio * BAR_WIDTH as f64).min(BAR_WIDTH as f64) as usize
-    } else {
-        0
-    };
-    let empty = BAR_WIDTH - filled;
-    let bar: String = format!("    [{}>{}]", "█".repeat(filled), "░".repeat(empty));
-    let pct = if total > 0 {
-        format!(" {}%", (downloaded as f64 / total as f64 * 100.0) as u64)
-    } else {
-        String::new()
-    };
+    let bar = bar_cells(downloaded, total, 20);
     let sizes = format!(
         " ({}/{})",
         format_bytes(downloaded),
@@ -2114,7 +2102,7 @@ fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static
             "?".to_string()
         }
     );
-    Line::from(Span::styled(format!("{bar}{pct}{sizes}"), *style))
+    Line::from(Span::styled(format!("    {bar}{sizes}"), *style))
 }
 
 #[cfg(test)]

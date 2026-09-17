@@ -358,6 +358,39 @@ impl Database {
         Ok(PageMeta { ids, total, offset })
     }
 
+    /// One page of endpoint ids for a sequential walk of the whole feed, in
+    /// display order — the batch plan loader's read.
+    ///
+    /// [`Self::profiles_page`] re-counts the filtered set on every call, which
+    /// made a feed-wide plan walk `O(feed²/200)` (92 `COUNT(*)`s for one
+    /// 18,334-endpoint batch, 2026-09-17). A walk asks for the total once
+    /// (`with_total`) and then reads ids only. Same builders, same ordering,
+    /// same offset paging as the page query — the parity test pins them
+    /// together.
+    pub async fn profiles_walk_page(
+        &self,
+        req: &PageRequest,
+        with_total: bool,
+    ) -> Result<(Vec<EndpointId>, Option<u64>)> {
+        let mut conn = self.connection().await?;
+        let total = if with_total {
+            Some(self.profiles_count_with(&mut conn, req).await?)
+        } else {
+            None
+        };
+
+        let mut sql = Sql::new();
+        base_select(&mut sql, req, PROJ_ID, needs_endpoints(req));
+        order_by(&mut sql, &req.order_terms());
+        let limit = sql.bind(i64::try_from(req.limit).unwrap_or(i64::MAX));
+        let offset_bind = sql.bind(i64::try_from(req.offset).unwrap_or(i64::MAX));
+        sql.push(&format!(" LIMIT {limit} OFFSET {offset_bind}"));
+
+        let rows = sql.exec(&mut conn).await?;
+        let ids = rows.iter().map(decode_id).collect::<Result<Vec<_>>>()?;
+        Ok((ids, total))
+    }
+
     async fn profiles_count_with(
         &self,
         conn: &mut toasty::Connection,

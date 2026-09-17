@@ -535,11 +535,11 @@ pub enum CoreEvent {
         protocol_id: i64,
         test_type: TestType,
     },
-    /// Batch-level progress for real ping.
-    BatchProgress {
-        total: u32,
-        completed: u32,
-    },
+    /// The batch's terminal signal: every probe has settled, the writer is
+    /// flushed and the sweeps have run. Replaces the per-settle progress event
+    /// (a feed-wide batch sent ~34k of them, and the shared `Arc<BatchMeters>`
+    /// already publishes everything they carried).
+    BatchEnded,
     /// Background whitelist files loaded; carries the ready checker.
     HostFeaturesLoaded(Arc<xray_tui_host_features::HostFeaturesChecker>),
     /// Background enrichment (DNS resolve / geo lookup / whitelist / outbound)
@@ -564,7 +564,47 @@ pub enum ConfirmAction {
     Quit,
 }
 
-/// Shared batch progress: `(total, completed)` links, read by the status bar
-/// and written by the batch task. `u32`, not `u16`: a batch plans every link in
-/// the feed, and a feed can exceed 65,535 links.
-pub type BatchProgress = Arc<(AtomicU32, AtomicU32)>;
+/// Live meters for one probe level (fast or real): candidates known so far,
+/// settles done, and a sampled rate for the remaining-time estimate.
+///
+/// `u32`, not `u16`: a batch plans every link in the feed, and a feed can exceed
+/// 65,535 links. The fast level's `total` grows with the plan walk and the real
+/// level's with the candidates that walk makes known — both can only grow, and
+/// `done` counts items already in `total`.
+#[derive(Debug, Default)]
+pub struct PhaseMeters {
+    pub total: AtomicU32,
+    pub done: AtomicU32,
+    /// results/s × 1000, sampled at most once per second by the batch task.
+    /// 0 = no sample yet (the bar renders `--` rather than a wrong estimate).
+    pub rate_milli: AtomicU32,
+}
+
+impl PhaseMeters {
+    /// Remaining seconds at the sampled rate; `None` when the phase has no
+    /// denominator yet, is complete, or has no rate sample.
+    #[must_use]
+    pub fn eta_secs(&self) -> Option<u64> {
+        let total = self.total.load(std::sync::atomic::Ordering::Relaxed);
+        let done = self.done.load(std::sync::atomic::Ordering::Relaxed);
+        let rate = self.rate_milli.load(std::sync::atomic::Ordering::Relaxed);
+        if total == 0 || done >= total || rate == 0 {
+            return None;
+        }
+        Some(u64::from(total - done) * 1000 / u64::from(rate))
+    }
+}
+
+/// Per-batch meters: the plan walk and the two probe levels.
+///
+/// Written by the batch task and read by the render path, which is why there is
+/// no per-result progress event — a feed-wide batch sent ~34k of them, and each
+/// described state this shared `Arc` already carries.
+#[derive(Debug, Default)]
+pub struct BatchMeters {
+    /// Pages of the plan walk, for the "planning" state of the fast bar.
+    pub plan_pages_done: AtomicU32,
+    pub plan_pages_total: AtomicU32,
+    pub fast: PhaseMeters,
+    pub real: PhaseMeters,
+}

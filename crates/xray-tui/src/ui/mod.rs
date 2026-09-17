@@ -240,10 +240,10 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     // in the log — and the per-class histograms only the summary carries were
     // lost with it. The handle published at batch start is reachable here, so
     // the interrupted run reports the SAME line a completed run writes, plus
-    // what has settled and what is still in flight. The pair alone cannot: its
-    // total is the FINAL phase's candidate count (0 until that set is known),
-    // so it must not be phrased as "N of M probes".
-    if let Some(progress) = &state.batch_progress {
+    // what has settled and what is still in flight. The meters alone cannot:
+    // they are a live view, not a record, so the fallback names only what is
+    // known without the handle.
+    if let Some(meters) = &state.batch_progress {
         if let Some(shared) = state.batch.as_ref().and_then(|slot| slot.get()) {
             tracing::info!(
                 target: "tui::ops::ping",
@@ -251,13 +251,17 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
                 crate::ops::ping::interrupted_summary_line(shared),
             );
         } else {
-            let (total, completed) = (
-                progress.0.load(Ordering::Relaxed),
-                progress.1.load(Ordering::Relaxed),
+            let (fast_done, fast_total) = (
+                meters.fast.done.load(Ordering::Relaxed),
+                meters.fast.total.load(Ordering::Relaxed),
+            );
+            let (real_done, real_total) = (
+                meters.real.done.load(Ordering::Relaxed),
+                meters.real.total.load(Ordering::Relaxed),
             );
             tracing::info!(
                 target: "tui::ops::ping",
-                "batch interrupted at quit: {completed} of {total} final-phase probe(s) reported, no batch summary; staged writes flushed, {} left staged",
+                "batch interrupted at quit: fast {fast_done}/{fast_total} probe(s), real {real_done}/{real_total} probe(s) reported, no batch summary; staged writes flushed, {} left staged",
                 state.link_writer.staged_len(),
             );
         }

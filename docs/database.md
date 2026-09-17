@@ -174,7 +174,8 @@ single `port` is the whole spec).
 
 **`endpoint_ip`** — a DNS endpoint's resolved addresses, **one row per address**
 (ADR 0005). `country` is the address's ISO-3166 alpha-2 code (`country.iso_code`
-from the mmdb), written once by the geo step and read back by the enrichment
+from the mmdb), written once by the geo step (the page seed batches a page's
+writes into one transaction) and read back by the enrichment
 seed — a launch whose addresses all carry one renders the flags without an mmdb
 walk (or the 60 MB download). It is the *only* persisted geo fact; the
 whitelist features and the exit-IP country stay per-launch (decision 13). The PK `(endpoint_id, ip_key)` makes the set deduped; `ip_key` is
@@ -286,7 +287,11 @@ them, or the page silently lists a stale position:
   rewrite **carries the countries of the addresses that survive it** — a
   re-resolution must not discard a lookup that already happened.
   `set_endpoint_ip_country` is the geo step's write: it updates the row, or
-  creates it when the lookup won the race against the address write.
+  creates it when the lookup won the race against the address write. The page
+  seed flushes through `set_endpoint_ip_countries` — the same per-row statements
+  inside ONE transaction for the page, because a connection + commit per endpoint
+  contended with the import's own 500-URL chunk commits (`database is locked` →
+  `retry_on_busy`).
   Deletions go through `endpoint_ip::delete_for` inside the same transaction as
   the endpoint rows.
 
