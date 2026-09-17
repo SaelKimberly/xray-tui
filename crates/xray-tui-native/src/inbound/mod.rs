@@ -1284,8 +1284,12 @@ fn reply_for(error: &NativeError) -> socks5::ReplyCode {
         },
         NativeError::Config(_)
         | NativeError::Tls(_)
+        | NativeError::CertNotValidForName(_)
+        | NativeError::CertExpired(_)
+        | NativeError::CleartextPeer(_)
         | NativeError::Reality(_)
         | NativeError::Transport(_)
+        | NativeError::TransportRejected { .. }
         | NativeError::Protocol { .. } => socks5::ReplyCode::GeneralFailure,
     }
 }

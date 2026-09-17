@@ -145,13 +145,23 @@ impl ServerVerifier for WebPkiVerifier {
                 None,
                 None,
             )
-            .map_err(|e| TlsError::Verify(format!("chain verification failed: {e}")))?;
+            .map_err(|e| match e {
+                // Expiry (and "not yet valid") is the one chain failure that is
+                // a statement about the certificate rather than a trust gap.
+                webpki::Error::CertExpired { .. } | webpki::Error::CertNotValidYet { .. } => {
+                    TlsError::CertExpired(e.to_string())
+                }
+                webpki::Error::CertNotValidForName(_) => {
+                    TlsError::CertNotValidForName(e.to_string())
+                }
+                other => TlsError::Verify(format!("chain verification failed: {other}")),
+            })?;
 
         let server_name = ServerName::try_from(ctx.sni)
             .map_err(|_| TlsError::Verify(format!("invalid server name {:?}", ctx.sni)))?;
         end_entity
             .verify_is_valid_for_subject_name(&server_name)
-            .map_err(|e| TlsError::Verify(format!("server name mismatch: {e}")))?;
+            .map_err(|e| TlsError::CertNotValidForName(e.to_string()))?;
 
         verify_certificate_verify(&end_entity, ctx)
     }
@@ -483,6 +493,37 @@ mod tests {
             .unwrap();
     }
 
+    /// An expired certificate is its own typed cause (`CertExpired`), not a
+    /// generic `Verify`: the purge policy reads the difference (spec §7).
+    #[tokio::test]
+    async fn rejects_expired_leaf_with_its_own_cause() {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "xray-tui expired test CA");
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        // A window that closed years ago: webpki answers `CertExpired`.
+        leaf_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(2020, 2, 1);
+        let issuer = rcgen::Issuer::new(ca_params, &ca_key);
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        let verifier = WebPkiVerifier::from_ca_der(ca_cert.der()).unwrap();
+        let err = connect_server(&verifier, "localhost", &leaf_cert, &leaf_key)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TlsError::CertExpired(_)),
+            "an expired chain is its own typed cause: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn rejects_wrong_sni() {
         let (ca_cert, _, leaf_cert, leaf_key) = ca_and_leaf();
@@ -490,7 +531,10 @@ mod tests {
         let err = connect_server(&verifier, "wrong.example", &leaf_cert, &leaf_key)
             .await
             .unwrap_err();
-        assert!(matches!(err, TlsError::Verify(_)), "got: {err}");
+        assert!(
+            matches!(err, TlsError::CertNotValidForName(_)),
+            "a name mismatch is its own typed cause, not a generic verify failure: {err}"
+        );
     }
 
     #[tokio::test]

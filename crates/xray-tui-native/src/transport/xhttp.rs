@@ -514,10 +514,10 @@ async fn send_200<S: V3Send>(
         .await
         .map_err(|_| NativeError::Timeout { step, limit })??;
     if resp.status != StatusCode::OK {
-        return Err(NativeError::Transport(format!(
-            "{step}: expected 200, got {}",
-            resp.status
-        )));
+        return Err(NativeError::TransportRejected {
+            detail: format!("{step}: expected 200, got {}", resp.status),
+            status: resp.status.as_u16(),
+        });
     }
     Ok(resp)
 }
@@ -1385,8 +1385,8 @@ mod tests {
             panic!("a 500 stream-one response must fail connect")
         };
         assert!(
-            matches!(err, NativeError::Transport(ref m) if m.contains("expected 200, got 500")),
-            "{err}"
+            matches!(err, NativeError::TransportRejected { status: 500, .. }),
+            "the peer's status is the typed evidence: {err}"
         );
         server.await.unwrap();
     }
@@ -2309,8 +2309,8 @@ mod tests {
             panic!("a 500 session open must fail connect_quic")
         };
         assert!(
-            matches!(err, NativeError::Transport(ref m) if m.contains("expected 200, got 500")),
-            "{err}"
+            matches!(err, NativeError::TransportRejected { status: 500, .. }),
+            "the peer's status is the typed evidence: {err}"
         );
         wait_obs(&obs, |o| o.conn_closed).await;
         server_task.await.expect("server task");

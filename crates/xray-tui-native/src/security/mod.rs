@@ -128,14 +128,19 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
 
 /// Map an engine handshake error onto the native error surface: a REALITY
 /// fallback (the server flight was not REALITY-authenticated — a real
-/// certificate, e.g. a transparent proxy) is a `Reality` error, everything
-/// else a `Tls` error.
+/// certificate, e.g. a transparent proxy) is a `Reality` error, and the three
+/// causes that identify the endpoint itself keep their own variant so the purge
+/// policy can read them typed. Everything else is a plain `Tls` error.
 fn map_tls_err(e: TlsError) -> NativeError {
     match e {
         TlsError::RealityFallback => NativeError::Reality(
             "REALITY: received real certificate (potential MITM or redirection)".into(),
         ),
-        other => NativeError::Tls(format!("TLS error: {other}")),
+        TlsError::CertNotValidForName(detail) => NativeError::CertNotValidForName(detail),
+        TlsError::CertExpired(detail) => NativeError::CertExpired(detail),
+        TlsError::CleartextPeer(detail) => NativeError::CleartextPeer(detail),
+        // The variant's own Display already carries the `TLS error: ` prefix.
+        other => NativeError::Tls(other.to_string()),
     }
 }
 

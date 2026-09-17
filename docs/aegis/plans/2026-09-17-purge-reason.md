@@ -674,9 +674,13 @@ the two `NativeError` variants, one accessor, and the status-bearing sites.
 
    and line ~154: `.map_err(|e| TlsError::CertNotValidForName(e.to_string()))?`.
 
-3. `record/mod.rs` (the `does not speak TLS` site) and `record/stream.rs` (its
-   twin): `TlsError::Handshake(format!("peer does not speak TLS: …"))` →
-   `TlsError::CleartextPeer(format!("{cleartext:?}"))`.
+3. `record/mod.rs` — the `does not speak TLS` site in `read_record_into`:
+   `TlsError::Handshake(format!("peer does not speak TLS: …"))` →
+   `TlsError::CleartextPeer(format!("{cleartext:?}"))`. This is the path the
+   probe takes (it reads the server flight through `read_record_into`); the
+   `TlsStream::poll_read` twin in `record/stream.rs` stays an `io::Error` — an
+   `AsyncRead` impl cannot return a `TlsError`, and its text is unchanged, so
+   that arm carries no evidence.
 
 4. `xray-tui-native/src/error.rs`:
 

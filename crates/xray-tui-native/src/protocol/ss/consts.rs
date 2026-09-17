@@ -23,14 +23,16 @@ pub(crate) const TIMESTAMP_TOLERANCE_SECS: u64 = 30;
 
 /// Seconds since the UNIX epoch — the timestamp both codecs stamp and check.
 ///
-/// A clock before the epoch cannot stamp a header anyone will accept, so it is
-/// a config error — never the panic shadowsocks-rust's `get_now_timestamp`
-/// takes.
+/// A clock before the epoch cannot stamp a header anyone will accept, so the
+/// failure is reported rather than panicked (shadowsocks-rust's
+/// `get_now_timestamp` takes the panic). It is an I/O-class failure, NOT a
+/// config one: `NativeError::Config` now means "this row can never dial as
+/// stored", and a broken system clock says nothing about the row.
 pub(crate) fn now_unix_secs() -> Result<u64, NativeError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs())
-        .map_err(|_| NativeError::Config("system clock is before the UNIX epoch".to_owned()))
+        .map_err(|e| NativeError::Io(std::io::Error::other(e)))
 }
 
 /// A wire failure in the 2022 codec (`NativeError::Protocol` with the 2022

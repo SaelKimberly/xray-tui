@@ -67,10 +67,10 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         .map_err(|e| NativeError::Transport(format!("httpupgrade request: {e}")))?;
 
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        return Err(NativeError::Transport(format!(
-            "httpupgrade: expected 101, got {}",
-            resp.status()
-        )));
+        return Err(NativeError::TransportRejected {
+            detail: format!("httpupgrade: expected 101, got {}", resp.status()),
+            status: resp.status().as_u16(),
+        });
     }
     // sing-box contract: both echo headers required, case-insensitive.
     let h = resp.headers();
@@ -195,6 +195,9 @@ mod tests {
         let Err(err) = connect(&ctx, Box::new(stream)).await else {
             panic!("expected a transport error, got a connection");
         };
-        assert!(matches!(err, NativeError::Transport(_)), "{err}");
+        assert!(
+            matches!(err, NativeError::TransportRejected { status: 400, .. }),
+            "the peer's status is the typed evidence: {err}"
+        );
     }
 }

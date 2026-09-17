@@ -93,10 +93,10 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
         })?
         .map_err(|e| NativeError::Transport(format!("v2rayhttp request: {e}")))?;
     if resp.status() != http::StatusCode::OK {
-        return Err(NativeError::Transport(format!(
-            "v2rayhttp: expected 200, got {}",
-            resp.status()
-        )));
+        return Err(NativeError::TransportRejected {
+            detail: format!("v2rayhttp: expected 200, got {}", resp.status()),
+            status: resp.status().as_u16(),
+        });
     }
     let reader = IncomingReader::new(resp.into_body());
 

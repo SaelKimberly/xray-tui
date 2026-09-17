@@ -93,10 +93,7 @@ where
     let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
 
     if let Some(cleartext) = cleartext_hello_answer(header) {
-        return Err(TlsError::Handshake(format!(
-            "peer does not speak TLS: it answered in cleartext ({cleartext:?}) — the endpoint's \
-             port or its `security` setting is wrong"
-        )));
+        return Err(TlsError::CleartextPeer(format!("{cleartext:?}")));
     }
 
     if length > MAX_RECORD_PAYLOAD {
@@ -315,10 +312,15 @@ mod tests {
         let (mut stream, mut w) = tokio::io::duplex(1024);
         w.write_all(b"HTTP/1.1 400 Bad Request\r\n").await.unwrap();
 
-        let err = read_record(&mut stream).await.unwrap_err().to_string();
+        let err = read_record(&mut stream).await.unwrap_err();
         assert!(
-            err.contains("does not speak TLS") && err.contains("HTTP/"),
-            "expected the cleartext-peer diagnosis, got: {err}"
+            matches!(err, TlsError::CleartextPeer(_)),
+            "a cleartext answer is its own typed cause, got: {err}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("does not speak TLS") && text.contains("HTTP/"),
+            "expected the cleartext-peer diagnosis, got: {text}"
         );
 
         // A real record header (content type < 0x20) is never mistaken for

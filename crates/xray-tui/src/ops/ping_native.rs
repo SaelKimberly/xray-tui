@@ -105,9 +105,14 @@ impl ProbeFailure {
             // probe path: both are "this row cannot be probed as configured".
             NativeError::Config(_) | NativeError::NotImplemented { .. } => ProbeClass::Config,
             NativeError::Dial(_) => ProbeClass::Dial,
-            NativeError::Tls(_) => ProbeClass::Tls,
+            NativeError::Tls(_)
+            | NativeError::CertNotValidForName(_)
+            | NativeError::CertExpired(_)
+            | NativeError::CleartextPeer(_) => ProbeClass::Tls,
             NativeError::Reality(_) => ProbeClass::Reality,
-            NativeError::Transport(_) => ProbeClass::Transport,
+            NativeError::Transport(_) | NativeError::TransportRejected { .. } => {
+                ProbeClass::Transport
+            }
             NativeError::Protocol { .. } => ProbeClass::Protocol,
             NativeError::Io(_) => ProbeClass::Io,
             NativeError::Timeout { .. } => ProbeClass::Timeout,

@@ -67,12 +67,20 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
             step: "ws upgrade",
             limit: timeouts::TRANSPORT,
         })?
-        .map_err(|e| NativeError::Transport(format!("ws handshake: {e}")))?;
+        .map_err(|e| match e {
+            // The server's own answer to the upgrade carries an HTTP status —
+            // the typed signal the purge policy reads (`evidence`).
+            tokio_tungstenite::tungstenite::Error::Http(resp) => NativeError::TransportRejected {
+                detail: format!("ws handshake: HTTP error: {}", resp.status()),
+                status: resp.status().as_u16(),
+            },
+            other => NativeError::Transport(format!("ws handshake: {other}")),
+        })?;
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        return Err(NativeError::Transport(format!(
-            "ws upgrade rejected: {}",
-            resp.status()
-        )));
+        return Err(NativeError::TransportRejected {
+            detail: format!("ws upgrade rejected: {}", resp.status()),
+            status: resp.status().as_u16(),
+        });
     }
     Ok(Box::new(WsStream::new(ws)))
 }
