@@ -628,11 +628,16 @@ impl EndpointRow {
 }
 
 /// Three-way toggle for the Profiles tab.
+///
+/// `Purgatory` is "not confirmed live and recent": links whose newest LIVE link
+/// is older than the TTL, plus endpoints whose every link carries a purge
+/// verdict (spec `2026-09-17-purge-reason-design.md` §5). The `Active` view is
+/// the effective-profiles list and hides purged links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PurgatoryView {
     #[default]
     Active,
-    Stale,
+    Purgatory,
     All,
 }
 

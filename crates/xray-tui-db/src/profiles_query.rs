@@ -24,7 +24,8 @@ use crate::Database;
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
     ConfigType, Endpoint, EndpointId, EndpointRow, ErrorInfo, HostType, Latency, ProfileErr,
-    ProfileStats, Protocol, ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
+    ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats,
+    Transport,
 };
 use toasty::Deferred;
 use toasty::schema::Load;
@@ -62,9 +63,14 @@ pub enum PageSort {
 #[derive(Debug, Clone)]
 pub struct PageRequest {
     pub view: PurgatoryView,
-    /// View window bounds, in epoch seconds (the unit the key columns store).
+    /// The view bound, in epoch seconds (the unit the key columns store):
+    /// `Active` selects `>= active`, `Purgatory` selects `< active`.
+    ///
+    /// There is no lower bound: with a live-only `rank_newest_seen`, an endpoint
+    /// whose only live links are older than retention while a purged link was
+    /// confirmed today is a state this feature creates deliberately, and a lower
+    /// bound would hide it from both views. The retention sweep owns deletion.
     pub active_threshold: i64,
-    pub stale_threshold: i64,
     pub search: Option<String>,
     pub group_id: Option<String>,
     pub sort: PageSort,
@@ -269,26 +275,24 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
     }
 }
 
-/// The view predicate: "has a link matching the window". `Active` and `Stale`
-/// share both computed bounds and let the view pick the ones it uses.
+/// The view predicate: "has a link matching the window". `Active` and
+/// `Purgatory` share the one computed bound and differ only in direction.
 fn view_predicate(sql: &mut Sql, req: &PageRequest) {
-    // "Some link falls in the band" is the same question as "the newest link
-    // does", so the window reads the stored maximum instead of scanning
-    // `profile_stats` per row.
+    // "Some link falls in the band" is the same question as "the newest LIVE
+    // link does", so the window reads the stored maximum instead of scanning
+    // `profile_stats` per row. `rank_newest_seen` is live-only (decision 16),
+    // which makes the two views a single range each: an endpoint whose every
+    // link is purged reports `NO_SEEN` and lands in Purgatory by construction,
+    // so no `OR` (which would defeat the window index) is needed.
     match req.view {
-        PurgatoryView::All => {
-            sql.push("1 = 1");
-        }
+        PurgatoryView::All => sql.push("1 = 1"),
         PurgatoryView::Active => {
             let ts = sql.bind(req.active_threshold);
             sql.push(&format!("k.rank_newest_seen >= {ts}"));
         }
-        PurgatoryView::Stale => {
-            let stale = sql.bind(req.stale_threshold);
-            let active = sql.bind(req.active_threshold);
-            sql.push(&format!(
-                "k.rank_newest_seen >= {stale} AND k.rank_newest_seen < {active}"
-            ));
+        PurgatoryView::Purgatory => {
+            let ts = sql.bind(req.active_threshold);
+            sql.push(&format!("k.rank_newest_seen < {ts}"));
         }
     }
 }
@@ -510,7 +514,7 @@ const PAGE_PROJECTION: &[&str] = &[
     "(SELECT group_concat(hex(ip_key), ',') FROM endpoint_ip ip WHERE ip.endpoint_id = e.id)",
     "e.resolved_at",
     "e.created_at",
-    // profile_stats (22)
+    // profile_stats (23)
     "ps.protocol_id",
     "ps.endpoint_id",
     "ps.core_type",
@@ -524,6 +528,7 @@ const PAGE_PROJECTION: &[&str] = &[
     "ps.error",
     "ps.error_kind",
     "ps.error_text",
+    "ps.purge_reason",
     "ps.traffic_today_up",
     "ps.traffic_today_down",
     "ps.traffic_total_up",
@@ -715,7 +720,7 @@ fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<Ip
     ))
 }
 
-/// `profile_stats` (22 columns, in [`PAGE_PROJECTION`] order). The three
+/// `profile_stats` (23 columns, in [`PAGE_PROJECTION`] order). The three
 /// multi-column embeds (`latency`, `error`, `traffic`) are flattened in the
 /// table, so they are reassembled by hand — the parity test against
 /// [`Database::load_page_rows`] pins every one of them.
@@ -733,6 +738,9 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     let error_flag = p.next_opt_bool()?;
     let error_kind: Option<ProfileErr> = p.next()?;
     let error_text: Option<String> = p.next()?;
+    // Only the Active view's panel hides purged links; the page decides which
+    // links it asked for, so this column is always decoded.
+    let purge_reason: Option<PurgeReason> = p.next()?;
     let today_up: i64 = p.next()?;
     let today_down: i64 = p.next()?;
     let total_up: i64 = p.next()?;
@@ -777,7 +785,7 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
         latency,
         speed_bps,
         error,
-        purge_reason: None,
+        purge_reason,
         traffic: TrafficStats {
             today_up,
             today_down,
@@ -861,7 +869,11 @@ impl Database {
     /// come back unloaded: reading one is a bug, not a fallback, because the
     /// connect path re-reads its protocol through
     /// [`Database::load_protocol_with_config`].
-    pub async fn load_page_projection(&self, ids: &[EndpointId]) -> Result<Vec<EndpointRow>> {
+    pub async fn load_page_projection(
+        &self,
+        ids: &[EndpointId],
+        include_purged: bool,
+    ) -> Result<Vec<EndpointRow>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -880,6 +892,11 @@ impl Database {
             sql.push(&id.get().to_string());
         }
         sql.push(")");
+        // The Active view is the effective-profiles list: a purged sibling of a
+        // live link is hidden there and shown in Purgatory/All (spec §5).
+        if !include_purged {
+            sql.push(" AND ps.purge_reason IS NULL");
+        }
         let rows = sql.exec(&mut conn).await?;
         drop(conn);
 

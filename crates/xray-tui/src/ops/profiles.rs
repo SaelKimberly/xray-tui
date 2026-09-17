@@ -82,7 +82,6 @@ pub async fn clear_expired_errors(db: &Database, ttl_hours: Option<i64>) {
 pub(crate) struct ProfilesLoad {
     pub view: PurgatoryView,
     pub purgatory_ttl_secs: i64,
-    pub purgatory_retention_secs: i64,
     pub error_ttl_hours: Option<i64>,
     pub search: Option<String>,
     pub sort: PageSort,
@@ -99,7 +98,6 @@ impl From<&AppState> for ProfilesLoad {
         Self {
             view: s.purgatory_view,
             purgatory_ttl_secs: s.purgatory_ttl_secs,
-            purgatory_retention_secs: s.purgatory_retention_secs,
             error_ttl_hours: s.config.speed_test.error_ttl_hours,
             search: (!s.search_query.is_empty()).then(|| s.search_query.clone()),
             sort: page_sort(s.sort_column),
@@ -109,6 +107,15 @@ impl From<&AppState> for ProfilesLoad {
             group_id: None,
         }
     }
+}
+
+/// Whether the current view's panel shows purged links.
+///
+/// The Active view is the effective-profiles list; Purgatory and All show every
+/// link, which is what makes a real test on a purged row possible at all.
+#[must_use]
+const fn includes_purged(view: PurgatoryView) -> bool {
+    matches!(view, PurgatoryView::Purgatory | PurgatoryView::All)
 }
 
 /// The DB half of a profile reload: error-TTL sweep + the current view's rows.
@@ -128,7 +135,9 @@ pub(crate) async fn load_profiles_rows(
     // One statement for the whole page: the typed hydration binds ~600
     // parameters per page (turso: ~0.8 ms each), the projection inlines the
     // ids and decodes the display columns only.
-    let rows = db.load_page_projection(&meta.ids).await?;
+    let rows = db
+        .load_page_projection(&meta.ids, includes_purged(load.view))
+        .await?;
     Ok((rows, meta))
 }
 
@@ -140,30 +149,30 @@ async fn load_profiles_page_only(
 ) -> Result<(Vec<EndpointRow>, PageMeta), DatabaseError> {
     let req = page_request(load);
     let meta = db.profiles_page(&req).await?;
-    let rows = db.load_page_projection(&meta.ids).await?;
+    let rows = db
+        .load_page_projection(&meta.ids, includes_purged(load.view))
+        .await?;
     Ok((rows, meta))
 }
 
 /// Build the query request a [`ProfilesLoad`] describes.
 fn page_request(load: &ProfilesLoad) -> PageRequest {
     let now = xray_tui_db::models::to_epoch(now_ts());
-    let threshold = |ttl_secs: i64| -> i64 { now.saturating_sub(ttl_secs) };
-    // Active and Stale share both bounds; the view decides which of them the
-    // query uses — Active: `last_seen_at >= active`; Stale: `>= stale` and NOT
-    // `>= active`. Passing `now` for Active made the window `last_seen_at >=
-    // now`, i.e. an empty tab (a sync only ever stamps the past).
-    let (active_threshold, stale_threshold) = match load.view {
-        PurgatoryView::Active | PurgatoryView::Stale => (
-            threshold(load.purgatory_ttl_secs),
-            threshold(load.purgatory_retention_secs),
-        ),
-        // `All`: no predicate is emitted, so the bounds are unused.
-        PurgatoryView::All => (0, 0),
+    // One bound, two directions: Active is `rank_newest_seen >= active`,
+    // Purgatory is `< active`. The stored maximum is live-only (decision 16), so
+    // an endpoint whose links are all purged sits below both bounds by
+    // construction and needs no second predicate. Passing `now` would make the
+    // window `>= now`, i.e. an empty tab (a sync only ever stamps the past).
+    let active_threshold = match load.view {
+        PurgatoryView::Active | PurgatoryView::Purgatory => {
+            now.saturating_sub(load.purgatory_ttl_secs)
+        }
+        // `All`: no predicate is emitted, so the bound is unused.
+        PurgatoryView::All => 0,
     };
     PageRequest {
         view: load.view,
         active_threshold,
-        stale_threshold,
         search: load.search.clone(),
         group_id: load.group_id.clone(),
         sort: load.sort,
@@ -1175,8 +1184,8 @@ pub async fn set_protocol_default(state: &mut AppState, endpoint_id: i64, protoc
 /// Cycle purgatory view: Active → Stale → All → Active
 pub const fn cycle_purgatory_view(state: &mut AppState) {
     state.purgatory_view = match state.purgatory_view {
-        PurgatoryView::Active => PurgatoryView::Stale,
-        PurgatoryView::Stale => PurgatoryView::All,
+        PurgatoryView::Active => PurgatoryView::Purgatory,
+        PurgatoryView::Purgatory => PurgatoryView::All,
         PurgatoryView::All => PurgatoryView::Active,
     };
 }
@@ -1805,13 +1814,15 @@ mod view_window_tests {
     use super::test_support::{fake_row, test_state};
     use super::*;
     use crate::ops::profiles::ttl_tests::persist_rows;
+    use xray_tui_db::models::PurgeReason;
 
     const DAY: i64 = 86_400;
 
-    /// Three endpoints whose only link was last seen 1, 10 and 40 days ago —
-    /// inside the 7d active window, inside the 30d retention but past the 7d
-    /// TTL, and past both. Ages are stamped relative to *now* because the
-    /// request computes its thresholds from now.
+    /// Five endpoints covering both Purgatory populations (spec §5): ages 1,
+    /// 10 and 40 days against the 7d TTL, a partially purged endpoint whose
+    /// live link is fresh, and a purged-only endpoint whose link was confirmed
+    /// TODAY. Ages are stamped relative to *now* because the request computes
+    /// its bound from now.
     async fn state_with_ages() -> AppState {
         let db = Arc::new(xray_tui_db::Database::in_memory().await.unwrap());
         let now = now_ts();
@@ -1820,7 +1831,22 @@ mod view_window_tests {
             row.links[0].last_seen_at = xray_tui_db::models::to_epoch(now) - days * DAY;
             row
         };
-        persist_rows(&db, &[aged(1, 1), aged(2, 10), aged(3, 40)]).await;
+        // 4: one purged link and one live link — stays Active, minus the link.
+        let mut mixed = fake_row(4, "h4.example", 2);
+        for link in &mut mixed.links {
+            link.last_seen_at = xray_tui_db::models::to_epoch(now);
+        }
+        mixed.links[0].purge_reason = Some(PurgeReason::NotTls);
+        // 5: the only link is purged, and fresh — staleness cannot move it.
+        let mut purged_only = fake_row(5, "h5.example", 1);
+        purged_only.links[0].last_seen_at = xray_tui_db::models::to_epoch(now);
+        purged_only.links[0].purge_reason = Some(PurgeReason::RealityFallback);
+
+        persist_rows(
+            &db,
+            &[aged(1, 1), aged(2, 10), aged(3, 40), mixed, purged_only],
+        )
+        .await;
 
         let mut state = test_state(Vec::new()).await;
         state.db = db;
@@ -1846,18 +1872,59 @@ mod view_window_tests {
     }
 
     #[tokio::test]
-    async fn active_shows_the_recently_seen_window() {
-        assert_eq!(ids_for(PurgatoryView::Active).await, vec![1]);
+    async fn active_shows_the_recently_seen_window_without_purged_links() {
+        // 5 is fresh but purged-only: not an effective profile, so not Active.
+        assert_eq!(ids_for(PurgatoryView::Active).await, vec![1, 4]);
+        let mut state = state_with_ages().await;
+        state.purgatory_view = PurgatoryView::Active;
+        reload_profiles(&mut state).await;
+        let mixed = state
+            .endpoints
+            .iter()
+            .find(|r| r.endpoint.id.get() == 4)
+            .expect("the partially purged endpoint stays");
+        assert_eq!(
+            mixed.links.len(),
+            1,
+            "and its purged sibling is not in the Active panel"
+        );
+        assert!(mixed.links[0].purge_reason.is_none());
     }
 
     #[tokio::test]
-    async fn stale_shows_the_aging_band_only() {
-        assert_eq!(ids_for(PurgatoryView::Stale).await, vec![2]);
+    async fn purgatory_shows_both_populations() {
+        // Aged past the TTL (2, 3) and purged-only (5) — one view, one range.
+        assert_eq!(ids_for(PurgatoryView::Purgatory).await, vec![2, 3, 5]);
+        // The purged link itself IS loaded here — that is what makes the row
+        // testable back to life, and what the Active view hides.
+        let mut state = state_with_ages().await;
+        state.purgatory_view = PurgatoryView::Purgatory;
+        reload_profiles(&mut state).await;
+        let only = state
+            .endpoints
+            .iter()
+            .find(|r| r.endpoint.id.get() == 5)
+            .expect("the purged-only endpoint is listed");
+        assert_eq!(only.links.len(), 1);
+        assert_eq!(
+            only.links[0].purge_reason,
+            Some(PurgeReason::RealityFallback),
+            "with its verdict available for the Test column"
+        );
     }
 
     #[tokio::test]
-    async fn all_shows_every_age() {
-        assert_eq!(ids_for(PurgatoryView::All).await, vec![1, 2, 3]);
+    async fn all_shows_every_age_and_every_link() {
+        assert_eq!(ids_for(PurgatoryView::All).await, vec![1, 2, 3, 4, 5]);
+        let mut state = state_with_ages().await;
+        state.purgatory_view = PurgatoryView::All;
+        reload_profiles(&mut state).await;
+        let mixed = state
+            .endpoints
+            .iter()
+            .find(|r| r.endpoint.id.get() == 4)
+            .expect("mixed endpoint");
+        assert_eq!(mixed.links.len(), 2, "All keeps every link");
     }
 }
 

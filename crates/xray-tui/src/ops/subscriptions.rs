@@ -865,7 +865,6 @@ mod tests {
         xray_tui_db::profiles_query::PageRequest {
             view: xray_tui_db::models::PurgatoryView::All,
             active_threshold: 0,
-            stale_threshold: 0,
             search: None,
             group_id: Some(group.to_string()),
             sort: xray_tui_db::profiles_query::PageSort::Test,
@@ -900,7 +899,10 @@ mod tests {
         // One endpoint per unique host, both linked to the group.
         let req = group_page_request("g1");
         let meta = db.profiles_page(&req).await.expect("group read");
-        let rows = db.load_page_rows(&meta.ids).await.expect("group rows");
+        let rows = db
+            .load_page_rows(&meta.ids, true)
+            .await
+            .expect("group rows");
         assert_eq!(rows.len(), 2, "one row per unique endpoint");
         assert_eq!(rows[0].links.len(), 1);
         assert_eq!(rows[1].links.len(), 1);
@@ -908,7 +910,10 @@ mod tests {
         // Rerun the same list: counts identical, no duplicate rows.
         let (count2, _) = persist_parsed_urls(&db, &urls, Some("g1"), &validation).await;
         assert_eq!(count2, 2, "idempotent rerun");
-        let rows2 = db.load_page_rows(&meta.ids).await.expect("group rows 2");
+        let rows2 = db
+            .load_page_rows(&meta.ids, true)
+            .await
+            .expect("group rows 2");
         assert_eq!(rows2.len(), 2, "no row duplication on rerun");
         assert_eq!(rows2[0].links.len(), 1, "no link duplication on rerun");
 

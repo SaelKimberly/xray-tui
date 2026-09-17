@@ -40,7 +40,6 @@ const fn request(sort: PageSort, ascending: bool, offset: usize, limit: usize) -
     PageRequest {
         view: PurgatoryView::All,
         active_threshold: ts(0),
-        stale_threshold: ts(0),
         search: None,
         group_id: None,
         sort,
@@ -578,7 +577,7 @@ async fn link_order_is_decision_16_order() {
         .iter()
         .map(|id| EndpointId::new(*id))
         .collect();
-    let rows = db.load_page_rows(&ids).await.expect("rows");
+    let rows = db.load_page_rows(&ids, true).await.expect("rows");
     assert_eq!(rows.len(), ids.len());
     assert!(rows.iter().all(|r| !r.links.is_empty()));
 
@@ -614,7 +613,7 @@ async fn every_statement_runs_against_a_pushed_schema() {
     db.profiles_anchor(&base, EndpointId::new(1))
         .await
         .expect("anchor");
-    db.load_page_projection(&[EndpointId::new(1)])
+    db.load_page_projection(&[EndpointId::new(1)], true)
         .await
         .expect("projection");
 
@@ -631,7 +630,7 @@ async fn every_statement_runs_against_a_pushed_schema() {
     }
     for view in [
         PurgatoryView::Active,
-        PurgatoryView::Stale,
+        PurgatoryView::Purgatory,
         PurgatoryView::All,
     ] {
         let req = PageRequest {
@@ -655,7 +654,7 @@ async fn load_page_rows_preserves_page_and_link_order() {
     let page = db.profiles_page(&req).await.expect("page");
     assert_eq!(page.ids.len(), 2);
 
-    let rows = db.load_page_rows(&page.ids).await.expect("rows");
+    let rows = db.load_page_rows(&page.ids, true).await.expect("rows");
     let row_ids: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect();
     let page_ids: Vec<i64> = page.ids.iter().map(|id| id.get()).collect();
     assert_eq!(row_ids, page_ids, "page order, not id order");
@@ -675,7 +674,12 @@ async fn load_page_rows_preserves_page_and_link_order() {
     }
 
     // Empty page: no query, no rows.
-    assert!(db.load_page_rows(&[]).await.expect("empty").is_empty());
+    assert!(
+        db.load_page_rows(&[], true)
+            .await
+            .expect("empty")
+            .is_empty()
+    );
 }
 
 // ── Ordering parity: the SQL vs the Rust oracle ─────────────────────────
@@ -789,7 +793,7 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
         .profiles_page(&request(PageSort::Test, true, 0, 1000))
         .await
         .expect("all ids");
-    let rows = db.load_page_rows(&all.ids).await.expect("rows");
+    let rows = db.load_page_rows(&all.ids, true).await.expect("rows");
     assert_eq!(rows.len(), 7, "fixture rows");
 
     for sort in ALL_SORTS {
@@ -912,6 +916,15 @@ async fn seed_projection_fixture() -> Database {
          (11, 2, 'xray', 'share_url', NULL, 1789045200, NULL, \
           NULL, NULL, NULL, 1, 'name', 'name probe', 0, 0, 0, 0, \
           1788220807, 1789045200, 2)",
+        // e2's second link: the only PURGED one, so the purge filter's two
+        // policies produce different pages from this fixture.
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
+         traffic_total_up, traffic_total_down, created_at, updated_at, version) VALUES \
+         (13, 2, 'xray', 'share_url', NULL, 1789047000, NULL, \
+          NULL, NULL, NULL, 1, 'real', 'reality error', 'reality_fallback', 0, 0, 0, 0, \
+          1788220810, 1789047000, 1)",
         // e3: a measured success AND a real failure on one endpoint, plus a
         // link whose protocol row does not exist (LEFT JOIN -> no entry).
         "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
@@ -979,8 +992,45 @@ fn assert_same_link(typed: &ProfileStats, projected: &ProfileStats, ctx: &str) {
 async fn page_projection_matches_the_orm_rows() {
     let db = seed_projection_fixture().await;
     let ids: Vec<EndpointId> = (1..=3).map(EndpointId::new).collect();
-    let typed = db.load_page_rows(&ids).await.expect("typed rows");
-    let projected = db.load_page_projection(&ids).await.expect("projected rows");
+
+    // Both purge policies: the projection applies the Active view's filter in
+    // SQL, the typed path in Rust, and the two must keep agreeing. The fixture
+    // carries one purged link, so the policies must actually differ.
+    let mut link_counts = Vec::new();
+    for include_purged in [true, false] {
+        let typed = db
+            .load_page_rows(&ids, include_purged)
+            .await
+            .expect("typed rows");
+        let projected = db
+            .load_page_projection(&ids, include_purged)
+            .await
+            .expect("projected rows");
+        assert_eq!(
+            typed.len(),
+            projected.len(),
+            "one row per id (include_purged = {include_purged})"
+        );
+        for (typed, projected) in typed.iter().zip(&projected) {
+            assert_eq!(
+                typed.links.len(),
+                projected.links.len(),
+                "the same links survive the filter (include_purged = {include_purged})"
+            );
+        }
+        link_counts.push(typed.iter().map(|r| r.links.len()).sum::<usize>());
+    }
+    assert_eq!(
+        link_counts,
+        vec![6, 5],
+        "the purged link is loaded only when the view asks for it"
+    );
+
+    let typed = db.load_page_rows(&ids, true).await.expect("typed rows");
+    let projected = db
+        .load_page_projection(&ids, true)
+        .await
+        .expect("projected rows");
 
     assert_eq!(typed.len(), projected.len(), "one row per id");
     for (typed, projected) in typed.iter().zip(&projected) {
@@ -1127,7 +1177,7 @@ async fn page_projection_matches_the_orm_rows() {
 async fn page_projection_keeps_the_requested_order_and_skips_empty_pages() {
     let db = seed_projection_fixture().await;
     assert!(
-        db.load_page_projection(&[])
+        db.load_page_projection(&[], true)
             .await
             .expect("empty page")
             .is_empty()
@@ -1135,7 +1185,7 @@ async fn page_projection_keeps_the_requested_order_and_skips_empty_pages() {
 
     let shuffled = vec![EndpointId::new(3), EndpointId::new(1), EndpointId::new(2)];
     let rows = db
-        .load_page_projection(&shuffled)
+        .load_page_projection(&shuffled, true)
         .await
         .expect("projected rows");
     let got: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect();

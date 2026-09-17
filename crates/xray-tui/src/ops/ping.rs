@@ -1833,7 +1833,6 @@ async fn load_feed_plan(
         let request = PageRequest {
             view: xray_tui_db::models::PurgatoryView::All,
             active_threshold: 0,
-            stale_threshold: 0,
             search: None,
             group_id: None,
             sort: PageSort::Address,
@@ -1846,7 +1845,7 @@ async fn load_feed_plan(
             break;
         }
         offset += meta.ids.len();
-        let rows = db.load_page_projection(&meta.ids).await?;
+        let rows = db.load_page_projection(&meta.ids, true).await?;
         plan.extend(rows.iter().flat_map(plan_row_links));
         if offset as u64 >= meta.total {
             break;

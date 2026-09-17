@@ -782,7 +782,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         KeyCode::Char('r' | 'R') if state.current_tab == Tab::Profiles => {
             if matches!(
                 state.purgatory_view,
-                xray_tui_db::models::PurgatoryView::Stale
+                xray_tui_db::models::PurgatoryView::Purgatory
             ) && let Some(id) = state.selected_profile_id()
             {
                 state

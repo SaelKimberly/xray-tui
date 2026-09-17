@@ -1093,7 +1093,7 @@ fn render_filter_strip(
 ) {
     let view_label = match state.purgatory_view {
         xray_tui_db::models::PurgatoryView::Active => "Active",
-        xray_tui_db::models::PurgatoryView::Stale => "Stale",
+        xray_tui_db::models::PurgatoryView::Purgatory => "Stale",
         xray_tui_db::models::PurgatoryView::All => "All",
     };
     let view_text = format!(" View: {view_label} [P]");

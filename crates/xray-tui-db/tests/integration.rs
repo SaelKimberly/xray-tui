@@ -25,13 +25,11 @@ use xray_tui_proto::proto_spec::{
 fn page_req(
     view: PurgatoryView,
     active: i64,
-    stale: i64,
     group: Option<&str>,
 ) -> xray_tui_db::profiles_query::PageRequest {
     xray_tui_db::profiles_query::PageRequest {
         view,
         active_threshold: active,
-        stale_threshold: stale,
         search: None,
         group_id: group.map(str::to_string),
         sort: xray_tui_db::profiles_query::PageSort::Test,
@@ -57,8 +55,20 @@ async fn page_rows(
     db: &Database,
     req: &xray_tui_db::profiles_query::PageRequest,
 ) -> Vec<EndpointRow> {
+    page_rows_filtered(db, req, true).await
+}
+
+/// The same rows with the purge policy made explicit: the Active view's panel
+/// hides purged links, Purgatory and All keep them.
+async fn page_rows_filtered(
+    db: &Database,
+    req: &xray_tui_db::profiles_query::PageRequest,
+    include_purged: bool,
+) -> Vec<EndpointRow> {
     let meta = db.profiles_page(req).await.expect("page");
-    db.load_page_rows(&meta.ids).await.expect("rows")
+    db.load_page_rows(&meta.ids, include_purged)
+        .await
+        .expect("rows")
 }
 
 async fn test_db() -> Database {
@@ -176,6 +186,43 @@ async fn seed_link(
     .expect("create link");
 }
 
+/// The same, with a purge verdict on the link (the classifier's write).
+async fn seed_purged_link(
+    conn: &mut toasty::Connection,
+    endpoint_id: i64,
+    protocol_id: i64,
+    last_seen: i64,
+    reason: PurgeReason,
+) {
+    toasty::create!(Protocol {
+        created_at: 0,
+        id: ProtocolId::new(protocol_id),
+        sig: protocol_id,
+        proto_kind: ProtocolKind::Vless,
+        transport: tcp_transport(),
+        security: no_security(),
+        config: Deferred::from(Json(vless_config())),
+    })
+    .exec(conn)
+    .await
+    .expect("create protocol");
+
+    toasty::create!(ProfileStats {
+        created_at: 0,
+        updated_at: 0,
+        protocol_id: ProtocolId::new(protocol_id),
+        endpoint_id: EndpointId::new(endpoint_id),
+        core_type: CoreType::Xray,
+        config_type: ConfigType::ShareUrl,
+        last_seen_at: ts(last_seen),
+        purge_reason: Some(reason),
+        traffic: zero_traffic(),
+    })
+    .exec(conn)
+    .await
+    .expect("create purged link");
+}
+
 // ── EndpointRow assembly ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -186,7 +233,7 @@ async fn page_rows_assemble_links_and_protocols() {
     seed_endpoint(&mut conn, 1, 1001, "1.2.3.4", HostType::Ipv4, 443, 10).await;
     seed_link(&mut conn, 1, 1002, 20).await;
 
-    let all = page_req(PurgatoryView::All, ts(0), ts(0), None);
+    let all = page_req(PurgatoryView::All, ts(0), None);
     // The fixture seeded with raw writes: make the stored keys follow.
     seed_ranks(&db).await;
     let rows = page_rows(&db, &all).await;
@@ -237,7 +284,7 @@ async fn large_page_loads_via_batched_in_list() {
 
     seed_ranks(&db).await;
 
-    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), None)).await;
     assert_eq!(rows.len(), 1000, "every endpoint on the page");
     assert!(
         rows.iter().all(|r| r.links.len() == 1),
@@ -280,7 +327,7 @@ async fn rows_are_sorted_by_test_priority() {
 
     seed_ranks(&db).await;
 
-    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), None)).await;
     let row = &rows[0];
     let order: Vec<i64> = row.links.iter().map(|l| l.protocol_id.get()).collect();
     assert_eq!(order, vec![1003, 1002, 1001], "real-ok, fast-ok, untested");
@@ -314,7 +361,7 @@ async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
 
     seed_ranks(&db).await;
 
-    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), None)).await;
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), None)).await;
     let row = &rows[0];
     assert_eq!(
         row.best_test_priority_key(true).expect("key").0,
@@ -380,16 +427,11 @@ async fn active_and_stale_windows() {
     )
     .await;
 
-    let active = page_req(
-        PurgatoryView::Active,
-        ts(now - 3_600),
-        ts(now - 7_200),
-        None,
-    );
+    let active = page_req(PurgatoryView::Active, ts(now - 3_600), None);
     seed_ranks(&db).await;
     assert_eq!(page_ids(&db, &active).await, vec![1]);
 
-    let stale = page_req(PurgatoryView::Stale, ts(now - 3_600), ts(now - 7_200), None);
+    let stale = page_req(PurgatoryView::Purgatory, ts(now - 3_600), None);
     assert_eq!(page_ids(&db, &stale).await, vec![2]);
     assert_eq!(
         db.profiles_page(&stale).await.expect("count").total,
@@ -397,12 +439,12 @@ async fn active_and_stale_windows() {
         "the footer count matches the stale window"
     );
 
-    let all = page_req(PurgatoryView::All, ts(now - 3_600), ts(now - 7_200), None);
+    let all = page_req(PurgatoryView::All, ts(now - 3_600), None);
     assert_eq!(page_ids(&db, &all).await, vec![1, 2]);
 }
 
 #[tokio::test]
-async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
+async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
     let now = 10_000i64;
@@ -461,22 +503,42 @@ async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
     seed_link(&mut conn, 5, 5002, now - 1_000).await;
     // 6: boundary — max exactly == stale_threshold -> stale.
     seed_endpoint(&mut conn, 6, 6001, "6.6.6.6", HostType::Ipv4, 443, stale).await;
-    // 7: boundary — max exactly == active_threshold -> NOT stale.
+    // 7: boundary — max exactly == active_threshold -> NOT in Purgatory.
     seed_endpoint(&mut conn, 7, 7001, "7.7.7.7", HostType::Ipv4, 443, active).await;
+    // 8: purged-only — the link was confirmed TODAY (so staleness cannot move
+    // it) but carries a verdict, so it is in Purgatory by construction: its
+    // live-only `rank_newest_seen` is NO_SEEN.
+    // (The endpoint row, not `seed_endpoint`: that helper also seeds a LIVE
+    // link, and this case needs the purged link to be the only one.)
+    toasty::create!(Endpoint {
+        created_at: 0,
+        id: EndpointId::new(8),
+        host: "8.8.8.8".to_string(),
+        host_type: HostType::Ipv4,
+        port: 443,
+        ports: Vec::<u16>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("purged-only endpoint");
+    seed_purged_link(&mut conn, 8, 8001, now, PurgeReason::RealityFallback).await;
 
-    let stale_req = page_req(PurgatoryView::Stale, ts(active), ts(stale), None);
+    let stale_req = page_req(PurgatoryView::Purgatory, ts(active), None);
     // The fixture seeded with raw writes: make the stored keys follow.
     seed_ranks(&db).await;
     let stale_ids = page_ids(&db, &stale_req).await;
     let count = db.profiles_page(&stale_req).await.expect("count").total;
     let rows = page_rows(&db, &stale_req).await;
 
-    let expected: Vec<i64> = vec![2, 6];
+    // No lower bound: 3's links all predate retention, but the sweep has not
+    // reclaimed it, and with a live-only maximum it belongs here with 2 and 6.
+    // 7 sits exactly on the bound and is Active; 8 has no live link at all.
+    let expected: Vec<i64> = vec![2, 3, 6, 8];
     let mut got = stale_ids.clone();
     got.sort_unstable();
     assert_eq!(
         got, expected,
-        "the stale window selects exactly the boundary rows"
+        "Purgatory = \"not confirmed live and recent\""
     );
     assert_eq!(count, expected.len() as u64, "count == id path length");
     let mut row_ids: Vec<i64> = rows.iter().map(|r| r.endpoint.id.get()).collect();
@@ -484,6 +546,20 @@ async fn stale_ids_match_assembled_rows_on_mixed_dataset() {
     assert_eq!(
         row_ids, expected,
         "id-only path agrees with the assembled-row count"
+    );
+
+    // The Active view is the effective-profiles list: the purged-only endpoint
+    // is gone, and its link is not loaded even for an endpoint that stays.
+    let active_req = page_req(PurgatoryView::Active, ts(active), None);
+    let mut active_ids = page_ids(&db, &active_req).await;
+    active_ids.sort_unstable();
+    assert_eq!(active_ids, vec![1, 5, 7], "purged-only rows leave Active");
+    let active_rows = page_rows_filtered(&db, &active_req, false).await;
+    assert!(
+        active_rows
+            .iter()
+            .all(|r| r.endpoint.id != EndpointId::new(8)),
+        "and the purged-only endpoint is not hydrated"
     );
 }
 
@@ -514,7 +590,7 @@ async fn group_filter_selects_by_group_membership() {
     .await
     .expect("link group b");
 
-    let group = |id: &str| page_req(PurgatoryView::All, ts(0), ts(0), Some(id));
+    let group = |id: &str| page_req(PurgatoryView::All, ts(0), Some(id));
     seed_ranks(&db).await;
     assert_eq!(page_ids(&db, &group("source-a")).await, vec![1]);
     assert_eq!(page_ids(&db, &group("source-b")).await, vec![1]);
@@ -1265,7 +1341,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         tx.commit().await.expect("commit 2");
     }
 
-    let row = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), Some("g1"))).await;
+    let row = page_rows(&db, &page_req(PurgatoryView::All, ts(0), Some("g1"))).await;
     assert_eq!(row.len(), 1, "one endpoint despite duplicate upserts");
     assert_eq!(row[0].endpoint.port, 8443, "port updated");
     assert_eq!(row[0].links.len(), 1, "one link despite duplicate upserts");
@@ -1359,7 +1435,7 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     .expect("upsert group link");
 
     // The subscription-shaped sequence assembles into one group row.
-    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), ts(0), Some("g1"))).await;
+    let rows = page_rows(&db, &page_req(PurgatoryView::All, ts(0), Some("g1"))).await;
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row.endpoint.id, EndpointId::new(1));
@@ -1371,12 +1447,9 @@ async fn subscription_upsert_flow_assembles_group_rows() {
 
     // A threshold past the link's last_seen_at drops the endpoint.
     assert!(
-        page_ids(
-            &db,
-            &page_req(PurgatoryView::Active, ts(100), ts(100), Some("g1"))
-        )
-        .await
-        .is_empty(),
+        page_ids(&db, &page_req(PurgatoryView::Active, ts(100), Some("g1")))
+            .await
+            .is_empty(),
         "the active window excludes a link last seen before the threshold"
     );
 }

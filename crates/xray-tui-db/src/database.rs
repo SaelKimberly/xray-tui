@@ -704,7 +704,11 @@ impl Database {
     /// caller's `ids`. [`Self::load_page_projection`] returns the same rows
     /// from one statement; the parity test in `tests/profiles_query.rs` pins
     /// the two together, and this path stays as their oracle.
-    pub async fn load_page_rows(&self, ids: &[EndpointId]) -> Result<Vec<EndpointRow>> {
+    pub async fn load_page_rows(
+        &self,
+        ids: &[EndpointId],
+        include_purged: bool,
+    ) -> Result<Vec<EndpointRow>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -713,8 +717,19 @@ impl Database {
             Endpoint::filter(toasty::stmt::in_list(Endpoint::fields().id(), ids.to_vec()))
                 .exec(&mut conn)
                 .await?;
-        let rows = self.load_endpoint_rows(endpoints, &mut conn).await?;
+        let mut rows = self.load_endpoint_rows(endpoints, &mut conn).await?;
         drop(conn);
+
+        // The same Active-view filter the projection applies in SQL, so the two
+        // page readers stay interchangeable (their parity test pins it).
+        // `load_endpoint_rows` itself stays unfiltered: the single-endpoint
+        // lookups must still see a purged link — that is how it gets re-proved.
+        if !include_purged {
+            for row in &mut rows {
+                row.links.retain(|l| l.purge_reason.is_none());
+                row.select_best_measured_link();
+            }
+        }
 
         // Page order, not id order: the caller's sequence IS the display order.
         let mut by_id: HashMap<EndpointId, EndpointRow> =
@@ -1573,11 +1588,10 @@ mod tests {
     use crate::models_toasty::PurgatoryView;
 
     /// A one-shot page request for the view predicates.
-    fn req(view: PurgatoryView, active: i64, stale: i64) -> crate::profiles_query::PageRequest {
+    fn req(view: PurgatoryView, active: i64) -> crate::profiles_query::PageRequest {
         crate::profiles_query::PageRequest {
             view,
             active_threshold: active,
-            stale_threshold: stale,
             search: None,
             group_id: None,
             sort: crate::profiles_query::PageSort::Test,
@@ -1604,7 +1618,7 @@ mod tests {
         req: &crate::profiles_query::PageRequest,
     ) -> Vec<crate::models_toasty::EndpointRow> {
         let meta = db.profiles_page(req).await.expect("page");
-        db.load_page_rows(&meta.ids).await.expect("rows")
+        db.load_page_rows(&meta.ids, true).await.expect("rows")
     }
 
     async fn seed_endpoint(
@@ -1686,11 +1700,11 @@ mod tests {
         db.repair_endpoint_ranks().await.expect("ranks");
 
         // Active: only the recent endpoint.
-        let active = req(PurgatoryView::Active, ts(now - 3_600), ts(now - 7_200));
+        let active = req(PurgatoryView::Active, ts(now - 3_600));
         assert_eq!(ids(&db, &active).await, vec![1]);
 
         // Stale: only the old endpoint.
-        let stale = req(PurgatoryView::Stale, ts(now - 3_600), ts(now - 7_200));
+        let stale = req(PurgatoryView::Purgatory, ts(now - 3_600));
         assert_eq!(ids(&db, &stale).await, vec![2]);
 
         // Count matches the stale view.
@@ -1707,7 +1721,7 @@ mod tests {
         // The fixture seeded with raw writes: make the stored keys follow.
         db.repair_endpoint_ranks().await.expect("ranks");
 
-        let rows = rows_of(&db, &req(PurgatoryView::All, ts(0), ts(0))).await;
+        let rows = rows_of(&db, &req(PurgatoryView::All, ts(0))).await;
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.endpoint.id, EndpointId::new(1));
@@ -1757,7 +1771,7 @@ mod tests {
 
         let group = |id: &str| crate::profiles_query::PageRequest {
             group_id: Some(id.to_string()),
-            ..req(PurgatoryView::All, ts(0), ts(0))
+            ..req(PurgatoryView::All, ts(0))
         };
         // The fixture seeded with raw writes: make the stored keys follow.
         db.repair_endpoint_ranks().await.expect("ranks");
@@ -1852,7 +1866,7 @@ mod tests {
         // The fixture seeded with raw writes: make the stored keys follow.
         db.repair_endpoint_ranks().await.expect("ranks");
 
-        let rows = rows_of(&db, &req(PurgatoryView::All, ts(0), ts(0))).await;
+        let rows = rows_of(&db, &req(PurgatoryView::All, ts(0))).await;
         let row = &rows[0];
         // Both links sink to tier 5; recency decides.
         assert_eq!(row.links[0].protocol_id, ProtocolId::new(1002));
