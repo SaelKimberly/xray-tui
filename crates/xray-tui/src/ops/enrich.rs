@@ -432,8 +432,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                 std::collections::HashMap::new()
             }
         };
-        let mut pending: Vec<(EndpointId, IpAddr, String)> =
-            Vec::with_capacity(PROFILES_PAGE_SIZE);
+        let mut pending: Vec<(EndpointId, IpAddr, String)> = Vec::with_capacity(PROFILES_PAGE_SIZE);
         let mut scanned = 0usize;
         let mut countries = 0usize;
         let mut flushes = 0usize;

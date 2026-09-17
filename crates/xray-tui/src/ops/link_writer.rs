@@ -25,12 +25,15 @@ type StageKey = ((ProtocolId, EndpointId), LinkGroups);
 /// Fold one staged column group onto `base`.
 ///
 /// The groups are disjoint by construction, so the order they are applied in
-/// never matters: RESULT owns latency/speed/error, TRAFFIC the four counters.
+/// never matters: RESULT owns latency/speed/error, PURGE the verdict, TRAFFIC
+/// the four counters.
 fn merge_group(base: &mut ProfileStats, flag: LinkGroups, staged: &ProfileStats) {
     if flag == LinkGroups::RESULT {
         base.latency.clone_from(&staged.latency);
         base.speed_bps = staged.speed_bps;
         base.error.clone_from(&staged.error);
+    } else if flag == LinkGroups::PURGE {
+        base.purge_reason = staged.purge_reason;
     } else {
         base.traffic = staged.traffic;
     }
@@ -90,7 +93,7 @@ impl LinkWriter {
     /// `groups` is normalised to one entry per flag, so a stage of `ALL` and a
     /// later stage of `RESULT` do not shadow each other.
     pub fn stage(&self, link: &ProfileStats, groups: LinkGroups) {
-        for flag in [LinkGroups::RESULT, LinkGroups::TRAFFIC] {
+        for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
             if groups.contains(flag) {
                 self.pending
                     .insert(((link.protocol_id, link.endpoint_id), flag), link.clone());
@@ -297,6 +300,7 @@ mod tests {
             latency: None,
             speed_bps: None,
             error: None,
+            purge_reason: None,
             traffic: TrafficStats {
                 today_up: 0,
                 today_down: 0,
@@ -378,8 +382,8 @@ mod tests {
     #[tokio::test]
     async fn flush_chunks_at_flush_rows() {
         let (db, _) = seeded().await;
-        // flush_rows = 1: three staged LINKS become three transactions (three
-        // column groups of ONE link would coalesce into a single write).
+        // flush_rows = 1: three staged LINKS become three transactions (the
+        // three column groups of ONE link would coalesce into a single write).
         let writer = LinkWriter::new(Arc::clone(&db), 1, DEFAULT_FLUSH_INTERVAL);
         let base = persisted(&db).await;
         for idx in 0..3 {
@@ -390,8 +394,8 @@ mod tests {
         }
         assert_eq!(
             writer.staged_len(),
-            6,
-            "ALL normalises to one entry per group (2), per link"
+            9,
+            "ALL normalises to one entry per group (RESULT, PURGE, TRAFFIC), per link"
         );
         assert_eq!(
             writer.flush().await.expect("flush"),

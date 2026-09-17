@@ -1308,6 +1308,7 @@ pub(crate) mod test_support {
                 latency: None,
                 speed_bps: None,
                 error: None,
+                purge_reason: None,
                 traffic: TrafficStats {
                     today_up: 0,
                     today_down: 0,
@@ -1606,6 +1607,7 @@ mod edit_tests {
                 latency: None,
                 speed_bps: None,
                 error: None,
+                purge_reason: None,
                 traffic: TrafficStats {
                     today_up: 0,
                     today_down: 0,

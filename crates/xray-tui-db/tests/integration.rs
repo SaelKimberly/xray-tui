@@ -10,8 +10,8 @@ use jiff::Timestamp;
 use toasty::{Deferred, Json};
 use xray_tui_db::models::{
     ConfigType, DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRow, ErrorInfo, Group,
-    HostType, Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, PurgatoryView, RoutingRule,
-    Security, TrafficStats, Transport,
+    HostType, Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason,
+    RoutingRule, Security, TrafficStats, Transport,
 };
 use xray_tui_db::{Database, LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
@@ -1179,6 +1179,7 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         latency,
         speed_bps: None,
         error: None,
+        purge_reason: None,
         traffic: zero_traffic(),
         created_at: ts(0),
         updated_at: ts(0),
@@ -1334,6 +1335,7 @@ async fn subscription_upsert_flow_assembles_group_rows() {
         latency: None,
         speed_bps: None,
         error: None,
+        purge_reason: None,
         traffic: zero_traffic(),
         created_at: ts(0),
         updated_at: ts(0),
@@ -1400,7 +1402,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     let db = Database::open(&path).await.expect("fresh open");
     let mut conn = db.connection().await.expect("connection");
 
-    // Fresh open writes the typed schema AND tags it `user_version=11` so a
+    // Fresh open writes the typed schema AND tags it `user_version=12` so a
     // reopen can skip push_schema.
     let rows = toasty::sql::query("PRAGMA user_version")
         .exec(&mut conn)
@@ -1408,8 +1410,8 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .expect("read version");
     assert_eq!(
         first_i64(&rows),
-        Some(11),
-        "fresh open must tag the schema user_version=11"
+        Some(12),
+        "fresh open must tag the schema user_version=12"
     );
     let rows = toasty::sql::query(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
@@ -1447,7 +1449,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .exec(&mut conn)
         .await
         .expect("read version");
-    assert_eq!(first_i64(&rows), Some(11), "reopen keeps the schema tag");
+    assert_eq!(first_i64(&rows), Some(12), "reopen keeps the schema tag");
     assert!(
         Endpoint::filter_by_id(EndpointId::new(9))
             .first()
@@ -1497,7 +1499,7 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         .expect("version");
     assert_eq!(
         first_i64(&rows),
-        Some(11),
+        Some(12),
         "the file is rebuilt at the new tag"
     );
     let rows = toasty::sql::query(
@@ -1873,6 +1875,7 @@ async fn apply_link_patches_isolates_column_groups() {
         total_up: 3,
         total_down: 4,
     };
+    row.purge_reason = Some(PurgeReason::NotTls);
     db.apply_link_patches(&[LinkPatch {
         link: row.clone(),
         groups: LinkGroups::ALL,
@@ -1884,6 +1887,7 @@ async fn apply_link_patches_isolates_column_groups() {
     let mut stale = row.clone();
     stale.latency = Some(Latency::Fast { delay: 99 });
     stale.error = None;
+    stale.purge_reason = None;
     stale.traffic = TrafficStats {
         today_up: 0,
         today_down: 0,
@@ -1933,7 +1937,7 @@ async fn apply_link_patches_isolates_column_groups() {
 
     // RESULT-only patch: traffic and task state must survive untouched.
     db.apply_link_patches(&[LinkPatch {
-        link: stale,
+        link: stale.clone(),
         groups: LinkGroups::RESULT,
     }])
     .await
@@ -1958,6 +1962,51 @@ async fn apply_link_patches_isolates_column_groups() {
             total_down: 40
         },
         "traffic survives a result patch"
+    );
+    assert_eq!(
+        after.purge_reason,
+        Some(PurgeReason::NotTls),
+        "a RESULT patch cannot clear a purge verdict its snapshot never classified \
+         (the fast-probe case: the classifier's own PURGE group owns the column)"
+    );
+
+    // PURGE-only patch: the verdict moves and nothing else does.
+    let mut verdict = stale.clone();
+    verdict.purge_reason = Some(PurgeReason::TransportRejected);
+    db.apply_link_patches(&[LinkPatch {
+        link: verdict,
+        groups: LinkGroups::PURGE,
+    }])
+    .await
+    .expect("purge patch");
+    let after = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(301),
+        EndpointId::new(3),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(
+        after.purge_reason,
+        Some(PurgeReason::TransportRejected),
+        "a PURGE patch writes the verdict"
+    );
+    assert_eq!(
+        after.latency,
+        Some(Latency::Fast { delay: 99 }),
+        "and leaves the result group alone"
+    );
+    assert_eq!(
+        after.traffic,
+        TrafficStats {
+            today_up: 10,
+            today_down: 20,
+            total_up: 30,
+            total_down: 40
+        },
+        "and the traffic group"
     );
 }
 

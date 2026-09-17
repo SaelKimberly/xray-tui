@@ -777,6 +777,7 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
         latency,
         speed_bps,
         error,
+        purge_reason: None,
         traffic: TrafficStats {
             today_up,
             today_down,

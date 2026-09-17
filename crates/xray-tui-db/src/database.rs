@@ -29,16 +29,24 @@ pub struct LinkGroups(u8);
 impl LinkGroups {
     /// `latency` + `speed_bps` + `error` (ping results, error TTL sweeps).
     pub const RESULT: Self = Self(0b001);
+    /// `purge_reason` (the real probe's verdict).
+    ///
+    /// Its own bit, not part of RESULT: [`link_patch_conflict_sql`] writes a
+    /// FIXED column set from each patch's *snapshot*, so riding RESULT would
+    /// let a phase-1 fast half — whose snapshot is the plan-time row — rewrite
+    /// a verdict it never classified. That is the clobber shape these groups
+    /// exist to prevent (ADR 0002), and the classifier is the only producer.
+    pub const PURGE: Self = Self(0b010);
     /// `traffic_*` (the gRPC stats poller).
     pub const TRAFFIC: Self = Self(0b100);
     /// Every group.
     ///
-    /// Both groups can change a STORED ORDERING KEY — the rank columns derive
+    /// Every group can change a STORED ORDERING KEY — the rank columns derive
     /// from a link's `error`/`latency`/`last_seen_at`/`speed_bps`/`traffic`/
-    /// `config_type` — so every patch refreshes its endpoint's keys. (The
-    /// scheduler's task state used to be a third group; it is runtime-only now
-    /// and never reaches this table.)
-    pub const ALL: Self = Self(0b101);
+    /// `config_type`/`purge_reason` — so every patch refreshes its endpoint's
+    /// keys. (The scheduler's task state used to be a third group; it is
+    /// runtime-only now and never reaches this table.)
+    pub const ALL: Self = Self(0b111);
 
     /// Whether `other`'s groups are all present in `self`.
     #[must_use]
@@ -114,7 +122,14 @@ impl Database {
         // once by the mmdb lookup, so a later launch renders the flag without
         // the database. A v10 file is WIPED (a column cannot be added to a
         // pushed table here; the countries are re-derived on the next pass).
-        const SCHEMA_VERSION: i64 = 11;
+        //
+        // 12 = `profile_stats.purge_reason` (spec 2026-09-17-purge-reason):
+        // the typed, permanent verdict a real probe's evidence writes and only
+        // a data-carrying success clears. A v11 file is WIPED (a column cannot
+        // be added to a pushed table here; the verdicts are re-derived by the
+        // next Real run, and the reference classification is kept beside the
+        // dataset copy the design spec names).
+        const SCHEMA_VERSION: i64 = 12;
 
         let path_str = path
             .as_ref()
@@ -372,8 +387,8 @@ const LINK_COMPARE_KEYS: &str = "protocol_id, endpoint_id";
 /// the order [`link_values_sql`] emits.
 const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, \
      config_type, last_used_at, last_seen_at, latency, latency_delay, latency_ip, speed_bps, \
-     error, error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
-     traffic_total_down, created_at, updated_at, version) VALUES ";
+     error, error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
+     traffic_total_up, traffic_total_down, created_at, updated_at, version) VALUES ";
 
 /// The whole-snapshot SQL tuple for one link.
 ///
@@ -416,6 +431,11 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
     }
     let _ = write!(
         sql,
+        ", {}",
+        sql_opt_lit(link.purge_reason.map(purge_reason_str))
+    );
+    let _ = write!(
+        sql,
         ", {}, {}, {}, {}, {}, {}, 1)",
         link.traffic.today_up,
         link.traffic.today_down,
@@ -434,8 +454,8 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
 /// another writer owns (`last_used_at`) or another group owns keeps its
 /// persisted value — the disjointness [`LinkGroups`] exists for. A patch that
 /// carries no group at all only creates a missing row (`DO NOTHING`).
-fn link_patch_conflict_sql(has_result: bool, has_traffic: bool) -> String {
-    let mut sets: Vec<&str> = Vec::with_capacity(11);
+fn link_patch_conflict_sql(has_result: bool, has_traffic: bool, has_purge: bool) -> String {
+    let mut sets: Vec<&str> = Vec::with_capacity(12);
     if has_result {
         sets.extend_from_slice(&[
             "latency = excluded.latency",
@@ -446,6 +466,9 @@ fn link_patch_conflict_sql(has_result: bool, has_traffic: bool) -> String {
             "error_kind = excluded.error_kind",
             "error_text = excluded.error_text",
         ]);
+    }
+    if has_purge {
+        sets.push("purge_reason = excluded.purge_reason");
     }
     if has_traffic {
         sets.extend_from_slice(&[
@@ -512,6 +535,23 @@ const fn error_kind_str(kind: crate::models_toasty::ProfileErr) -> &'static str 
         crate::models_toasty::ProfileErr::Real => "real",
         crate::models_toasty::ProfileErr::Fast => "fast",
         crate::models_toasty::ProfileErr::Name => "name",
+    }
+}
+
+/// The `CHECK`-constrained storage text of a [`PurgeReason`] variant, spelled
+/// the way toasty's derive renders it (`snake_case`, verified by the column-shape
+/// probe of 2026-09-17). A wrong spelling is refused by the column CHECK, and
+/// `purge_reason_is_written_by_its_own_group_only` executes this statement.
+const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static str {
+    use crate::models_toasty::PurgeReason;
+    match reason {
+        PurgeReason::RealityFallback => "reality_fallback",
+        PurgeReason::CertificateMismatch => "certificate_mismatch",
+        PurgeReason::CertificateExpired => "certificate_expired",
+        PurgeReason::NotTls => "not_tls",
+        PurgeReason::ConfigInvalid => "config_invalid",
+        PurgeReason::TransportRejected => "transport_rejected",
+        PurgeReason::OriginUnreachable => "origin_unreachable",
     }
 }
 
@@ -848,6 +888,7 @@ impl Database {
             .latency(s.latency.clone())
             .speed_bps(s.speed_bps)
             .error(s.error.clone())
+            .purge_reason(s.purge_reason)
             .traffic(s.traffic)
             .updated_at(now_epoch())
             .on_create(|create| create.created_at(now_epoch()))
@@ -890,20 +931,28 @@ impl Database {
         // bucketed by the action they need (both groups / RESULT / TRAFFIC /
         // none) rather than by their exact bit pattern — `contains` is what
         // decides the columns written, exactly as the per-row form did.
-        for (has_result, has_traffic) in
-            [(true, true), (true, false), (false, true), (false, false)]
-        {
+        for (has_result, has_purge, has_traffic) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+            (false, true, true),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
             let shape: Vec<&LinkPatch> = patches
                 .iter()
                 .filter(|p| {
                     p.groups.contains(LinkGroups::RESULT) == has_result
+                        && p.groups.contains(LinkGroups::PURGE) == has_purge
                         && p.groups.contains(LinkGroups::TRAFFIC) == has_traffic
                 })
                 .collect();
             if shape.is_empty() {
                 continue;
             }
-            let conflict = link_patch_conflict_sql(has_result, has_traffic);
+            let conflict = link_patch_conflict_sql(has_result, has_traffic, has_purge);
             for chunk in shape.chunks(LINK_STATEMENT_ROWS) {
                 let mut sql = String::with_capacity(chunk.len() * 160 + LINK_UPSERT_PREFIX.len());
                 sql.push_str(LINK_UPSERT_PREFIX);
@@ -2135,6 +2184,7 @@ mod tests {
             latency: None,
             speed_bps: None,
             error: None,
+            purge_reason: None,
             traffic: zero_traffic(),
             created_at: ts(0),
             updated_at: ts(0),
@@ -2638,7 +2688,9 @@ mod tests {
             .await
             .expect("country");
 
-        db.set_endpoint_ip_countries(&[]).await.expect("empty batch");
+        db.set_endpoint_ip_countries(&[])
+            .await
+            .expect("empty batch");
 
         let resolved = db
             .endpoint_resolutions(&[EndpointId::new(1)])
@@ -2668,9 +2720,13 @@ mod tests {
         ])
         .await
         .expect("batch first");
-        db.update_endpoint_resolution(EndpointId::new(1), vec![ip("9.9.9.9"), ip("1.1.1.1")], ts(100))
-            .await
-            .expect("resolve second");
+        db.update_endpoint_resolution(
+            EndpointId::new(1),
+            vec![ip("9.9.9.9"), ip("1.1.1.1")],
+            ts(100),
+        )
+        .await
+        .expect("resolve second");
 
         let resolved = db
             .endpoint_resolutions(&[EndpointId::new(1)])

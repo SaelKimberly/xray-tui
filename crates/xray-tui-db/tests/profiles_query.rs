@@ -196,6 +196,7 @@ fn link_value(
             },
             text: format!("{kind} probe"),
         }),
+        purge_reason: None,
         traffic: TrafficStats {
             today_up: 0,
             today_down: 0,

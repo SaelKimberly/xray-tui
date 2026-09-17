@@ -162,6 +162,34 @@ pub struct ErrorInfo {
     pub text: String,
 }
 
+/// Why a link was moved to Purgatory permanently (spec
+/// `2026-09-17-purge-reason-design.md` §7).
+///
+/// Fieldless on purpose: the exact case IS the variant, so the row needs ONE
+/// nullable column and one CHECK list — the HTTP status and the human detail
+/// stay in `error_text` beside it. Distinct from [`ErrorInfo`]: that is a
+/// measurement marker the error-TTL sweep clears, this is a verdict only a
+/// data-carrying success clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
+pub enum PurgeReason {
+    /// A REALITY handshake was answered by a real certificate: wrong
+    /// `pbk`/`sid`, or the host is not a REALITY endpoint.
+    RealityFallback,
+    /// The server's certificate does not cover the configured host/SNI.
+    CertificateMismatch,
+    /// The server's certificate is expired (or not yet valid).
+    CertificateExpired,
+    /// The port answered in cleartext: not the TLS endpoint the config claims.
+    NotTls,
+    /// The config as stored cannot dial (missing `pbk`, unknown xhttp mode,
+    /// unusable PSK, a request its own host/path cannot compose).
+    ConfigInvalid,
+    /// The proxy's OWN upgrade handshake was answered with an HTTP status.
+    TransportRejected,
+    /// The CDN answered an origin error (530/521/522/526).
+    OriginUnreachable,
+}
+
 /// Traffic accounting for an endpoint/group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub struct TrafficStats {
@@ -331,6 +359,15 @@ pub struct ProfileStats {
     /// 15k rows, on a reload only), which does not pay for a third raw DDL
     /// statement next to the schema tag.
     pub error: Option<ErrorInfo>,
+    /// Permanent-purge verdict from the last real probe (spec §7/§8).
+    ///
+    /// Not indexed: the page predicate reads the derived rank keys, and the
+    /// rank refresh reads this column per endpoint. Written only by a
+    /// [`LinkGroups::PURGE`] patch — the classifier's own group — so a fast
+    /// probe's result can neither set nor clear it.
+    ///
+    /// [`LinkGroups::PURGE`]: crate::LinkGroups::PURGE
+    pub purge_reason: Option<PurgeReason>,
     pub traffic: TrafficStats, // today/total up/down
     pub created_at: i64,       // epoch seconds (stamped by the writer)
     pub updated_at: i64,       // epoch seconds (stamped by the writer)
@@ -631,6 +668,7 @@ mod tests {
                 latency: latency.clone(),
                 speed_bps: None,
                 error: error.clone(),
+                purge_reason: None,
                 traffic: TrafficStats {
                     today_up: 0,
                     today_down: 0,

@@ -335,6 +335,7 @@ pub fn link_from_parsed_with_id(
         latency: None,
         speed_bps: None,
         error: None,
+        purge_reason: None,
         traffic: TrafficStats {
             today_up: 0,
             today_down: 0,
