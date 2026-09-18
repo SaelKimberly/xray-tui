@@ -670,13 +670,20 @@ serialize — REALITY must agree twice with the same scalar.
 - `hello/` — `build_hello`/`to_record` (GREASE pairing, 512-byte record
   padding), `parse_hello`.
 - `crypto/` — TLS 1.3 key schedule (RFC 8448-verified) + TLS 1.2 key block, AEAD record keys
-  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs. Every secret-producing entry point returns
+  (IV XOR seq), `X25519KeyPair`, JA3/JA4 codecs, and ML-KEM-768 (`mlkem.rs`, RustCrypto
+  `ml-kem`, FIPS 203 — liboqs was removed 2026-09-18 because its vendored build added CMake +
+  a C/C++ toolchain; the seed→ek bytes are pinned by a KAT captured before the swap). Every
+  secret-producing entry point returns
   `Zeroizing<…>` (`hkdf_extract`/`hkdf_expand_label`/`derive_secret`/`master_secret`/
   `finished_key`, the `TrafficSecrets` pair alias, `X25519KeyPair::agree`, the whole
-  `tls12` PRF chain) and `mlkem::SecretKey`/`SharedSecret` are `ZeroizeOnDrop` with
-  length-only `Debug`. Wire-visible outputs stay plain `Vec<u8>` (`transcript_hash`,
+  `tls12` PRF chain), `mlkem::SharedSecret` is `ZeroizeOnDrop` with length-only `Debug`, and
+  `mlkem::SecretKey` holds the RustCrypto `DecapsulationKey` (self-wiping, serialized as the
+  64-byte FIPS 203 keygen seed). Wire-visible outputs stay plain `Vec<u8>` (`transcript_hash`,
   `finished_mac`), and the key bytes ring holds inside `LessSafeKey`/`Prk` are
-  unwipeable — the wipeable surface is the derivation buffers on either side.
+  unwipeable — the wipeable surface is the derivation buffers on either side. Every
+  non-default crypto site (this engine, xray's AES-CTR mask, the binary-context BLAKE3, the
+  legacy KDFs, QUIC header protection) is inventoried in `docs/crypto-dependencies.md`; both
+  crypto crates carry `#![forbid(unsafe_code)]`.
 - `record/` — record framing, `read_record`, `TlsStream<S>`.
 - `handshake/` — client handshake (HRR detection, `ServerVerifier` seam,
   multi-record flight reassembly); TLS 1.2 fallback driver in `handshake/tls12.rs`

@@ -25,6 +25,12 @@
 //! ([`ProtocolConfig`], [`EndpointEssentials`]). No config model is defined
 //! here.
 
+// The protocol/transport/security core holds no `unsafe`: every primitive is
+// ring/RustCrypto and every buffer is a safe abstraction. Forbidding it here
+// keeps that true — a future edit cannot add hand-rolled unsafe to the
+// protocol engine silently.
+#![forbid(unsafe_code)]
+
 /// Byte-stream capability: readable, writable, `Unpin`, `Send` — the seam
 /// between layers.
 ///

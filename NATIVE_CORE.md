@@ -68,8 +68,12 @@ the dial.
   documented exception: x25519-dalek (runtime dep) for the REALITY client,
   because ring's `EphemeralPrivateKey` is single-use and cannot serialize —
   REALITY must agree twice with the same scalar. A second documented
-  exception: `oqs` (vendored liboqs build, no system dep) for ML-KEM-768 —
-  ring has no post-quantum KEM (SP7). `zeroize` is NOT a third exception:
+  exception: `ml-kem` (RustCrypto, pure Rust) for ML-KEM-768 —
+  ring has no post-quantum KEM (SP7). It replaced `oqs`/liboqs on 2026-09-18:
+  liboqs' vendored build needed CMake, libclang and a C/C++ toolchain, which
+  the `x86_64-pc-windows-gnu` target cannot assume, and the FIPS 203 bytes are
+  unchanged (pinned by the seed→ek KAT in `crypto/mlkem.rs`). `zeroize` is NOT
+  a third exception:
   it supplies no algorithm and competes with nothing in ring — it is a
   memory-hygiene dep, and both its own feature and the `zeroize` features
   of the cipher crates are a separate contract (next bullet).
@@ -92,6 +96,19 @@ the dial.
   lacks a field the tunnel needs, that's a proto change evaluated separately
   (SP7's VLESS `mlkem768x25519plus` encryption parser + hybrid curve names
   are the one instance so far).
+- **Crate-backed cryptography, hazmat sites governed.** ring and RustCrypto
+  supply every primitive, and both crates are `#![forbid(unsafe_code)]`. The
+  non-default sites — the hand-rolled BLAKE3 derive-key, xray's AES-CTR mask,
+  the hand-rolled TLS key schedule and 1.2 PRF, QUIC Initial decryption, the
+  protocol-mandated legacy KDFs, and the triaged dependency advisories — are
+  inventoried in `docs/crypto-dependencies.md` with a cause, an **independent
+  oracle** (RFC/NIST vector, the Go peer's own output, or a real peer — never a
+  self-consistent round-trip), and a retirement trigger. ML-KEM is RustCrypto
+  `ml-kem`; the liboqs backend was removed 2026-09-18 because its vendored build
+  added CMake, libclang and a C/C++ toolchain requirement on top of what the
+  `x86_64-pc-windows-gnu` target already needs (`cc` for zstd-sys / lmdb /
+  sqlite, plus turso's unused `bindgen` build-dep); FIPS 203 bytes are
+  unchanged — pinned by the KAT in `crypto/mlkem.rs`.
 
 ## Verification tiers
 
@@ -192,7 +209,7 @@ hellos are OS-independent within a family). See `docs/tls-fingerprint-roster.md`
 | `fingerprints/` | identity selector: `Fingerprint { browser, version?, os?, device? }` → **next-modern** table resolution over the 71-row two-tier table (smallest kept major `>= v` within the os/device-compatible group; above-newest / below-oldest refuse) with **cross-triple os-drop** fallback (exact triple miss → retry os-dropped — desktop hellos are OS-independent within a family); never a different browser, never older than requested; unknown combos error listing what IS resolvable; `FingerprintBuilder` overrides (ciphers/extensions/curves/ALPN/signature-algs, `GreasePolicy::Keep|Strip`); generated JA4 catalog (`catalog/catalog_data.rs`, from the frozen ja4db-export snapshot 2026-05-15 via ua-parser — rerun `gen.py`, never hand-edit) as evidence (`Resolved::in_catalog`); full-JA4 oracle in `crypto/fingerprint/ja4.rs` (final FoxIO scheme, peet.ws-validated) |
 | `client/` | unified engine API: `TlsConfig { mode, server_name, alpn, rng }` + `TlsMode::{Plain, Reality}` + one `connect(stream, &TlsConfig)` entry |
 | `hello/` | `build_hello`/`to_record` (GREASE pairing, 512-byte record padding), `parse_hello` |
-| `crypto/` | key schedule (RFC 8448-verified; hybrid input = `pq ‖ classical` shared secrets), AEAD record keys (IV XOR seq), TLS 1.2 key block (`tls12.rs` — X25519 + secp256r1 ECDHE, AES-GCM/ChaCha20-Poly1305 explicit-nonce AEAD via `seal_with_nonce`/`open_with_nonce`; both curves yield the same 32-byte premaster, so the schedule is curve-blind), `X25519KeyPair` (low-order peer points refused per RFC 7748 §6.1), `mlkem.rs` ML-KEM-768 primitives via liboqs (`oqs`, vendored — pk 1184 / sk 2400 / ct 1088 / ss 32), `fingerprint/` JA3 + JA4 encoders |
+| `crypto/` | key schedule (RFC 8448-verified; hybrid input = `pq ‖ classical` shared secrets), AEAD record keys (IV XOR seq), TLS 1.2 key block (`tls12.rs` — X25519 + secp256r1 ECDHE, AES-GCM/ChaCha20-Poly1305 explicit-nonce AEAD via `seal_with_nonce`/`open_with_nonce`; both curves yield the same 32-byte premaster, so the schedule is curve-blind), `X25519KeyPair` (low-order peer points refused per RFC 7748 §6.1), `mlkem.rs` ML-KEM-768 primitives via RustCrypto `ml-kem` (pure Rust — pk 1184 / sk = the 64-byte FIPS 203 seed / ct 1088 / ss 32), `fingerprint/` JA3 + JA4 encoders |
 | `record/` | record framing, `read_record`, `TlsStream<S>` (AsyncRead/Write, close_notify→EOF; per-direction direct mode `set_write_direct`/`set_read_direct` — raw record-layer bypass that hands the socket to the tunnel, backing the vision Direct splice). TLS 1.2 record protection (`aead_aad_12` plaintext-length AAD, explicit nonce, one write counter advanced only after a successful seal, `AppKeys` deliberately not `Clone`; a plaintext CCS after the handshake is `unexpected_message`, not a skip) |
 | `handshake/` | TLS 1.3 client handshake + TLS 1.2 fallback driver (`handshake/tls12.rs`, ECDHE + AEAD over X25519 or secp256r1 — reached from the shared `drive()` on a 1.2 ServerHello; REALITY over 1.2 surfaces `RealityFallback`), `ServerVerifier` seam, multi-record flight reassembly; one shared `drive()` for plain + REALITY; hybrid-curve key exchange (curve 4588 selected → decapsulate the ServerHello's 1088-B ML-KEM ciphertext, feed `pq ‖ classical` to the key schedule) |
 | `verify/` | `WebPkiVerifier` (roots/CA DER/`insecure`/`pin_sha256`; CV signature always checked — the server sigalg is checked against the ClientHello offer on both versions; TLS 1.2 ECDSA schemes name no curve (RFC 8422 §5.1.3), so one candidate per curve is tried) |
@@ -235,9 +252,10 @@ ServerHello the client decapsulates the server's 1088-B ciphertext and feeds
 `pq ‖ classical` to the TLS 1.3 key schedule — the Go wire order (xray
 `handshake_client_tls13.go`/`handshake_server_tls13.go`; an earlier
 classical-first draft was wrong and is fixed everywhere: encode, parse,
-IKM order, fakes, goldens). ML-KEM-768 primitives come from liboqs via the
-`oqs` crate (vendored build — no system liboqs; FIPS 203, wire-compatible
-with Go's `crypto/mlkem`). `SecP256r1MLKEM768` (4587) /
+IKM order, fakes, goldens). ML-KEM-768 primitives come from RustCrypto
+`ml-kem` (pure Rust; FIPS 203, wire-compatible with Go's `crypto/mlkem` —
+pinned by the seed→ek KAT in `crypto/mlkem.rs`, which was captured from the
+retired liboqs implementation and independently reproduced by Go). `SecP256r1MLKEM768` (4587) /
 `SecP384r1MLKEM1024` (4589) are parsed but rejected at handshake time — the
 engine has no P-256/P-384 ECDH (explicit error, not a silent classical
 fallback). REALITY accepts the 4588 share per xray `reality.go:79` /

@@ -129,7 +129,7 @@ fn a_part_ok(computed: &str, registered: &str, ext_delta: u8) -> bool {
 fn every_generated_entry_hashes_to_source_ja4() {
     // One ML-KEM-768 keypair serves every spec (the key-share BODY is
     // JA4-invisible; only the group ids count), same as the profiles tests.
-    let (mlkem_pk, _) = xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
+    let (mlkem_pk, _) = xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair();
 
     let mut full = 0u32;
     let mut padding_in_hello = 0u32;

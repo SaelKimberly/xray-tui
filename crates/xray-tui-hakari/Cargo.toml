@@ -28,7 +28,7 @@ bytemuck = { version = "1", default-features = false, features = ["derive"] }
 bytes = { version = "1" }
 chacha20 = { version = "0.10", default-features = false, features = ["rng", "xchacha", "zeroize"] }
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
-compact_str = { version = "0.9", default-features = false, features = ["std"] }
+compact_str = { version = "0.9", features = ["serde"] }
 constant_time_eq = { version = "0.4" }
 criterion = { version = "0.8", features = ["async_tokio"] }
 crossbeam-epoch = { version = "0.9" }
@@ -47,14 +47,13 @@ h2 = { version = "0.4", default-features = false, features = ["stream"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 http-body-util = { version = "0.1", features = ["channel"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["zeroize"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
 icu_locale_core = { version = "2", default-features = false, features = ["alloc", "zerovec"] }
 icu_normalizer = { version = "2", default-features = false, features = ["compiled_data", "utf16_iter", "utf8_iter"] }
 icu_provider = { version = "2", default-features = false, features = ["alloc", "baked"] }
-itertools-582f2526e08bb6a0 = { package = "itertools", version = "0.14" }
-itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
+itertools = { version = "0.14" }
 kasuari = { version = "0.4", default-features = false, features = ["std"] }
 libc = { version = "0.2" }
 litemap = { version = "0.8", default-features = false, features = ["alloc"] }
@@ -129,13 +128,11 @@ bit-vec = { version = "0.10", default-features = false, features = ["serde", "st
 bitflags = { version = "2", default-features = false, features = ["serde", "std"] }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
-clang-sys = { version = "1", default-features = false, features = ["clang_11_0", "runtime"] }
 either = { version = "1", features = ["use_std"] }
 form_urlencoded = { version = "1" }
 futures-core = { version = "0.3" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
-itertools-582f2526e08bb6a0 = { package = "itertools", version = "0.14" }
-itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
+itertools = { version = "0.14" }
 libc = { version = "0.2" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
@@ -190,7 +187,7 @@ chacha20 = { version = "0.10", default-features = false, features = ["rng", "xch
 cipher = { version = "0.5", default-features = false, features = ["stream-wrapper", "zeroize"] }
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["zeroize"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 nom = { version = "7" }
@@ -230,7 +227,7 @@ cipher = { version = "0.5", default-features = false, features = ["stream-wrappe
 crypto-common = { version = "0.2", default-features = false, features = ["getrandom", "zeroize"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
-hybrid-array = { version = "0.4", default-features = false, features = ["zeroize"] }
+hybrid-array = { version = "0.4", default-features = false, features = ["ctutils", "extra-sizes", "zeroize"] }
 nom = { version = "7" }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", default-features = false, features = ["visit"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
@@ -259,7 +256,6 @@ ignored = [
     "cc",
     "chacha20",
     "cipher",
-    "clang-sys",
     "compact_str",
     "constant_time_eq",
     "criterion",
@@ -290,8 +286,7 @@ ignored = [
     "icu_normalizer",
     "icu_provider",
     "ipnet",
-    "itertools-582f2526e08bb6a0",
-    "itertools-594e8ee84c453af0",
+    "itertools",
     "kasuari",
     "libc",
     "linux-raw-sys",

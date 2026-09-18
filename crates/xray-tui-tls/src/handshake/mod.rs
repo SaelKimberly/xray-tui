@@ -250,8 +250,7 @@ pub(crate) async fn drive<S: AsyncRead + AsyncWrite + Unpin + Send>(
         (Some(sk), Some(ct)) => {
             // The ciphertext was validated at parse; decapsulate it
             // directly — no second copy through a temp `Vec`.
-            let pq_shared =
-                Mlkem768::decapsulate(sk, ct).map_err(|e| TlsError::Crypto(e.to_string()))?;
+            let pq_shared = Mlkem768::decapsulate(sk, ct);
             let mut combined = Zeroizing::new(Vec::with_capacity(classical_shared.len() + 32));
             combined.extend_from_slice(pq_shared.as_bytes());
             combined.extend_from_slice(classical_shared.as_slice());
@@ -393,7 +392,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send>(
         )
     });
     let mlkem = if offers_hybrid {
-        let (pk, sk) = Mlkem768::generate_keypair().map_err(|e| TlsError::Crypto(e.to_string()))?;
+        let (pk, sk) = Mlkem768::generate_keypair();
         (Some(pk), Some(sk))
     } else {
         (None, None)

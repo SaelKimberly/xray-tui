@@ -15,6 +15,28 @@ ignore = ["RUSTSEC-2023-0071"]
 informational_warnings = ["unmaintained", "unsound", "notice"]
 severity_threshold = "low"
 
+# Reachable but unactionable from this workspace — deliberately NOT in
+# `ignore`, so they keep showing up in the warning list instead of being
+# hidden. Both are third-party pins, neither is on a path this app drives:
+#
+# - lru 0.16.4, RUSTSEC-2026-0253 "unsound: potential use-after-free due to
+#   lack of panic safety in LruCache::pop()". Reached as
+#   toasty-driver-turso → turso_core 0.7.2 → tantivy 0.26.1 → lru. 0.16.4 is
+#   the newest 0.16.x published and tantivy pins ^0.16.3, so there is no
+#   in-range fix — only a turso/tantivy bump or a `[patch]`. We never call
+#   `LruCache::pop`; the unsoundness requires a panic inside tantivy's cache,
+#   i.e. the FTS index path, which this app never populates. Re-evaluate when
+#   turso or tantivy moves.
+# - bincode 1.3.3, RUSTSEC-2025-0141 (unmaintained). A `heed-types` dependency
+#   (heed 0.22 → heed-types), not ours to migrate: heed-types would have to
+#   move to bincode 2's different API. Re-evaluate with the next heed bump.
+# - rustls-pemfile 2.2.0, RUSTSEC-2025-0134 (unmaintained; superseded by
+#   rustls-pki-types' PEM support). Same class as the `rsa` entry above: it
+#   enters only through toasty's optional postgresql driver
+#   (toasty-driver-postgresql → tokio-postgres → rustls-pemfile), and no
+#   workspace member enables that driver — this project is SQLite/turso-only.
+#   It disappears with the driver chain, not with a bump.
+
 [database]
 fetch = true
 stale = false

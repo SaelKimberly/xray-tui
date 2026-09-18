@@ -277,7 +277,7 @@ pub async fn connect_reality<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>
     //     the encapsulation key then flows into the provisioned key share.
     //     Classical-only profiles skip the ~100 µs keygen entirely.
     let (pq_public, pq_secret) = if params.provisioner.offers_hybrid_key_share() {
-        let (pk, sk) = Mlkem768::generate_keypair().map_err(|e| TlsError::Crypto(e.to_string()))?;
+        let (pk, sk) = Mlkem768::generate_keypair();
         (Some(pk), Some(sk))
     } else {
         (None, None)
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn fixed_chrome133_provisioner_builds_auth_payload_hello() {
         let rng = ring::rand::SystemRandom::new();
-        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
+        let (mlkem_pk, _) = Mlkem768::generate_keypair();
         let hello = FixedChrome133
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",
@@ -458,7 +458,7 @@ mod tests {
         use crate::crypto::fingerprint::ja3::Ja3Fields;
         use crate::crypto::fingerprint::ja4::full_ja4;
 
-        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
+        let (mlkem_pk, _) = Mlkem768::generate_keypair();
         let rng = FixedRandom {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),

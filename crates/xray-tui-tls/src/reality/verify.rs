@@ -8,6 +8,7 @@
 //! Ed25519 pair.
 
 use ring::{digest, hmac, signature};
+use subtle::ConstantTimeEq as _;
 
 use crate::error::{Result, TlsError};
 
@@ -72,7 +73,9 @@ pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<(
     }
     let key = hmac::Key::new(hmac::HMAC_SHA512, auth_key);
     let expected = hmac::sign(&key, &pubkey);
-    if !ct_eq(expected.as_ref(), signature) {
+    // Constant-time: `subtle`'s slice comparison (both sides are fixed-size
+    // HMAC-SHA512 tags). ring's `verify_slices_are_equal` is deprecated.
+    if expected.as_ref().ct_eq(signature).unwrap_u8() != 1 {
         return Err(TlsError::Verify(
             "certificate signature is not HMAC-SHA512(auth_key, ed25519_pub) — not a REALITY server"
                 .into(),
@@ -310,19 +313,6 @@ fn extract_spki(cert_der: &[u8]) -> Result<&[u8]> {
     Err(TlsError::Verify(
         "no SubjectPublicKeyInfo found in certificate".into(),
     ))
-}
-
-/// Constant-time equality: the branch depends only on the accumulated XOR
-/// difference, never on the bytes themselves. ring's
-/// `verify_slices_are_equal` is deprecated (0.17.14), so the fold is
-/// written out; both sides here are fixed-size `HMAC-SHA512` outputs.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_ok = a.len() == b.len();
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0 && len_ok
 }
 
 /// Splits a BIT STRING *value* (`unused_bits(1) || payload`) into its

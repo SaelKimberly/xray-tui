@@ -151,8 +151,7 @@ async fn grade(profile: &'static str, fingerprint: &Fingerprint) -> Result<(), B
         bytes: vec![0x42; 128],
         pos: AtomicUsize::new(0),
     };
-    let (mlkem_pk, _) =
-        xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
+    let (mlkem_pk, _) = xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair();
     let local_hello = build_hello(
         &spec,
         &BuildParams {
@@ -578,8 +577,7 @@ mod roster {
         };
         println!("roster sweep: {} entries ({scope})", entries.len());
 
-        let (mlkem_pk, _) =
-            xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
+        let (mlkem_pk, _) = xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair();
         // One shared ML-KEM keypair for the whole sweep (the key-share BODY
         // is JA4-invisible; only the group ids count). Leaked once: the
         // sweep tasks need `'static` — a CLI-sized, single allocation.

@@ -42,7 +42,11 @@ toasty.workspace = true
 smallvec.workspace = true
 bstr = { version = "^1.12.1", default-features = false, features = ["std"] }
 aho-corasick.workspace = true
-smartstring = { version = "^1.0.1", features = ["serde"] }
+# Small inline string for URL/credential text. `compact_str` replaces the
+# unmaintained `smartstring` (RUSTSEC-2026-0249) and is already in the graph
+# via ratatui-core, so this pins the version already resolved (0.9.x) instead
+# of adding a second major.
+compact_str = { version = "^0.9.1", features = ["serde"] }
 
 # ============ IDNA for hostname parsing ============
 idna = { version = "^1.1.0", default-features = false, features = ["std", "compiled_data"] }

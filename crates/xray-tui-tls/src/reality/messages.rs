@@ -156,7 +156,7 @@ mod tests {
                 .unwrap();
         let rng = ring::rand::SystemRandom::new();
         let keypair = X25519KeyPair::generate(&rng).unwrap();
-        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
+        let (mlkem_pk, _) = Mlkem768::generate_keypair();
         let shared = keypair.agree(&server_pub).unwrap();
 
         // Fixed random bytes [0..32]: salt = [0..20], nonce = [20..32].
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn extract_client_random_from_provisioned_hello() {
         let rng = ring::rand::SystemRandom::new();
-        let (mlkem_pk, _) = Mlkem768::generate_keypair().unwrap();
+        let (mlkem_pk, _) = Mlkem768::generate_keypair();
         let hello = FixedChrome133
             .provision(&HelloProvisionParams {
                 server_name: "www.microsoft.com",

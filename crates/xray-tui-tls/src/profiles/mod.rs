@@ -382,7 +382,7 @@ mod tests {
         // entries; a truncated roster would silently shrink this test's
         // coverage).
         assert_eq!(super::generated::GENERATED.len(), 69);
-        let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
+        let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair();
         for (name, spec_fn) in all_specs() {
             let spec = spec_fn();
             let rng = FixedRandom {
@@ -443,7 +443,7 @@ mod tests {
             (0xfe0d, 38, "encrypted_client_hello (RFC 9849 §5.1)"),
         ];
 
-        let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair().unwrap();
+        let (mlkem_pk, _) = crate::crypto::mlkem::Mlkem768::generate_keypair();
         for (name, spec_fn) in all_specs() {
             let spec = spec_fn();
             let rng = FixedRandom {

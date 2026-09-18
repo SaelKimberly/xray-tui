@@ -266,6 +266,17 @@ impl WireAead {
 /// first run through `blake3.DeriveKey("VLESS", ..)`. Go's `cipher.NewCTR`
 /// treats the full 16-byte IV as the initial big-endian counter block —
 /// `Ctr128BE`.
+///
+/// Hazmat assessment (`ctr`'s crate banner warns that ciphertexts are
+/// unauthenticated, and that warning is about *encryption*): this is a
+/// keystream MASK, not an encryption scheme. It hides relay blocks
+/// (`xorpub`/`random`) and, in `random` mode, the 5-byte record headers, on
+/// exactly the bytes xray masks; the bytes that carry user data are sealed by
+/// the NFS AEAD (`WireAead`, ChaCha20-Poly1305) and the relay chain is
+/// authenticated by `b3::hash32`. No `RustCrypto` API provides raw AES-CTR
+/// other than this crate, and xray's wire format fixes the construction, so
+/// the crate stays; the wire bytes are pinned against Go by the KAT tests at
+/// the bottom of this file. Recorded in `docs/crypto-dependencies.md`.
 fn new_ctr(key: &[u8], iv: &[u8; 16]) -> Ctr128BE<Aes256> {
     let derived = b3::derive_key_bytes(b"VLESS", key);
     Ctr128BE::<Aes256>::new(&derived.into(), iv.into())
@@ -537,8 +548,7 @@ pub async fn handshake(
     // Client PFS key exchange: ephemeral ML-KEM-768 + ephemeral X25519.
     // The public material is staged in a stack array and sealed straight
     // into the hello — no `pfs_public` Vec, no seal temp `Vec`s.
-    let (mlkem_pk, mlkem_dsk) =
-        Mlkem768::generate_keypair().map_err(|e| NativeError::Tls(e.to_string()))?;
+    let (mlkem_pk, mlkem_dsk) = Mlkem768::generate_keypair();
     let x25519_eph = X25519KeyPair::generate(&rng).map_err(|e| NativeError::Tls(e.to_string()))?;
     let mut pfs_public = [0u8; 1184 + X25519_LEN];
     pfs_public[..1184].copy_from_slice(mlkem_pk.as_bytes());
@@ -604,8 +614,7 @@ pub async fn handshake(
     let server_pfs = nfs_aead.open_with(MAX_NONCE, encrypted_pfs, &[])?;
     let mlkem_ct = Ciphertext::from_bytes(&server_pfs[..MLKEM_CT_LEN])
         .map_err(|e| NativeError::Tls(e.to_string()))?;
-    let mlkem_key = Mlkem768::decapsulate(&mlkem_dsk, &mlkem_ct)
-        .map_err(|e| NativeError::Tls(e.to_string()))?;
+    let mlkem_key = Mlkem768::decapsulate(&mlkem_dsk, &mlkem_ct);
     let mut peer_x25519 = [0u8; X25519_LEN];
     peer_x25519.copy_from_slice(&server_pfs[MLKEM_CT_LEN..MLKEM_CT_LEN + X25519_LEN]);
     let x25519_key = x25519_eph
@@ -1033,10 +1042,7 @@ mod tests {
                         &relays[off..off + MLKEM_CT_LEN],
                     )
                     .expect("ct");
-                    nfs_key = Mlkem768::decapsulate(&mlkem_sk, &ct)
-                        .expect("decapsulate")
-                        .as_bytes()
-                        .to_vec();
+                    nfs_key = Mlkem768::decapsulate(&mlkem_sk, &ct).as_bytes().to_vec();
                 }
             }
             if j == keys.len() - 1 {
@@ -1144,7 +1150,7 @@ mod tests {
         xray_tui_tls::crypto::mlkem::SecretKey,
     ) {
         let x = X25519KeyPair::generate(&ring::rand::SystemRandom::new()).expect("x25519");
-        let (pk, sk) = Mlkem768::generate_keypair().expect("mlkem");
+        let (pk, sk) = Mlkem768::generate_keypair();
         (
             vec![
                 ServerKey::X25519(x.public_key()),
@@ -1225,6 +1231,109 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_random_custom_padding() {
         roundtrip(MlkemMode::Random, "100-35-111.0-0-0", 100).await;
+    }
+
+    // ── Go-pinned keystream vectors (2026-09-18) ─────────────────────────
+    //
+    // The `roundtrip_*` tests and `random_mode_masks_headers_only` compare
+    // this implementation against itself (our own server double, our own
+    // `new_ctr`), so a wrong mask passes on both ends. These constants come
+    // from Go 1.27.1 using xray's own libraries — `lukechampine.com/blake3`
+    // `DeriveKey("VLESS", key)` plus `crypto/aes` under `cipher.NewCTR` — and
+    // are what makes the mask wire-compatible with the peer rather than
+    // merely self-consistent. Generator: derive `k = DeriveKey("VLESS", key)`
+    // then `cipher.NewCTR(aes.NewCipher(k), iv).XORKeyStream(out, out)` over
+    // zeros; inputs are `iv = 0..15`, keys/secret = `[n + 0..31]`.
+
+    /// Decode a hex string (KAT constants stay readable and copy-pasteable
+    /// from their sources).
+    fn unhex(s: &str) -> Vec<u8> {
+        assert!(
+            s.len().is_multiple_of(2),
+            "hex string must have an even length"
+        );
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
+            .collect()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            write!(out, "{b:02x}").expect("string write");
+        }
+        out
+    }
+
+    fn ramp(len: usize, base: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| base.wrapping_add(u8::try_from(i).expect("small len")))
+            .collect()
+    }
+
+    /// The raw counter-mode primitive against the published vector: NIST SP
+    /// 800-38A F.5.5 (CTR-AES256.Encrypt, block 1). Pins `Ctr128BE`'s
+    /// semantics — the 16-byte IV is the initial big-endian counter block,
+    /// which is exactly what makes this equal to Go's `cipher.NewCTR`.
+    #[test]
+    fn nist_sp800_38a_aes256_ctr_matches_the_published_vector() {
+        let key: [u8; 32] =
+            unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+                .try_into()
+                .expect("32-byte key");
+        let iv: [u8; 16] = unhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+            .try_into()
+            .expect("16-byte counter block");
+        let mut buf = unhex("6bc1bee22e409f96e93d7e117393172a");
+        Ctr128BE::<Aes256>::new(&key.into(), (&iv).into()).apply_keystream(&mut buf);
+        assert_eq!(hex(&buf), "601ec313775789a5b7a7f504bbf3d228");
+    }
+
+    /// `new_ctr`'s composition (blake3 `DeriveKey("VLESS", ..)` then AES-256
+    /// CTR) against Go/xray bytes.
+    #[test]
+    fn xray_new_ctr_keystream_matches_go() {
+        let iv: [u8; 16] = ramp(16, 0).try_into().expect("16 bytes");
+        let key: [u8; 32] = ramp(32, 0x40).try_into().expect("32 bytes");
+        let mut ks = [0u8; 32];
+        new_ctr(&key, &iv).apply_keystream(&mut ks);
+        assert_eq!(
+            hex(&ks),
+            "c7dc79c22501a8db2f0c846f64e623c6ddf364bce1581b178a78a7bcb5f3c16d"
+        );
+    }
+
+    /// The relay-chain masking order against Go bytes: (a) `hash32` of the
+    /// next server key masked by THIS hop's shared secret, and (b) the next
+    /// block, where that same CTR instance CONTINUES from the `hash32` region
+    /// into the block (offset 32) while the block's own server-key stream
+    /// starts at 0. Restarting the stream per block — a plausible
+    /// "simplification" — breaks (b) and the peer rejects the chain.
+    #[test]
+    fn xray_relay_chain_masking_matches_go() {
+        let iv: [u8; 16] = ramp(16, 0).try_into().expect("16 bytes");
+        let k1: [u8; 32] = ramp(32, 0x80).try_into().expect("32 bytes");
+        let s0: [u8; 32] = ramp(32, 0xa0).try_into().expect("32 bytes");
+
+        let mut hash_region = b3::hash32(&k1);
+        new_ctr(&s0, &iv).apply_keystream(&mut hash_region);
+        assert_eq!(
+            hex(&hash_region),
+            "087f1ddc1f178975c335512d7de1e7c6dd0029ba66d549cd226806003de2a45e"
+        );
+
+        let mut block1 = [0u8; 64];
+        new_ctr(&k1, &iv).apply_keystream(&mut block1);
+        let mut continuing = new_ctr(&s0, &iv);
+        let mut consumed = [0u8; 32];
+        continuing.apply_keystream(&mut consumed);
+        continuing.apply_keystream(&mut block1[..32]);
+        assert_eq!(
+            hex(&block1),
+            "b817a575de017b6239fcf7e718acf8ef813d0ae423115721d061300e56c6130ad3a01296603a8af67680d643656e443edb29a859441774f29daa327c664440db"
+        );
     }
 
     /// Pins the random-mode masking semantics against xray `XorConn`

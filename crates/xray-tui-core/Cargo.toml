@@ -60,7 +60,11 @@ tempfile = "3"
 
 # ============ Persistent Log Storage ============
 heed = { version = "0.22" }
-postcard = { version = "1", features = ["alloc"] }
+# Serialization for the LMDB log store. `default-features = false` drops
+# postcard's default `heapless-cas` feature: we only use `to_slice` (core),
+# `to_allocvec` and `from_bytes` — never `postcard::heapless` — so this removes
+# unmaintained `heapless 0.7`/`atomic-polyfill` from the graph.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 	[build-dependencies]

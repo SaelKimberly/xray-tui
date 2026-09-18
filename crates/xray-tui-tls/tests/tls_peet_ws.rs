@@ -54,8 +54,7 @@ fn local_fingerprints_match_locked_constants() {
             bytes: vec![0x42; 128],
             pos: AtomicUsize::new(0),
         };
-        let (mlkem_pk, _) =
-            xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
+        let (mlkem_pk, _) = xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair();
         let hello = build_hello(
             &spec,
             &BuildParams {
@@ -173,8 +172,7 @@ async fn sampled_roster_bands_match_live_peet_ws() {
     );
 
     let mut failures: Vec<String> = Vec::new();
-    let (mlkem_pk, _) =
-        xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
+    let (mlkem_pk, _) = xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair();
     for entry in entries {
         let spec = (entry.spec_fn)();
         let fixed = local::FixedRandom {
@@ -348,8 +346,7 @@ async fn fetch_peet_report_spec(
         bytes: vec![0x42; 128],
         pos: AtomicUsize::new(0),
     };
-    let (mlkem_pk, _) =
-        xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair().expect("mlkem keypair");
+    let (mlkem_pk, _) = xray_tui_tls::crypto::mlkem::Mlkem768::generate_keypair();
     let local_hello = build_hello(
         spec,
         &BuildParams {

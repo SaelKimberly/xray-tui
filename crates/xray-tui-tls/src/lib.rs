@@ -4,6 +4,12 @@
 //! including JA3 fingerprinting, TLS record and handshake handling, certificate
 //! verification, and REALITY protocol integration.
 
+// The crypto/TLS engine holds no `unsafe`: every primitive is ring/RustCrypto,
+// and the engine owns no raw-pointer or FFI surface. Forbidding it here keeps
+// that true — a future edit cannot add hand-rolled unsafe to the crypto core
+// silently (a genuine need would move the code out of this crate instead).
+#![forbid(unsafe_code)]
+
 pub mod fingerprints;
 pub mod profiles;
 pub mod spec;

@@ -80,8 +80,7 @@ pub fn mlkem_enc_pair() -> (String, String) {
     ring::rand::SystemRandom::new()
         .fill(&mut seed)
         .expect("mlkem seed rng");
-    let (ek, _) =
-        xray_tui_tls::crypto::mlkem::Mlkem768::keypair_from_seed(&seed).expect("mlkem seed keygen");
+    let (ek, _) = xray_tui_tls::crypto::mlkem::Mlkem768::keypair_from_seed(&seed);
     let client = format!(
         "mlkem768x25519plus.native.1rtt.{PAD}.{}.{}",
         b64(x_pub.as_bytes()),
