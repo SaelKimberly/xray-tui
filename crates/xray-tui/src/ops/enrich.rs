@@ -222,9 +222,18 @@ pub fn spawn_dns_resolve_host(
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
-        // One permit per in-flight lookup — see [`RESOLVE_SEM`].
-        let Ok(_permit) = Arc::clone(&RESOLVE_SEM).acquire_owned().await else {
-            return;
+        // One permit per in-flight lookup — see [`RESOLVE_SEM`]. A FORCED
+        // lookup (the `x` key, the connect path) bypasses the bound: the
+        // semaphore is fair, so a user-triggered resolve would otherwise queue
+        // behind an entire feed's fan-out and look dead, and a single request
+        // cannot flood anything.
+        let _permit = if force {
+            None
+        } else {
+            match Arc::clone(&RESOLVE_SEM).acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(_) => return,
+            }
         };
         let now = unix_now();
         // Whether the resolution produced a usable answer; `false` feeds the

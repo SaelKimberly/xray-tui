@@ -324,6 +324,14 @@ async fn plan_scopes_select_by_materialized_tier() {
     assert_eq!(ids_of(&new), vec![1, 2, 3, 4, 5, 7]);
     assert_eq!(new.total, 6);
 
+    // ...and `New` alone is that same set minus the successful ones.
+    let untested = db
+        .profiles_page(&scoped(PlanScope::New))
+        .await
+        .expect("page");
+    assert_eq!(ids_of(&untested), vec![3, 5]);
+    assert_eq!(untested.total, 2);
+
     // tiers 3/4/5: nothing measured clean and nothing untested. e6 is the DNS
     // host whose stored measurement sits in the name band — the row that shows
     // `[name]` and cannot otherwise be re-tested deliberately.

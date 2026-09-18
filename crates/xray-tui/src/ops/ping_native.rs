@@ -315,28 +315,68 @@ const IP_INFO_ATTEMPTS: u32 = 2;
 /// A short pause costs one sleep and lets a transient miss recover.
 const IP_INFO_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// What one exit-IP attempt produced.
+enum IpInfoOutcome {
+    /// The provider answered with the expected object.
+    Answer(String),
+    /// The provider REFUSED: a non-2xx status, or a body that is not the
+    /// expected object (ip-api's `{"status":"fail","message":…}` — its HTTPS
+    /// form, its rate limit, its quota). Deterministic, so a retry repeats it.
+    Refused(String),
+    /// The tunnel or the request failed — transient, worth the one retry.
+    Transport(String),
+}
+
 /// Exit IP + country through a second tunnel; any failure is `None` (the
 /// latency result stands on its own — parity with the old probe).
 ///
-/// The retry is load-bearing for the UI: without it a single transient miss left
-/// `Latency::Real { ip: None }` on a link whose tunnel demonstrably worked, and
-/// the row rendered a real delay with no exit IP. Each attempt carries
-/// `IP_INFO_TIMEOUT`, so the pair is bounded.
+/// The retry runs only on a TRANSPORT miss. A refusal is deterministic and is
+/// usually the provider's rate limit, which every concurrent probe shares — so
+/// retrying it would double the request rate exactly when that limit is already
+/// biting. Both outcomes are logged at `debug` (the Actions panel), so a row
+/// that renders `—` has a stated reason instead of being silent.
 async fn fetch_ip_info(params: &NativeConnectParams, ip_api_url: &str) -> Option<String> {
     let target = parse_probe_url(ip_api_url).ok()?;
     for attempt in 0..IP_INFO_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(IP_INFO_RETRY_DELAY).await;
         }
-        if let Some(info) = fetch_ip_info_once(params, &target).await {
-            return Some(info);
+        match fetch_ip_info_once(params, &target).await {
+            IpInfoOutcome::Answer(info) => return Some(info),
+            IpInfoOutcome::Refused(reason) => {
+                tracing::debug!(
+                    target: "tui::ops::ping_native",
+                    "exit-IP fetch refused: {reason} (retry skipped — a refusal is deterministic)"
+                );
+                return None;
+            }
+            IpInfoOutcome::Transport(e) => {
+                tracing::debug!(target: "tui::ops::ping_native", "exit-IP fetch failed: {e}");
+            }
         }
     }
     None
 }
 
+/// The provider's own explanation for a body that carries no answer.
+fn refusal_reason(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    v.get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|s| format!("status={s}"))
+                })
+        })
+        .unwrap_or_else(|| "unexpected body".to_string())
+}
+
 /// One exit-IP fetch: a single HTTP request over a fresh tunnel.
-async fn fetch_ip_info_once(params: &NativeConnectParams, target: &ProbeUrl) -> Option<String> {
+async fn fetch_ip_info_once(params: &NativeConnectParams, target: &ProbeUrl) -> IpInfoOutcome {
     let request = ProbeRequest {
         host: &target.host,
         port: target.port,
@@ -345,16 +385,44 @@ async fn fetch_ip_info_once(params: &NativeConnectParams, target: &ProbeUrl) -> 
         path: &target.path,
         timeout: IP_INFO_TIMEOUT,
     };
-    let response = probe::fetch(params.clone(), &request).await.ok()?;
+    let response = match probe::fetch(params.clone(), &request).await {
+        Ok(response) => response,
+        Err(e) => return IpInfoOutcome::Transport(e.to_string()),
+    };
     if !(200..300).contains(&response.status) {
-        return None;
+        return IpInfoOutcome::Refused(format!("HTTP {}", response.status));
     }
-    parse_ip_info(&response.body)
+    match parse_ip_info(&response.body) {
+        Some(info) => IpInfoOutcome::Answer(info),
+        None => IpInfoOutcome::Refused(refusal_reason(&response.body)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ip_info, parse_probe_url};
+    use super::{parse_ip_info, parse_probe_url, refusal_reason};
+
+    /// The provider's refusal shapes are what tell a rate limit (or a broken
+    /// endpoint) apart from a dead tunnel — without this the row's `—` is
+    /// silent, and a deterministic refusal would be retried like a transient
+    /// miss.
+    #[test]
+    fn refusal_reason_names_the_providers_own_answer() {
+        // The measured HTTPS answer (403 on ip-api's free tier).
+        assert_eq!(
+            refusal_reason(
+                br#"{"status":"fail","message":"SSL unavailable for this endpoint, order a key at https://members.ip-api.com/"}"#
+            ),
+            "SSL unavailable for this endpoint, order a key at https://members.ip-api.com/"
+        );
+        // A rate-limit / quota answer carries a status but no message.
+        assert_eq!(refusal_reason(br#"{"status":"fail"}"#), "status=fail");
+        // Not the provider's object at all.
+        assert_eq!(
+            refusal_reason(b"<html>captive portal</html>"),
+            "unexpected body"
+        );
+    }
 
     #[test]
     fn probe_url_defaults_the_port_per_scheme() {

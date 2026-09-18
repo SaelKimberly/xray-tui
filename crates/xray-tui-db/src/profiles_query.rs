@@ -82,7 +82,11 @@ pub enum PlanScope {
     All,
     /// Endpoints that achieved a real success.
     Successful,
-    /// `Successful` plus every endpoint with an untested link.
+    /// Endpoints with an untested link and no clean measurement — the ones a
+    /// run has never answered for.
+    New,
+    /// `Successful` plus every endpoint with an untested link (= `Successful ∪
+    /// New`).
     SuccessfulAndNew,
     /// Endpoints whose links all failed, or whose name never resolved.
     Failed,
@@ -95,6 +99,7 @@ impl PlanScope {
         match self {
             Self::All => &[],
             Self::Successful => &[0],
+            Self::New => &[2],
             Self::SuccessfulAndNew => &[0, 2],
             Self::Failed => &[3, 4, 5],
         }

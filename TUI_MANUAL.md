@@ -261,6 +261,7 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 │  Fast Ping (All Profiles)                               │
 │  Fast + Real Ping (All Profiles)                        │
 │  Fast + Real Ping (Successful)                          │
+│  Fast + Real Ping (New)                                 │
 │  Fast + Real Ping (Successful + New)                    │
 │  Fast + Real Ping (Failed)                              │
 │  Sort by Test                                         │
@@ -574,12 +575,17 @@ appended when updates are available for installed backends.
    - **UDP Test** — tests UDP forwarding
    - **Fast Ping (All Profiles)** — batch fast pings every link in the database
    - **Fast + Real Ping (All Profiles)** — the same fast phase, then a real ping per reachable link (links the fast phase proved unreachable are skipped, and rows the native engine cannot serve are marked `[real]` instead of probed)
-   - **Fast + Real Ping (Successful / Successful + New / Failed)** — the same run narrowed to a scope of the feed: endpoints that achieved a real success; those plus endpoints with an untested link; or those whose links all failed (including a DNS name that never resolved). The scope reads the endpoint's stored test tier, so it is a filter on the plan, not a different pipeline
+   - **Fast + Real Ping (Successful / New / Successful + New / Failed)** — the same run narrowed to a scope of the feed: endpoints that achieved a real success; endpoints nothing has answered for yet (untested); those two together; or those whose links all failed (including a DNS name that never resolved). The scope reads the endpoint's stored test tier, so it is a filter on the plan, not a different pipeline. A scoped run freezes its endpoint list before the first probe, so an endpoint leaving the scope mid-run is still tested.
    - **Sort by Test** — re-sorts the table by test priority (real successes by delay, then the failure bands)
    - **Remove Bad Servers** — removes profiles with failed tests
 5. Results populate the expanded panel's per-protocol sub-table; real-ping
    exit IPs fill the single-line Outbound/Country columns — shown only once the
-   endpoint's address is resolved, since an exit IP is evidence a tunnel worked
+   endpoint's address is resolved, since an exit IP is evidence a tunnel worked.
+   The Test cell reports the endpoint's representative protocol, so a row shows
+   a delay or the marker for its worst state, never a failed protocol's stale
+   delay. The free ip-api tier allows ~45 exit-IP lookups/minute, so a
+   feed-wide run fills only the earliest results; point Settings → Speed Test →
+   IP API URL at a keyed provider to fill more.
 
    Batch runs (All Visible) go through the per-profile task queue: a profile
    already being tested queues further tests up to `task_queue_limit` (queue

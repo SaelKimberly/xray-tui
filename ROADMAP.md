@@ -60,7 +60,7 @@
 - ✅ Speed test (download test through proxy)
 - ✅ UDP test
 - ✅ Fast batch ping (all servers)
-- ✅ Fast + real batch ping (all profiles), and its scoped variants: successful / successful+new / failed
+- ✅ Fast + real batch ping (all profiles), and its scoped variants: successful / new / successful+new / failed
 - ✅ Sort by results, remove invalid servers
 - ✅ Test result caching in SQLite
 - ✅ Test cell reports the endpoint's representative link (delay band or failure marker), never a failed link's stale delay

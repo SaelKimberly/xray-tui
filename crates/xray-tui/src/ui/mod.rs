@@ -499,23 +499,26 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         state.start_batch_then_real_ping_scoped(PlanScope::Successful);
                     }
                     8 => {
-                        state.start_batch_then_real_ping_scoped(PlanScope::SuccessfulAndNew);
+                        state.start_batch_then_real_ping_scoped(PlanScope::New);
                     }
                     9 => {
-                        state.start_batch_then_real_ping_scoped(PlanScope::Failed);
+                        state.start_batch_then_real_ping_scoped(PlanScope::SuccessfulAndNew);
                     }
                     10 => {
+                        state.start_batch_then_real_ping_scoped(PlanScope::Failed);
+                    }
+                    11 => {
                         state.sort_column = SortColumn::Test;
                         state.sort_ascending = true;
                         state.filter_cache_valid.set(false);
                     }
-                    11 => {
+                    12 => {
                         state.remove_failed_servers().await;
                     }
-                    13 => {
+                    14 => {
                         state.stop_speed_test();
                     }
-                    15 => {
+                    16 => {
                         state.confirmation = Some(crate::ConfirmAction::ClearStats);
                     }
                     _ => {}
@@ -1152,6 +1155,7 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Item("Fast Ping (All Profiles)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (All Profiles)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (Successful)"),
+    SpeedTestMenuItem::Item("Fast + Real Ping (New)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (Successful + New)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (Failed)"),
     SpeedTestMenuItem::Item("Sort by Test"),

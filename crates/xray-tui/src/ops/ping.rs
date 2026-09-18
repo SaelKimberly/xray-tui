@@ -2411,6 +2411,11 @@ mod tests {
             "the successful plus the untested endpoint"
         );
         assert_eq!(
+            planned_hosts(PlanScope::New).await,
+            vec!["10.0.0.2"],
+            "only the endpoint nothing has answered for"
+        );
+        assert_eq!(
             planned_hosts(PlanScope::Failed).await,
             vec!["10.0.0.3"],
             "only the endpoint whose links all failed"
