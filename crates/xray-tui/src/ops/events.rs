@@ -19,6 +19,17 @@ fn fmt_profile_id(id: i64) -> String {
     format!("xray-tui://{id:x}")
 }
 
+/// Minimum spacing between result-driven Profiles page refetches while a batch
+/// is running.
+///
+/// A refetch is one `profiles_page` + `load_page_projection` on the UI task
+/// (measured 23 ms against a 16 ms tick on the 7,486-endpoint reference feed),
+/// and a batch produces results continuously — unthrottled, the task that also
+/// dispatches the probes spends the whole run reloading. A single (manual)
+/// ping keeps its immediate refetch: it is one result, not a stream.
+pub(crate) const RESULT_RELOAD_THROTTLE: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 /// Find the endpoint row whose links own `protocol_id` (a `Protocol` row id).
 /// Endpoint ids (stable hashes of host:port) are unrelated to protocol ids,
 /// so the match scans `r.links`.
@@ -539,6 +550,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 let ip_info_clone = ip_info.clone();
                 let writer = Arc::clone(&state.link_writer);
 
+                let mut on_page = true;
                 let name = {
                     let row = state
                         .endpoints
@@ -570,6 +582,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         // The page does not hold this row: the batch stages its
                         // own results, so this is a UI-only miss (a page reload
                         // while a batch runs). Never silent.
+                        on_page = false;
                         tracing::debug!(
                             target: "tui::ops::events",
                             endpoint_id,
@@ -616,7 +629,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // priority after every fast/real ping result. `selected_sub`
                 // follows its protocol to its new index (only when this
                 // result's endpoint is the one currently selected).
-                if matches!(test_type, TestType::TcpPing | TestType::RealPing) {
+                if on_page && matches!(test_type, TestType::TcpPing | TestType::RealPing) {
                     let keep = if state.selected_profile_id() == Some(ep_id) {
                         state.selected_sub.and_then(|n| {
                             state
@@ -654,7 +667,30 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         // `active_link()` (checked first).
                         row.select_best_measured_link();
                     }
-                    state.filter_cache_valid.set(false);
+                    // Page refetch policy. The row above was already patched in
+                    // memory, so the refetch exists only to re-place it in the
+                    // ordered WINDOW — which is a fact about a row this page can
+                    // show. Two guards keep a running batch off the UI task:
+                    //
+                    // - off-page results (a feed-wide batch's ~98%: the window
+                    //   holds 200 of the feed) have nothing to re-place here;
+                    // - while a batch is live, at most one refetch per
+                    //   `RESULT_RELOAD_THROTTLE`.
+                    //
+                    // Measured cost of the unconditional version: one
+                    // `profiles_page` + hydrate per 16 ms tick (23 ms on the
+                    // 7,486-endpoint reference feed) for the whole run, on the
+                    // same task that dispatches the probes.
+                    let now = std::time::Instant::now();
+                    let due = state.batch_progress.is_none()
+                        || state
+                            .last_result_reload
+                            .get()
+                            .is_none_or(|last| now.duration_since(last) >= RESULT_RELOAD_THROTTLE);
+                    if due {
+                        state.last_result_reload.set(Some(now));
+                        state.filter_cache_valid.set(false);
+                    }
                 }
 
                 // Update tracking fields for actions log
@@ -818,6 +854,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 state.batch_progress = None;
                 state.batch = None;
                 state.speed_test_stop.store(false, Ordering::Relaxed);
+                // The run's last results may have been throttled (the page
+                // refetch during a batch is at most one per
+                // `RESULT_RELOAD_THROTTLE`), so settle the window on the exact
+                // final order — this is also the first tick after which no
+                // further result will re-place a row.
+                state.last_result_reload.set(None);
+                state.filter_cache_valid.set(false);
             }
             CoreEvent::HostFeaturesLoaded(checker) => {
                 state.host_features = Some(checker);
@@ -1429,6 +1472,108 @@ mod tests {
             cidr_whitelisted: true,
         };
         assert_eq!(merge_host_features(real, other), other);
+    }
+
+    /// The result-driven page refetch is per-VISIBLE-row, and at most one per
+    /// `RESULT_RELOAD_THROTTLE` while a batch runs.
+    ///
+    /// A refetch is a full `profiles_page` + `load_page_projection` on the UI
+    /// task (measured 23 ms against a 16 ms tick on the 7,486-endpoint
+    /// reference feed), and a feed-wide batch's results are ~98% off-page: the
+    /// window holds 200 of the feed. Unconditional invalidation kept that task
+    /// reloading for the whole run.
+    #[tokio::test]
+    async fn result_driven_page_reload_is_visible_row_and_throttled() {
+        use crate::ops::profiles::test_support::{fake_row, test_state};
+
+        /// Queue one armed result pair (the `TestTypeUpdate` re-arms the
+        /// handler's dedupe guard) and drain it.
+        async fn armed_result(
+            state: &mut AppState,
+            tx: &tokio::sync::mpsc::Sender<CoreEvent>,
+            pair: (i64, i64),
+        ) {
+            tx.try_send(CoreEvent::TestTypeUpdate {
+                endpoint_id: pair.0,
+                protocol_id: pair.1,
+                test_type: TestType::TcpPing,
+            })
+            .expect("arm");
+            tx.try_send(CoreEvent::SpeedTestResult {
+                endpoint_id: pair.0,
+                protocol_id: pair.1,
+                test_type: TestType::TcpPing,
+                latency_ms: Some(7),
+                speed_bps: None,
+                ip_info: None,
+                error: None,
+                purge: None,
+            })
+            .expect("result");
+            let _ = state.poll_core_events().await;
+        }
+
+        let rows = vec![fake_row(1, "10.0.0.1", 3), fake_row(2, "10.0.0.2", 3)];
+        let on_page = (
+            rows[0].endpoint.id.get(),
+            rows[0].links[0].protocol_id.get(),
+        );
+        let on_page_2 = (
+            rows[0].endpoint.id.get(),
+            rows[0].links[1].protocol_id.get(),
+        );
+        let off_page = (9_999, 999_901);
+        let mut state = test_state(rows).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        state.core_event_tx = Some(tx.clone());
+        state.core_event_rx = Some(rx);
+
+        // Off-page: nothing to re-place in this window, no refetch.
+        state.filter_cache_valid.set(true);
+        armed_result(&mut state, &tx, off_page).await;
+        assert!(
+            state.filter_cache_valid.get(),
+            "an off-page result must not refetch the page"
+        );
+
+        // On-page, no batch: the row moves at once (one manual ping is not a
+        // stream).
+        state.filter_cache_valid.set(true);
+        armed_result(&mut state, &tx, on_page).await;
+        assert!(
+            !state.filter_cache_valid.get(),
+            "a visible result refetches immediately outside a batch"
+        );
+
+        // On-page during a batch: the first one refetches, the second inside
+        // the throttle window does not. Both halves of the batch handle are
+        // set: `poll_core_events` treats a progress meter with no published
+        // handle as a batch that never reported its end and clears it.
+        state.batch_progress = Some(Arc::new(crate::types::BatchMeters::default()));
+        state.batch = Some(Arc::new(std::sync::OnceLock::new()));
+        state.last_result_reload.set(None);
+        state.filter_cache_valid.set(true);
+        armed_result(&mut state, &tx, on_page).await;
+        assert!(
+            !state.filter_cache_valid.get(),
+            "the first result of the window still refetches"
+        );
+        state.filter_cache_valid.set(true);
+        armed_result(&mut state, &tx, on_page_2).await;
+        assert!(
+            state.filter_cache_valid.get(),
+            "a second visible result inside the throttle window must not"
+        );
+
+        // The batch's end settles the window on the final order.
+        tx.try_send(CoreEvent::BatchEnded).expect("end");
+        state.filter_cache_valid.set(true);
+        let _ = state.poll_core_events().await;
+        assert!(
+            !state.filter_cache_valid.get(),
+            "BatchEnded forces the last refetch the throttle may have skipped"
+        );
+        assert!(state.last_result_reload.get().is_none(), "stamp reset");
     }
 
     #[tokio::test]

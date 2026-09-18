@@ -28,6 +28,11 @@ use crate::ops::scheduler::{ScheduleOutcome, TaskScheduler};
 use crate::state::load_protocol_with_config;
 use crate::try_send_or_warn;
 use crate::types::CoreEvent;
+
+/// Perf lab for the fast + real flow (ignored tests; see the module docs).
+#[cfg(test)]
+mod flow_cost;
+
 /// Bound on concurrent single-test tasks (menu-triggered pings): the spawned
 /// future parks on this permit before doing work, so rapid keypresses queue
 /// as tiny futures instead of spawning unbounded concurrent cores. Batch
@@ -535,11 +540,17 @@ enum PlanSource {
 
 /// One link in a batch plan: the scheduler identity (link snapshot), the
 /// endpoint (probe target + dedup identity), and the protocol row snapshot
-/// (fast config type; real probes reload the row WITH config inside the task).
+/// (fast config type; real probes load the row WITH config from the batch's
+/// per-protocol cache).
+///
+/// The endpoint is shared (`Arc`) because a plan page carries the same endpoint
+/// once per link of that endpoint, and `dispatch_page` hands it straight to the
+/// per-batch map the probes read: one clone and one allocation per ENDPOINT,
+/// not per link.
 #[derive(Clone, Debug)]
 struct PlanLink {
     link: ProfileStats,
-    endpoint: Endpoint,
+    endpoint: Arc<Endpoint>,
     protocol: DbProtocol,
 }
 
@@ -705,6 +716,14 @@ impl BatchProbeRunner for EngineProbeRunner {
     }
 }
 
+/// One protocol row as a real probe needs it: the kind (for the config-level
+/// capability gate) and the typed config the engine is built from.
+#[derive(Debug)]
+struct LoadedProtocol {
+    kind: xray_tui_proto::proto_spec::ProtocolKind,
+    config: ProtocolConfig,
+}
+
 /// Shared per-batch state, cloned into every spawned probe task.
 ///
 /// `pub(crate)` because the quit path (`ui/mod.rs`) has to render the run's
@@ -744,6 +763,15 @@ pub(crate) struct BatchShared {
     /// Endpoint rows by id (real probes need the full endpoint). `Arc` so a
     /// probe clones the handle instead of holding a shard guard across an await.
     endpoints: DashMap<EndpointId, Arc<Endpoint>>,
+    /// Protocol rows WITH their config, loaded once per `ProtocolId` per batch.
+    ///
+    /// A `Protocol` row is shared by every endpoint carrying the same config
+    /// (identity ignores host/port), and the real half used to reload it per
+    /// LINK: a toasty query plus a JSON decode, measured at 67–121 µs, i.e.
+    /// 0.6–1.1 s over the 9k-link reference feed and 2.3–4.1 s over a 34k-link
+    /// plan. A load FAILURE is not cached, so a transient read error cannot
+    /// poison the protocol for the rest of the run.
+    protocols: DashMap<ProtocolId, Arc<LoadedProtocol>>,
     /// Links the native engine cannot serve (kind-level gate, no config load),
     /// keyed by identity and carrying the persisted marker text. The fast half
     /// still probes them; their marker is emitted right after that result.
@@ -906,6 +934,7 @@ impl BatchShared {
             batch_slot: p.batch_slot,
             fast_config: DashMap::new(),
             endpoints: DashMap::new(),
+            protocols: DashMap::new(),
             untestable: DashMap::new(),
             fast_sem: Arc::new(Semaphore::new(p.fast_concurrency.max(1))),
             real_sem: Arc::new(Semaphore::new(p.real_concurrency.max(1))),
@@ -1194,8 +1223,9 @@ impl PlanWalk {
                 // own endpoints to tier 0 as they succeed, the filtered set
                 // shrinks, and the next page's OFFSET lands past rows it never
                 // visited. `PlanScope::All` is immune — its membership ("has a
-                // link") and its `PageSort::Address` order are both independent
-                // of probe results — so it keeps streaming one page at a time.
+                // link") and its `PageSort::Id` order (endpoint ids, which no
+                // write can move) are both independent of probe results — so it
+                // keeps streaming one page at a time.
                 if frozen.is_none() && *scope != PlanScope::All {
                     let request = PageRequest {
                         view: PurgatoryView::All,
@@ -1203,7 +1233,7 @@ impl PlanWalk {
                         scope: *scope,
                         search: None,
                         group_id: None,
-                        sort: PageSort::Address,
+                        sort: PageSort::Id,
                         ascending: true,
                         offset: 0,
                         limit: usize::MAX,
@@ -1235,7 +1265,7 @@ impl PlanWalk {
                         scope: *scope,
                         search: None,
                         group_id: None,
-                        sort: PageSort::Address,
+                        sort: PageSort::Id,
                         ascending: true,
                         offset: *offset,
                         limit: *page_size,
@@ -1556,8 +1586,11 @@ impl BatchShared {
             let key = (plan.link.protocol_id, plan.link.endpoint_id);
             self.fast_config
                 .insert(key, plan.protocol.proto_kind.to_i32());
+            // One entry per endpoint, not per link: every link of an endpoint
+            // shares the plan's `Arc`, and the map only needs the first.
             self.endpoints
-                .insert(plan.endpoint.id, Arc::new(plan.endpoint.clone()));
+                .entry(plan.endpoint.id)
+                .or_insert_with(|| Arc::clone(&plan.endpoint));
             // A feed-wide plan reaches endpoints the UI never loads, so the
             // batch asks for their resolution itself: resolving "the endpoint by
             // id" in the result handler only ever sees the loaded page, which is
@@ -1821,10 +1854,12 @@ impl BatchShared {
             .fast_config
             .get(&(link.protocol_id, link.endpoint_id))
             .map_or(0, |v| *v.value());
-        let addr = endpoint.host.clone();
+        // Borrowed, not cloned: `endpoint` is an owned `Arc` local held across
+        // the probe's await, so the address needs no second `String` per probe.
+        let addr = endpoint.host.as_str();
         let port = endpoint.port;
         if is_owner {
-            let outcome = self.runner.fast(config_type, &addr, port, timeout).await;
+            let outcome = self.runner.fast(config_type, addr, port, timeout).await;
             let mut inner = self.fast_dedup.lock();
             inner.cache.insert(key.clone(), outcome.clone());
             inner.in_flight.remove(&key);
@@ -1845,25 +1880,19 @@ impl BatchShared {
         }
     }
 
-    /// Real probe for one link: reload the protocol row WITH its deferred
-    /// config (the builders refuse unloaded configs — mirrors
-    /// `start_real_ping`), then run through the pooled core.
+    /// Real probe for one link: load the protocol row WITH its deferred config
+    /// (the builders refuse unloaded configs — mirrors `start_real_ping`)
+    /// through the batch's per-`ProtocolId` cache, then run through the engine.
     async fn real_probe(&self, link: &ProfileStats) -> ProbeOutcome {
-        let protocol = match load_protocol_with_config(&self.db, link.protocol_id).await {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                return ProbeOutcome::soft_failure("Protocol row not found for real ping");
-            }
-            Err(e) => {
-                return ProbeOutcome::soft_failure(format!("Failed to load protocol: {e}"));
-            }
+        let protocol = match self.protocol_config(link.protocol_id).await {
+            Ok(loaded) => loaded,
+            Err(outcome) => return outcome,
         };
-        let config = protocol.config.get().0.clone();
         // Config-level capability gate: kind-level refusals were already retired
         // at plan time, so only a native-capable kind whose CONFIG the engine
         // refuses reaches here. Its marker IS the probe's result — phase 2, so
         // it lands after the fast result and is not cleared by it.
-        if let Some(reason) = capability::support_reason(protocol.proto_kind, &config) {
+        if let Some(reason) = capability::support_reason(protocol.kind, &protocol.config) {
             return ProbeOutcome::soft_failure(untestable_marker_text(reason));
         }
         let Some(endpoint) = self
@@ -1876,7 +1905,7 @@ impl BatchShared {
         self.runner
             .real(
                 &endpoint,
-                &config,
+                &protocol.config,
                 NativeProbeReq {
                     ping_url: &self.ping_url,
                     ip_provider: self.ip_provider,
@@ -1885,6 +1914,38 @@ impl BatchShared {
                 },
             )
             .await
+    }
+
+    /// The link's protocol row WITH config, loaded from the database at most
+    /// once per `ProtocolId` in this batch.
+    ///
+    /// The load is 67–121 µs (toasty query + JSON decode) and a `Protocol` row
+    /// is shared by every endpoint carrying the same config, so the per-link
+    /// reload dominated the plan's serial work. Misses are not memoized: a read
+    /// error returns this link's failure outcome and the next link tries again.
+    async fn protocol_config(&self, id: ProtocolId) -> Result<Arc<LoadedProtocol>, ProbeOutcome> {
+        if let Some(hit) = self.protocols.get(&id) {
+            return Ok(Arc::clone(hit.value()));
+        }
+        let row = match load_protocol_with_config(&self.db, id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return Err(ProbeOutcome::soft_failure(
+                    "Protocol row not found for real ping",
+                ));
+            }
+            Err(e) => {
+                return Err(ProbeOutcome::soft_failure(format!(
+                    "Failed to load protocol: {e}"
+                )));
+            }
+        };
+        let loaded = Arc::new(LoadedProtocol {
+            kind: row.proto_kind,
+            config: row.config.get().0.clone(),
+        });
+        self.protocols.insert(id, Arc::clone(&loaded));
+        Ok(loaded)
     }
 
     /// Stage one link's RESULT columns from a probe outcome.
@@ -2096,11 +2157,14 @@ fn plan_selected_endpoint(state: &AppState) -> Vec<PlanLink> {
 }
 
 fn plan_row_links(row: &EndpointRow) -> impl Iterator<Item = PlanLink> + '_ {
-    row.links.iter().filter_map(|link| {
+    // One clone of the endpoint per ROW: every link of this endpoint shares it
+    // (`Arc::clone` per link instead of a `String`-carrying `Endpoint` clone).
+    let endpoint = Arc::new(row.endpoint.clone());
+    row.links.iter().filter_map(move |link| {
         let protocol = row.protocols.get(&link.protocol_id)?.clone();
         Some(PlanLink {
             link: link.clone(),
-            endpoint: row.endpoint.clone(),
+            endpoint: Arc::clone(&endpoint),
             protocol,
         })
     })
@@ -2625,6 +2689,52 @@ mod tests {
     }
 
     // ── phase 1 + phase 2 on a 3-link batch ─────────────────────────────
+
+    /// A `Protocol` row is shared by every endpoint that carries the same
+    /// config (identity ignores host/port), so the real half must load it once
+    /// per batch rather than once per link: the load is a toasty query plus a
+    /// JSON decode (measured 67–121 µs), i.e. 0.6–1.1 s over the 9k-link
+    /// reference feed and 2.3–4.1 s over a 34k-link plan.
+    #[tokio::test]
+    async fn real_probe_loads_each_protocol_row_once_per_batch() {
+        let first = fake_row(1, "10.0.0.1", 1);
+        let mut second = fake_row(2, "10.0.0.2", 1);
+        // One `Protocol` row, two endpoints: the second link points at the
+        // first row's protocol id and carries that same `Protocol` snapshot.
+        let shared_id = first.links[0].protocol_id;
+        let protocol = first
+            .protocols
+            .get(&shared_id)
+            .expect("fake_row links a protocol")
+            .clone();
+        second.links[0].protocol_id = shared_id;
+        second.protocols.clear();
+        second.protocols.insert(shared_id, protocol);
+
+        let rows = vec![first, second];
+        let mut h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        start_test_batch(&mut h, plan, true, false)
+            .await
+            .expect("batch");
+
+        assert_eq!(
+            h.runner.real_calls.load(Ordering::Relaxed),
+            2,
+            "both links got their real probe"
+        );
+        let shared = h
+            .state
+            .batch
+            .as_ref()
+            .and_then(|slot| slot.get())
+            .expect("run_batch publishes its shared state");
+        assert_eq!(
+            shared.protocols.len(),
+            1,
+            "one load for the one protocol row the two links share"
+        );
+    }
 
     #[tokio::test]
     async fn batch_three_links_schedules_fast_then_real() {

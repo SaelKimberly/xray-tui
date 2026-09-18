@@ -25,7 +25,7 @@ const fn ts(secs: i64) -> i64 {
 
 const ALL_ENDPOINTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
 
-const ALL_SORTS: [PageSort; 8] = [
+const ALL_SORTS: [PageSort; 9] = [
     PageSort::Test,
     PageSort::Address,
     PageSort::Port,
@@ -34,6 +34,7 @@ const ALL_SORTS: [PageSort; 8] = [
     PageSort::Traffic,
     PageSort::ConfigType,
     PageSort::Ip,
+    PageSort::Id,
 ];
 
 const fn request(sort: PageSort, ascending: bool, offset: usize, limit: usize) -> PageRequest {
@@ -827,6 +828,7 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> (i64, i
             )
         }
         PageSort::Address | PageSort::Ip => (0, 0, 0, 0),
+        PageSort::Id => (row.endpoint.id.get(), 0, 0, 0),
         PageSort::Port => (i64::from(row.endpoint.port), 0, 0, 0),
         PageSort::LastSeen => (
             display_link(row).map_or(i64::MIN, |l| l.last_seen_at),

@@ -146,6 +146,15 @@ pub struct AppState {
     pub(crate) batch: Option<Arc<std::sync::OnceLock<Arc<crate::ops::ping::BatchShared>>>>,
     pub last_test_real: Option<u64>,
     pub last_test_speed: Option<u64>,
+    /// When the last result-driven Profiles page refetch was scheduled.
+    ///
+    /// A test result patches its row in memory; the DB refetch exists only to
+    /// re-place the row in the ordered window. Every result used to invalidate
+    /// the page unconditionally, which costs one full page query + hydrate per
+    /// UI tick (measured 23 ms against a 16 ms tick on the 7,486-endpoint
+    /// reference feed, for the whole length of a batch) — see
+    /// `RESULT_RELOAD_THROTTLE`.
+    pub last_result_reload: Cell<Option<std::time::Instant>>,
     pub current_traffic_up: i64,
     pub current_traffic_down: i64,
     pub current_memory: u64,
@@ -509,6 +518,7 @@ impl AppState {
             last_test_tcp: None,
             last_test_real: None,
             last_test_speed: None,
+            last_result_reload: std::cell::Cell::new(None),
             current_traffic_up: 0,
             current_traffic_down: 0,
             current_memory: 0,
