@@ -565,7 +565,11 @@ fn form_field_defs_for_section(
         SettingsSection::ProtocolCore => PROTOCOL_CORE_DEFS,
         SettingsSection::SpeedTest => &[
             ("ping_url", "Ping Test URL", "Url"),
-            ("ip_api_url", "IP API URL", "Url"),
+            (
+                "ip_provider",
+                "IP Provider",
+                xray_tui_config::ip_provider::SELECT_CELL,
+            ),
             ("tcp_timeout_secs", "TCP Timeout", "Duration"),
             ("real_ping_timeout_secs", "Real Ping Timeout", "Duration"),
             ("real_ping_retries", "Real Ping Retries", "Number"),
@@ -2107,6 +2111,7 @@ fn progress_bar_line(downloaded: u64, total: u64, style: &Style) -> Line<'static
 
 #[cfg(test)]
 mod tests {
+    use super::form_field_defs_for_section;
     use super::handle_form_key;
     use crate::AppState;
     use crate::types::{AppMode, SettingsMode, SettingsSection, SplitFocus, SplitRightPane};
@@ -2154,5 +2159,20 @@ mod tests {
             &KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
         )
         .await;
+    }
+
+    /// The Speed Test form and the settings apply (which looks fields up by KEY)
+    /// only agree while the defs key and the snapshot key match — the render
+    /// zips defs with fields positionally, so a renamed key here loses the
+    /// setting silently while the form still looks right.
+    #[test]
+    fn speed_test_defs_wire_the_provider_key_to_the_enum_cell() {
+        let defs = form_field_defs_for_section(SettingsSection::SpeedTest);
+        let (_, label, cell) = defs
+            .iter()
+            .find(|(key, _, _)| *key == "ip_provider")
+            .expect("the Speed Test form must carry the provider row");
+        assert_eq!(*label, "IP Provider");
+        assert_eq!(*cell, xray_tui_config::ip_provider::SELECT_CELL);
     }
 }

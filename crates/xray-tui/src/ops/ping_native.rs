@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use xray_tui_config::IpProvider;
 use xray_tui_db::models::Endpoint;
 use xray_tui_native::addr::TargetAddr;
 use xray_tui_native::context::NativeConnectParams;
@@ -145,7 +146,9 @@ impl ProbeFailure {
 /// Parameters for one native real ping.
 pub struct NativeProbeReq<'a> {
     pub ping_url: &'a str,
-    pub ip_api_url: &'a str,
+    /// Which exit-IP provider to ask first (the rest of the family-agnostic set
+    /// is the fallback chain).
+    pub ip_provider: IpProvider,
     /// Per-attempt budget (the whole dial + request for one attempt).
     pub timeout: Duration,
     /// Concurrent attempts; the fastest 2xx wins.
@@ -201,18 +204,6 @@ pub fn parse_probe_url(url: &str) -> Result<ProbeUrl, String> {
     })
 }
 
-/// `"<ip> | <country>"` from an `ip-api` JSON body; `None` when the body is
-/// not the expected object (the probe's latency result does not depend on it).
-pub fn parse_ip_info(body: &[u8]) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let ip = json.get("query").and_then(serde_json::Value::as_str)?;
-    let country = json
-        .get("country")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("-");
-    Some(format!("{ip} | {country}"))
-}
-
 /// Run one native real ping for `endpoint` + the already-loaded protocol config.
 ///
 /// `Err` carries the user-facing failure text the event path persists plus the
@@ -231,7 +222,7 @@ pub async fn real_ping(
     );
 
     let latency_ms = probe_attempts(&params, &target, req).await?;
-    let ip_info = fetch_ip_info(&params, req.ip_api_url).await;
+    let ip_info = fetch_ip_info(&params, req.ip_provider).await;
     Ok(NativeProbeResult {
         latency_ms,
         ip_info,
@@ -316,43 +307,93 @@ const IP_INFO_ATTEMPTS: u32 = 2;
 const IP_INFO_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// What one exit-IP attempt produced.
+#[derive(Debug, PartialEq, Eq)]
 enum IpInfoOutcome {
     /// The provider answered with the expected object.
     Answer(String),
     /// The provider REFUSED: a non-2xx status, or a body that is not the
     /// expected object (ip-api's `{"status":"fail","message":…}` — its HTTPS
-    /// form, its rate limit, its quota). Deterministic, so a retry repeats it.
+    /// form, its rate limit, its quota). Deterministic for the provider that
+    /// produced it, so a retry repeats it — the next provider is asked instead.
     Refused(String),
     /// The tunnel or the request failed — transient, worth the one retry.
     Transport(String),
 }
 
+/// What the fetch does after one attempt.
+///
+/// This IS the exit-IP policy, split out of the loop so it can be pinned by a
+/// fake outcome sequence: a refusal is deterministic for the provider that
+/// produced it (usually its rate limit, which every concurrent probe shares, so
+/// retrying would double the request rate exactly when that limit is biting) and
+/// hands over to the next provider at once; a transport miss is transient and
+/// gets [`IP_INFO_ATTEMPTS`] tries first. At the last provider `NextProvider`
+/// ends the fetch.
+#[derive(Debug, PartialEq, Eq)]
+enum IpInfoStep {
+    /// The provider answered — the fetch is done.
+    Answered(String),
+    /// Ask the same provider again.
+    Retry,
+    /// This provider is spent; ask the next one.
+    NextProvider,
+}
+
+fn next_step(outcome: IpInfoOutcome, attempt: u32) -> IpInfoStep {
+    match outcome {
+        IpInfoOutcome::Answer(info) => IpInfoStep::Answered(info),
+        IpInfoOutcome::Transport(_) if attempt + 1 < IP_INFO_ATTEMPTS => IpInfoStep::Retry,
+        IpInfoOutcome::Refused(_) | IpInfoOutcome::Transport(_) => IpInfoStep::NextProvider,
+    }
+}
+
 /// Exit IP + country through a second tunnel; any failure is `None` (the
 /// latency result stands on its own — parity with the old probe).
 ///
-/// The retry runs only on a TRANSPORT miss. A refusal is deterministic and is
-/// usually the provider's rate limit, which every concurrent probe shares — so
-/// retrying it would double the request rate exactly when that limit is already
-/// biting. Both outcomes are logged at `debug` (the Actions panel), so a row
-/// that renders `—` has a stated reason instead of being silent.
-async fn fetch_ip_info(params: &NativeConnectParams, ip_api_url: &str) -> Option<String> {
-    let target = parse_probe_url(ip_api_url).ok()?;
-    for attempt in 0..IP_INFO_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(IP_INFO_RETRY_DELAY).await;
+/// The providers of [`IpProvider::fallback_chain`] are asked in order until one
+/// answers. The exit IP does not depend on which one does, so the chain is
+/// capacity: the free tiers rate-limit (ip-api publishes ~45 requests/minute)
+/// while one real probe issues one request, and a feed-wide real level (measured
+/// 2.6 results/s ≈ 156/min on 2026-09-16) runs several times over that ceiling.
+/// Every outcome is logged at `debug` (the Actions panel), so a row that renders
+/// `—` has a stated reason instead of being silent.
+async fn fetch_ip_info(params: &NativeConnectParams, provider: IpProvider) -> Option<String> {
+    for provider in provider.fallback_chain() {
+        if let Some(info) = fetch_ip_info_provider(params, provider).await {
+            return Some(info);
         }
-        match fetch_ip_info_once(params, &target).await {
-            IpInfoOutcome::Answer(info) => return Some(info),
-            IpInfoOutcome::Refused(reason) => {
+    }
+    None
+}
+
+/// One provider: up to [`IP_INFO_ATTEMPTS`] requests, spaced by
+/// [`IP_INFO_RETRY_DELAY`], stepping through [`next_step`].
+async fn fetch_ip_info_provider(
+    params: &NativeConnectParams,
+    provider: IpProvider,
+) -> Option<String> {
+    // A provider URL is a constant pinned by its own test, so a parse failure
+    // here is a bug — but a probe task must not panic on a shared worker.
+    let Ok(target) = parse_probe_url(provider.url()) else {
+        tracing::debug!(
+            target: "tui::ops::ping_native",
+            "exit-IP URL {} is unusable; skipping {provider}",
+            provider.url()
+        );
+        return None;
+    };
+    for attempt in 0..IP_INFO_ATTEMPTS {
+        let outcome = fetch_ip_info_once(params, provider, &target).await;
+        match next_step(outcome, attempt) {
+            IpInfoStep::Answered(info) => {
                 tracing::debug!(
                     target: "tui::ops::ping_native",
-                    "exit-IP fetch refused: {reason} (retry skipped — a refusal is deterministic)"
+                    "exit IP read from {provider}"
                 );
-                return None;
+                return Some(info);
             }
-            IpInfoOutcome::Transport(e) => {
-                tracing::debug!(target: "tui::ops::ping_native", "exit-IP fetch failed: {e}");
-            }
+            IpInfoStep::Retry => tokio::time::sleep(IP_INFO_RETRY_DELAY).await,
+            IpInfoStep::NextProvider => return None,
         }
     }
     None
@@ -375,8 +416,13 @@ fn refusal_reason(body: &[u8]) -> String {
         .unwrap_or_else(|| "unexpected body".to_string())
 }
 
-/// One exit-IP fetch: a single HTTP request over a fresh tunnel.
-async fn fetch_ip_info_once(params: &NativeConnectParams, target: &ProbeUrl) -> IpInfoOutcome {
+/// One exit-IP fetch: a single HTTP request over a fresh tunnel, classified as
+/// the provider's answer, a refusal, or a transport miss.
+async fn fetch_ip_info_once(
+    params: &NativeConnectParams,
+    provider: IpProvider,
+    target: &ProbeUrl,
+) -> IpInfoOutcome {
     let request = ProbeRequest {
         host: &target.host,
         port: target.port,
@@ -385,22 +431,38 @@ async fn fetch_ip_info_once(params: &NativeConnectParams, target: &ProbeUrl) -> 
         path: &target.path,
         timeout: IP_INFO_TIMEOUT,
     };
-    let response = match probe::fetch(params.clone(), &request).await {
-        Ok(response) => response,
-        Err(e) => return IpInfoOutcome::Transport(e.to_string()),
+    let outcome = match probe::fetch(params.clone(), &request).await {
+        Ok(response) => {
+            if (200..300).contains(&response.status) {
+                match provider.parse(&response.body) {
+                    Some(info) => IpInfoOutcome::Answer(info),
+                    None => IpInfoOutcome::Refused(refusal_reason(&response.body)),
+                }
+            } else {
+                IpInfoOutcome::Refused(format!("HTTP {}", response.status))
+            }
+        }
+        Err(e) => IpInfoOutcome::Transport(e.to_string()),
     };
-    if !(200..300).contains(&response.status) {
-        return IpInfoOutcome::Refused(format!("HTTP {}", response.status));
+    match &outcome {
+        IpInfoOutcome::Answer(_) => {}
+        IpInfoOutcome::Refused(reason) => tracing::debug!(
+            target: "tui::ops::ping_native",
+            "exit-IP fetch refused by {provider}: {reason}"
+        ),
+        IpInfoOutcome::Transport(e) => tracing::debug!(
+            target: "tui::ops::ping_native",
+            "exit-IP fetch failed at {provider}: {e}"
+        ),
     }
-    match parse_ip_info(&response.body) {
-        Some(info) => IpInfoOutcome::Answer(info),
-        None => IpInfoOutcome::Refused(refusal_reason(&response.body)),
-    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ip_info, parse_probe_url, refusal_reason};
+    use super::{
+        IP_INFO_ATTEMPTS, IpInfoOutcome, IpInfoStep, next_step, parse_probe_url, refusal_reason,
+    };
 
     /// The provider's refusal shapes are what tell a rate limit (or a broken
     /// endpoint) apart from a dead tunnel — without this the row's `—` is
@@ -451,22 +513,49 @@ mod tests {
         assert!(parse_probe_url("www.gstatic.com/generate_204").is_err());
     }
 
+    /// The fall-through lives in `next_step`, so this is the sequence that
+    /// decides whether a rate-limited provider is ever left behind: a refusal is
+    /// deterministic (ask the next provider at once — no retry can change a rate
+    /// limit every concurrent probe shares), a transport miss is transient and
+    /// gets the retries first, and an answer ends the fetch.
     #[test]
-    fn ip_info_reads_query_and_country() {
-        let body = br#"{"query":"203.0.113.7","country":"Germany","isp":"x"}"#;
+    fn exit_ip_policy_refuses_fast_and_retries_transport() {
         assert_eq!(
-            parse_ip_info(body).as_deref(),
-            Some("203.0.113.7 | Germany")
+            next_step(IpInfoOutcome::Refused("HTTP 429".into()), 0),
+            IpInfoStep::NextProvider
+        );
+        assert_eq!(
+            next_step(
+                IpInfoOutcome::Refused("status=fail".into()),
+                IP_INFO_ATTEMPTS - 1
+            ),
+            IpInfoStep::NextProvider
+        );
+        assert_eq!(
+            next_step(IpInfoOutcome::Transport("eof".into()), 0),
+            IpInfoStep::Retry
+        );
+        assert_eq!(
+            next_step(IpInfoOutcome::Transport("eof".into()), IP_INFO_ATTEMPTS - 1),
+            IpInfoStep::NextProvider
+        );
+        assert_eq!(
+            next_step(IpInfoOutcome::Answer("1.2.3.4 | X".into()), 0),
+            IpInfoStep::Answered("1.2.3.4 | X".into())
         );
     }
 
+    /// A transport miss must actually be retried the declared number of times
+    /// before the provider is given up on.
     #[test]
-    fn ip_info_missing_country_falls_back_and_garbage_is_none() {
+    fn a_transport_miss_is_retried_before_the_next_provider() {
+        let attempts: Vec<IpInfoStep> = (0..IP_INFO_ATTEMPTS)
+            .map(|attempt| next_step(IpInfoOutcome::Transport("eof".into()), attempt))
+            .collect();
         assert_eq!(
-            parse_ip_info(br#"{"query":"203.0.113.7"}"#).as_deref(),
-            Some("203.0.113.7 | -")
+            attempts,
+            vec![IpInfoStep::Retry, IpInfoStep::NextProvider],
+            "IP_INFO_ATTEMPTS and the policy disagree"
         );
-        assert_eq!(parse_ip_info(b"<html>nope</html>"), None);
-        assert_eq!(parse_ip_info(br#"{"country":"Germany"}"#), None);
     }
 }

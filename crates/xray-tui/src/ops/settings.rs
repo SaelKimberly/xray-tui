@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use ratatui_cheese::tree::TreeState;
+use xray_tui_config::IpProvider;
 use xray_tui_core::CoreType;
 use xray_tui_db::models::RoutingRule;
 
@@ -234,8 +235,8 @@ pub async fn build_settings_fields(
             vec![
                 ("ping_url".into(), state.config.speed_test.ping_url.clone()),
                 (
-                    "ip_api_url".into(),
-                    state.config.speed_test.ip_api_url.clone(),
+                    "ip_provider".into(),
+                    state.config.speed_test.ip_provider.to_string(),
                 ),
                 (
                     "tcp_timeout_secs".into(),
@@ -475,8 +476,8 @@ fn apply_settings_fields(
             if !get_str("ping_url").is_empty() {
                 state.config.speed_test.ping_url = get("ping_url");
             }
-            if !get_str("ip_api_url").is_empty() {
-                state.config.speed_test.ip_api_url = get("ip_api_url");
+            if let Ok(p) = get_str("ip_provider").parse::<IpProvider>() {
+                state.config.speed_test.ip_provider = p;
             }
             if let Ok(d) = humantime::parse_duration(get_str("tcp_timeout_secs")) {
                 *state.config.speed_test.tcp_timeout_secs = d;
@@ -832,9 +833,12 @@ fn protocol_core_form_fields(overrides: &HashMap<String, String>) -> Vec<(String
 
 #[cfg(test)]
 mod tests {
+    use super::apply_settings_fields;
+    use super::build_settings_fields;
     use super::protocol_core_form_fields;
     use super::save_route_probes;
     use crate::AppState;
+    use crate::types::SettingsSection;
     use crate::ui::settings::PROTOCOL_CORE_DEFS;
     use std::collections::HashMap;
 
@@ -860,6 +864,49 @@ mod tests {
         let fields = protocol_core_form_fields(&HashMap::new());
         assert_eq!(fields.len(), PROTOCOL_CORE_DEFS.len());
         assert!(fields.iter().all(|(_, v)| v == "Auto"));
+    }
+
+    /// The exit-IP provider crosses three representations on one save: the
+    /// Select's option string, the stored field value, and the enum the apply
+    /// parses. A mismatch anywhere leaves the setting silently at its default
+    /// (the apply keeps the old value when the string does not parse), which no
+    /// compiler and no render check would catch.
+    #[tokio::test]
+    async fn speed_test_provider_survives_the_form_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            xray_tui_db::Database::open(dir.path().join("t.db"))
+                .await
+                .unwrap(),
+        );
+        let mut state = AppState::new(db, xray_tui_config::AppConfig::default()).await;
+        let names: Vec<String> = xray_tui_config::ip_provider::SELECT_CELL
+            .strip_prefix("Select:")
+            .expect("the cell must declare its options")
+            .split(',')
+            .map(str::to_string)
+            .collect();
+
+        for name in &names {
+            let provider: xray_tui_config::IpProvider = name
+                .parse()
+                .unwrap_or_else(|_| panic!("the select offers {name}, which does not parse"));
+            state.config.speed_test.ip_provider = provider;
+            let fields = build_settings_fields(&state, SettingsSection::SpeedTest).await;
+            let saved = fields
+                .iter()
+                .find(|(k, _)| k == "ip_provider")
+                .unwrap_or_else(|| panic!("the form must carry ip_provider, got {fields:?}"));
+            assert_eq!(&saved.1, name, "the snapshot must emit the selectable name");
+
+            // Clobber, then replay the save: the value must come back.
+            state.config.speed_test.ip_provider = xray_tui_config::IpProvider::default();
+            apply_settings_fields(&mut state, SettingsSection::SpeedTest, &fields);
+            assert_eq!(
+                state.config.speed_test.ip_provider, provider,
+                "{name} did not survive the round trip"
+            );
+        }
     }
 
     #[tokio::test]

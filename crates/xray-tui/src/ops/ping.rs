@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
+use xray_tui_config::IpProvider;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
 use xray_tui_db::models::Protocol as DbProtocol;
@@ -216,7 +217,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
     let db = state.db.clone();
 
     let ping_url = state.config.speed_test.ping_url.clone();
-    let ip_api_url = state.config.speed_test.ip_api_url.clone();
+    let ip_provider = state.config.speed_test.ip_provider;
     let timeout = *state.config.speed_test.real_ping_timeout_secs;
     let retries = state.config.speed_test.real_ping_retries;
 
@@ -296,7 +297,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
             &config,
             &NativeProbeReq {
                 ping_url: &ping_url,
-                ip_api_url: &ip_api_url,
+                ip_provider,
                 timeout,
                 retries,
             },
@@ -728,7 +729,7 @@ pub(crate) struct BatchShared {
     real_timeout: Duration,
     real_retries: u32,
     ping_url: String,
-    ip_api_url: String,
+    ip_provider: IpProvider,
     defer_delay: Duration,
     real_concurrency: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
@@ -858,7 +859,7 @@ pub(crate) struct BatchParams {
     real_timeout: Duration,
     real_retries: u32,
     ping_url: String,
-    ip_api_url: String,
+    ip_provider: IpProvider,
     defer_delay: Duration,
     real_concurrency: usize,
     fast_concurrency: usize,
@@ -897,7 +898,7 @@ impl BatchShared {
             real_timeout: p.real_timeout,
             real_retries: p.real_retries,
             ping_url: p.ping_url,
-            ip_api_url: p.ip_api_url,
+            ip_provider: p.ip_provider,
             defer_delay: p.defer_delay,
             real_concurrency: p.real_concurrency,
             error_ttl_hours: p.error_ttl_hours,
@@ -1878,7 +1879,7 @@ impl BatchShared {
                 &config,
                 NativeProbeReq {
                     ping_url: &self.ping_url,
-                    ip_api_url: &self.ip_api_url,
+                    ip_provider: self.ip_provider,
                     timeout: self.real_timeout,
                     retries: self.real_retries,
                 },
@@ -2192,7 +2193,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     let real_timeout = *state.config.speed_test.real_ping_timeout_secs;
     let real_retries = state.config.speed_test.real_ping_retries;
     let ping_url = state.config.speed_test.ping_url.clone();
-    let ip_api_url = state.config.speed_test.ip_api_url.clone();
+    let ip_provider = state.config.speed_test.ip_provider;
     let real_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
     let fast_concurrency = state.config.speed_test.fast_ping_concurrency.max(1);
     let error_ttl_hours = state.config.speed_test.error_ttl_hours;
@@ -2217,7 +2218,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         real_timeout,
         real_retries,
         ping_url,
-        ip_api_url,
+        ip_provider,
         defer_delay,
         real_concurrency,
         fast_concurrency,
@@ -2563,7 +2564,7 @@ mod tests {
             real_timeout: Duration::from_secs(2),
             real_retries: 1,
             ping_url: "http://127.0.0.1/".to_string(),
-            ip_api_url: "http://127.0.0.1/ip".to_string(),
+            ip_provider: IpProvider::IpApi,
             defer_delay: Duration::from_millis(50),
             real_concurrency: 8,
             fast_concurrency: 8,

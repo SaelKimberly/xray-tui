@@ -91,7 +91,7 @@ from the remaining "deferred" sections.
 8. TUN Mode — enabled, interface name, MTU
 9. Mux — multiplexing settings
 10. Statistics — enable/disable stats collection
-11. Speed Test — ping URL, IP API URL, timeouts, batch concurrency, per-profile task queue limit, DNS-failure deferral, error-label TTL
+11. Speed Test — ping URL, exit-IP provider, timeouts, batch concurrency, per-profile task queue limit, DNS-failure deferral, error-label TTL
 12. Logging — log level, log-to-file path, log retention
 13. Subscriptions — group list, add/edit/delete/update (`g` from Profiles jumps here)
 14. Updates — check and install backend updates
@@ -584,8 +584,11 @@ appended when updates are available for installed backends.
    The Test cell reports the endpoint's representative protocol, so a row shows
    a delay or the marker for its worst state, never a failed protocol's stale
    delay. The free ip-api tier allows ~45 exit-IP lookups/minute, so a
-   feed-wide run fills only the earliest results; point Settings → Speed Test →
-   IP API URL at a keyed provider to fill more.
+   feed-wide run fills only the earliest results; when it refuses, the other
+   family-agnostic providers are asked automatically (the exit IP is the same
+   either way), which raises but does not remove the ceiling — and the
+   provider set is fixed (Settings → Speed Test → IP Provider picks which one
+   is asked first), so a keyed provider is not available.
 
    Batch runs (All Visible) go through the per-profile task queue: a profile
    already being tested queues further tests up to `task_queue_limit` (queue

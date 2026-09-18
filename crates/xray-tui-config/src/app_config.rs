@@ -500,8 +500,12 @@ impl Default for UpdateConfig {
 pub struct SpeedTestConfig {
     #[serde(default = "default_ping_url")]
     pub ping_url: String,
-    #[serde(default = "default_ip_api_url")]
-    pub ip_api_url: String,
+    /// Exit-IP lookup endpoint, fetched through the probe's own tunnel. The
+    /// family-agnostic providers are also the automatic fallback order: the
+    /// exit IP does not depend on which one answers, so a rate-limited free
+    /// tier just hands over to the next.
+    #[serde(default)]
+    pub ip_provider: crate::IpProvider,
     #[serde(default = "default_tcp_timeout_secs")]
     pub tcp_timeout_secs: crate::DurationOrSecs,
     #[serde(default = "default_real_ping_timeout_secs")]
@@ -536,16 +540,6 @@ pub struct SpeedTestConfig {
 
 fn default_ping_url() -> String {
     "https://www.gstatic.com/generate_204".to_string()
-}
-
-fn default_ip_api_url() -> String {
-    // ip-api's free tier is HTTP-only: the HTTPS endpoint answers 403
-    // `{"status":"fail","message":"SSL unavailable for this endpoint"}`, and
-    // `parse_ip_info` needs `query`, so a real ping whose exit-IP fetch used it
-    // persisted `Latency::Real { ip: None }` on EVERY success — the Outbound
-    // column rendered `—` for a working tunnel. The request rides the probe's
-    // own tunnel, so the proxy leg stays encrypted.
-    "http://ip-api.com/json/".to_string()
 }
 
 fn default_tcp_timeout_secs() -> crate::DurationOrSecs {
@@ -584,7 +578,7 @@ impl Default for SpeedTestConfig {
     fn default() -> Self {
         Self {
             ping_url: default_ping_url(),
-            ip_api_url: default_ip_api_url(),
+            ip_provider: crate::IpProvider::default(),
             tcp_timeout_secs: default_tcp_timeout_secs(),
             real_ping_timeout_secs: default_real_ping_timeout_secs(),
             real_ping_retries: default_real_ping_retries(),

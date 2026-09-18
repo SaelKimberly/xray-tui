@@ -4,6 +4,7 @@ pub mod duration_or_secs;
 pub mod fast_perc;
 pub mod forms;
 pub mod import_export;
+pub mod ip_provider;
 pub mod permissive_json;
 pub mod subscription;
 
@@ -13,3 +14,4 @@ pub use app_config::{
 };
 pub use duration_or_secs::DurationOrSecs;
 pub use import_export::{ValidationSettings, ValidationSummary, profile_user_id};
+pub use ip_provider::IpProvider;

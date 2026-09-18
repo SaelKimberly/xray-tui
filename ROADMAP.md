@@ -94,7 +94,7 @@
 - ✅ Ctrl+G fallback — alternative connect key for terminals that can't distinguish Ctrl+Enter
 - ✅ Group overlay fixes — sorted visual selection, Clear Group advertised, ALL-group mirror cleanup on delete
 - ✅ Conditional Group column — shows profile origin group on "All" tab, hidden for specific groups, hidden at <107 col width
-:- ✅ Speed test config — configurable ping URL, IP API URL, timeouts, batch page size via Settings > Speed Test form with persistent SpeedTestConfig
+:- ✅ Speed test config — configurable ping URL, exit-IP provider (`IpProvider`, fixed set with automatic fallback), timeouts, batch page size via Settings > Speed Test form with persistent SpeedTestConfig
 - ✅ Batch-then-real-ping — automatic real ping (with IP info) on fastest profiles after TCP batch, TestTypeUpdate event for emoji switching
 - ✅ Profiles table redesign — connected indicator column (▶/space), IP info column, graveyard group filter, connected row highlight (TABLE_ROW_CONNECTED), selection preserved across sort column changes
 - ✅ Log source validation toggle — V key on Logs tab toggles validation/subscription source logs visibility

@@ -233,7 +233,7 @@ pub async fn udp_test(proxy: &str, port: u16, test_timeout: Duration) -> Result<
 ```
 tcp_ping connects directly to the target address. real_ping, speed_test, and udp_test route through the active SOCKS5 proxy.
 `real_ping` sends up to `retries` HTTP GETs through SOCKS5, takes the fastest 2xx response, and optionally
-fetches IP info (ISP/location) from a configurable `ip_api_url` through the same proxy (retried once, spaced 250 ms; the default is ip-api's working free endpoint — the HTTPS form answers 403 on the free tier, which made every real OK persist no exit IP). Returns `RealPingResult`
+fetches IP info (ISP/location) from the selected `IpProvider` through the same proxy (its URL first, then the remaining family-agnostic providers as an automatic fallback chain; retried once per provider, spaced 250 ms; the default provider is ip-api's working free endpoint — its HTTPS form answers 403 on the free tier, which made every real OK persist no exit IP). Returns `RealPingResult`
 with both latency and IP metadata.
 Results are sent via CoreEvent::SpeedTestResult (with optional `ip_info` field) and handled in poll_core_events(),
 which writes the link's typed columns (`latency` — the Real/Fast variant carrying `latency_ip` — plus `error`/`error_kind`) in memory and stages them through `LinkWriter` (error events keep any stored measurement and set only the marker), then re-sorts the owning endpoint's

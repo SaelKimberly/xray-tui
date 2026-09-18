@@ -8096,6 +8096,7 @@ dependencies = [
  "serde_json",
  "simdutf8",
  "smallvec",
+ "strum 0.28.0",
  "thiserror 2.0.20",
  "url",
  "urlencoding",

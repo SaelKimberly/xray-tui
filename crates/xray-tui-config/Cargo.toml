@@ -25,6 +25,9 @@ urlencoding.workspace = true
 simdutf8 = "0.1"
 url.workspace = true
 
+# ============ Enum Utilities ============
+strum = { version = "0.28", default-features = false, features = ["derive"] }
+
 # ============ Text / Search / Hash ============
 	aho-corasick.workspace = true
 memchr.workspace = true
