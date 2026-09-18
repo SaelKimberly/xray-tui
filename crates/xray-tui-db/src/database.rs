@@ -1593,6 +1593,7 @@ mod tests {
         crate::profiles_query::PageRequest {
             view,
             active_threshold: active,
+            scope: crate::profiles_query::PlanScope::All,
             search: None,
             group_id: None,
             sort: crate::profiles_query::PageSort::Test,

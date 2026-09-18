@@ -539,7 +539,13 @@ fn default_ping_url() -> String {
 }
 
 fn default_ip_api_url() -> String {
-    "https://ip-api.com/json/".to_string()
+    // ip-api's free tier is HTTP-only: the HTTPS endpoint answers 403
+    // `{"status":"fail","message":"SSL unavailable for this endpoint"}`, and
+    // `parse_ip_info` needs `query`, so a real ping whose exit-IP fetch used it
+    // persisted `Latency::Real { ip: None }` on EVERY success — the Outbound
+    // column rendered `—` for a working tunnel. The request rides the probe's
+    // own tunnel, so the proxy leg stays encrypted.
+    "http://ip-api.com/json/".to_string()
 }
 
 fn default_tcp_timeout_secs() -> crate::DurationOrSecs {

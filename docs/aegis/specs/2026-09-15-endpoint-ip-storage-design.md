@@ -245,3 +245,40 @@ plus another derived column to every rank refresh.
 | `crates/xray-tui-db/examples/page_load_ab_probe.rs` | the before/after page load (§7), version-agnostic seeding |
 | `crates/xray-tui-db/examples/advisory_probe.rs` | the reachability gate (§5b): driver flags through our stack, raw-DDL STRICT/`inet` validation on the reachable route, the refused order/index/MV, and the page-statement restructure pricing (§6) |
 | `crates/xray-tui-db/examples/reconcile_probe.rs` | §6 re-timed through one decode path on one feed (checksums proving identical decode work), the fully-resolved-page floor, and the `#[column(type = "inet")]` hatch's DDL/inertness |
+
+## Amendment — 2026-09-18: one resolution source, and resolution driven by persisted state
+
+Three defects found in real use, all in the resolution ownership this spec
+established. The storage decision (`endpoint_ip` owns the address set,
+`endpoints.resolved_at` owns the attempt) is unchanged.
+
+1. **The label and the band read different sources.** The Test cell's `[name]`
+   read the in-memory `endpoint_info` cache, while the ordering law's tier-5
+   band (`endpoint_rank::dns_unresolved`) reads the row's persisted addresses.
+   The cell now reads the row — `endpoint_dns_unresolved(row)` — so the label
+   and the band are one fact. The cache stays a cache.
+
+2. **An outbound-only entry poisoned the resolver gate.** `spawn_outbound_enrich`
+   materializes an `endpoint_info` entry carrying `outbound_ip` with an EMPTY
+   address set and no attempt timestamp (it knows the endpoint's exit IP, not
+   its inbound address). Two readers treated that shape as "already resolved":
+   `should_resolve`'s `None => false` arm and the startup seed's
+   `!contains_key` filter. A DNS host whose first successful real ping landed
+   before its first resolution attempt was therefore never resolved — `[name]`
+   for good. Both readers now treat "no address AND no attempt" as "still needs
+   resolving", so materializing an outbound-only entry is safe and the exit IP
+   is not lost.
+
+3. **Resolution was driven by page membership, not by state.** The only
+   non-forced trigger lived in the `SpeedTestResult` handler, which resolved the
+   endpoint through the LOADED PAGE. A feed-wide batch persists `latency_ip` for
+   every planned link but holds only 200 rows, so every off-page DNS host kept
+   `[name]` while its exit IP and country were persisted and rendered. The batch
+   now carries the endpoint facts with its request
+   (`CoreEvent::DnsResolveRequest { endpoint_id, host, host_type, sni }`),
+   deduped per page, so the trigger no longer depends on what is loaded.
+
+Consequence for the columns: the Outbound/Country pair is gated on the endpoint
+being resolved. The exit IP is evidence that a tunnel to this endpoint worked,
+so a DNS host that has never resolved — or whose resolution failed — must not
+assert one.

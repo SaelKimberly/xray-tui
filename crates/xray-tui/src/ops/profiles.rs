@@ -14,7 +14,7 @@ use crate::{common_field_defaults, get_field, profile_to_fields};
 use xray_tui_db::Database;
 use xray_tui_db::DatabaseError;
 use xray_tui_db::models::{EndpointRow, ProfileStats, PurgatoryView};
-use xray_tui_db::profiles_query::{PageMeta, PageRequest, PageSort};
+use xray_tui_db::profiles_query::{PageMeta, PageRequest, PageSort, PlanScope};
 use xray_tui_proto::proto_spec::{CoreType as ProtoCoreType, ParsedProto, ProtocolKind};
 
 /// Unix-seconds now, as a `Timestamp` (the typed staleness clock).
@@ -173,6 +173,9 @@ fn page_request(load: &ProfilesLoad) -> PageRequest {
     PageRequest {
         view: load.view,
         active_threshold,
+        // The tab never narrows by plan scope: its filters are the view, the
+        // search box and the group. A scope belongs to a batch entry point.
+        scope: PlanScope::All,
         search: load.search.clone(),
         group_id: load.group_id.clone(),
         sort: load.sort,

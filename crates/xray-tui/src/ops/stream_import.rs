@@ -447,6 +447,7 @@ mod tests {
         xray_tui_db::profiles_query::PageRequest {
             view: xray_tui_db::models::PurgatoryView::All,
             active_threshold: 0,
+            scope: xray_tui_db::profiles_query::PlanScope::All,
             search: None,
             group_id: Some(group.to_string()),
             sort: xray_tui_db::profiles_query::PageSort::Test,

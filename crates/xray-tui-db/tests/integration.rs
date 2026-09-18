@@ -30,6 +30,7 @@ fn page_req(
     xray_tui_db::profiles_query::PageRequest {
         view,
         active_threshold: active,
+        scope: xray_tui_db::profiles_query::PlanScope::All,
         search: None,
         group_id: group.map(str::to_string),
         sort: xray_tui_db::profiles_query::PageSort::Test,

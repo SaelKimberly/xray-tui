@@ -13,9 +13,10 @@ use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{
-    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, PurgatoryView, TaskKind,
+    Endpoint, EndpointId, EndpointRow, HostType, Latency, ProfileStats, ProtocolId, PurgatoryView,
+    TaskKind,
 };
-use xray_tui_db::profiles_query::{PageRequest, PageSort};
+use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_native::capability;
 use xray_tui_proto::proto_spec::ProtocolConfig;
 
@@ -525,8 +526,8 @@ pub async fn remove_failed_servers(state: &mut AppState) {
 /// that appear *after* the plan is built can be missed.
 #[derive(Debug)]
 enum PlanSource {
-    /// Every link in the database.
-    Feed,
+    /// Every link in the database, narrowed to a [`PlanScope`] of endpoints.
+    Feed(PlanScope),
     /// An explicit plan: the selected-endpoint entry points, and tests.
     Links(Vec<PlanLink>),
 }
@@ -732,6 +733,8 @@ pub(crate) struct BatchShared {
     real_concurrency: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
+    /// The DNS-resolution cache TTL, the gate on the batch's resolve requests.
+    dns_cache_ttl_secs: i64,
     /// Where `run_batch` publishes the batch's shared state — `AppState::batch`
     /// holds the same slot and the UI reads the summary through it.
     batch_slot: Arc<OnceLock<Arc<Self>>>,
@@ -864,6 +867,8 @@ pub(crate) struct BatchParams {
     page_size: usize,
     /// "Clear error after" (design §6.4): `None` = never sweep.
     error_ttl_hours: Option<i64>,
+    /// The DNS-resolution cache TTL the batch gates its resolve requests on.
+    dns_cache_ttl_secs: i64,
     /// Where `run_batch` publishes the batch's shared state as soon as it is
     /// built — `AppState::batch` holds the same slot and the UI reads the
     /// summary through it.
@@ -896,6 +901,7 @@ impl BatchShared {
             defer_delay: p.defer_delay,
             real_concurrency: p.real_concurrency,
             error_ttl_hours: p.error_ttl_hours,
+            dns_cache_ttl_secs: p.dns_cache_ttl_secs,
             batch_slot: p.batch_slot,
             fast_config: DashMap::new(),
             endpoints: DashMap::new(),
@@ -1113,6 +1119,14 @@ enum PlanWalk {
     /// The whole feed, walked page by page through the tab's own query.
     Feed {
         db: Arc<Database>,
+        /// The plan scope: which endpoints the walk visits.
+        scope: PlanScope,
+        /// The frozen endpoint ids of a SCOPED walk, read once before any probe
+        /// runs — the scope predicate is derived state this batch mutates, so
+        /// offset paging over the live predicate would skip rows. `None` while
+        /// unscoped (streams one page at a time) and until a scoped walk's first
+        /// page.
+        frozen: Option<Vec<EndpointId>>,
         page_size: usize,
         offset: usize,
         pages_done: u32,
@@ -1125,8 +1139,10 @@ impl PlanWalk {
     fn new(source: PlanSource, db: Arc<Database>, page_size: usize) -> Self {
         match source {
             PlanSource::Links(links) => Self::Links(vec![links].into_iter()),
-            PlanSource::Feed => Self::Feed {
+            PlanSource::Feed(scope) => Self::Feed {
                 db,
+                scope,
+                frozen: None,
                 page_size,
                 offset: 0,
                 pages_done: 0,
@@ -1158,39 +1174,84 @@ impl PlanWalk {
             Self::Links(iter) => Ok(iter.next()),
             Self::Feed {
                 db,
+                scope,
                 page_size,
                 offset,
                 pages_done,
                 pages_total,
                 exhausted,
+                frozen,
             } => {
                 if *exhausted {
                     return Ok(None);
                 }
-                // `PurgatoryView::All` and no search/group: the run is about the
-                // whole database, not about what the tab currently filters to.
-                // The thresholds are unused for that view.
-                let request = PageRequest {
-                    view: PurgatoryView::All,
-                    active_threshold: 0,
-                    search: None,
-                    group_id: None,
-                    sort: PageSort::Address,
-                    ascending: true,
-                    offset: *offset,
-                    limit: *page_size,
-                };
-                let (ids, total) = db.profiles_walk_page(&request, *offset == 0).await?;
-                if let Some(total) = total {
-                    let pages = total.div_ceil(u64::try_from(*page_size).unwrap_or(u64::MAX));
+                // A SCOPED walk freezes its endpoint set BEFORE the first probe
+                // is dispatched. The scope predicate reads the endpoint's
+                // `rank_tier`, which this very batch changes as its results land,
+                // so an offset-paged walk over a mutating set silently SKIPS
+                // every endpoint that leaves the scope: a `Failed` run moves its
+                // own endpoints to tier 0 as they succeed, the filtered set
+                // shrinks, and the next page's OFFSET lands past rows it never
+                // visited. `PlanScope::All` is immune — its membership ("has a
+                // link") and its `PageSort::Address` order are both independent
+                // of probe results — so it keeps streaming one page at a time.
+                if frozen.is_none() && *scope != PlanScope::All {
+                    let request = PageRequest {
+                        view: PurgatoryView::All,
+                        active_threshold: 0,
+                        scope: *scope,
+                        search: None,
+                        group_id: None,
+                        sort: PageSort::Address,
+                        ascending: true,
+                        offset: 0,
+                        limit: usize::MAX,
+                    };
+                    let page = db.profiles_page(&request).await?;
+                    let pages = page
+                        .total
+                        .div_ceil(u64::try_from(*page_size).unwrap_or(u64::MAX));
                     *pages_total = u32::try_from(pages).unwrap_or(u32::MAX);
+                    *frozen = Some(page.ids);
                 }
-                if ids.is_empty() {
-                    *exhausted = true;
-                    return Ok(None);
-                }
-                *offset += ids.len();
-                *pages_done += 1;
+                let ids: Vec<EndpointId> = if let Some(all) = frozen {
+                    if *offset >= all.len() {
+                        *exhausted = true;
+                        return Ok(None);
+                    }
+                    let end = (*offset + *page_size).min(all.len());
+                    let chunk = all[*offset..end].to_vec();
+                    *offset = end;
+                    *pages_done += 1;
+                    chunk
+                } else {
+                    // `PurgatoryView::All` and no search/group: the run is about
+                    // the whole database, not about what the tab currently
+                    // filters to. The thresholds are unused for that view.
+                    let request = PageRequest {
+                        view: PurgatoryView::All,
+                        active_threshold: 0,
+                        scope: *scope,
+                        search: None,
+                        group_id: None,
+                        sort: PageSort::Address,
+                        ascending: true,
+                        offset: *offset,
+                        limit: *page_size,
+                    };
+                    let (ids, total) = db.profiles_walk_page(&request, *offset == 0).await?;
+                    if let Some(total) = total {
+                        let pages = total.div_ceil(u64::try_from(*page_size).unwrap_or(u64::MAX));
+                        *pages_total = u32::try_from(pages).unwrap_or(u32::MAX);
+                    }
+                    if ids.is_empty() {
+                        *exhausted = true;
+                        return Ok(None);
+                    }
+                    *offset += ids.len();
+                    *pages_done += 1;
+                    ids
+                };
                 // Purged links are skipped by a feed-wide sweep: the real half
                 // is the long pole, and re-proving a link the classifier has
                 // already judged is the one thing the purge exists to stop.
@@ -1460,16 +1521,60 @@ async fn run_task_chain(
 }
 
 impl BatchShared {
+    /// True when the endpoint's PERSISTED resolution attempt is inside the TTL.
+    ///
+    /// The handler's gate reads the SESSION's `endpoint_info`, which is seeded
+    /// for the loaded page only — so without this every off-page DNS endpoint is
+    /// re-resolved on every run. That wastes lookups and, worse, a transient
+    /// failure anywhere in the fan-out calls `scheduler.mark_dns_failure` and
+    /// DNS-defers a healthy endpoint inside the very batch that asked for it.
+    ///
+    /// A DNS host whose lookups never produced addresses carries no persisted
+    /// attempt (a failed lookup does not clear the address set), so it stays a
+    /// candidate — which is exactly the case this feature exists for.
+    fn dns_resolution_is_fresh(&self, endpoint: &Endpoint) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        endpoint
+            .resolved_at
+            .is_some_and(|attempted| now.saturating_sub(attempted) < self.dns_cache_ttl_secs)
+    }
+
     /// Schedule one page's links. The maps the probes read are filled here, so a
     /// link's own halves find their config and endpoint without a second pass
     /// over the whole plan.
     async fn dispatch_page(self: &Arc<Self>, links: Vec<PlanLink>) {
+        // One resolution request per DNS endpoint in this page. The handler's
+        // TTL gate makes a repeat cheap, but a fresh entry is invisible to that
+        // gate until its resolution completes, so per-link requests would all
+        // spawn their own lookup.
+        let mut resolve_requested: HashSet<i64> = HashSet::new();
         for plan in links {
             let key = (plan.link.protocol_id, plan.link.endpoint_id);
             self.fast_config
                 .insert(key, plan.protocol.proto_kind.to_i32());
             self.endpoints
                 .insert(plan.endpoint.id, Arc::new(plan.endpoint.clone()));
+            // A feed-wide plan reaches endpoints the UI never loads, so the
+            // batch asks for their resolution itself: resolving "the endpoint by
+            // id" in the result handler only ever sees the loaded page, which is
+            // how a full run left every off-page DNS host `[name]` while it
+            // persisted their exit IPs. Best-effort like every other batch
+            // event: a full channel drops the request, and the next batch (or a
+            // connect) asks again.
+            if plan.endpoint.host_type == HostType::Dns
+                && resolve_requested.insert(plan.endpoint.id.get())
+                && !self.dns_resolution_is_fresh(&plan.endpoint)
+            {
+                let _ = self.tx.try_send(CoreEvent::DnsResolveRequest {
+                    endpoint_id: plan.endpoint.id.get(),
+                    host: plan.endpoint.host.clone(),
+                    host_type: plan.endpoint.host_type,
+                    sni: crate::ops::enrich::extract_sni(&plan.protocol),
+                });
+            }
             // The kind-level testability gate: it needs only the in-memory
             // `proto_kind`, so it is decided here — the one place every batch
             // (production and test) passes through. The config-aware half runs
@@ -2002,7 +2107,7 @@ fn plan_row_links(row: &EndpointRow) -> impl Iterator<Item = PlanLink> + '_ {
 
 /// Batch fast-ping every link in the database.
 pub fn start_batch_ping(state: &mut AppState) {
-    start_batch(state, PlanSource::Feed, false, false);
+    start_batch(state, PlanSource::Feed(PlanScope::All), false, false);
 }
 
 /// Batch fast-ping every link in the database, then real-ping each link.
@@ -2011,7 +2116,18 @@ pub fn start_batch_ping(state: &mut AppState) {
 /// ping on an endpoint retires the remaining links' real tasks.
 pub fn start_batch_then_real_ping(state: &mut AppState) {
     let dedup = !state.config.speed_test.real_ping_test_all_protocols;
-    start_batch(state, PlanSource::Feed, true, dedup);
+    start_batch(state, PlanSource::Feed(PlanScope::All), true, dedup);
+}
+
+/// Fast + real over one SCOPE of the feed.
+///
+/// The scope narrows which ENDPOINTS the walk visits (`rank_tier`, materialized
+/// by ADR 0003); every link of a selected endpoint is planned, so a scope is a
+/// plan filter and nothing about the per-link pipeline changes. Dedup is the
+/// same setting the unscoped variant uses.
+pub fn start_batch_then_real_ping_scoped(state: &mut AppState, scope: PlanScope) {
+    let dedup = !state.config.speed_test.real_ping_test_all_protocols;
+    start_batch(state, PlanSource::Feed(scope), true, dedup);
 }
 
 /// Fast-ping every link of the selected endpoint (collapsed multi-protocol rows).
@@ -2080,6 +2196,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     let real_concurrency = state.config.speed_test.real_ping_concurrency.max(1);
     let fast_concurrency = state.config.speed_test.fast_ping_concurrency.max(1);
     let error_ttl_hours = state.config.speed_test.error_ttl_hours;
+    let dns_cache_ttl_secs = state.dns_cache_ttl_secs;
     // Sleep the full deferral window once, then re-schedule (the window is
     // measured in whole seconds and comes from the speed-test config via
     // `TaskScheduler::set_limits`).
@@ -2106,6 +2223,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
         fast_concurrency,
         page_size: PROFILES_PAGE_SIZE,
         error_ttl_hours,
+        dns_cache_ttl_secs,
         batch_slot,
     }));
 }
@@ -2216,28 +2334,156 @@ mod tests {
         runner: Arc<StubRunner>,
     }
 
-    /// D3: the "test all" entry point walks the FEED, and the walk skips purged
-    /// links — the real half is the long pole, and re-proving a link the
+    /// D3: the "test all" entry point walks the FEED, and the walk plans no
+    /// purged link — the real half is the long pole, and re-proving a link the
     /// classifier already judged is the one thing the purge exists to stop.
+    /// The plan is the walk's output, so this is asserted at the walk (the
+    /// batch always runs the real probe runner, which no stub counter sees).
     /// The selected-endpoint entry point reads the loaded page instead, so a
     /// Purgatory row is still testable by hand (the test below).
     #[tokio::test]
-    async fn a_feed_sweep_probes_no_purged_link() {
+    async fn a_feed_sweep_plans_no_purged_link() {
         use xray_tui_db::models::PurgeReason;
 
-        let mut rows = vec![fake_row(1, "10.0.0.1", 1)];
-        rows[0].links[0].purge_reason = Some(PurgeReason::NotTls);
-        let mut h = harness(rows).await;
+        let mut row = fake_row(1, "10.0.0.1", 2);
+        row.links[1].purge_reason = Some(PurgeReason::NotTls);
+        let live = row.links[0].protocol_id.get();
+        let h = harness(vec![row]).await;
 
-        start_batch(&mut h.state, PlanSource::Feed, true, false);
-        await_batch_done(&mut h.state).await;
+        let mut walk = PlanWalk::new(PlanSource::Feed(PlanScope::All), h.state.db.clone(), 10);
+        let mut planned: Vec<i64> = Vec::new();
+        while let Some(links) = walk.next_page().await.expect("walk page") {
+            planned.extend(links.iter().map(|pl| pl.link.protocol_id.get()));
+        }
+        assert_eq!(
+            planned,
+            vec![live],
+            "the purged link is not planned by a feed sweep"
+        );
+    }
+
+    /// A plan scope narrows which ENDPOINTS the walk visits, so the plan — and
+    /// therefore the probes — covers only the selected endpoints' links. The
+    /// scope is the feed query plus a `rank_tier` predicate; this is the seam
+    /// where the menu's scope reaches the SQL.
+    #[tokio::test]
+    async fn a_plan_scope_narrows_the_feed_walk() {
+        use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
+
+        // e1: a real success (tier 0) plus an untested sibling.
+        let mut successful = fake_row(1, "10.0.0.1", 2);
+        successful.links[0].latency = Some(Latency::Real {
+            delay: 30,
+            ip: None,
+        });
+        // e2: untested (tier 2).
+        let untested = fake_row(2, "10.0.0.2", 1);
+        // e3: a fast-error marker, nothing measured (tier 4).
+        let mut failed = fake_row(3, "10.0.0.3", 1);
+        failed.links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Fast,
+            text: "timeout".into(),
+        });
+
+        let h = harness(vec![successful, untested, failed]).await;
+        let planned_hosts = |scope| {
+            let db = h.state.db.clone();
+            async move {
+                let mut walk = PlanWalk::new(PlanSource::Feed(scope), db, 100);
+                let mut hosts: Vec<String> = Vec::new();
+                while let Some(links) = walk.next_page().await.expect("walk page") {
+                    hosts.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+                }
+                hosts.sort();
+                hosts.dedup();
+                hosts
+            }
+        };
 
         assert_eq!(
-            h.runner.fast_calls.load(Ordering::Relaxed),
-            0,
-            "the purged link is not even fast-probed by a feed sweep"
+            planned_hosts(PlanScope::Successful).await,
+            vec!["10.0.0.1"],
+            "only the endpoint with a real success"
         );
-        assert_eq!(h.runner.real_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            planned_hosts(PlanScope::SuccessfulAndNew).await,
+            vec!["10.0.0.1", "10.0.0.2"],
+            "the successful plus the untested endpoint"
+        );
+        assert_eq!(
+            planned_hosts(PlanScope::Failed).await,
+            vec!["10.0.0.3"],
+            "only the endpoint whose links all failed"
+        );
+        assert_eq!(
+            planned_hosts(PlanScope::All).await,
+            vec!["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+            "the unscoped walk still covers the feed"
+        );
+    }
+
+    /// A scoped walk freezes its endpoint set before any probe is dispatched.
+    /// The scope predicate is the endpoint's `rank_tier`, which this run's own
+    /// results change — so an offset-paged walk over the LIVE predicate skips
+    /// every endpoint that leaves the scope mid-walk (which is most of a
+    /// `Failed` run, whose whole purpose is to move endpoints to a success tier).
+    #[tokio::test]
+    async fn a_scoped_walk_freezes_its_set_before_probing() {
+        use xray_tui_db::models::Latency;
+
+        let rows: Vec<EndpointRow> = (1..=4)
+            .map(|i| {
+                let mut row = fake_row(i, &format!("10.0.0.{i}"), 1);
+                row.links[0].error = Some(ErrorInfo {
+                    kind: ProfileErr::Fast,
+                    text: "timeout".into(),
+                });
+                row
+            })
+            .collect();
+        let h = harness(rows).await;
+
+        let mut walk = PlanWalk::new(PlanSource::Feed(PlanScope::Failed), h.state.db.clone(), 1);
+        let first = walk.next_page().await.expect("page").expect("a page");
+        let mut planned: Vec<String> = first.iter().map(|pl| pl.endpoint.host.clone()).collect();
+
+        // The batch's own results: the endpoints still unvisited would leave the
+        // `Failed` scope now.
+        for i in 2..=4 {
+            let mut fixed = fake_row(i, &format!("10.0.0.{i}"), 1);
+            fixed.links[0].latency = Some(Latency::Fast { delay: 10 });
+            h.state
+                .db
+                .upsert_link(&fixed.links[0])
+                .await
+                .expect("upsert the now-succeeding link");
+        }
+
+        while let Some(links) = walk.next_page().await.expect("page") {
+            planned.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+        }
+        planned.sort();
+        assert_eq!(
+            planned,
+            ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"],
+            "every endpoint the walk started with is visited"
+        );
+
+        // …and the live predicate no longer matches them: the freeze is what
+        // made the difference, not a scope that still held.
+        let request = PageRequest {
+            view: PurgatoryView::All,
+            active_threshold: 0,
+            scope: PlanScope::Failed,
+            search: None,
+            group_id: None,
+            sort: PageSort::Address,
+            ascending: true,
+            offset: 0,
+            limit: 10,
+        };
+        let live = h.state.db.profiles_page(&request).await.expect("page");
+        assert_eq!(live.total, 1, "only the first endpoint still fails");
     }
 
     /// The selected-endpoint plan keeps purged links: it reads the loaded page,
@@ -2319,6 +2565,7 @@ mod tests {
             // Tiny pages: the streaming walk is what a feed batch exercises.
             page_size: 2,
             error_ttl_hours: None,
+            dns_cache_ttl_secs: h.state.dns_cache_ttl_secs,
             batch_slot: Arc::new(OnceLock::new()),
         }
     }
@@ -2421,7 +2668,7 @@ mod tests {
 
         // page_size 2 over 5 endpoints: three pages, one of them partial — the
         // walk must stop on the feed count, not on a short page.
-        let mut walk = PlanWalk::new(PlanSource::Feed, h.state.db.clone(), 2);
+        let mut walk = PlanWalk::new(PlanSource::Feed(PlanScope::All), h.state.db.clone(), 2);
         let mut hosts: Vec<String> = Vec::new();
         let mut pages = 0;
         while let Some(links) = walk.next_page().await.expect("walk page") {
@@ -2451,7 +2698,7 @@ mod tests {
         h.state.endpoints.clear();
 
         let p = BatchParams {
-            plan: PlanSource::Feed,
+            plan: PlanSource::Feed(PlanScope::All),
             ..build_params(&h, Vec::new(), false, false)
         };
         h.state.batch_progress = Some(p.meters.clone());

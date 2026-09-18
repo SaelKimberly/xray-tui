@@ -59,6 +59,48 @@ pub enum PageSort {
     Ip,
 }
 
+/// Which endpoints a batch plans — the "Fast + Real Ping" scope variants.
+///
+/// Every variant is a predicate over the endpoint's materialized `rank_tier`
+/// (ADR 0003), so the plan is index-driven and needs no new stored column:
+///
+/// | tier | means |
+/// | --- | --- |
+/// | 0 | a live, resolved link with a real measurement and no marker |
+/// | 2 | no link has a clean measurement, and ≥1 link is untested |
+/// | 3/4/5 | no live link is measured or untested (real / fast / name error) |
+///
+/// The one boundary this cannot express exactly: an endpoint with BOTH an
+/// untested link and a failed link reports tier 2, so `Failed` does not select
+/// it even though its row shows a marker. It is selected by `SuccessfulAndNew`
+/// instead, which is correct — it still has a link worth probing, and one
+/// failed probe later it lands in `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanScope {
+    /// Every endpoint that has a link (the default).
+    #[default]
+    All,
+    /// Endpoints that achieved a real success.
+    Successful,
+    /// `Successful` plus every endpoint with an untested link.
+    SuccessfulAndNew,
+    /// Endpoints whose links all failed, or whose name never resolved.
+    Failed,
+}
+
+impl PlanScope {
+    /// The `rank_tier` values this scope selects. Empty means "no predicate".
+    #[must_use]
+    pub const fn tiers(self) -> &'static [i64] {
+        match self {
+            Self::All => &[],
+            Self::Successful => &[0],
+            Self::SuccessfulAndNew => &[0, 2],
+            Self::Failed => &[3, 4, 5],
+        }
+    }
+}
+
 /// One page request. The thresholds are view filters, not ordering inputs.
 #[derive(Debug, Clone)]
 pub struct PageRequest {
@@ -73,6 +115,9 @@ pub struct PageRequest {
     pub active_threshold: i64,
     pub search: Option<String>,
     pub group_id: Option<String>,
+    /// The plan scope — a batch entry point's filter. The tab always asks for
+    /// `All`; the scoped batch variants narrow the walk.
+    pub scope: PlanScope,
     pub sort: PageSort,
     pub ascending: bool,
     pub offset: usize,
@@ -272,6 +317,15 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
             " AND (lower(e.host) LIKE {pattern} ESCAPE '\\' \
              OR CAST(e.port AS TEXT) LIKE {pattern} ESCAPE '\\')"
         ));
+    }
+    // The plan scope reads the endpoint's materialized tier, so the scoped
+    // batch variants are an index range over the covering index — no new
+    // stored column and no per-link scan. Bound (never inlined) like every
+    // other predicate, and shared with the count so the footer cannot drift.
+    let tiers = req.scope.tiers();
+    if !tiers.is_empty() {
+        let binds: Vec<String> = tiers.iter().map(|t| sql.bind(*t)).collect();
+        sql.push(&format!(" AND k.rank_tier IN ({})", binds.join(", ")));
     }
 }
 

@@ -869,6 +869,14 @@ impl AppState {
     pub fn start_batch_then_real_ping(&mut self) {
         ping::start_batch_then_real_ping(self);
     }
+    /// Fast + real over one scope of the feed (successful / successful+new /
+    /// failed), the "Fast + Real Ping" menu variants.
+    pub fn start_batch_then_real_ping_scoped(
+        &mut self,
+        scope: xray_tui_db::profiles_query::PlanScope,
+    ) {
+        ping::start_batch_then_real_ping_scoped(self, scope);
+    }
     /// Fast-ping every link of the selected endpoint (collapsed multi-protocol rows).
     pub fn start_endpoint_batch_ping(&mut self) {
         ping::start_endpoint_batch_ping(self);

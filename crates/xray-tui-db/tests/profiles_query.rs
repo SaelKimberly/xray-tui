@@ -10,7 +10,7 @@ use xray_tui_db::models::{
     ConfigType, Endpoint, EndpointId, EndpointIp, ErrorInfo, HostType, Latency, ProfileStats,
     Protocol, ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
 };
-use xray_tui_db::profiles_query::{PageRequest, PageSort};
+use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_db::{LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
@@ -40,6 +40,7 @@ const fn request(sort: PageSort, ascending: bool, offset: usize, limit: usize) -
     PageRequest {
         view: PurgatoryView::All,
         active_threshold: ts(0),
+        scope: PlanScope::All,
         search: None,
         group_id: None,
         sort,
@@ -285,6 +286,66 @@ async fn paging_visits_every_endpoint_exactly_once() {
             "no duplicates, limit {limit}"
         );
     }
+}
+
+/// The plan scopes select endpoints by their MATERIALIZED tier (ADR 0003), and
+/// the page, the walk and the count agree at every scope — the batch plan and
+/// its footer cannot drift.
+#[tokio::test]
+async fn plan_scopes_select_by_materialized_tier() {
+    let db = seed_fixture().await;
+    let scoped = |scope: PlanScope| {
+        let mut req = request(PageSort::Test, true, 0, 100);
+        req.scope = scope;
+        req
+    };
+    let ids_of = |meta: &xray_tui_db::profiles_query::PageMeta| {
+        let mut ids: Vec<i64> = meta.ids.iter().map(|id| EndpointId::get(*id)).collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    // tier 0 = a live resolved link with a real measurement: e1, e2, e4 (its
+    // manual override does not move the tier) and e7 (whose `name` sibling
+    // does not either, because its real link outranks it).
+    let successful = db
+        .profiles_page(&scoped(PlanScope::Successful))
+        .await
+        .expect("page");
+    assert_eq!(ids_of(&successful), vec![1, 2, 4, 7]);
+    assert_eq!(successful.total, 4, "the count carries the scope too");
+
+    // tier 2 adds the endpoint with no clean measurement but an untested link:
+    // e3 (untested only) and e5 (a fast-error link BESIDE an untested one).
+    let new = db
+        .profiles_page(&scoped(PlanScope::SuccessfulAndNew))
+        .await
+        .expect("page");
+    assert_eq!(ids_of(&new), vec![1, 2, 3, 4, 5, 7]);
+    assert_eq!(new.total, 6);
+
+    // tiers 3/4/5: nothing measured clean and nothing untested. e6 is the DNS
+    // host whose stored measurement sits in the name band — the row that shows
+    // `[name]` and cannot otherwise be re-tested deliberately.
+    let failed = db
+        .profiles_page(&scoped(PlanScope::Failed))
+        .await
+        .expect("page");
+    assert_eq!(ids_of(&failed), vec![6]);
+    assert_eq!(failed.total, 1);
+
+    // The default scope is the whole feed, and the walk pages the same set.
+    let all = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page");
+    assert_eq!(all.total, ALL_ENDPOINTS.len() as u64);
+    let walked = db
+        .profiles_walk_page(&scoped(PlanScope::Failed), true)
+        .await
+        .expect("walk");
+    assert_eq!(walked.0, failed.ids, "the walk reads the same predicate");
+    assert_eq!(walked.1, Some(1));
 }
 
 /// The walk page is the page query minus its per-page count: same ids in the

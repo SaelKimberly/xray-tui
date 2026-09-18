@@ -625,6 +625,29 @@ impl EndpointRow {
             .map(|l| Self::link_test_key(l, dns_unresolved))
             .min()
     }
+
+    /// Index of the endpoint's REPRESENTATIVE link: the one whose
+    /// [`Self::link_test_key`] is the endpoint's minimum.
+    ///
+    /// This is the link [`crate::endpoint_rank::compute_rank`] stores the
+    /// endpoint's tier from, so a reader that selects it reports the endpoint's
+    /// own tier band — the Test cell and the Test sort cannot disagree. Note it
+    /// is NOT `active_link()`: that one prefers the lowest-delay MEASURED link
+    /// and honours a manual override, so on an endpoint whose measured link also
+    /// carries a failure marker it returns a link the ordering law ranks three
+    /// tiers below the endpoint's own position.
+    ///
+    /// Ties keep the lowest index, matching `Iterator::min`'s first-wins rule in
+    /// `compute_rank`.
+    #[must_use]
+    pub fn representative_link_index(&self, dns_unresolved: bool) -> Option<usize> {
+        self.links
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (i, Self::link_test_key(l, dns_unresolved)))
+            .min_by_key(|&(_, key)| key)
+            .map(|(i, _)| i)
+    }
 }
 
 /// Three-way toggle for the Profiles tab.

@@ -389,40 +389,49 @@ const fn test_glyph(test_type: TestType) -> &'static str {
 const TEST_WARN_MS: i32 = 500;
 const TEST_BAD_MS: i32 = 1000;
 
-/// Compute the Test cell for one endpoint row: `[value]` with the active
-/// link's last measured delay, colored by magnitude, or the red problem
-/// labels — `[name]` when the DNS name could not be resolved, `[real]`/`[fast]`
-/// when any of the endpoint's links carries a persisted failure marker of
-/// Failure label for the single-row Test cell, from the ACTIVE (preferred)
-/// link only — the row represents the endpoint's chosen protocol, so a
-/// failed sibling must not paint it red when the best protocol succeeded
-/// (the expanded panel still shows per-link markers). Precedence follows the
-/// tier model (decision 16): real-err (3) ranks above fast-err (4) — when
-/// both marker classes are present the deeper real check wins — and
-/// DNS-unresolved (5) is the deepest, so `[name]` beats both.
+/// Compute the Test cell for one endpoint row: `[value]` with the last
+/// measured delay, colored by magnitude, or the red problem labels — `[name]`
+/// when the DNS name could not be resolved, `[real]`/`[fast]` when the link has
+/// no clean measurement left.
+///
+/// The cell describes the endpoint's REPRESENTATIVE link
+/// ([`EndpointRow::representative_link_index`] — the minimum of the
+/// decision-16 key, the same link `compute_rank` stores the endpoint's stored
+/// tier from). Selecting by `active_link()` instead (the lowest-delay MEASURED
+/// link, error-blind) let a marker render on a row the ordering law had placed
+/// in a measurement band: for a link with a fast latency plus a real failure
+/// beside a sibling still measured clean, the cell showed `[real]` while the
+/// endpoint's own tier was 1. With the representative link the cell's content
+/// and the row's tier band come from one fact, so they cannot disagree.
+///
+/// Precedence follows the tier model (decision 16): real-err (3) ranks above
+/// fast-err (4) — when both marker classes are present the deeper real check
+/// wins — and DNS-unresolved (5) is the deepest, so `[name]` beats both.
 fn compute_test_cell(
     row: &EndpointRow,
     resolved: bool,
     palette: &ratatui_cheese::theme::Palette,
 ) -> (String, Style) {
     use xray_tui_db::models::ProfileErr;
-    let active_error = row.active_link().and_then(|l| l.error.as_ref());
+    let representative = row
+        .representative_link_index(!resolved)
+        .and_then(|i| row.links.get(i));
+    let representative_error = representative.and_then(|l| l.error.as_ref());
     // A "not testable by the native engine" marker is a STATUS, not a failed
     // measurement, so it outranks a stored delay (see `test_cell_content`).
-    let untestable = active_error.is_some_and(crate::ops::ping::is_untestable_marker);
+    let untestable = representative_error.is_some_and(crate::ops::ping::is_untestable_marker);
     // A purge verdict is a STATUS too, and the same precedence applies: the
     // delay a purged link still carries is the phase-1 result of a row the
-    // classifier has already judged (spec §9).
-    let purged = row
-        .active_link()
-        .and_then(|l| l.purge_reason)
-        .map(purge_label);
-    let failure = match active_error.map(|e| e.kind) {
+    // classifier has already judged (spec §9). Reachable only when every link
+    // is purged — the representative of an endpoint that still has a live link
+    // is that live link, because tier 6 sits below every live band.
+    let purged = representative.and_then(|l| l.purge_reason).map(purge_label);
+    let failure = match representative_error.map(|e| e.kind) {
         Some(ProfileErr::Real | ProfileErr::Name) => Some(TestFailure::Real),
         Some(ProfileErr::Fast) => Some(TestFailure::Fast),
         None => None,
     };
-    let active_delay = row.active_link().and_then(|l| match l.latency {
+    let delay = representative.and_then(|l| match l.latency {
         Some(
             xray_tui_db::models::Latency::Real { delay, .. }
             | xray_tui_db::models::Latency::Fast { delay },
@@ -435,7 +444,7 @@ fn compute_test_cell(
         untestable,
         purged,
         failure,
-        active_delay,
+        delay,
         palette,
     )
 }
@@ -497,12 +506,23 @@ fn test_cell_content(
         // Purgatory/All row: the verdict is what the row IS.
         return (format!("[{}]", center_cell(label, 4)), bad);
     }
-    // A measured delay wins over a failure marker: a link that carries both a
-    // successful measurement and a later failure (e.g. a batch probe that
-    // succeeded, then a transient retry failed) still has a result the row
-    // should show. The failure label appears only when the active link has no
-    // measurement — decision 16 keeps fresh failures dominating the sub-table
-    // order, but the single-row cell reflects the measured state.
+    // A failure marker outranks the link's OWN measurement. A failed real
+    // probe keeps its fast latency in `profile_stats` (`apply_test_result`
+    // preserves the measurement when it writes a marker), so rendering that
+    // delay would present a failed profile as a working one — and the
+    // ordering law already ranks the same link in an error tier
+    // (`RankLink::key` lets `error_kind` force tier 3/4), so a delay here
+    // made the cell and the sort key two different laws. Tier ordering
+    // (decision 16): real-err ranks above fast-err — the real check is the
+    // deeper probe, so when both classes failed `[real]` wins.
+    let failure_label = match failure {
+        Some(TestFailure::Real) => Some("real"),
+        Some(TestFailure::Fast) => Some("fast"),
+        None => None,
+    };
+    if let Some(label) = failure_label {
+        return (format!("[{}]", center_cell(label, 4)), bad);
+    }
     match active_delay {
         Some(d) if d >= 0 => {
             let style = if d >= TEST_BAD_MS {
@@ -514,18 +534,7 @@ fn test_cell_content(
             };
             (format!("[{}]", center_cell(&d.to_string(), 4)), style)
         }
-        _ => {
-            // Tier ordering (decision 16): real-err ranks above fast-err —
-            // the real check is the deeper probe, so when both classes
-            // failed `[real]` wins.
-            if failure == Some(TestFailure::Real) {
-                (format!("[{}]", center_cell("real", 4)), bad)
-            } else if failure == Some(TestFailure::Fast) {
-                (format!("[{}]", center_cell("fast", 4)), bad)
-            } else {
-                (" ".repeat(6), Style::default())
-            }
-        }
+        _ => (" ".repeat(6), Style::default()),
     }
 }
 
@@ -684,7 +693,12 @@ fn build_display_rows(
         let idx_str = index_cell(state.page_offset + i + 1, is_multi);
 
         let info = state.endpoint_info.get(&row.endpoint.id.get());
-        let resolved = info.is_some_and(|i| !i.resolved_ips.is_empty());
+        // One resolution source: the loaded row's persisted addresses — the
+        // same fact the ordering law's `rank_dns` is computed from
+        // (`endpoint_rank::dns_unresolved`). Reading the in-memory cache here
+        // made `[name]` and the tier-5 band two different answers for the same
+        // endpoint, which is what let a row show `[name]` beside a live exit IP.
+        let resolved = !crate::ops::profiles::endpoint_dns_unresolved(state, row);
 
         let country_flag = info
             .and_then(|i| i.country.as_deref())
@@ -720,22 +734,35 @@ fn build_display_rows(
         // Exit IP: the ACTIVE link's persisted real-ping IP wins (survives
         // reruns); endpoint_info is the live-enrich fallback. Country comes
         // from the per-IP mmdb cache (seeded at load + on ping).
+        //
+        // Both columns are gated on the endpoint being RESOLVED: the exit IP is
+        // evidence that a tunnel to this endpoint worked, and a DNS host whose
+        // name has never resolved — or whose resolution failed — must not
+        // assert one. Without the gate a feed batch (which persists `latency_ip`
+        // for every planned link) rendered `[name]` beside a live exit IP for
+        // every endpoint outside the loaded page.
         let active_outbound_ip = row.active_link().and_then(|l| match &l.latency {
             Some(xray_tui_db::models::Latency::Real { ip: Some(ip), .. }) => Some(ip.clone()),
             _ => None,
         });
-        let outbound_addr = active_outbound_ip
+        let persisted_outbound = active_outbound_ip
             .clone()
-            .or_else(|| info.and_then(|i| i.outbound_ip.map(|ip| ip.to_string())))
-            .unwrap_or_else(|| "—".to_string());
-        let outbound_country = active_outbound_ip
+            .or_else(|| info.and_then(|i| i.outbound_ip.map(|ip| ip.to_string())));
+        let enriched_country = active_outbound_ip
             .as_deref()
             .and_then(|ip| state.outbound_country_for(ip))
-            .or_else(|| info.and_then(|i| i.outbound_country.clone()))
-            .map_or_else(
-                || "—".to_string(),
-                |iso| truncate_pad(&format!("{} {iso}", iso_to_flag(&iso)), 7),
-            );
+            .or_else(|| info.and_then(|i| i.outbound_country.clone()));
+        // The gate: an unresolved endpoint asserts no exit IP.
+        let (persisted_outbound, enriched_country) = if resolved {
+            (persisted_outbound, enriched_country)
+        } else {
+            (None, None)
+        };
+        let outbound_addr = persisted_outbound.unwrap_or_else(|| "—".to_string());
+        let outbound_country = enriched_country.map_or_else(
+            || "—".to_string(),
+            |iso| truncate_pad(&format!("{} {iso}", iso_to_flag(&iso)), 7),
+        );
 
         // Panel content
         let panel_ips = info
@@ -1347,13 +1374,13 @@ mod tests {
         }
     }
 
-    /// Regression: multi-protocol endpoint — first protocol fails real ping,
-    /// second succeeds. The single-row Test cell must reflect the ACTIVE
-    /// (preferred) link: no red `[real]` when the best protocol succeeded,
-    /// and its delay shown. Pre-fix the label scanned ANY link, so a failed
-    /// sibling painted the row red despite the endpoint working.
+    /// Regression: multi-protocol endpoint — the cell describes the
+    /// REPRESENTATIVE link (the minimum of the decision-16 key), never the raw
+    /// `selected_protocol` and never "any link". A failed sibling must not paint
+    /// the row red while the endpoint's own tier is a success band, and the
+    /// marker must appear once no link has a clean measurement left.
     #[test]
-    fn test_cell_label_follows_active_link_not_any_link() {
+    fn test_cell_follows_the_representative_link() {
         use crate::ops::profiles::test_support::fake_row;
         use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
         let palette =
@@ -1367,27 +1394,76 @@ mod tests {
             delay: 40,
             ip: None,
         });
+        // p102 stays untested.
 
-        // Active = p101 (success): no failure label, delay shown.
+        // The representative is p101 (tier 0), so its delay is what the row
+        // shows — whatever the selection is.
+        for selected in [0, 1, 2] {
+            row.selected_protocol = selected;
+            let (text, _) = compute_test_cell(&row, true, &palette);
+            assert!(text.contains("40"), "representative delay: {text:?}");
+            assert!(!text.contains("real"), "no marker: {text:?}");
+        }
+
+        // Every link failed → no clean measurement remains → the marker, from
+        // the representative's kind (real ranks above fast).
+        row.links[1].latency = None;
+        row.links[1].error = Some(ErrorInfo {
+            kind: ProfileErr::Fast,
+            text: "timeout".into(),
+        });
+        row.links[2].error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "timeout".into(),
+        });
         row.selected_protocol = 1;
-        let (text, _style) = compute_test_cell(&row, true, &palette);
-        assert!(
-            !text.contains("real"),
-            "active success must not paint red: {text:?}"
-        );
-        assert!(text.contains("40"), "active delay must be shown: {text:?}");
-
-        // Active = p100 (failed): [real] red, as expected.
-        row.selected_protocol = 0;
-        let (text, _style) = compute_test_cell(&row, true, &palette);
-        assert!(text.contains("real"), "active failure must label: {text:?}");
+        let (text, _) = compute_test_cell(&row, true, &palette);
+        assert_eq!(text, "[real]");
     }
 
-    /// A link that carries both a measured success and a later failure
-    /// marker must still show the delay — the single-row cell reflects the
-    /// measured state, not the stale marker.
+    /// A link carrying BOTH a fast measurement and a real failure (tier 3)
+    /// beside a sibling whose fast measurement is clean (tier 1): the endpoint's
+    /// tier is 1, so the cell must show the clean measurement. Selecting by
+    /// lowest-delay MEASURED (error-blind) picked the failing link — whose delay
+    /// is lower — and rendered its marker on a row the ordering law had placed in
+    /// the measurement band. This state is routine mid-batch: the failing link is
+    /// a previous run's result, the clean one landed seconds ago.
     #[test]
-    fn test_cell_delay_beats_failure_marker_on_active_link() {
+    fn test_cell_ignores_a_marker_on_a_link_worse_than_the_endpoints_tier() {
+        use crate::ops::profiles::test_support::fake_row;
+        use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let mut row = fake_row(1, "1.2.3.4", 2);
+        row.links[0].latency = Some(Latency::Fast { delay: 12 });
+        row.links[0].error = Some(ErrorInfo {
+            kind: ProfileErr::Real,
+            text: "timeout".into(),
+        });
+        row.links[1].latency = Some(Latency::Fast { delay: 20 });
+
+        // `select_best_measured_link` would pick links[0] (12 < 20) — the cell
+        // must not follow it.
+        let mut probing = row.clone();
+        probing.select_best_measured_link();
+        assert_eq!(probing.selected_protocol, 0, "the error-blind rule picks A");
+
+        let (text, _) = compute_test_cell(&row, true, &palette);
+        assert_eq!(
+            text, "[ 20 ]",
+            "the endpoint's tier is 1, so its clean measurement shows"
+        );
+    }
+
+    /// A link that carries both a measurement and a failure marker shows the
+    /// MARKER. A failed real probe keeps its fast latency in `profile_stats`
+    /// (`apply_test_result` preserves the measurement when it writes the
+    /// marker), so rendering that delay would present a failed profile as a
+    /// working one — and the ordering law already ranks the same link in an
+    /// error tier, so a delay here made the cell and the sort key two
+    /// different laws.
+    #[test]
+    fn test_cell_failure_marker_beats_the_links_own_delay() {
         use crate::ops::profiles::test_support::fake_row;
         use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
         let palette =
@@ -1399,10 +1475,16 @@ mod tests {
             text: "timeout".into(),
         });
         let (text, _style) = compute_test_cell(&row, true, &palette);
-        assert!(text.contains("44"), "measured delay must win: {text:?}");
+        assert_eq!(text, "[fast]", "the marker must win over a stale delay");
+        assert!(!text.contains("44"), "no delay over a marker: {text:?}");
+
+        // The delay is displayable again once the marker is gone — the TTL
+        // sweep is the only remover.
+        row.links[0].error = None;
+        let (text, _style) = compute_test_cell(&row, true, &palette);
         assert!(
-            !text.contains("fast"),
-            "no [fast] label over a delay: {text:?}"
+            text.contains("44"),
+            "a clean measurement still shows: {text:?}"
         );
     }
 
@@ -1847,9 +1929,9 @@ mod tests {
     #[test]
     fn test_cell_labels_persisted_failure_markers() {
         let palette = test_palette();
-        // A measured delay wins over a failure marker: a link carrying both a
-        // success and a later failure still shows its result. Labels appear
-        // only when the active link has NO measurement.
+        // A failure marker outranks the link's OWN measurement: a failed probe
+        // keeps its latency stored, and rendering it would hide a failure the
+        // ordering law already ranks in an error tier.
         let (t, _) = test_cell_content(
             false,
             true,
@@ -1859,7 +1941,7 @@ mod tests {
             Some(12),
             &palette,
         );
-        assert_eq!(t, "[ 12 ]");
+        assert_eq!(t, "[real]");
         let (t, _) = test_cell_content(
             false,
             true,
@@ -1869,7 +1951,7 @@ mod tests {
             Some(12),
             &palette,
         );
-        assert_eq!(t, "[ 12 ]");
+        assert_eq!(t, "[fast]");
         // Both marker classes present with no delay → [real]: real-err
         // (tier 3) ranks above fast-err (tier 4), the real check being the
         // deeper probe (T20 flip).
@@ -1960,7 +2042,8 @@ mod tests {
         let (t, s) = test_cell_content(false, true, true, None, None, Some(12), &palette);
         assert_eq!(t, "[real]");
         assert_eq!(s.fg, Some(palette.error));
-        // A genuine failure marker still lets a measured delay win.
+        // A genuine failure marker outranks a measured delay too — the marker
+        // is the later, deeper statement about the link.
         let (t, _) = test_cell_content(
             false,
             true,
@@ -1970,7 +2053,7 @@ mod tests {
             Some(12),
             &palette,
         );
-        assert_eq!(t, "[ 12 ]");
+        assert_eq!(t, "[real]");
         // DNS-unresolved stays the deepest state.
         let (t, _) = test_cell_content(true, false, true, None, None, None, &palette);
         assert_eq!(t, "[name]");

@@ -155,3 +155,54 @@ unchanged and still in force (the covering index serves the page at 8–14 ms).
 The hydration bullet was also acted on rather than accepted: the page is a
 one-statement raw read with the ids interpolated as integer literals
 (`load_page_projection`, 1,027 ms → 49.6 ms), and ADR 0001 was amended for it.
+
+## Amendment — 2026-09-18: a marker-carrying link contributes no displayable delay
+
+Decision 16's law was implemented TWICE, for two different purposes, and the two
+disagreed about a link that carries both a measurement and a failure marker —
+which is exactly the shape `apply_test_result` persists (it keeps `latency` when
+it writes an error) and `stage_result` re-creates (it overlays the batch's fast
+latency onto every patch, failures included).
+
+- **The ordering key** reads `error_kind` first: tier 3/4, `rank_latency =
+  i32::MAX`. Unchanged, and still the law.
+- **The single-row Test cell** read `active_link()` →
+  `select_best_measured_link`, which is error-BLIND, and then let the delay win
+  over the marker. So a real failure kept rendering its fast latency while the
+  row sorted into an error band: numeric cells interleaved with a band the user
+  could not see, and — worse — a full fast+real batch left every failed real
+  probe looking like a working fast one.
+
+**The cell now selects the same link the key does.** The Test cell renders the
+endpoint's REPRESENTATIVE link — the argmin of `RankLink::key`, the very link
+`compute_rank` stores `rank_tier` from — and that link's own failure marker
+outranks its own stored delay. Precedence: `[name]` > untestable > purge >
+marker > delay > blank.
+
+Selecting by `active_link()` → `select_best_measured_link` was the deeper defect,
+not the precedence alone: that rule is error-BLIND (it takes the lowest-delay
+MEASURED link), so for `A = fast-ok 12 + real-err` (tier 3) beside
+`B = fast-ok 20 + real pending` (tier 1) it picks A and a precedence-only fix
+would render `[real]` on a row whose `rank_tier` is 1 — a marker cell inside the
+measurement band. With the representative link the cell's content IS the row's
+tier band: tier 0/1 → that link's delay (identical to `rank_latency`), tier 2 →
+blank, tiers 3/4 → the marker, tier 5 → `[name]`, tier 6 → the purge label
+(reachable only when every link is purged, because tier 6 sits below every live
+band — which is what the purge label's own comment always claimed).
+
+Deliberate behaviour change: the cell no longer follows
+`selected_protocol`/`manual_protocol_override`. The ordering law's tier ignores
+the override, and a cell that honoured it could not report the endpoint's band.
+The override still wins for `active_link()`, which drives the row's exit IP,
+country, speed and traffic, and for the sub-table's first position.
+
+`select_best_measured_link` and `display_link_index` stay two functions for two
+purposes (the display link vs the tier). What changed is the cell's link
+selection and content rule, both of which are now functions of the tier the
+ordering law already computes.
+
+Also recorded here because it is the same class of defect on the ordering side:
+the cell's `[name]` and the tier-5 band read DIFFERENT resolution sources (the
+in-memory `endpoint_info` cache vs the row's persisted `endpoint_ip` addresses).
+The cell now reads `endpoint_rank::dns_unresolved(row)` — the row — so the label
+and the band are one fact.

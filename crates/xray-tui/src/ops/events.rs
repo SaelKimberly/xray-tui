@@ -836,12 +836,13 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     .get(&endpoint_id)
                     .is_some_and(|i| !i.resolved_ips.is_empty());
                 // Merge by field group so concurrent enrichment (resolution /
-                // whitelist / outbound) does not clobber each other. Events
-                // with empty resolved_ips (failed lookup) carry nothing
-                // mergable and must NOT materialize an entry — an empty entry
-                // would block the startup seeding pass and make
-                // `should_resolve` treat the endpoint as a never-retried IP
-                // host.
+                // whitelist / outbound) does not clobber each other. An event
+                // with an empty `resolved_ips` may materialize an entry — a
+                // failed lookup, or an outbound-only event that knows the exit
+                // IP but not the inbound address. Such an entry is safe: it
+                // reads as "no address and no attempt", which both
+                // `should_resolve` and the startup seeding pass treat as "still
+                // needs resolving" rather than as a resolved IP host.
                 let mut persist: Option<(Vec<std::net::IpAddr>, i64)> = None;
                 if !info.resolved_ips.is_empty()
                     || info.sni_whitelisted.is_some()
@@ -914,6 +915,25 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     }
                     state.filter_cache_valid.set(false);
                 }
+            }
+            CoreEvent::DnsResolveRequest {
+                endpoint_id,
+                host,
+                host_type,
+                sni,
+            } => {
+                // The batch plans every endpoint in the feed but the UI holds
+                // only the loaded page, so it carries the endpoint facts with
+                // the request rather than an id to look up. Resolving by id here
+                // is what left every off-page DNS host `[name]` for good.
+                crate::ops::enrich::spawn_dns_resolve_host(
+                    state,
+                    endpoint_id,
+                    host,
+                    host_type,
+                    sni,
+                    false,
+                );
             }
         }
         budget -= 1;

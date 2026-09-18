@@ -140,7 +140,7 @@ erDiagram
     endpoint_rank {
         BIGINT endpoint_id PK
         BIGINT rank_dns "1 = DNS-unresolved (tier 5)"
-        BIGINT rank_tier "0 real-ok .. 5 dns"
+        BIGINT rank_tier "0 real-ok, 1 fast-ok, 2 untested, 3 real/name-err, 4 fast-err, 5 dns, 6 purged — also the batch plan-scope predicate"
         BIGINT rank_latency "i32::MAX outside tiers 0-1"
         BIGINT rank_seen "representative link last_seen_at"
         BIGINT rank_protocol "order tiebreak"

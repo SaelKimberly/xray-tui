@@ -511,3 +511,53 @@ status bar), DB page query + endpoint_ip write. Owners touched: `ops/ping.rs`
 (render), `profiles_query.rs` + `endpoint_ip.rs` + `database.rs` (SQL), 
 `ops/enrich.rs` (geo seed). Invariants: §4. Compatibility: none outside the
 process (no persisted schema, no config key, no identity change).
+
+## Amendment — 2026-09-18: plan scopes, and why a marker must be visible
+
+Two additions. The per-link fast→real pipeline, the gate, the meters and the
+summary are unchanged.
+
+### Plan scopes
+
+`PlanSource::Feed` now carries a `PlanScope`, and `PageRequest` carries the same
+enum, so the walk narrows which ENDPOINTS it visits:
+
+| Menu item | `PlanScope` | `rank_tier` predicate |
+| --- | --- | --- |
+| Fast + Real Ping (All Profiles) | `All` | none |
+| Fast + Real Ping (Successful) | `Successful` | `= 0` |
+| Fast + Real Ping (Successful + New) | `SuccessfulAndNew` | `IN (0, 2)` |
+| Fast + Real Ping (Failed) | `Failed` | `IN (3, 4, 5)` |
+
+No new storage: the endpoint's min-tier is already materialized and indexed by
+ADR 0003, so a scope is an index range on the covering index. The predicate is
+BOUND (never inlined) and lives in `profiles_query::base_from_where`, which the
+page, the walk and the count all share — a scoped plan and its footer cannot
+drift. `plan_scopes_select_by_materialized_tier` pins all three scopes plus the
+walk/count agreement.
+
+Scope selects endpoints; every link of a selected endpoint is planned, so
+nothing about `dispatch_page` or the chain changes. Recorded boundary: an
+endpoint with both an untested link and a failed link reports tier 2 and is
+selected by *Successful + New*, not *Failed* — it still has a link worth probing.
+
+### The batch resolves the endpoints it plans
+
+`dispatch_page` sends one `CoreEvent::DnsResolveRequest` per DNS endpoint in the
+page, carrying the endpoint facts (`host`, `host_type`, `sni`) rather than an id
+to look up. The result handler's trigger was page-scoped, so a feed-wide run left
+every off-page DNS host `[name]` while it persisted their exit IPs; the batch is
+the only party that knows all of them. The handler's TTL gate collapses repeats,
+and the per-page dedup exists because a fresh entry is invisible to that gate
+until its resolution completes.
+
+### The marker must be visible, or the run's outcome is unreadable
+
+`test_cell_content` used to let a link's own delay win over its failure marker.
+Since `apply_test_result` keeps a link's latency when it writes an error and
+`stage_result` overlays the batch's fast latency onto every patch, a failed real
+probe persisted `latency = Fast` + `error = Real` and rendered the bare number —
+so a full fast+real batch left every real failure looking like a working fast
+result, with no visible reason. The cell now follows the per-link tier the
+ordering key uses: a marker-carrying link contributes no displayable delay.
+See ADR 0003's 2026-09-18 amendment.

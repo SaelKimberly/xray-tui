@@ -9,6 +9,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use xray_tui_db::models::{Endpoint, EndpointId, HostType, Protocol};
 use xray_tui_host_features::HostFeatures;
 
@@ -20,7 +21,7 @@ use crate::types::{CoreEvent, EndpointInfo};
 /// write time from `config.security().sni()` (covers both `tls` and `reality`
 /// variants). The column is queryable without loading the deferred `config`
 /// JSON; when the config IS loaded, the typed accessor chain is equivalent.
-fn extract_sni(protocol: &Protocol) -> Option<String> {
+pub(crate) fn extract_sni(protocol: &Protocol) -> Option<String> {
     use xray_tui_proto::proto_spec::ProtoSpec;
     if !protocol.config.is_unloaded()
         && let Some(sni) = protocol.config.get().0.security().and_then(|s| s.sni())
@@ -30,21 +31,34 @@ fn extract_sni(protocol: &Protocol) -> Option<String> {
     protocol.security.sni.clone()
 }
 
-/// True when a resolution must run: no entry, or a DNS entry older than the
-/// TTL, or `force`. IP-host entries (`resolved_at_secs: None`) never re-resolve.
+/// True when a resolution must run: no entry, no address and no attempt, or a
+/// DNS entry older than the TTL, or `force`.
+///
+/// An entry with an empty address set AND no attempt timestamp is not an
+/// IP-host entry and carries no resolution information: `spawn_outbound_enrich`
+/// materializes exactly that shape (it knows the endpoint's exit IP, not its
+/// inbound address). Treating it as "already resolved" is what made `[name]`
+/// terminal for a DNS host whose first real ping landed before its first
+/// resolution attempt.
 const fn should_resolve(
     entry: Option<&EndpointInfo>,
     force: bool,
     ttl_secs: i64,
     now_secs: i64,
 ) -> bool {
-    match entry {
-        None => true,
-        Some(e) => match e.resolved_at_secs {
-            None => false,
-            Some(ts) => force || now_secs - ts >= ttl_secs,
-        },
+    let Some(e) = entry else {
+        return true;
+    };
+    // No address and no attempt is not a resolution — see the note above.
+    if e.resolved_ips.is_empty() && e.resolved_at_secs.is_none() {
+        return true;
     }
+    // An IP host carries its own address and no attempt stamp: its address IS
+    // the resolution, so it never re-resolves.
+    let Some(ts) = e.resolved_at_secs else {
+        return false;
+    };
+    force || now_secs - ts >= ttl_secs
 }
 
 /// A DNS hostname safe to hand to the resolver: ASCII letters/digits/hyphens
@@ -148,6 +162,10 @@ fn stored_country(addrs: &[(IpAddr, Option<String>)]) -> Option<String> {
 /// TTL gate: fresh DNS entries are skipped (no network) unless `force`.
 /// Results arrive via `CoreEvent::EndpointInfoUpdated`; DNS-host results are
 /// persisted by the event handler so they survive launches.
+///
+/// Page-scoped: the row must be in the loaded page. A batch plans the whole
+/// feed, so it sends [`CoreEvent::DnsResolveRequest`] and the handler calls
+/// [`spawn_dns_resolve_host`] with the facts instead.
 pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     let Some(row) = state
         .endpoints
@@ -156,6 +174,37 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     else {
         return;
     };
+    let host = row.endpoint.host.clone();
+    let host_type = row.endpoint.host_type;
+    let sni = row.active_protocol().and_then(|(_, p)| extract_sni(p));
+    spawn_dns_resolve_host(state, endpoint_id, host, host_type, sni, force);
+}
+
+/// Bound on concurrent inbound resolutions.
+///
+/// A feed-wide batch asks for one resolution per DNS endpoint — ~18k on the
+/// reference feed — and the trigger it replaces was bounded by
+/// `real_ping_concurrency`. Every in-flight lookup holds a permit and one shared
+/// hickory resolver's sockets, so without this the whole fan-out opens at once.
+/// Acquired INSIDE the spawned task: taking a permit in `poll_core_events` would
+/// stall the UI tick on DNS.
+static RESOLVE_SEM: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
+
+/// Resolve one endpoint's inbound host from facts the caller already holds.
+///
+/// The TTL gate
+/// ([`should_resolve`]) is evaluated here, against the session's
+/// `endpoint_info`, so repeated requests for the same endpoint collapse to one
+/// lookup and a fresh resolution is never repeated.
+pub fn spawn_dns_resolve_host(
+    state: &mut AppState,
+    endpoint_id: i64,
+    host: String,
+    host_type: HostType,
+    sni: Option<String>,
+    force: bool,
+) {
     if !should_resolve(
         state.endpoint_info.get(&endpoint_id),
         force,
@@ -170,12 +219,13 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     let checker = state.host_features.clone();
     let scheduler = state.scheduler.clone();
     let db = state.db.clone();
-    let host = row.endpoint.host.clone();
-    let host_type = row.endpoint.host_type;
-    let sni = row.active_protocol().and_then(|(_, p)| extract_sni(p));
     let tx = state.core_event_tx.clone();
 
     tokio::spawn(async move {
+        // One permit per in-flight lookup — see [`RESOLVE_SEM`].
+        let Ok(_permit) = Arc::clone(&RESOLVE_SEM).acquire_owned().await else {
+            return;
+        };
         let now = unix_now();
         // Whether the resolution produced a usable answer; `false` feeds the
         // scheduler's DNS-failure gate below. IP hosts and hosts without a
@@ -324,7 +374,15 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
             matches!(r.endpoint.host_type, HostType::Ipv4 | HostType::Ipv6)
                 || !r.resolved_ips.is_empty()
         })
-        .filter(|r| !state.endpoint_info.contains_key(&r.endpoint.id.get()))
+        // An entry with no address and no attempt timestamp carries no
+        // resolution information (an outbound-only event materializes one), so
+        // it must still be seeded rather than treated as already resolved.
+        .filter(|r| {
+            state
+                .endpoint_info
+                .get(&r.endpoint.id.get())
+                .is_none_or(|e| e.resolved_ips.is_empty() && e.resolved_at_secs.is_none())
+        })
         .map(|r| {
             (
                 r.endpoint.id.get(),
@@ -349,7 +407,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
     let mut feature_targets: Vec<(i64, EndpointInfo, Option<String>)> =
         Vec::with_capacity(targets.len());
     for (endpoint_id, ep, cached_as, cached_at, sni) in targets {
-        let info = if cached_as.is_empty() {
+        let mut info = if cached_as.is_empty() {
             // IP host — its own address is the "resolution".
             EndpointInfo {
                 resolved_ips: vec![
@@ -377,6 +435,14 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                 resolved_at_secs: cached_at,
             }
         };
+        // An entry the seed is allowed to replace may still carry the exit-IP
+        // fields an outbound-only event wrote (that event knows the endpoint's
+        // outbound IP, never its inbound address, so it cannot fill
+        // `resolved_ips`). Those fields are not the seed's to drop.
+        if let Some(existing) = state.endpoint_info.get(&endpoint_id) {
+            info.outbound_ip = existing.outbound_ip;
+            info.outbound_country.clone_from(&existing.outbound_country);
+        }
         state.endpoint_info.insert(endpoint_id, info.clone());
         feature_targets.push((endpoint_id, info, sni));
     }
@@ -721,7 +787,17 @@ mod tests {
         assert!(should_resolve(Some(&stale), false, ttl, now));
         // force → resolve regardless
         assert!(should_resolve(Some(&fresh), true, ttl, now));
-        // IP host (resolved_at None) → never
+        // An outbound-only entry (no address, no attempt) carries no resolution
+        // information, so it must NOT read as "already resolved": treating it
+        // that way is what made `[name]` terminal for a DNS host whose first
+        // real ping landed before its first resolution attempt.
+        let outbound_only = EndpointInfo {
+            outbound_ip: Some("5.6.7.8".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(should_resolve(Some(&outbound_only), false, ttl, now));
+        // ...but an entry whose address set is non-empty with no attempt stamp
+        // is an IP host, and never re-resolves.
         let ip_host = EndpointInfo {
             resolved_at_secs: None,
             ..fresh

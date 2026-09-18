@@ -28,6 +28,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tui_popup::{KnownSizeWrapper, Popup};
 use xray_tui_config::subscription::subscription_url_split;
+use xray_tui_db::profiles_query::PlanScope;
 
 pub fn render_confirmation_overlay(frame: &mut Frame, area: Rect, text: &str) {
     use unicode_width::UnicodeWidthStr;
@@ -495,17 +496,26 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                         state.start_batch_then_real_ping();
                     }
                     7 => {
+                        state.start_batch_then_real_ping_scoped(PlanScope::Successful);
+                    }
+                    8 => {
+                        state.start_batch_then_real_ping_scoped(PlanScope::SuccessfulAndNew);
+                    }
+                    9 => {
+                        state.start_batch_then_real_ping_scoped(PlanScope::Failed);
+                    }
+                    10 => {
                         state.sort_column = SortColumn::Test;
                         state.sort_ascending = true;
                         state.filter_cache_valid.set(false);
                     }
-                    8 => {
+                    11 => {
                         state.remove_failed_servers().await;
                     }
-                    10 => {
+                    13 => {
                         state.stop_speed_test();
                     }
-                    12 => {
+                    15 => {
                         state.confirmation = Some(crate::ConfirmAction::ClearStats);
                     }
                     _ => {}
@@ -1141,6 +1151,9 @@ const SPEED_TEST_MENU_ITEMS: &[SpeedTestMenuItem] = &[
     SpeedTestMenuItem::Separator,
     SpeedTestMenuItem::Item("Fast Ping (All Profiles)"),
     SpeedTestMenuItem::Item("Fast + Real Ping (All Profiles)"),
+    SpeedTestMenuItem::Item("Fast + Real Ping (Successful)"),
+    SpeedTestMenuItem::Item("Fast + Real Ping (Successful + New)"),
+    SpeedTestMenuItem::Item("Fast + Real Ping (Failed)"),
     SpeedTestMenuItem::Item("Sort by Test"),
     SpeedTestMenuItem::Item("Remove Bad Servers"),
     SpeedTestMenuItem::Separator,
@@ -1181,7 +1194,7 @@ fn render_speed_test_menu(frame: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
     }
 
-    let popup_width = 34u16.min(area.width.saturating_sub(4));
+    let popup_width = 40u16.min(area.width.saturating_sub(4));
     let popup_height = (SPEED_TEST_MENU_ITEMS.len() as u16 + 2).min(area.height.saturating_sub(4));
 
     let para = Paragraph::new(lines).alignment(Alignment::Left);

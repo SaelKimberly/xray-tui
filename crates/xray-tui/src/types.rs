@@ -13,6 +13,7 @@ use xray_tui_native::telemetry::{TraceEvent, TraceKind, TraceSecurity};
 
 /// Re-export `EndpointRow` as `EndpointRow` for backward compatibility.
 pub use xray_tui_db::models::EndpointRow;
+use xray_tui_db::models::HostType;
 use xray_tui_proto::proto_spec::ProtocolKind;
 
 /// Clash API /traffic response struct.
@@ -552,6 +553,22 @@ pub enum CoreEvent {
     EndpointInfoUpdated {
         endpoint_id: i64,
         info: EndpointInfo,
+    },
+    /// Resolve one DNS endpoint's inbound host, carrying the endpoint facts
+    /// instead of an id to look up.
+    ///
+    /// The batch plans every endpoint in the feed but the UI holds only the
+    /// loaded page, so a trigger that resolves "the endpoint by id" silently
+    /// does nothing for every endpoint outside that page — which is how a
+    /// feed-wide run left DNS hosts `[name]` while it persisted their exit IPs.
+    /// The batch already has these facts (`PlanLink.endpoint`), so it sends them.
+    DnsResolveRequest {
+        endpoint_id: i64,
+        host: String,
+        host_type: HostType,
+        /// The link's SNI, when the protocol row was loaded. `None` skips the
+        /// SNI whitelist check for this pass (it is re-run on every launch).
+        sni: Option<String>,
     },
     /// Native-core routing decision/probe event (surfaced in Actions Log).
     Route(xray_tui_route::events::RouteEvent),

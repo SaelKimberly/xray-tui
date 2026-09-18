@@ -301,10 +301,42 @@ async fn probe_attempts(
     })
 }
 
+/// Attempts at the exit-IP fetch. The fetch rides a SECOND tunnel through the
+/// same proxy, so it can miss while the latency probe (which proves the config
+/// works) succeeded — one retry covers a transient dial/TLS failure without
+/// doubling the cost of every real ping.
+const IP_INFO_ATTEMPTS: u32 = 2;
+
+/// Space between the exit-IP attempts.
+///
+/// Every concurrent real probe fetches from the SAME IP API URL, so an immediate
+/// retry doubles the request rate at exactly the moment that endpoint is most
+/// likely to be rate-limiting — the failure shape a retry is supposed to rescue.
+/// A short pause costs one sleep and lets a transient miss recover.
+const IP_INFO_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Exit IP + country through a second tunnel; any failure is `None` (the
 /// latency result stands on its own — parity with the old probe).
+///
+/// The retry is load-bearing for the UI: without it a single transient miss left
+/// `Latency::Real { ip: None }` on a link whose tunnel demonstrably worked, and
+/// the row rendered a real delay with no exit IP. Each attempt carries
+/// `IP_INFO_TIMEOUT`, so the pair is bounded.
 async fn fetch_ip_info(params: &NativeConnectParams, ip_api_url: &str) -> Option<String> {
     let target = parse_probe_url(ip_api_url).ok()?;
+    for attempt in 0..IP_INFO_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(IP_INFO_RETRY_DELAY).await;
+        }
+        if let Some(info) = fetch_ip_info_once(params, &target).await {
+            return Some(info);
+        }
+    }
+    None
+}
+
+/// One exit-IP fetch: a single HTTP request over a fresh tunnel.
+async fn fetch_ip_info_once(params: &NativeConnectParams, target: &ProbeUrl) -> Option<String> {
     let request = ProbeRequest {
         host: &target.host,
         port: target.port,

@@ -27,3 +27,4 @@
 | 2026-09-17 | spec | `specs/2026-09-17-purge-reason-design.md` | Purge reasons: evidence-based permanent moves to Purgatory | implemented (schema tag 12) |
 | 2026-09-17 | adr | `adr/0006-purge-evidence.md` | Purge evidence is persisted per link; Purgatory is "not confirmed live and recent" | accepted |
 | 2026-09-17 | plan | `plans/2026-09-17-purge-reason.md` | Purge reasons — implementation | executed (T1-T7 green; T8 is the live re-run) |
+| 2026-09-18 | spec | `specs/2026-09-18-test-cell-truth-and-plan-scopes-design.md` | Test-cell truth, resolution ownership, and batch plan scopes | approved; implementation in progress |
