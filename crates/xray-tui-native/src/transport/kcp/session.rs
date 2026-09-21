@@ -555,9 +555,9 @@ struct OutAck {
 /// Ack list: per-number due times + flush candidates (Go `AckList`).
 #[derive(Debug)]
 pub(crate) struct AckList {
-    numbers: Vec<u32>,
-    timestamps: Vec<u32>,
-    next_flush: Vec<u32>,
+    numbers: VecDeque<u32>,
+    timestamps: VecDeque<u32>,
+    next_flush: VecDeque<u32>,
     dirty: bool,
     limit: usize,
 }
@@ -565,24 +565,40 @@ pub(crate) struct AckList {
 impl AckList {
     const fn new(limit: usize) -> Self {
         Self {
-            numbers: Vec::new(),
-            timestamps: Vec::new(),
-            next_flush: Vec::new(),
+            numbers: VecDeque::new(),
+            timestamps: VecDeque::new(),
+            next_flush: VecDeque::new(),
             dirty: false,
             limit,
         }
     }
 
     #[must_use]
-    const fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.numbers.is_empty()
     }
 
-    /// Go `Add`.
-    fn add(&mut self, number: u32, timestamp: u32) {
-        self.numbers.push(number);
-        self.timestamps.push(timestamp);
-        self.next_flush.push(0);
+    /// Go `Add`, but bounded and duplicate-free.
+    ///
+    /// Go pushes unconditionally, so a peer that replays one in-window Data
+    /// segment grows the list by one entry per datagram and the `clear` scan
+    /// runs over the whole list each time — quadratic total, attacker-chosen
+    /// memory (finding f7). The receive window already dedups the same `sn`
+    /// (`window.entry(sn).or_insert`), so an `sn` already queued for
+    /// acknowledgement is skipped, and the list is capped at the receive
+    /// window size (`cap = rcv_inflight`).
+    fn add(&mut self, number: u32, timestamp: u32, cap: usize) {
+        if self.numbers.contains(&number) {
+            return; // this sn is already queued for acknowledgement
+        }
+        while self.numbers.len() >= cap.max(1) {
+            self.numbers.pop_front();
+            self.timestamps.pop_front();
+            self.next_flush.pop_front();
+        }
+        self.numbers.push_back(number);
+        self.timestamps.push_back(timestamp);
+        self.next_flush.push_back(0);
         self.dirty = true;
     }
 
@@ -699,7 +715,7 @@ impl ReceivingWorker {
     }
 
     #[must_use]
-    const fn acklist_nonempty(&self) -> bool {
+    fn acklist_nonempty(&self) -> bool {
         !self.acklist.is_empty()
     }
 
@@ -718,7 +734,11 @@ impl ReceivingWorker {
             return; // out of window → drop (never acked, like Go)
         }
         self.acklist.clear(una);
-        self.acklist.add(sn, ts);
+        // Cap the ack list by the receive window (rcv_inflight): state derived
+        // from received segments must be bounded by the window, not the peer's
+        // cumulative datagram count (finding f7).
+        let cap = usize::try_from(self.window_size).unwrap_or(usize::MAX);
+        self.acklist.add(sn, ts, cap);
         self.window.entry(sn).or_insert(payload);
     }
 
@@ -1871,7 +1891,7 @@ mod tests {
     fn acklist_batching_and_due_times() {
         let mut l = AckList::new(128);
         for i in 0..300 {
-            l.add(i, i * 10);
+            l.add(i, i * 10, 1024);
         }
         let out = l.flush(1000, 100);
         assert_eq!(out.len(), 3); // 128 + 128 + 44
@@ -1890,11 +1910,11 @@ mod tests {
     fn acklist_candidates_ride_along() {
         let mut l = AckList::new(128);
         for i in 0..6 {
-            l.add(i, 1);
+            l.add(i, 1, 1024);
         }
         assert_eq!(l.flush(1000, 100).len(), 1); // all due; nextFlush = 1050
         for i in 6..10 {
-            l.add(i, 1);
+            l.add(i, 1, 1024);
         }
         // 0..5 not yet due → candidates; 6..9 due → batch; the final write
         // (dirty from the adds) appends the candidates.
@@ -1906,11 +1926,11 @@ mod tests {
     #[test]
     fn acklist_clear_drops_acked() {
         let mut l = AckList::new(128);
-        l.add(3, 1);
-        l.add(7, 1);
-        l.add(9, 1);
+        l.add(3, 1, 1024);
+        l.add(7, 1, 1024);
+        l.add(9, 1, 1024);
         l.clear(8); // drops 3 and 7
-        assert_eq!(l.numbers, vec![9]);
+        assert_eq!(l.numbers.iter().copied().collect::<Vec<_>>(), vec![9]);
         assert!(l.dirty);
     }
 
@@ -1918,7 +1938,7 @@ mod tests {
     fn acklist_dirty_writes_header_only_ack() {
         // Go writes a header-only ack when the list is dirty but empty.
         let mut l = AckList::new(128);
-        l.add(5, 1);
+        l.add(5, 1, 1024);
         l.clear(6); // drops 5 → dirty, empty
         let out = l.flush(1000, 100);
         assert_eq!(out.len(), 1);
@@ -1929,11 +1949,38 @@ mod tests {
     fn acklist_ts_wrap_keeps_latest() {
         // PutTimestamp replaces only when the new ts is wrap-ahead.
         let mut l = AckList::new(128);
-        l.add(0, 0xFFFF_FFFF);
-        l.add(1, 100);
+        l.add(0, 0xFFFF_FFFF, 1024);
+        l.add(1, 100, 1024);
         let out = l.flush(1000, 100);
         assert_eq!(out[0].ts, 100); // 100 is wrap-ahead of 0xFFFFFFFF? No —
         // 100 - 0xFFFFFFFF wraps to 101 < 0x7FFFFFFF → replaced. Yes.
+    }
+
+    /// A peer replaying one in-window Data segment must not grow the ack list:
+    /// duplicates are skipped and the list is capped at the receive window
+    /// (finding f7 — the unbounded, quadratic-growth case).
+    #[test]
+    fn acklist_dedups_and_caps_at_receive_window() {
+        let cap = 776_u32; // rcv_inflight at the defaults
+        let cap_usize = usize::try_from(cap).unwrap();
+        let mut l = AckList::new(128);
+        // Replay the SAME sn 10_000 times: one entry, not 10_000.
+        for _ in 0..10_000 {
+            l.add(0, 1, cap_usize);
+        }
+        assert_eq!(l.numbers.len(), 1, "replays must not enqueue duplicates");
+        // Distinct sns beyond the cap evict the oldest, never exceed `cap`.
+        for i in 0..(cap + 500) {
+            l.add(i, 1, cap_usize);
+        }
+        assert_eq!(
+            l.numbers.len(),
+            cap_usize,
+            "the list must be capped at the window"
+        );
+        // Oldest entries evicted: the front is the oldest survivor.
+        assert_eq!(l.numbers.front().copied(), Some(500));
+        assert_eq!(l.numbers.back().copied(), Some(cap + 499));
     }
 
     // --- state machine (Go Connection) ---

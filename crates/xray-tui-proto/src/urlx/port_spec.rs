@@ -32,6 +32,11 @@ impl std::fmt::Display for PortSpec {
 }
 
 impl PortSpec {
+    /// Upper bound on the ports one spec may represent. A share URL is one
+    /// line of untrusted input; without a cap `hysteria2://h:1-65535` expands to
+    /// a 65 536-entry list in memory and in the store (finding f15).
+    pub const MAX_PORTS: u16 = 4096;
+
     pub const fn new() -> Self {
         Self {
             ports: Vec::new(),
@@ -46,6 +51,9 @@ impl PortSpec {
     }
 
     pub fn add(&mut self, port: u16) -> bool {
+        if self.total >= usize::from(Self::MAX_PORTS) {
+            return false; // port budget exhausted — refuse to grow further
+        }
         for decl in &self.ports {
             match decl {
                 &PortDecl::Single(p) if p == port => return false,
@@ -59,6 +67,19 @@ impl PortSpec {
         true
     }
     pub fn add_range(&mut self, range: Range<u16>) {
+        // `end` is inclusive, so a range is empty only when it descends
+        // (`"2000-1000"`). The old arithmetic `end - start` underflowed on that
+        // input — panicking in debug, persisting an inconsistent spec in release
+        // (finding f14). A descending range contributes nothing, so the caller's
+        // empty-spec check rejects the URL.
+        if range.start > range.end {
+            return;
+        }
+        // Bound one range's contribution so an absurd span cannot expand into a
+        // 65 536-entry list (finding f15).
+        if usize::from(range.end) - usize::from(range.start) + 1 > usize::from(Self::MAX_PORTS) {
+            return;
+        }
         // Coalesce every decl that touches the new range into one span: ranges whose
         // port sets intersect it (end-inclusive touch, so a boundary port shared with
         // an adjacent range counts) and singles inside it are all removed and re-added
@@ -74,7 +95,7 @@ impl PortSpec {
                 false
             }
             PortDecl::Range(r) if r.start <= range.end && r.end >= range.start => {
-                removed_len += usize::from(r.end) - usize::from(r.start) + 1;
+                removed_len += (usize::from(r.end) - usize::from(r.start)).saturating_add(1);
                 new_start = new_start.min(r.start);
                 new_end = new_end.max(r.end);
                 false
@@ -83,7 +104,9 @@ impl PortSpec {
         });
         self.total = self.total.saturating_sub(removed_len);
         // Range<u16> end is inclusive here: (end - start + 1) ports.
-        self.total += usize::from(new_end) - usize::from(new_start) + 1;
+        self.total = self
+            .total
+            .saturating_add(usize::from(new_end) - usize::from(new_start) + 1);
         self.ports.push(PortDecl::Range(new_start..new_end));
     }
 
@@ -238,14 +261,44 @@ mod tests {
     }
 
     #[test]
-    fn full_range_ports_do_not_overflow() {
+    fn oversized_range_is_refused_by_the_port_budget() {
+        // One untrusted URL line must not expand into a 65 536-entry port
+        // list in memory and in the store (finding f15): an over-budget span
+        // is refused, leaving the spec empty.
         let mut spec = PortSpec::new();
         spec.add_range(1..65535);
-        assert_eq!(spec.length(), 65535);
-        let all: Vec<u16> = spec.iter().collect();
-        assert_eq!(all.len(), 65535);
-        assert_eq!(all[0], 1);
-        assert_eq!(*all.last().unwrap(), 65535);
+        assert_eq!(spec.length(), 0, "over-budget range must be refused");
+        assert!(spec.iter().next().is_none());
+        assert!(spec.first().is_none());
+
+        // At exactly the budget the range is accepted.
+        let mut ok = PortSpec::new();
+        ok.add_range(1..PortSpec::MAX_PORTS);
+        assert_eq!(ok.length(), usize::from(PortSpec::MAX_PORTS));
+        assert_eq!(ok.iter().count(), usize::from(PortSpec::MAX_PORTS));
+    }
+
+    #[test]
+    fn descending_range_contributes_nothing() {
+        // "2000-1000": the old `end - start` underflowed (panic in debug,
+        // inconsistent spec in release; finding f14). Built as a struct literal
+        // so the intent survives `clippy::reversed_empty_ranges`.
+        let mut spec = PortSpec::new();
+        spec.add_range(std::ops::Range {
+            start: 2000,
+            end: 1000,
+        });
+        assert_eq!(spec.length(), 0);
+        assert!(spec.first().is_none());
+
+        // Through the public parse path too: an empty spec lets the caller
+        // reject the URL rather than persisting port=start with no ports.
+        let parsed: PortSpec = "2000-1000".parse().expect("parse must not panic");
+        assert!(parsed.first().is_none());
+        // A valid range still parses (end-inclusive: 1000..=2000).
+        let ok: PortSpec = "1000-2000".parse().expect("parse");
+        assert_eq!(ok.length(), 1001);
+        assert_eq!(ok.first(), Some(1000));
     }
 
     #[test]
@@ -306,13 +359,21 @@ mod tests {
     }
 
     #[test]
-    fn full_u16_range_does_not_wrap() {
+    fn full_u16_range_is_refused_and_iterator_never_wraps() {
+        // The full u16 span would expand to a 65 536-entry list; the port
+        // budget refuses it (finding f15).
+        let mut refused = PortSpec::new();
+        refused.add_range(0..65535);
+        assert_eq!(refused.length(), 0);
+
+        // Within the budget, a range still enumerates exactly start..=end
+        // once (the iterator must not wrap at a boundary).
         let mut spec = PortSpec::new();
-        spec.add_range(0..65535);
-        assert_eq!(spec.length(), 65536);
+        spec.add_range(0..(PortSpec::MAX_PORTS - 1));
+        assert_eq!(spec.length(), usize::from(PortSpec::MAX_PORTS));
         let all: Vec<u16> = spec.iter().collect();
-        assert_eq!(all.len(), 65536);
+        assert_eq!(all.len(), usize::from(PortSpec::MAX_PORTS));
         assert_eq!(all[0], 0);
-        assert_eq!(*all.last().unwrap(), 65535);
+        assert_eq!(*all.last().unwrap(), PortSpec::MAX_PORTS - 1);
     }
 }

@@ -7,8 +7,74 @@ use thiserror::Error;
 /// process instead of one `Client::new()` per check.
 static UPDATE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     crate::ensure_tls_provider();
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .redirect(safe_redirect_policy(false))
+        .build()
+        .expect("update HTTP client build must succeed")
 });
+
+/// Whether a redirect target is an interior/local address or a local name.
+/// A fetch whose response is adopted (an update, a geo file, a subscription
+/// feed) must not be movable onto a loopback/LAN/metadata endpoint by the
+/// origin that answers it (findings f10/f11).
+fn redirect_target_is_local(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return true;
+    }
+    // `Url::host_str` keeps the brackets around an IPv6 literal.
+    let bare = lower
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&lower);
+    let Ok(ip) = bare.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+        }
+    }
+}
+
+/// Redirect policy for fetch clients whose body is adopted (updates, geo
+/// files, subscription feeds). Rejects a plaintext downgrade, refuses to land
+/// on a local-use host, and caps the chain. `require_https` forces every hop
+/// to HTTPS (pass `false` for feeds whose provider may legitimately be http —
+/// a downgrade from https is still always refused).
+#[must_use]
+pub fn safe_redirect_policy(require_https: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        let target = attempt.url();
+        let downgrade = attempt
+            .previous()
+            .last()
+            .is_some_and(|prev| prev.scheme() == "https" && target.scheme() != "https");
+        if downgrade
+            || (require_https && target.scheme() != "https")
+            || redirect_target_is_local(target)
+        {
+            return attempt.stop();
+        }
+        attempt.follow()
+    })
+}
 
 /// Clone the shared update HTTP client (`Client::clone` is an `Arc` bump).
 #[must_use]
@@ -463,6 +529,37 @@ mod tests {
 
         let singbox_url = release_asset_url(CoreType::SingBox, "v1.10.3").unwrap();
         assert!(singbox_url.contains("sing-box-1.10.3-linux-amd64.tar.gz"));
+    }
+
+    /// The redirect guard must recognise the local-use targets a malicious
+    /// origin could move a fetch to (findings f10/f11).
+    #[test]
+    fn redirect_target_is_local_matches_local_use_hosts() {
+        for local in [
+            "http://127.0.0.1/x",
+            "http://10.0.0.1/x",
+            "http://192.168.1.1/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/x",
+            "http://localhost/x",
+            "http://foo.localhost/x",
+            "http://printer.local/x",
+        ] {
+            assert!(
+                redirect_target_is_local(&reqwest::Url::parse(local).unwrap()),
+                "{local} must be refused as a redirect target"
+            );
+        }
+        for public in [
+            "https://example.com/x",
+            "http://8.8.8.8/x",
+            "https://github.com/x",
+        ] {
+            assert!(
+                !redirect_target_is_local(&reqwest::Url::parse(public).unwrap()),
+                "{public} must be allowed"
+            );
+        }
     }
 
     #[test]

@@ -599,6 +599,28 @@ pub fn handle_target_picker_key(state: &mut AppState, key: &KeyEvent) {
 
 // ── Copy —───────────────────────────────────────────────────────────
 
+/// Format one log entry for the system clipboard, stripping terminal control
+/// bytes from the message.
+///
+/// The on-screen render path filters control bytes; the clipboard path must
+/// too. A log line is remote-controlled (the core's stdout/stderr), and a
+/// pasted raw `ESC` (`ESC[201~`, cursor moves, SGR) can forge terminal
+/// output. `\n` is kept: entries are joined with it.
+fn clipboard_line(log: &crate::LogLine) -> String {
+    let message: String = log
+        .message
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect();
+    format!(
+        "{} [{}] [{}] {}",
+        fmt_ts(log.timestamp_nanos),
+        log.level,
+        log.target,
+        message,
+    )
+}
+
 /// Copy the selected log range to the system clipboard.
 fn copy_selection(state: &AppState) {
     let Some(anchor) = state.log_select_anchor else {
@@ -635,15 +657,7 @@ fn copy_selection(state: &AppState) {
     let lines: Vec<String> = filtered_indices[lo_fi..=hi_fi]
         .iter()
         .filter_map(|&ci| state.log_cache.get(ci))
-        .map(|log| {
-            format!(
-                "{} [{}] [{}] {}",
-                fmt_ts(log.timestamp_nanos),
-                log.level,
-                log.target,
-                log.message,
-            )
-        })
+        .map(clipboard_line)
         .collect();
     if lines.is_empty() {
         return;
@@ -682,13 +696,7 @@ fn copy_cursor_line(state: &AppState) {
     let Some(log) = state.log_cache.get(cache_idx) else {
         return;
     };
-    let text = format!(
-        "{} [{}] [{}] {}",
-        fmt_ts(log.timestamp_nanos),
-        log.level,
-        log.target,
-        log.message,
-    );
+    let text = clipboard_line(log);
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(text);
     }
@@ -703,15 +711,7 @@ fn copy_all_filtered(state: &AppState) {
         .log_cache
         .iter()
         .filter(|l| state.selected_targets.is_empty() || state.selected_targets.contains(&l.target))
-        .map(|log| {
-            format!(
-                "{} [{}] [{}] {}",
-                fmt_ts(log.timestamp_nanos),
-                log.level,
-                log.target,
-                log.message,
-            )
-        })
+        .map(clipboard_line)
         .collect();
     if lines.is_empty() {
         return;
@@ -755,5 +755,23 @@ mod tests {
         let cache = vec![make_line("a"); 10000];
         let rows = build_rows_viewport(&cache, 0, 30);
         assert_eq!(rows.len(), 30);
+    }
+
+    /// A remote-controlled log message must not put terminal control bytes on
+    /// the clipboard (finding f16: raw `ESC` / `ESC[201~`).
+    #[test]
+    fn clipboard_line_strips_control_bytes() {
+        let mut log = make_line("plain");
+        log.message = "before\u{1b}[201~after\u{7}\u{9b}31m".to_string();
+        let out = clipboard_line(&log);
+        assert!(
+            !out.chars().any(char::is_control),
+            "no control bytes may survive: {out:?}"
+        );
+        assert!(out.ends_with("before[201~after31m"), "text kept: {out:?}");
+        // A newline is preserved (entries are joined with it).
+        let mut multi = make_line("a");
+        multi.message = "line1\nline2".to_string();
+        assert!(clipboard_line(&multi).contains("line1\nline2"));
     }
 }

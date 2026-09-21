@@ -102,6 +102,24 @@ impl Drop for CoreProcess {
     }
 }
 
+/// Helper to write config files with owner-only permissions (0600 on Unix).
+async fn write_config_file(path: &Path, content: &str) -> Result<(), std::io::Error> {
+    // Write config with owner-only permissions (0600 on Unix).
+    // The file contains proxy credentials (passwords, UUIDs, etc.).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.open(path)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        tokio::fs::write(path, content).await
+    }
+    #[cfg(not(unix))]
+    tokio::fs::write(path, content).await
+}
+
 /// Manages a single core process lifecycle.
 pub struct RealCoreManager {
     config_dir: tempfile::TempDir,
@@ -118,6 +136,18 @@ impl RealCoreManager {
             .prefix("xray-tui-config-")
             .tempdir_in(&fallback_config_dir)
             .unwrap_or_else(|_| tempfile::TempDir::new().expect("tempdir creation failed"));
+        // The tempdir holds config.json with proxy credentials. `tempfile`
+        // creates it 0700 on Unix; enforce it explicitly so the
+        // credential-bearing directory is never traversable, whatever the
+        // creation path. Do NOT touch the parent: on the `TempDir::new()`
+        // fallback that parent is the shared `/tmp` (1777) and chmodding it
+        // would break the host.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ =
+                std::fs::set_permissions(config_dir.path(), std::fs::Permissions::from_mode(0o700));
+        }
         Self {
             config_dir,
             current: None,
@@ -163,7 +193,7 @@ impl RealCoreManager {
         } else {
             json
         };
-        tokio::fs::write(&config_path, &json).await?;
+        write_config_file(&config_path, &json).await?;
 
         // Build args from template: "run -c {0}" → ["run", "-c", config_path]
         let config_str = config_path.to_string_lossy().to_string();
@@ -338,7 +368,7 @@ impl RealCoreManager {
         } else {
             json
         };
-        tokio::fs::write(&config_path, &json).await?;
+        write_config_file(&config_path, &json).await?;
         Ok(())
     }
 
@@ -509,6 +539,39 @@ mod tests {
         let mgr = RealCoreManager::new(PathBuf::from("/tmp"), tx);
         assert!(!mgr.is_running());
         assert!(mgr.running_core_type().is_none());
+    }
+
+    /// The credentials-bearing core config and its directory must be owner
+    /// only, independent of the caller's umask (finding f3).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn written_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mgr = RealCoreManager::new(base.path().to_path_buf(), tx);
+        assert_eq!(
+            std::fs::metadata(mgr.config_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "config tempdir must not be group/other accessible"
+        );
+        let path = mgr.config_dir().join("config.json");
+        super::write_config_file(&path, r#"{"password":"secret"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+            0,
+            "config.json must not be group/other readable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"password":"secret"}"#
+        );
     }
 
     #[tokio::test]

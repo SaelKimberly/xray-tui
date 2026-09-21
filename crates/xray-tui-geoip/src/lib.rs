@@ -3,13 +3,16 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maxminddb::Reader;
 use tokio::io::AsyncWriteExt;
 
 const GEOLITE_DOWNLOAD: &str =
     "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb";
+
+/// Upper bound on the `GeoLite` artifact (the real database is about 70 MB).
+const MAX_GEOLITE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Fetches the `GeoLite` database, streaming the body to `dest` on disk — the
 /// ~70 MB payload is never buffered in memory, let alone copied.
@@ -34,6 +37,19 @@ pub struct GeoIp {
     /// repeated IP costs a lock + `Arc` clones, never another mmdb walk or
     /// string decode; distinct-IP churn evicts cold entries.
     cache: Mutex<lru::LruCache<IpAddr, Option<Arc<Location>>>>,
+    /// Cross-lookup latch for a persistently-unopenable artifact. Without it
+    /// every cache-missing lookup deletes + re-downloads the database, since a
+    /// failed heal latches nothing (finding f5).
+    heal_latch: Mutex<HealLatch>,
+}
+
+/// Backoff state for the `GeoLite` heal path (see [`GeoIp::heal_latch`]).
+#[derive(Debug, Default)]
+struct HealLatch {
+    /// The next instant a heal attempt is permitted; `None` = not latched.
+    retry_after: Option<Instant>,
+    /// Consecutive heal failures, driving the backoff (`1 << min(failures, 6)` s).
+    failures: u32,
 }
 
 impl GeoIp {
@@ -58,6 +74,7 @@ impl GeoIp {
             cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(1024).expect("cache cap is nonzero"),
             )),
+            heal_latch: Mutex::new(HealLatch::default()),
         }
     }
 
@@ -128,8 +145,64 @@ impl GeoIp {
     }
 
     /// Open the database, healing a corrupt/truncated file by deleting it and
-    /// re-downloading once before giving up.
+    /// re-downloading once before giving up. A failed heal is LATCHED with a
+    /// growing backoff so a persistently-unopenable artifact is not deleted and
+    /// re-downloaded on every cache-missing lookup (finding f5).
     async fn open_reader_healing(&self) -> anyhow::Result<Reader<Vec<u8>>> {
+        if let Some(wait) = self.heal_backoff_remaining() {
+            anyhow::bail!(
+                "GeoLite artifact {} unavailable; retrying in {}s",
+                self.db_path.display(),
+                wait.as_secs().max(1)
+            );
+        }
+        match self.try_open_healing().await {
+            Ok(reader) => {
+                self.clear_heal_latch();
+                Ok(reader)
+            }
+            Err(e) => {
+                self.record_heal_failure();
+                Err(e)
+            }
+        }
+    }
+
+    /// Remaining backoff before the next heal attempt, if one is latched.
+    fn heal_backoff_remaining(&self) -> Option<Duration> {
+        let latch = self
+            .heal_latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        latch
+            .retry_after
+            .and_then(|at| at.checked_duration_since(Instant::now()))
+    }
+
+    /// Latch a failed heal, growing the backoff (`1..=64` s).
+    fn record_heal_failure(&self) {
+        let mut latch = self
+            .heal_latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        latch.failures = latch.failures.saturating_add(1);
+        let secs = 1_u64 << latch.failures.min(6);
+        latch.retry_after = Some(Instant::now() + Duration::from_secs(secs));
+    }
+
+    /// Clear the latch after a successful open.
+    fn clear_heal_latch(&self) {
+        let mut latch = self
+            .heal_latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        latch.failures = 0;
+        latch.retry_after = None;
+    }
+
+    /// The heal itself: ensure the file, open it, and on an open failure
+    /// delete + re-download once before giving up.
+    async fn try_open_healing(&self) -> anyhow::Result<Reader<Vec<u8>>> {
         self.ensure_db().await?;
         // The 70 MB read is blocking — never on the async runtime.
         let path = self.db_path.clone();
@@ -203,15 +276,37 @@ fn ensure_tls_provider() {
 async fn fetch_geolite_to(dest: &Path) -> anyhow::Result<()> {
     ensure_tls_provider();
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_mins(2))
+        .timeout(Duration::from_secs(120))
         .build()?;
-    let mut response = client
+    let response = client
         .get(GEOLITE_DOWNLOAD)
         .send()
         .await?
         .error_for_status()?;
+    stream_capped(response, dest, MAX_GEOLITE_BYTES).await
+}
+
+/// Stream `response` into `dest`, refusing a body larger than `cap` — both a
+/// declared `Content-Length` over the cap and the accumulated bytes actually
+/// received (findings f1). On breach the caller's error path removes the temp
+/// file, so an oversized artifact never becomes the live database.
+async fn stream_capped(
+    mut response: reqwest::Response,
+    dest: &Path,
+    cap: u64,
+) -> anyhow::Result<()> {
+    if let Some(n) = response.content_length()
+        && n > cap
+    {
+        anyhow::bail!("artifact declares {n} bytes, over the {cap}-byte cap");
+    }
     let mut file = tokio::fs::File::create(dest).await?;
+    let mut written: u64 = 0;
     while let Some(chunk) = response.chunk().await? {
+        written += chunk.len() as u64;
+        if written > cap {
+            anyhow::bail!("artifact exceeds the {cap}-byte cap");
+        }
         file.write_all(&chunk).await?;
     }
     file.sync_all().await?;
@@ -293,6 +388,79 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "corrupt db must trigger exactly one re-download attempt"
+        );
+    }
+
+    /// A persistently-unopenable artifact must be latched: the first lookup
+    /// attempts the heal, later lookups fail fast without another download
+    /// (finding f5 — the per-lookup delete + re-download loop).
+    #[tokio::test]
+    async fn failed_heal_is_latched_across_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("GeoLite2-City.mmdb");
+        tokio::fs::write(&db_path, b"not a maxmind database")
+            .await
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher_calls = Arc::clone(&calls);
+        let geo = GeoIp::new_with_fetcher(db_path.as_path(), move |_dest: &Path| {
+            let calls = Arc::clone(&fetcher_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("simulated download failure"))
+            })
+        });
+
+        // Four lookups with distinct IPs (so every one takes the init path):
+        // only the first may fetch.
+        for ip in ["1.1.1.1", "8.8.8.8", "9.9.9.9", "1.1.1.1"] {
+            assert!(geo.location_by_ip(ip.parse().unwrap()).await.is_err());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the failed heal must be latched, not repeated per lookup"
+        );
+    }
+
+    /// A body over the cap must be refused — both a declared `Content-Length`
+    /// over the cap and the accumulated streamed bytes (finding f1). The
+    /// fixture omits `Content-Length` so the streamed counter decides.
+    #[tokio::test]
+    async fn stream_capped_refuses_an_over_cap_body() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = [0_u8; 4096];
+                let _ = stream.read(&mut head).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.write_all(&vec![b'a'; 2048]).await;
+            }
+        });
+
+        ensure_tls_provider();
+        let client = reqwest::Client::builder().build().unwrap();
+        let response = client
+            .get(format!("http://{addr}/geo.mmdb"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("geo.mmdb");
+        let err = stream_capped(response, &dest, 1024)
+            .await
+            .expect_err("an over-cap body must be refused");
+        assert!(
+            err.to_string().contains("cap"),
+            "error names the cap: {err}"
         );
     }
 

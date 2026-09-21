@@ -290,6 +290,9 @@ fn ensure_tls_provider() {
 /// Fetch `url` to `path` only if the file is not already present. Download is
 /// bounded (30s) and written atomically (tmp + rename); empty downloads are
 /// rejected so a rate-limit HTML page can never become a permanent tombstone.
+/// Upper bound on one whitelist artifact (the upstream lists are a few MB).
+const MAX_WHITELIST_BYTES: usize = 64 * 1024 * 1024;
+
 async fn ensure_file(path: &Path, url: &str) -> anyhow::Result<()> {
     if path.is_file() {
         return Ok(());
@@ -298,13 +301,21 @@ async fn ensure_file(path: &Path, url: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let bytes = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let mut response = client.get(url).send().await?.error_for_status()?;
+    if let Some(n) = response.content_length()
+        && n > MAX_WHITELIST_BYTES as u64
+    {
+        anyhow::bail!(
+            "whitelist download declares {n} bytes, over the {MAX_WHITELIST_BYTES}-byte cap"
+        );
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > MAX_WHITELIST_BYTES {
+            anyhow::bail!("whitelist download exceeds the {MAX_WHITELIST_BYTES}-byte cap");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     ensure_file_from_bytes(path, &bytes).await
 }
 
@@ -492,6 +503,55 @@ mod tests {
         let result = ensure_file_from_bytes(&path, b"").await;
         assert!(result.is_err(), "empty download must fail");
         assert!(!path.exists(), "no tombstone file left behind");
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        assert!(!tmp.exists(), "no tmp file left behind");
+    }
+
+    /// Serve `len` bytes of filler on a loopback port with NO `Content-Length`
+    /// (framed by connection close), returning the URL. Omitting the declared
+    /// length forces the STREAMED byte counter to be the deciding check.
+    async fn serve_no_content_length(len: usize) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = [0_u8; 4096];
+                let _ = stream.read(&mut head).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    .await;
+                let chunk = vec![b'a'; 64 * 1024];
+                let mut sent = 0;
+                while sent < len {
+                    let n = (len - sent).min(chunk.len());
+                    if stream.write_all(&chunk[..n]).await.is_err() {
+                        break; // client bailed after the cap
+                    }
+                    sent += n;
+                }
+            }
+        });
+        format!("http://{addr}/whitelist.txt")
+    }
+
+    /// A body over the cap must be refused and leave no file behind. The
+    /// fixture sends NO `Content-Length`, so the streamed-byte counter — the
+    /// check that exists because this path changed to streaming accumulation
+    /// — is what fires (finding f1).
+    #[tokio::test]
+    async fn oversized_download_is_refused_without_writing_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whitelist.txt");
+        let url = serve_no_content_length(MAX_WHITELIST_BYTES + 1).await;
+        let err = ensure_file(&path, &url)
+            .await
+            .expect_err("an over-cap body must be refused");
+        assert!(
+            err.to_string().contains("cap"),
+            "error names the cap: {err}"
+        );
+        assert!(!path.exists(), "an over-cap body must leave no file behind");
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         assert!(!tmp.exists(), "no tmp file left behind");
     }

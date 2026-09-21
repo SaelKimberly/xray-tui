@@ -167,6 +167,13 @@ where
     // Bound each source chunk: a hung source (open socket, no data) must
     // degrade to a partial result, never hang the import.
     const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
+    // Aggregate budgets for one feed. reqwest transparently decodes gzip, so
+    // `chunk.len()` is the DECODED size: a feed host answering with an
+    // unbounded body (or an endless stream) must be cut off, and a feed that
+    // yields unbounded rows must stop too (finding f12).
+    const MAX_FEED_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_FEED_LINKS: usize = 200_000;
+    let mut feed_bytes = 0usize;
     let mut batcher = UrlBatcher::new(batch_size);
     let mut summary = ValidationSummary::default();
     let mut count = 0usize;
@@ -206,6 +213,15 @@ where
                     break None;
                 }
                 Some(Ok(chunk)) => {
+                    feed_bytes = feed_bytes.saturating_add(chunk.len());
+                    if feed_bytes > MAX_FEED_BYTES {
+                        tracing::warn!(
+                            target: "tui::ops::subscriptions",
+                            "Feed exceeded the {MAX_FEED_BYTES}-byte budget ({feed_bytes} bytes) — stopping with partial results"
+                        );
+                        ended_early = Some(format!("feed over the {MAX_FEED_BYTES}-byte budget"));
+                        break None;
+                    }
                     if let Err(e) = batcher.feed(&chunk) {
                         tracing::error!(
                             target: "tui::ops::subscriptions",
@@ -259,6 +275,14 @@ where
         summary.merge(&s);
         if let Some(cb) = on_progress {
             cb(count);
+        }
+        if count > MAX_FEED_LINKS {
+            tracing::warn!(
+                target: "tui::ops::subscriptions",
+                "Feed exceeded the {MAX_FEED_LINKS}-link budget ({count} links) — stopping with partial results"
+            );
+            ended_early = Some(format!("feed over the {MAX_FEED_LINKS}-link budget"));
+            break;
         }
         tokio::task::yield_now().await;
     }
@@ -379,6 +403,7 @@ pub async fn import_http_subscription(
         .user_agent(user_agent)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        .redirect(xray_tui_core::updater::safe_redirect_policy(false))
         .build()
     {
         Ok(c) => c,
@@ -491,6 +516,28 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(meta.ids.len(), 4);
+    }
+
+    /// A feed that streams past the decode budget must stop early instead of
+    /// buffering/parsing an unbounded body (finding f12).
+    #[tokio::test]
+    async fn streaming_import_stops_at_the_byte_budget() {
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+        // One chunk over the 64 MiB decode budget; content is irrelevant —
+        // the budget is checked before the bytes are decoded.
+        let huge = bytes::Bytes::from(vec![b'x'; 64 * 1024 * 1024 + 1]);
+        let mut source = ScriptedSource {
+            chunks: std::iter::once(Ok(huge)),
+        };
+        let outcome =
+            run_streaming_import(&mut source, &db, None, &validation, 2, None::<&fn(usize)>).await;
+        let reason = outcome.ended_early.expect("budget must end the run early");
+        assert!(
+            reason.contains("byte budget"),
+            "reason must name the budget: {reason}"
+        );
+        assert_eq!(outcome.links, 0);
     }
 
     #[tokio::test]

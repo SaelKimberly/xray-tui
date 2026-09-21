@@ -272,6 +272,17 @@ impl AppConfig {
     pub fn save(&self) -> Result<()> {
         let path = default_config_path();
         if let Some(parent) = path.parent() {
+            // Owner-only: this directory also holds data.db, the profile
+            // credential store, so it must not be traversable by other users.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self)?;

@@ -14,7 +14,9 @@
 
 use std::net::IpAddr;
 
-use xray_tui_proto::proto_spec::{EndpointEssentials, ParseError, ParsedProto, ProtocolConfig};
+use xray_tui_proto::proto_spec::{
+    EndpointEssentials, ParseError, ParsedProto, ProtoSpec, ProtocolConfig, SecurityConfig,
+};
 use xray_tui_proto::urlx::RawUrlX;
 
 /// Result of parsing a share URL: the typed parse-boundary payload.
@@ -151,6 +153,23 @@ pub fn parse_share_url(url: &str, settings: &ValidationSettings) -> Result<Parse
     let parsed = ProtocolConfig::try_parse_proto(&raw).map_err(ImportError::from)?;
 
     let validation = validate_required_fields(&parsed);
+
+    // `reject_insecure`: the documented import policy. Without this branch
+    // the setting is dead state and a feed's `allowInsecure=1` /
+    // `insecure=1` always lands in the store with TLS certificate
+    // verification disabled.
+    if settings.reject_insecure
+        && parsed
+            .protocol
+            .config
+            .security()
+            .and_then(SecurityConfig::insecure)
+            == Some(true)
+    {
+        return Err(ImportError::Validation(
+            "profile disables certificate verification (allowInsecure/insecure)".into(),
+        ));
+    }
 
     validate_host(&parsed, settings)?;
 
@@ -587,12 +606,35 @@ fn validate_required_fields(parsed: &ParsedProto) -> Result<(), String> {
     }
 }
 
+/// Check whether a hostname is valid for use as a server address.
+/// Rejects underscores, non-ASCII, and other characters that are
+/// not valid in DNS labels.
+fn is_valid_hostname(host: &str) -> bool {
+    // Strip a trailing dot (FQDN root dot).
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.contains("..") {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
 /// Validate the primary endpoint host is not unspecified/private/loopback/link-local.
 ///
 /// This config layer is the single authority for host policy (T11 moved it
 /// out of the parse boundary): the hard unspecified-address rule applies to
 /// every host, and the `allow_private_ips` setting gates private, loopback,
 /// link-local, and "localhost" hosts.
+///
+/// Hostnames are validated against RFC-compliant DNS labels — underscores,
+/// non-ASCII, and other invalid characters are rejected.
 fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<(), ImportError> {
     let Some(endpoint) = parsed.endpoints.first() else {
         return Ok(()); // no address to validate
@@ -602,12 +644,30 @@ fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<
         return Ok(()); // no address to validate
     }
 
-    // Bracketed IPv6 (e.g. "[::1]") — parse the inner literal.
+    // Strip brackets for IPv6 literals (e.g. "[::1]").
     let parse_target: &str = addr
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(addr);
-    let parsed_ip: Option<IpAddr> = parse_target.parse().ok();
+
+    // Normalize IDN (internationalized domain names) to punycode using
+    // `url::Host`, which handles non-ASCII labels per RFC 3490. Non-ASCII
+    // hostnames like `中文.example.com` become `xn--fsqu00a.xn--0zwm56d.xn--5nxp`,
+    // which the IP/hostname checks below can classify correctly.
+    let normalized =
+        url::Host::parse(parse_target).map_or_else(|_| parse_target.to_string(), |h| h.to_string());
+
+    let parsed_ip: Option<IpAddr> = normalized.parse().ok();
+
+    // Classify a NORMALIZED address. "::ffff:a.b.c.d" denotes the embedded
+    // IPv4 address, but Ipv6Addr::is_loopback/is_unique_local/
+    // is_unicast_link_local/is_unspecified are defined over native v6 prefixes
+    // only, so the mapped form escaped every check below (including the
+    // ungated unspecified hard rule). Unwrap it before choosing the rules.
+    let parsed_ip: Option<IpAddr> = parsed_ip.map(|ip| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 @ IpAddr::V4(_) => v4,
+    });
 
     // Hard rule: unspecified addresses (0.0.0.0 / ::) are never valid server
     // targets — not gated by allow_private_ips.
@@ -652,10 +712,15 @@ fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<
             }
         }
         None => {
-            // DNS name — check for localhost
-            let lower = addr.to_lowercase();
+            // DNS name — reject localhost and names with invalid
+            // characters (underscores, non-ASCII, etc.) that are
+            // not valid server hostnames.
+            let lower = normalized.to_lowercase();
             if lower == "localhost" || lower.ends_with(".localhost") {
                 return Err(ImportError::Validation("localhost hostname".into()));
+            }
+            if !is_valid_hostname(&normalized) {
+                return Err(ImportError::Validation("invalid hostname".into()));
             }
         }
     }
@@ -835,6 +900,100 @@ mod tests {
         );
     }
 
+    /// IPv4-mapped IPv6 literals (e.g. `::ffff:0.0.0.0`) must NOT bypass
+    /// the unspecified-address hard rule.
+    #[test]
+    fn validate_host_rejects_ipv4_mapped_unspecified() {
+        for addr in ["::ffff:0.0.0.0", "[::ffff:0.0.0.0]"] {
+            let err =
+                validate_host(&parsed_with_host(addr), &ValidationSettings::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("unspecified"),
+                "error for {addr} must mention unspecified: {err}"
+            );
+        }
+    }
+
+    /// IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) must NOT bypass
+    /// the loopback check.
+    #[test]
+    fn validate_host_rejects_ipv4_mapped_loopback() {
+        let err = validate_host(
+            &parsed_with_host("::ffff:127.0.0.1"),
+            &ValidationSettings::default(),
+        )
+        .expect_err("mapped loopback must be rejected");
+        assert!(
+            err.to_string().contains("loopback"),
+            "error must mention loopback: {err}"
+        );
+    }
+
+    /// IPv4-mapped IPv6 private addresses (`::ffff:192.168.1.1`) must NOT
+    /// bypass the private-IP check.
+    #[test]
+    fn validate_host_rejects_ipv4_mapped_private() {
+        let err = validate_host(
+            &parsed_with_host("::ffff:192.168.1.1"),
+            &ValidationSettings::default(),
+        )
+        .expect_err("mapped private must be rejected");
+        assert!(
+            err.to_string().contains("private"),
+            "error must mention private: {err}"
+        );
+    }
+
+    /// Hostnames that IDN can normalize must be validated in their punycode
+    /// form. Non-ASCII names are ACCEPTED (converted to punycode), but a
+    /// Unicode spelling of `localhost` or a private/loopback IP must still be
+    /// rejected after normalization — otherwise the normalization itself would
+    /// be a bypass.
+    #[test]
+    fn validate_host_accepts_idn_and_rejects_unicode_bypasses() {
+        // Underscores are not punycode-encodable and are not valid hostname
+        // characters → rejected.
+        let err = validate_host(
+            &parsed_with_host("host_with_underscore.example.com"),
+            &ValidationSettings::default(),
+        )
+        .expect_err("underscore hostname must be rejected");
+        assert!(
+            err.to_string().contains("host"),
+            "error must mention host: {err}"
+        );
+
+        // Genuine IDN (Chinese) converts to punycode → accepted.
+        validate_host(
+            &parsed_with_host("中文.example.com"),
+            &ValidationSettings::default(),
+        )
+        .expect("IDN hostname must be accepted via punycode");
+
+        // A Unicode/fullwidth spelling of a restricted form must still be
+        // rejected once normalized: `ｌｏｃａｌｈｏｓｔ` → `localhost`.
+        let err = validate_host(
+            &parsed_with_host("ｌｏｃａｌｈｏｓｔ"),
+            &ValidationSettings::default(),
+        )
+        .expect_err("fullwidth localhost must be rejected after normalization");
+        assert!(
+            err.to_string().contains("localhost"),
+            "error must mention localhost: {err}"
+        );
+
+        // `１２７.０.０.１` (fullwidth digits) → `127.0.0.1` → loopback.
+        let err = validate_host(
+            &parsed_with_host("１２７.０.０.１"),
+            &ValidationSettings::default(),
+        )
+        .expect_err("fullwidth loopback IP must be rejected after normalization");
+        assert!(
+            err.to_string().contains("loopback"),
+            "error must mention loopback: {err}"
+        );
+    }
+
     // ── parse_share_url error paths ──
 
     #[test]
@@ -933,6 +1092,42 @@ mod tests {
             let p = parse_share_url(&url, &settings).unwrap();
             assert_eq!(p.parsed.endpoints[0].host, host);
         }
+    }
+
+    /// The documented `parsing.reject_insecure` gate must actually reject a
+    /// feed-supplied profile whose TLS verification is disabled.
+    #[test]
+    fn reject_insecure_gate_is_enforced() {
+        let rejecting = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: true,
+        };
+        let permissive = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
+        let insecure_urls = [
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?security=tls&type=tcp&allowInsecure=1#r",
+            "trojan://humanity@example.com:443?security=tls&type=tcp&allowInsecure=1#r",
+            "hysteria2://secret@example.com:443?insecure=1#r",
+        ];
+        for url in insecure_urls {
+            assert!(
+                matches!(
+                    parse_share_url(url, &rejecting),
+                    Err(ImportError::Validation(_))
+                ),
+                "reject_insecure=true must reject {url}"
+            );
+            assert!(
+                parse_share_url(url, &permissive).is_ok(),
+                "reject_insecure=false must accept {url}"
+            );
+        }
+        // A profile that keeps verification is unaffected by the gate.
+        let secure =
+            "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?security=tls&type=tcp#r";
+        assert!(parse_share_url(secure, &rejecting).is_ok());
     }
 
     #[test]

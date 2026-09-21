@@ -152,8 +152,45 @@ async fn main() -> Result<()> {
         std::sync::mpsc::sync_channel::<xray_tui_core::log_heed::LogMessage>(4096);
     let dropped_logs = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // 2. Open database (~/.config/xray-tui/data.db)
+    // The directory holds the profile credential store (data.db) and the log
+    // store: make it owner-only so it is not traversable by other local users.
+    // `AppConfig::save` already creates it 0700 on a fresh install; this
+    // tightens an install created by an older build.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::create_dir_all(&config_dir);
+        let _ = std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700));
+    }
     let db_path = config_dir.join("data.db");
+    // The store holds every stored profile's proxy credentials: create it
+    // owner-only before the driver touches it, and tighten an existing store.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&db_path);
+        let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+    }
     let db = Database::open(&db_path).await?;
+    // The driver creates data.db-wal (and data.db-shm) with its own open,
+    // which passes no create-time mode, so they inherit the umask and land
+    // 0644 at umask 022 unless tightened here, after the driver has created
+    // them. They hold the same cleartext credentials as data.db.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for sidecar in ["data.db-wal", "data.db-shm"] {
+            let _ = std::fs::set_permissions(
+                config_dir.join(sidecar),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+    }
     // 3. Open heed log storage (~/.config/xray-tui/logs.lmdb)
     let log_path = config_dir.join("logs.lmdb");
     let heed = Arc::new(HeedLogStorage::new(&log_path)?);

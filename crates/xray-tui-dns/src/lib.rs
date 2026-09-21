@@ -40,24 +40,49 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
         .expect("reqwest client build must succeed")
 });
 
+/// Opt-in for artifact-supplied resolver addresses in the local-use classes
+/// (loopback/private/link-local/multicast). Off by default, mirroring the
+/// config layer's `allow_private_ips` default (finding f4).
+const ALLOW_LOCAL_RESOLVERS: bool = false;
+
+/// Whether an artifact-supplied stamp address may become the client's
+/// resolver. Mirrors the host policy the config layer applies to profile
+/// hosts (`crates/xray-tui-config/src/import_export.rs`): an unspecified
+/// address is never acceptable, and the local-use classes need an explicit
+/// opt-in. Without this, an artifact line could point the client's own
+/// resolver at loopback/LAN/metadata addresses and at arbitrary ports.
+const fn stamp_addr_allowed(addr: IpAddr) -> bool {
+    if ALLOW_LOCAL_RESOLVERS {
+        return !addr.is_unspecified();
+    }
+    match addr {
+        IpAddr::V4(v4) => {
+            !(v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast())
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast())
+        }
+    }
+}
+
 fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
     let Ok(stamp) = DnsStamp::decode(url.as_str()) else {
         return None;
     };
     match stamp {
-        DnsStamp::DnsPlain(s) => {
-            if (allow_ipv6 || s.addr.is_ipv4())
-                && s.props.contains(Props::NO_LOGS)
-                && s.props.contains(Props::NO_FILTER)
-            {
-                Some(NameServerConfig::udp(s.addr))
-            } else {
-                None
-            }
-        }
         DnsStamp::DnsOverHttps(s) => {
             if let Some(Addr::SocketAddr(addr)) = s.addr
                 && (allow_ipv6 || addr.is_ipv4())
+                && stamp_addr_allowed(addr.ip())
                 && s.props.contains(Props::NO_LOGS)
                 && s.props.contains(Props::NO_FILTER)
             {
@@ -72,6 +97,7 @@ fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
         DnsStamp::DnsOverTls(s) => {
             if let Some(Addr::SocketAddr(addr)) = s.addr
                 && (allow_ipv6 || addr.is_ipv4())
+                && stamp_addr_allowed(addr.ip())
                 && s.props.contains(Props::NO_LOGS)
                 && s.props.contains(Props::NO_FILTER)
             {
@@ -85,6 +111,7 @@ fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
         DnsStamp::DnsOverQuic(s) => {
             if let Some(Addr::SocketAddr(addr)) = s.addr
                 && (allow_ipv6 || addr.is_ipv4())
+                && stamp_addr_allowed(addr.ip())
                 && s.props.contains(Props::NO_LOGS)
                 && s.props.contains(Props::NO_FILTER)
             {
@@ -95,6 +122,9 @@ fn sdns_to_nsc(url: &url::Url, allow_ipv6: bool) -> Option<NameServerConfig> {
                 None
             }
         }
+        // A plain stamp carries no authenticated transport, so its answers are
+        // forgeable by anyone on the path; never install one from artifact data.
+        // The same holds for any stamp kind this client does not implement.
         _ => None,
     }
 }
@@ -142,15 +172,32 @@ fn ensure_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Upper bound on the `DNSCrypt` resolver list (the published list is under 1 MB).
+const MAX_RESOLVER_LIST_BYTES: usize = 8 * 1024 * 1024;
+
 /// Downloads the `DNSCrypt` public resolver list under a hard 10s deadline;
 /// without the timeout a blocked network hangs every lookup forever.
 async fn download_dnscrypt_resolvers(resolvers_url: &str) -> anyhow::Result<String> {
-    let response = HTTP_CLIENT
+    let mut response = HTTP_CLIENT
         .get(resolvers_url)
         .send()
         .await?
         .error_for_status()?;
-    Ok(response.text().await?)
+    if let Some(n) = response.content_length()
+        && n > MAX_RESOLVER_LIST_BYTES as u64
+    {
+        anyhow::bail!(
+            "resolver list declares {n} bytes, over the {MAX_RESOLVER_LIST_BYTES}-byte cap"
+        );
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > MAX_RESOLVER_LIST_BYTES {
+            anyhow::bail!("resolver list exceeds the {MAX_RESOLVER_LIST_BYTES}-byte cap");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(bytes)?)
 }
 
 /// Atomically writes the fetched list to the cache file (temp file + rename,
@@ -356,6 +403,62 @@ mod tests {
         assert!(parsed[0].ip.is_ipv4());
     }
 
+    /// The stamp address policy must match the config layer's host policy:
+    /// unspecified is never allowed, local-use classes need an opt-in.
+    #[test]
+    fn stamp_addr_policy_matches_host_policy() {
+        for bad in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "::",
+        ] {
+            assert!(
+                !stamp_addr_allowed(bad.parse().unwrap()),
+                "{bad} must be refused"
+            );
+        }
+        for good in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "217.169.20.22",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(
+                stamp_addr_allowed(good.parse().unwrap()),
+                "{good} must be allowed"
+            );
+        }
+    }
+
+    /// A plain (unauthenticated) stamp and a stamp pointing at a local-use
+    /// address must both be refused, while the published public stamp is
+    /// still accepted (finding f4).
+    #[test]
+    fn sdns_refuses_plain_and_local_stamps() {
+        // Plain 127.0.0.1, props NO_LOGS|NO_FILTER.
+        const PLAIN_LOOPBACK: &str = "sdns://AAYAAAAAAAAACTEyNy4wLjAuMQ";
+        // DoT 127.0.0.1:<port>, TLS name v12-verify.example.
+        const DOT_LOOPBACK: &str =
+            "sdns://AwYAAAAAAAAADzEyNy4wLjAuMTozMzk5OQASdjEyLXZlcmlmeS5leGFtcGxl";
+        for s in [PLAIN_LOOPBACK, DOT_LOOPBACK] {
+            let url = url::Url::parse(s).expect("fixture parses");
+            assert!(
+                DnsStamp::decode(url.as_str()).is_ok(),
+                "fixture must decode (rejection must be policy, not parse): {s}"
+            );
+            assert!(sdns_to_nsc(&url, false).is_none(), "must be refused: {s}");
+        }
+        // The published public DoH stamp is still accepted.
+        let public = url::Url::parse(STAMP_IPV4).expect("fixture parses");
+        assert!(sdns_to_nsc(&public, false).is_some());
+    }
+
     #[tokio::test]
     async fn stale_cache_is_refreshed_or_falls_back_to_stale() -> anyhow::Result<()> {
         // A cache older than 7 days triggers a refresh attempt; with the list
@@ -408,6 +511,21 @@ mod tests {
         assert!(
             contents.is_empty(),
             "empty download must not be written to cache"
+        );
+        Ok(())
+    }
+
+    /// An over-cap body must be refused outright, so the unbounded artifact
+    /// fetch can never write a huge cache file (finding f1).
+    #[tokio::test]
+    async fn oversized_resolver_list_is_refused() -> anyhow::Result<()> {
+        let url = serve("x".repeat(MAX_RESOLVER_LIST_BYTES + 1)).await;
+        let err = download_dnscrypt_resolvers(&url)
+            .await
+            .expect_err("an over-cap body must be refused");
+        assert!(
+            err.to_string().contains("cap"),
+            "error names the cap: {err}"
         );
         Ok(())
     }

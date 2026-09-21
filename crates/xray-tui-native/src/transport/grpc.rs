@@ -75,29 +75,70 @@ pub fn encode_frame(payload: &[u8]) -> Bytes {
     out.freeze()
 }
 
-/// Decode ONE gRPC Hunk message from the front of `buf`, consuming only
-/// complete messages. Returns `None` when fewer than a full message is
-/// available (partial prefix/payload stays in `buf`).
-pub fn decode_frame(buf: &mut BytesMut) -> Option<Bytes> {
+/// Upper bound on a peer-declared gRPC frame (Hunk) length. A legitimate Hunk
+/// carries one VLESS byte chunk; a multi-megabyte declaration is a protocol
+/// violation. Without this bound a peer declaring `0xFFFFFFFF` makes the
+/// client buffer every byte it sends, unbounded (found `f13`).
+const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// A framing violation the peer caused. Unlike `Ok(None)` ("need more
+/// bytes"), this is terminal: the caller must fail the stream rather than
+/// buffer forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GrpcFrameError {
+    #[error("gRPC frame declares {0} bytes, over the {1}-byte cap")]
+    FrameTooLarge(usize, usize),
+    #[error("gRPC Hunk declares an out-of-range payload length")]
+    LengthOverflow,
+}
+
+/// Decode ONE gRPC Hunk message from the front of `buf`.
+///
+/// Consumes only complete messages: returns `Ok(None)` when fewer than a full
+/// message is available (partial prefix/payload stays in `buf`), and `Err` when
+/// the peer declares a frame the client refuses to buffer.
+///
+/// # Errors
+///
+/// [`GrpcFrameError::FrameTooLarge`] when the peer's declared frame length
+/// exceeds [`MAX_FRAME_LEN`], and [`GrpcFrameError::LengthOverflow`] when the
+/// peer's inner varint length does not fit the address space (the old
+/// `1 + dstart + dlen` panicked in debug and sliced `16..15` in release).
+pub fn decode_frame(buf: &mut BytesMut) -> Result<Option<Bytes>, GrpcFrameError> {
     if buf.len() < 5 {
-        return None;
+        return Ok(None);
     }
     let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(GrpcFrameError::FrameTooLarge(len, MAX_FRAME_LEN));
+    }
     if buf.len() < 5 + len {
-        return None;
+        return Ok(None);
     }
     let msg = buf.split_to(5 + len).freeze();
     let hunk = &msg[5..];
     // Hunk: 0x0A tag, then varint data length, then data.
-    let tag = *hunk.first()?;
+    let Some(&tag) = hunk.first() else {
+        return Ok(None);
+    };
     if tag != 0x0A {
-        return None;
+        return Ok(None);
     }
-    let (dlen, dstart) = varint_decode(hunk, 1)?;
-    if 1 + dstart + dlen > hunk.len() {
-        return None;
+    let Some((dlen, dstart)) = varint_decode(hunk, 1) else {
+        return Ok(None);
+    };
+    // `dlen` is a peer-supplied varint value (up to usize::MAX): keep every
+    // bound check in checked arithmetic and slice in message coordinates.
+    let start = 1usize
+        .checked_add(dstart)
+        .ok_or(GrpcFrameError::LengthOverflow)?;
+    let end = start
+        .checked_add(dlen)
+        .ok_or(GrpcFrameError::LengthOverflow)?;
+    if end > hunk.len() {
+        return Ok(None);
     }
-    Some(msg.slice(5 + 1 + dstart..5 + 1 + dstart + dlen))
+    Ok(Some(msg.slice(5 + start..5 + end)))
 }
 
 /// Decode a base-128 varint starting at `start`; returns (value, bytes).
@@ -232,9 +273,16 @@ impl AsyncRead for GrpcStream {
                 }
                 return Poll::Ready(Ok(()));
             }
-            if let Some(msg) = decode_frame(&mut self.read_buf) {
-                self.queued.push_back(msg);
-                continue;
+            match decode_frame(&mut self.read_buf) {
+                Ok(Some(msg)) => {
+                    self.queued.push_back(msg);
+                    continue;
+                }
+                // Partial frame: fall through and pull more bytes.
+                Ok(None) => {}
+                // Protocol violation (over-cap or overflow): fail the stream
+                // instead of buffering the peer's bytes without bound.
+                Err(e) => return Poll::Ready(Err(io::Error::other(e))),
             }
             if self.recv.is_none() {
                 let rx = self
@@ -373,7 +421,7 @@ mod tests {
         assert_eq!(&framed[..5], &prefix);
         assert_eq!(framed[5], 0x0A);
         let mut buf = BytesMut::from(&framed[..]);
-        assert_eq!(decode_frame(&mut buf), Some(Bytes::from(payload)));
+        assert_eq!(decode_frame(&mut buf), Ok(Some(Bytes::from(payload))));
         assert!(buf.is_empty());
     }
 
@@ -388,9 +436,9 @@ mod tests {
         let framed = encode_frame(&payload);
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&framed[..split]);
-        assert_eq!(decode_frame(&mut buf), None); // partial frame
+        assert_eq!(decode_frame(&mut buf), Ok(None)); // partial frame
         buf.extend_from_slice(&framed[split..]);
-        assert_eq!(decode_frame(&mut buf), Some(Bytes::from(payload)));
+        assert_eq!(decode_frame(&mut buf), Ok(Some(Bytes::from(payload))));
     }
 
     #[test]
@@ -398,9 +446,39 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&encode_frame(b"one"));
         buf.extend_from_slice(&encode_frame(b"two"));
-        assert_eq!(decode_frame(&mut buf), Some(Bytes::from_static(b"one")));
-        assert_eq!(decode_frame(&mut buf), Some(Bytes::from_static(b"two")));
+        assert_eq!(decode_frame(&mut buf), Ok(Some(Bytes::from_static(b"one"))));
+        assert_eq!(decode_frame(&mut buf), Ok(Some(Bytes::from_static(b"two"))));
         assert!(buf.is_empty());
+    }
+
+    /// A peer-declared varint of `usize::MAX` must be rejected with checked
+    /// arithmetic — the old `1 + dstart + dlen` panicked in debug and sliced
+    /// `16..15` in release (finding f6).
+    #[test]
+    fn hostile_varint_length_is_rejected_not_panicking() {
+        // gRPC prefix: flag 0, BE hunk len = 11 (tag + 10-byte varint).
+        // Hunk: tag 0x0A + 10-byte protobuf varint = usize::MAX.
+        let mut buf = BytesMut::from(
+            &[
+                0x00, 0x00, 0x00, 0x00, 0x0b, 0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0x01,
+            ][..],
+        );
+        assert_eq!(decode_frame(&mut buf), Err(GrpcFrameError::LengthOverflow));
+    }
+
+    /// A peer-declared frame larger than `MAX_FRAME_LEN` must be refused
+    /// before any buffering (finding f13).
+    #[test]
+    fn oversized_declared_frame_is_rejected() {
+        let mut buf = BytesMut::from(&[0x00, 0xff, 0xff, 0xff, 0xff][..]);
+        assert_eq!(
+            decode_frame(&mut buf),
+            Err(GrpcFrameError::FrameTooLarge(
+                u32::MAX as usize,
+                MAX_FRAME_LEN
+            ))
+        );
     }
 
     #[test]

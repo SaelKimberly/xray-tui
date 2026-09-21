@@ -212,6 +212,24 @@ mod tests {
         );
     }
 
+    /// A descending range (`"2000-1000"`) used to underflow `add_range`
+    /// (panic in debug, inconsistent spec in release); it must parse to an
+    /// empty spec instead (finding f14), and an over-budget span must be
+    /// refused (finding f15).
+    #[test]
+    fn test_port_spec_rejects_descending_and_oversized_spans() {
+        let (_, spec) = super::port_specs(b"2000-1000").unwrap();
+        assert_eq!(spec.length(), 0, "descending range contributes nothing");
+        assert!(spec.first().is_none());
+
+        let (_, spec) = super::port_specs(b"1-65535").unwrap();
+        assert_eq!(spec.length(), 0, "over-budget span is refused");
+
+        // A valid small range is unaffected.
+        let (_, spec) = super::port_specs(b"1000-1010").unwrap();
+        assert_eq!(spec.length(), 11);
+    }
+
     #[test]
     fn test_dns_name_idn() {
         let s = "例子.测试".as_bytes();
