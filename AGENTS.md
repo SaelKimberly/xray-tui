@@ -70,7 +70,7 @@ cargo run
 - `crates/xray-tui-route/src/` — first-match routing engine (`Engine` `decide`/`decide_async`, IR + xray/sing-box/DB-row compilers, `resolve` `DnsSink`/`ProbeTracker`). Sniffer (`sniff.rs`): TLS `ClientHello` SNI + HTTP `Host` + QUIC `Initial` decryption (RFC 9001 §5.2 key schedule + header-protection removal) with stateful multi-datagram `ClientHello` reassembly (`QuicSniffer`); `SniffedProtocol::Quic` accepted in both compilers (`protocol` tokens http/tls/dns/quic)
 - `crates/xray-tui-hakari/` — generated feature-unification crate (cargo-hakari); deps exist only to unify features, never referenced from code. Every member depends on it; regenerate after any Cargo.lock change. The `hakari-check` gate runs all three checks (`generate --diff` freshness, `manage-deps --dry-run` membership, `verify` single-feature-set) — `verify` alone misses a stale hack or a member with no dep.
 ### TUI screens (crates/xray-tui/src/ui/)
-- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay
+- `mod.rs` — run(), render(), event loop, keyboard handler, tab routing, AppMode dispatch, speed test menu overlay. Only key-DOWN events act (`handle_event` dispatches `Event::Key` with `KeyEventKind::Press`): a Windows console reports a key-up record for every keypress, so dispatching every `Event::Key` applied each press (and each pasted character) twice there
 - `profiles.rs` — profile list DataGrid (16 columns; Protocol Info = `protocol/transport/security`) with connected indicator, Test column (colored delay + `[name]`/`[fast]`/`[real]` labels from the persisted failure marker), Feat flag column, multi-sort indicators (Test column sortable: ranks endpoints by best protocol's test priority), purgatory view filter (`p`: Active/Stale/All), tree markers (▶/▾) for expandable endpoints, column separators; sub-row protocol variants in an 8-row windowed panel (visible-range indicator on the separator); reverse-highlighted selected sub-row; multi-select, delete confirmation, batch import overlay; expand/collapse (←/→), variant navigation (↑↓), Enter to activate variant
 - `add_server.rs` — form rendering, protocol picker, field editing, import URL screen
 - `settings.rs` — Settings panel with split-pane tree+form view. Left pane: collapsible tree (SETTINGS_TREE const, SettingsSection-navigated). Right pane: Form, UpdateForm, GroupList, GroupForm, Empty. Sections: Core, GUI, Inbound, Routing, DNS, System Proxy, TUN, Mux, Statistics, Protocol Core, Updates, Speed Test, Logging, Subscriptions (14 total). Tree navigation (arrows) + form focus switching (Ctrl+W). Full rewrite. Replaced per-section SettingsMode variants with unified Split { tree, focus, right }. Group (subscription) management lives here — `g` from Profiles jumps straight to the Subscriptions section (GroupList/GroupForm).
@@ -316,6 +316,16 @@ Identity is a frozen wire format — `scripts`-less, order-sensitive, and re-key
   itself — `cargo criterion` runs the bench executable directly and does NOT apply `[env]` from
   `.cargo/config.toml`, so without it the throughput rows print `SKIP … is not set` and still exit 0
 - `cargo build --release` — release build
+- Cross-building for Windows (`x86_64-pc-windows-gnu`): `cargo zigbuild --target x86_64-pc-windows-gnu
+  -p xray-tui` needs two host fixes when a Homebrew rustc shadows the rustup shims —
+  `RUSTC=<rustup toolchain>/bin/rustc` (the Homebrew rustc owns only the Linux std, and the
+  `rustc-wrapper` in `.cargo/config.toml` makes cargo hand the wrapper a bare `rustc` name it resolves
+  from PATH), and a mingw-capable `windres` early in PATH (`turso_sdk_kit`'s build script runs bare
+  `windres`; Homebrew binutils' `windres` cannot emit a PE resource — `llvm-windres` can). Two Windows
+  gaps remain in the runtime, neither reachable from the cross-build: `find_binary` (`xray-tui-core`)
+  looks the cores up through `which` and extensionless names (`xray`/`sing-box`, never `xray.exe`), and
+  the backend updater is Linux-only (`release_asset_url` rejects a non-Linux OS, `asset_name` hardcodes
+  `-linux-`)
 - Manual: run xray-tui against real xray-core and sing-box binaries, verify connect/speedtest/disconnect flow for both backends
 
 ### Tool Restrictions

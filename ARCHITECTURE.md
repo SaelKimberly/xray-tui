@@ -1030,7 +1030,7 @@ Single tokio async runtime on the main thread for I/O. Ratatui rendering in a sy
 - Log reader task → TUI: `log_line_tx` (timestamp, level, message)
 - Native session task → TUI: `core_event_tx` (`NativeTrace`, `StatsUpdate`, `SysStatsUpdate`) plus the shared heed log channel; the in-process core's own accept/relay tasks live inside `NativeCoreServer` and all select on one `watch` shutdown signal
 - Log persistence → heed (LMDB): a batched writer (up to 100 messages) owns the `std::sync::mpsc` receiver in a `spawn_blocking` task; async readers wrap LMDB reads in `spawn_blocking` too
-- TUI event loop: polls all channels + terminal events + renders frame
+- TUI event loop: polls all channels + terminal events + renders frame. Only key-DOWN events act (`Event::Key` with `KeyEventKind::Press`): a Windows console reports a key-up record for every keypress and crossterm maps it to `Release`, so dispatching every `Event::Key` applied each press — and each pasted character — twice
 
 **Shutdown.** `AppState::shutdown_token: Arc<AtomicBool>` is the one flag every
 background loop checks. `main` creates it, installs it on the state, stores `true`

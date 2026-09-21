@@ -291,6 +291,9 @@ impl RealCoreManager {
             .as_ref()
             .and_then(|c| c.id())
             .ok_or_else(|| ProcessError::Startup("No child PID".into()))?;
+        // No SIGHUP on Windows — the caller stops and restarts instead. The
+        // success path lives inside the unix block: a `return` in the non-unix
+        // arm would leave a trailing `Ok(pid)` unreachable there.
         #[cfg(unix)]
         {
             unsafe {
@@ -299,15 +302,15 @@ impl RealCoreManager {
                     return Err(ProcessError::Startup(format!("SIGHUP failed: {err}")));
                 }
             }
+            Ok(pid)
         }
         #[cfg(not(unix))]
         {
-            // Windows: no SIGHUP — caller should use stop+restart instead
-            return Err(ProcessError::Startup(
+            let _ = pid;
+            Err(ProcessError::Startup(
                 "SIGHUP not supported on Windows".into(),
-            ));
+            ))
         }
-        Ok(pid)
     }
 
     /// Write config to the existing temp directory without restarting.

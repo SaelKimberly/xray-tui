@@ -149,7 +149,7 @@ AGENTS.md
 | Ping history | Transient (not persisted) | Persisted per pair on `profile_stats` (latency kind + delay + exit IP, failure marker with its kind) — no per-attempt history table |
 | Settings persistence | XML AppConfig file | JSON AppConfig file + SQLite for Routing/DNS |
 | Config generation | C# objects to JSON serialization | config_builder/xray.rs + singbox.rs producing serde_json::Value to file |
-| Binary discovery | Checked process compatibility | bin_manager.rs: searches bin_dir, PATH, extracts archives |
+| Binary discovery | Checked process compatibility | bin_manager.rs: searches bin_dir, PATH, extracts archives — Unix-shaped (PATH via `which`, extensionless names), see ROADMAP Phase 27 |
 
 ### Display & UX
 

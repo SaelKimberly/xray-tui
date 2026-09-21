@@ -11,7 +11,9 @@ pub mod theme;
 pub mod widgets;
 use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -279,7 +281,14 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
 
 async fn handle_event(ev: &Event, state: &mut AppState) {
     match ev {
-        Event::Key(key) => handle_key(key, state).await,
+        // Only a key-DOWN is an action. A Windows console delivers a key-up
+        // record for every keypress and crossterm maps it to
+        // `KeyEventKind::Release` (`event/sys/windows/parse.rs`), so acting on
+        // every `Event::Key` applied each press twice there — and doubled every
+        // pasted character too, since the terminal injects a paste as key
+        // records. Unix terminals report only `Press`, which is why the defect
+        // was Windows-only.
+        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(key, state).await,
         Event::Mouse(mouse) => handle_mouse(mouse, state).await,
         _ => {}
     }
@@ -1263,4 +1272,37 @@ pub fn render_placeholder_screen(frame: &mut Frame, area: Rect, name: &str) {
         .style(Style::default().fg(Color::Gray))
         .block(Block::default().title(name).borders(Borders::ALL));
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Windows console reports a key-up record for every keypress, and
+    /// crossterm maps it to `KeyEventKind::Release` — dispatching every
+    /// `Event::Key` applied each press twice there, and doubled every character
+    /// of a paste (injected as key records). Unix terminals report only
+    /// `Press`.
+    #[tokio::test]
+    async fn a_key_up_record_does_not_repeat_the_action() {
+        let mut state = crate::ops::profiles::test_support::test_state(Vec::new()).await;
+        let f1 = |kind| {
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::F(1),
+                KeyModifiers::NONE,
+                kind,
+            ))
+        };
+
+        // One keypress is one action, whatever the platform reports around it.
+        assert!(!state.actions_compact);
+        handle_event(&f1(KeyEventKind::Press), &mut state).await;
+        handle_event(&f1(KeyEventKind::Release), &mut state).await;
+        assert!(state.actions_compact, "key-up must not undo the press");
+
+        // …and two presses are still two actions.
+        handle_event(&f1(KeyEventKind::Press), &mut state).await;
+        handle_event(&f1(KeyEventKind::Release), &mut state).await;
+        assert!(!state.actions_compact);
+    }
 }
