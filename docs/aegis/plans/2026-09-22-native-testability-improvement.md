@@ -195,7 +195,7 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 
 **Tests**: `xray_build_refuses_the_removed_http_and_quic_transports` (all three spellings — `http`, `h2`, `quic` — refuse, the reason names the transport, and no partial config is left behind); `the_removed_transports_are_still_buildable_for_singbox` (the refusal is scoped to the core that removed them, not to the transport); and `the_removed_transports_emit_the_names_xray_refuses` in `common.rs`, which pins the coupling the validator exists for — `ws`/`httpupgrade`/`splithttp` were already pinned, these two were the unpinned pair, which is why nothing failed when xray-core removed them.
 
-### T9 — mlkem differential · `strict` (landed — verdict: the client, not the pin)
+### T9 — mlkem differential · `strict` (verdict landed: the client; **the item did NOT close** — returned to design)
 
 **Landed 2026-09-22.** Built the HEAD peer (`thirdparty/Xray-core` → **Xray 26.7.28**, go 1.27.1) and added `vless_pq_enc_against_head` — an ignored test that resolves the SECOND pin and runs the same pq-enc case against it. `XRAY_VERSION` is untouched, so the suite's baseline and its 136 rows are unchanged.
 
