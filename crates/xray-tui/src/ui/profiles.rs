@@ -438,7 +438,25 @@ fn compute_test_cell(
         ) => Some(delay),
         None => None,
     });
-    test_cell_content(
+    // The approximation marker: `~` says the verdict beside it was produced by a
+    // SUBSTITUTED ClientHello — the link asked for a fingerprint with no roster
+    // row, so the engine probed with its default. It is a provenance note about
+    // the measurement, so it appends to whatever the cell already shows instead
+    // of displacing it.
+    //
+    // Scoped to the REPRESENTATIVE link's own protocol, never "the endpoint has
+    // an unrosterable `fp` somewhere": a `Protocol` row is shared across
+    // endpoints (identity excludes host/port) and an endpoint carries several
+    // links, so an endpoint-level predicate would mark a verdict that came from
+    // a roster-mapped sibling — destroying the one thing the marker means.
+    let approximated = representative
+        .and_then(|l| row.protocols.get(&l.protocol_id))
+        .is_some_and(|p| {
+            // The `security_fp` COLUMN, not the deferred config: the column is
+            // what the page query projects, so the label needs no config load.
+            xray_tui_native::security::fingerprint::resolve_fingerprint(p.security.fp.as_deref()).1
+        });
+    let (mut text, style) = test_cell_content(
         row.endpoint.host_type == xray_tui_db::models::HostType::Dns,
         resolved,
         untestable,
@@ -446,7 +464,11 @@ fn compute_test_cell(
         failure,
         delay,
         palette,
-    )
+    );
+    if approximated {
+        text.push('~');
+    }
+    (text, style)
 }
 
 /// The short name a purged link shows in place of its Test-cell content.
@@ -842,7 +864,24 @@ fn build_display_rows(
                     });
                     let config_type = match (t, s) {
                         (None, None) => "-".to_string(),
-                        (t, s) => format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-")),
+                        (t, s) => {
+                            let base = format!("{}/{}", t.unwrap_or("-"), s.unwrap_or("-"));
+                            // `~` marks a substituted ClientHello. The panel row
+                            // IS one link, so this is per-link by construction —
+                            // the same predicate the endpoint Test cell applies to
+                            // its representative, so the two surfaces cannot
+                            // disagree about what "approximated" means.
+                            if proto.is_some_and(|p| {
+                                xray_tui_native::security::fingerprint::resolve_fingerprint(
+                                    p.security.fp.as_deref(),
+                                )
+                                .1
+                            }) {
+                                format!("{base}~")
+                            } else {
+                                base
+                            }
+                        }
                     };
                     let protocol_type =
                         proto.map_or_else(|| "-".to_string(), |p| p.proto_kind.to_string());
@@ -940,7 +979,7 @@ fn render_data_grid(
         SortDirection::Descending
     };
 
-    // 16 fixed columns (117 cells total); headers carry only descriptive
+    // 16 fixed columns (118 cells total); headers carry only descriptive
     // names (decorative separator cells have empty headers).
     let columns = vec![
         Column::new("", ColumnWidth::Fixed(1)),  // 0 — tree marker
@@ -954,7 +993,7 @@ fn render_data_grid(
         Column::new("", ColumnWidth::Fixed(4)),  // 8 — ]=>{
         Column::new("Protocol Info", ColumnWidth::Fixed(24)), // 9 — protocol/transport/security
         Column::new("", ColumnWidth::Fixed(3)),  // 10 — }=> arrow
-        Column::new("Test", ColumnWidth::Fixed(6)), // 11 — [delay]/[name]/[fast]/[real]
+        Column::new("Test", ColumnWidth::Fixed(7)), // 11 — [delay]/[name]/[fast]/[real] + `~` approximation
         Column::new("", ColumnWidth::Fixed(1)),  // 12 — [ outbound opener
         Column::new("Outbound", ColumnWidth::Fixed(16)), // 13
         Column::new("Country", ColumnWidth::Fixed(7)), // 14
@@ -1374,6 +1413,60 @@ mod tests {
         }
     }
 
+    /// The approximation marker is scoped to the REPRESENTATIVE link's own
+    /// protocol — the same link the cell describes (decision 16). A `Protocol`
+    /// row is shared across endpoints (identity excludes host/port) and an
+    /// endpoint carries several links, so "the endpoint has an unrosterable `fp`
+    /// somewhere" would mark a verdict that came from a roster-mapped sibling —
+    /// which is the one thing the marker must never mean.
+    #[test]
+    fn approximation_marker_follows_the_representative_link() {
+        use crate::ops::profiles::test_support::fake_row;
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let mut row = fake_row(1, "1.2.3.4", 3); // p100, p101, p102
+        let rep = row.representative_link_index(true).expect("a representative");
+        let rep_id = row.links[rep].protocol_id;
+        let sibling_id = row.links[(rep + 1) % row.links.len()].protocol_id;
+
+        // A sibling carrying an unrosterable id must NOT mark the row.
+        row.protocols.get_mut(&sibling_id).expect("sibling").security.fp =
+            Some(String::from("qq"));
+        let (text, _) = compute_test_cell(&row, true, &palette);
+        assert!(!text.contains('~'), "sibling-only: {text:?}");
+
+        // The representative's own protocol carrying it MUST.
+        row.protocols.get_mut(&rep_id).expect("rep").security.fp = Some(String::from("qq"));
+        let (text, _) = compute_test_cell(&row, true, &palette);
+        assert!(text.ends_with('~'), "representative: {text:?}");
+
+        // A roster id, and the two spellings of "no fingerprint requested", are
+        // honoured as specified and unmarked.
+        for fp in ["chrome", "firefox", "", "unsafe"] {
+            row.protocols.get_mut(&rep_id).expect("rep").security.fp =
+                Some(String::from(fp));
+            let (text, _) = compute_test_cell(&row, true, &palette);
+            assert!(!text.contains('~'), "fp={fp:?} honoured: {text:?}");
+        }
+    }
+
+    /// The marker appends to whatever the cell already shows — it is a
+    /// provenance note about the measurement, never a replacement for it.
+    #[test]
+    fn approximation_marker_composes_with_the_verdict() {
+        use crate::ops::profiles::test_support::fake_row;
+        use xray_tui_db::models::Latency;
+        let palette =
+            crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
+        let mut row = fake_row(1, "1.2.3.4", 1);
+        let rep_id = row.links[0].protocol_id;
+        row.links[0].latency = Some(Latency::Fast { delay: 42 });
+        row.protocols.get_mut(&rep_id).expect("rep").security.fp = Some(String::from("qq"));
+        let (text, _) = compute_test_cell(&row, true, &palette);
+        assert!(text.contains("42"), "the measurement survives: {text:?}");
+        assert!(text.ends_with('~'), "and carries the marker: {text:?}");
+    }
+
     /// Regression: multi-protocol endpoint — the cell describes the
     /// REPRESENTATIVE link (the minimum of the decision-16 key), never the raw
     /// `selected_protocol` and never "any link". A failed sibling must not paint
@@ -1564,7 +1657,7 @@ mod tests {
         pr.delay = "1234ms".to_string();
         let mut row = sample_row(true, vec![pr], "00");
         row.row_style = ThemeStyles::table_row_normal(&palette);
-        let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 6, 1, 16, 7, 1];
+        let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 7, 1, 16, 7, 1];
         let mut col_xs = Vec::with_capacity(col_widths.len());
         let mut x = 0u16;
         for w in &col_widths {
@@ -1600,9 +1693,12 @@ mod tests {
         row.row_style = ThemeStyles::table_row_normal(&palette);
         row.panel_selected_style = ThemeStyles::panel_row_selected(&palette);
         row.panel_selected = Some(9);
-        // Real column geometry (117 cells) so the panel draws at its
-        // production width.
-        let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 6, 1, 16, 7, 1];
+        // Real column geometry (118 cells) so the panel draws at its
+        // production width. Keep in step with the `Column::new` widths in
+        // `columns()` — this literal is a copy, so a width change there must
+        // change it here too (the Test column is 7: 6 for `[value]` plus the
+        // `~` approximation marker).
+        let col_widths = vec![1u16, 2, 7, 1, 4, 34, 2, 4, 4, 24, 3, 7, 1, 16, 7, 1];
         let mut col_xs = Vec::with_capacity(col_widths.len());
         let mut x = 0u16;
         for w in &col_widths {

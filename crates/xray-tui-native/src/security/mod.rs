@@ -40,11 +40,15 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
     let rng: Arc<dyn SecureRandom> = Arc::new(ring::rand::SystemRandom::new());
     match &sec.tls {
         Some(TlsConfig::Tls(opts)) => {
-            let fingerprint = opts
-                .fp
-                .as_ref()
-                .map(|fp| fingerprint::parse_fingerprint_id(fp).and_then(fingerprint::profile_for))
-                .transpose()?;
+            let (fp_id, approximated) = fingerprint::resolve_fingerprint(opts.fp.as_deref());
+            if approximated {
+                tracing::debug!(
+                    target: "xray_tui_native::security",
+                    fp = opts.fp.as_deref().unwrap_or(""),
+                    "probing with the default TLS fingerprint: no roster row for the requested id"
+                );
+            }
+            let fingerprint = fp_id.map(fingerprint::profile_for).transpose()?;
             let verifier: Arc<dyn ServerVerifier> = Arc::new(fingerprint::verifier_for(
                 opts.insecure.unwrap_or(false),
                 fingerprint::decode_pin_sha256(opts.pin_sha256.as_deref())?,
@@ -77,19 +81,21 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 .ok_or_else(|| NativeError::Reality("reality config missing pbk".into()))?;
             let provisioner: Arc<dyn HelloProvisioner> = match &ctx.params.reality_provisioner {
                 HelloProvisionerChoice::Custom(p) => p.clone(),
-                HelloProvisionerChoice::FixedChrome133 => match &opts.fp {
-                    Some(fp) => Arc::new(SpecProvisioner::from(
-                        &fingerprint::parse_fingerprint_id(fp)
-                            .and_then(fingerprint::profile_for)?,
-                    )),
-                    // No explicit fingerprint: the fixed provisioner shapes
-                    // the surviving wire-exact chrome_130 spec (the
-                    // Chrome-133 hand profile was dropped in the roster
-                    // reduction). Byte-equivalent to the previous
-                    // chrome_133-fingerprint default modulo the dropped
-                    // profile's keyshare shape — see `fixed_chrome_spec`.
-                    None => Arc::new(FixedChrome133),
-                },
+                HelloProvisionerChoice::FixedChrome133 => {
+                    match fingerprint::resolve_fingerprint(opts.fp.as_deref()).0 {
+                        Some(id) => {
+                            Arc::new(SpecProvisioner::from(&fingerprint::profile_for(id)?))
+                        }
+                        // No fingerprint requested (absent, `""` or `unsafe`), or
+                        // an id with no roster row: the fixed provisioner shapes
+                        // the surviving wire-exact chrome_130 spec (the
+                        // Chrome-133 hand profile was dropped in the roster
+                        // reduction). Byte-equivalent to the previous
+                        // chrome_133-fingerprint default modulo the dropped
+                        // profile's keyshare shape — see `fixed_chrome_spec`.
+                        None => Arc::new(FixedChrome133),
+                    }
+                }
             };
             let spider = SpiderConfig {
                 paths: opts

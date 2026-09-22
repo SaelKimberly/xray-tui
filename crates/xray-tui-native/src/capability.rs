@@ -23,13 +23,12 @@
 
 use xray_tui_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use xray_tui_proto::proto_spec::{
-    Hysteria2Config, ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, TrojanConfig,
+    Hysteria2Config, ProtocolConfig, ProtocolKind, SsConfig, TrojanConfig,
     VlessConfig, VmessConfig,
 };
 
 use crate::protocol::ss::method::password_key;
 use crate::protocol::ss::resolve_method;
-use crate::security::fingerprint::parse_fingerprint_id;
 
 /// The protocols with a native implementation, in canonical order.
 ///
@@ -186,26 +185,13 @@ fn kcp_reason(cfg: &KcpConfig, path: Option<&str>) -> Option<&'static str> {
     (seeded || camouflaged).then_some("mKCP seed or header_type is not implemented")
 }
 
-/// Why the row's TLS fingerprint id is not one native parses, or [`None`]
-/// when it is.
-///
-/// `security::wrap` feeds `fp` straight to [`parse_fingerprint_id`] in both
-/// arms (plain TLS and REALITY's default provisioner), and an id it does not
-/// know is a fatal `NativeError::Config` — the dial fails where xray's uTLS
-/// would have connected. Gating on the SAME parser is what keeps the two
-/// lists from drifting: accepted ids are exactly `chrome`,
-/// `chrome-randomized`, `firefox`, `safari`, `random`, so xray-only ids
-/// (`randomized`, `ios`, `android`, `edge`, `360`, `qq`, …) are refused as
-/// `"unparseable TLS fingerprint id"` and defer to the subprocess.
-///
-/// No `fp` at all is supported: plain TLS then uses the engine default and
-/// REALITY the fixed chrome spec.
-fn security_reason(security: &SecurityConfig) -> Option<&'static str> {
-    match security.fp() {
-        Some(fp) if parse_fingerprint_id(fp).is_err() => Some("unparseable TLS fingerprint id"),
-        _ => None,
-    }
-}
+// The fingerprint refusal gate is retired: an id with no engine hello is now
+// probed with the engine default and marked approximated
+// (`security::fingerprint::resolve_fingerprint`) rather than refused, so a
+// subscription carrying `qq`/`android`/`360` no longer defers to the
+// subprocess. It was removed rather than left returning `None`, so no caller
+// can quietly re-introduce a divergence between this gate and
+// `security::wrap`: both now read the same resolver.
 
 /// VLESS row: no deferred account encryption or flow, a fingerprint native
 /// parses, implemented transport.
@@ -217,7 +203,7 @@ fn security_reason(security: &SecurityConfig) -> Option<&'static str> {
 /// limited to the vision pair native encodes (`connect_vision`); any other
 /// non-empty flow is a `NotImplemented` guard, refused as `"vless flow is
 /// not implemented"`. A fingerprint or transport refusal appends the
-/// [`security_reason`]/[`transport_reason`] string.
+/// [`transport_reason`] string.
 ///
 /// Both vision flows stay supported even though a native session cannot
 /// carry their UDP leg (`xtls-rprx-vision-udp443` forces XUDP, and the proxy
@@ -237,7 +223,7 @@ fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
     {
         return Some("vless flow is not implemented");
     }
-    security_reason(&cfg.security).or_else(|| transport_reason(&cfg.transport, cfg.path.as_deref()))
+    transport_reason(&cfg.transport, cfg.path.as_deref())
 }
 
 /// `VMess` row: modern AEAD payload security only, a fingerprint native
@@ -251,7 +237,7 @@ fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
 /// not implemented"`. A non-zero `alter_id` selects the legacy pre-AEAD
 /// session scheme native never implemented, refused as `"vmess alter_id is
 /// not implemented"`. A fingerprint or transport refusal appends the
-/// [`security_reason`]/[`transport_reason`] string.
+/// [`transport_reason`] string.
 fn vmess_reason(cfg: &VmessConfig) -> Option<&'static str> {
     if let Some(enc) = cfg.security.enc.as_deref()
         && !(enc.is_empty() || enc == "auto" || enc == "aes-128-gcm" || enc == "chacha20-poly1305")
@@ -263,17 +249,17 @@ fn vmess_reason(cfg: &VmessConfig) -> Option<&'static str> {
     {
         return Some("vmess alter_id is not implemented");
     }
-    security_reason(&cfg.security).or_else(|| transport_reason(&cfg.transport, cfg.path.as_deref()))
+    transport_reason(&cfg.transport, cfg.path.as_deref())
 }
 
-/// Trojan row: a fingerprint native parses, implemented transport.
+/// Trojan row: implemented transport.
 ///
 /// Trojan has no account-level encryption/flow variants in the typed config;
-/// security is none/tls/reality, all of which `security::wrap` implements —
-/// for the ids [`security_reason`] accepts. So the only refusals are the
-/// fingerprint and transport strings those two predicates return.
+/// security is none/tls/reality, all of which `security::wrap` implements, and
+/// every fingerprint id now resolves (an id with no roster row is approximated,
+/// never refused). So the only refusal left is the transport.
 fn trojan_reason(cfg: &TrojanConfig) -> Option<&'static str> {
-    security_reason(&cfg.security).or_else(|| transport_reason(&cfg.transport, cfg.path.as_deref()))
+    transport_reason(&cfg.transport, cfg.path.as_deref())
 }
 
 /// Hysteria2 row: never refused — and it MUST stay that way.
@@ -317,8 +303,7 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 /// Refusals, in check order: `"shadowsocks method is not implemented"`,
 /// `"shadowsocks method family does not match the protocol kind"`,
 /// `"shadowsocks SIP003 plugin is not implemented"`, `"shadowsocks 2022
-/// password key is malformed"`, then the [`security_reason`] fingerprint
-/// string.
+/// password key is malformed"`.
 ///
 /// Every refusal below is a dead native dial the subprocess would have
 /// served:
@@ -341,9 +326,9 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 /// - `password_key`: a malformed 2022 PSK (not base64, or the wrong length
 ///   for the method) is a fatal `NativeError::Config` in the connect path, so
 ///   refusing at gate time keeps Auto resolution on the subprocess.
-/// - `security_reason`: an xray-only uTLS fingerprint id is fatal on the
-///   SS TCP path too, because `security::wrap` parses it there like any
-///   other TLS/REALITY row.
+///
+/// A fingerprint id is no longer a refusal here: `security::wrap` resolves
+/// every id, approximating one with no roster row rather than failing.
 fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<&'static str> {
     let Ok(method) = resolve_method(cfg) else {
         return Some("shadowsocks method is not implemented");
@@ -357,7 +342,7 @@ fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<&'static str> {
     if password_key(method, &cfg.password).is_err() {
         return Some("shadowsocks 2022 password key is malformed");
     }
-    security_reason(&cfg.security)
+    None
 }
 
 #[cfg(test)]
@@ -629,8 +614,6 @@ mod tests {
         vless_enc.encryption = Some("mlkem768x25519plus.native.0rtt".into());
         let mut vless_flow = vless_cfg();
         vless_flow.flow = Some("xtls-rprx-direct".into());
-        let mut vless_fp = vless_cfg();
-        vless_fp.security = tls_fp("qq");
         let mut vless_kcp = vless_cfg();
         vless_kcp.transport = TransportConfig::Kcp(KcpConfig {
             seed: Some("obfs".into()),
@@ -642,8 +625,6 @@ mod tests {
         vmess_sec.security.enc = Some("aes-128-cfb".into());
         let mut vmess_alter = vmess_cfg();
         vmess_alter.alter_id = Some("1".into());
-        let mut trojan_fp = trojan_cfg();
-        trojan_fp.security = reality_fp("android");
         let mut ss_legacy = ss_cfg("aes-128-cfb", "secret");
         ss_legacy.method = "aes-128-cfb".into();
         let mut ss_family = ss_cfg("2022-blake3-aes-128-gcm", "secret");
@@ -657,12 +638,10 @@ mod tests {
             (ProtocolKind::Vless, ProtocolConfig::Vmess(vmess_cfg())),
             (ProtocolKind::Vless, ProtocolConfig::Vless(vless_enc)),
             (ProtocolKind::Vless, ProtocolConfig::Vless(vless_flow)),
-            (ProtocolKind::Vless, ProtocolConfig::Vless(vless_fp)),
             (ProtocolKind::Vless, ProtocolConfig::Vless(vless_kcp)),
             (ProtocolKind::Vless, ProtocolConfig::Vless(vless_quic)),
             (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_sec)),
             (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_alter)),
-            (ProtocolKind::Trojan, ProtocolConfig::Trojan(trojan_fp)),
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_legacy)),
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_family)),
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_plugin)),
@@ -693,7 +672,7 @@ mod tests {
             }
         }
         assert!(
-            refusals >= 13,
+            refusals >= 11,
             "the table must exercise every refusal class"
         );
     }
@@ -732,28 +711,45 @@ mod tests {
     }
 
     #[test]
-    fn xray_only_fingerprints_deferred() {
-        // ids xray's uTLS accepts but `parse_fingerprint_id` refuses because
-        // no engine hello models them: native would otherwise dial with a
-        // shape the link did not ask for, so the row defers to the
-        // subprocess. The empty value is refused by the same parser.
-        for fp in ["android", "360", "qq", "chrome-130", ""] {
-            assert!(!vless_with(tls_fp(fp)), "vless tls fp={fp:?}");
-            assert!(!vless_with(reality_fp(fp)), "vless reality fp={fp:?}");
+    fn unrosterable_fingerprints_probed_with_the_default_not_refused() {
+        // An id with no engine hello used to defer the row to the subprocess.
+        // It is now probed with the engine default hello and MARKED
+        // approximated (`security::fingerprint::resolve_fingerprint`), which is
+        // the whole point of the policy: refusing a config the engine can dial
+        // costs a testable link, and the marker keeps the substitution visible.
+        // `""` and `unsafe` are not in this set — they mean "no fingerprint
+        // requested", so the default IS the requested shape.
+        for fp in ["android", "360", "qq", "randomizednoalpn", "chrome-130"] {
+            assert!(vless_with(tls_fp(fp)), "vless tls fp={fp:?}");
+            assert!(vless_with(reality_fp(fp)), "vless reality fp={fp:?}");
 
             let mut vmess = vmess_cfg();
             vmess.security = tls_fp(fp);
             assert!(
-                !supported(ProtocolKind::Vmess, &ProtocolConfig::Vmess(vmess)),
+                supported(ProtocolKind::Vmess, &ProtocolConfig::Vmess(vmess)),
                 "vmess fp={fp:?}"
             );
 
             let mut trojan = trojan_cfg();
             trojan.security = tls_fp(fp);
             assert!(
-                !supported(ProtocolKind::Trojan, &ProtocolConfig::Trojan(trojan)),
+                supported(ProtocolKind::Trojan, &ProtocolConfig::Trojan(trojan)),
                 "trojan fp={fp:?}"
             );
+        }
+    }
+
+    #[test]
+    fn no_fingerprint_request_is_supported_and_unmarked() {
+        // The three spellings of "no fingerprint requested" reach the gate as
+        // a supported row: absent, empty, and xray's `unsafe` sentinel.
+        for security in [
+            tls_fp(""),
+            tls_fp("unsafe"),
+            reality_fp(""),
+            reality_fp("unsafe"),
+        ] {
+            assert!(vless_with(security));
         }
     }
 
@@ -1039,20 +1035,20 @@ mod tests {
     }
 
     #[test]
-    fn ss_xray_only_fingerprint_defers() {
-        // `security::wrap` parses `fp` on the SS TCP path too, so an id the
-        // engine has no hello for is fatal there exactly as on
-        // vless/vmess/trojan.
+    fn ss_unrosterable_fingerprint_probed_with_the_default() {
+        // `security::wrap` resolves `fp` on the SS TCP path too, so an id with
+        // no engine hello is approximated there exactly as on
+        // vless/vmess/trojan — it is no longer a reason to defer the row.
         let mut cfg = ss_cfg("aes-128-gcm", "pw");
         cfg.security = tls_fp("qq");
-        assert!(!ss_row(ProtocolKind::Shadowsocks, cfg));
+        assert!(ss_row(ProtocolKind::Shadowsocks, cfg));
 
         let mut cfg = ss_cfg(
             "2022-blake3-aes-256-gcm",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         );
         cfg.security = reality_fp("android");
-        assert!(!ss_row(ProtocolKind::Shadowsocks2022, cfg));
+        assert!(ss_row(ProtocolKind::Shadowsocks2022, cfg));
     }
 
     #[test]

@@ -15,9 +15,10 @@ use crate::error::NativeError;
 /// Browser fingerprint id, mirrored from the URL `fp` parameter.
 ///
 /// The accepted set is xray's `PresetFingerprints` minus the ids this engine
-/// has no hello for (`360`, `qq`, `android`, `randomizednoalpn`, `unsafe`):
-/// a subscription carrying one of those is reported untestable rather than
-/// probed with a shape it did not ask for.
+/// has no hello for (`360`, `qq`, `android`, `randomizednoalpn`). A
+/// subscription carrying one of those is **probed with the engine default and
+/// marked approximated** by [`resolve_fingerprint`], never refused and never
+/// silently substituted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FingerprintId {
     Chrome,
@@ -51,8 +52,10 @@ impl std::fmt::Display for FingerprintId {
 /// (`HelloRandomized`), and `edge`/`ios` are presets the roster carries
 /// (`edge_106`, Safari-on-iOS) — three ids that used to be refused although a
 /// profile existed, which marked ~19 links per subscription "not testable by
-/// the native engine". `360`, `qq`, `android`, `randomizednoalpn` and
-/// `unsafe` have no engine hello and stay refused.
+/// the native engine". `360`, `qq`, `android` and `randomizednoalpn` have no
+/// engine hello and are **approximated** by [`resolve_fingerprint`] rather than
+/// refused; `unsafe` means "no fingerprint requested" and resolves to the
+/// engine default.
 pub fn parse_fingerprint_id(s: &str) -> Result<FingerprintId, NativeError> {
     match s {
         "chrome" => Ok(FingerprintId::Chrome),
@@ -66,6 +69,33 @@ pub fn parse_fingerprint_id(s: &str) -> Result<FingerprintId, NativeError> {
             "unknown fingerprint id {other:?} (expected chrome, chrome-randomized, \
              randomized, firefox, safari, edge, ios or random)"
         ))),
+    }
+}
+
+/// Resolve a URL `fp` value to the identity the engine probes with, plus
+/// whether the requested shape was honoured.
+///
+/// This is the single decision point for the fingerprint policy, so the
+/// capability gate and the row label cannot drift: both read this function.
+///
+/// - `None`, `""` and `unsafe` all mean *no fingerprint requested*. The engine
+///   default IS the requested shape, so they resolve to `None` with
+///   `approximated = false` — the same shape an absent `fp` has always taken.
+///   An empty string reaches here as `Some("")` for a present-but-empty field,
+///   which is why it must be handled explicitly rather than left to the parser.
+/// - A known id resolves to its own profile.
+/// - An id with no roster row (an xray-only uTLS preset, or a future one)
+///   resolves to the engine default with `approximated = true`: probing with a
+///   shape the link did not ask for is a decision the row must carry visibly.
+///
+/// `Option<FingerprintId>` (`None` = engine default) is the shape both call
+/// sites need: plain TLS passes it through, REALITY maps `None` to its fixed
+/// provisioner.
+#[must_use]
+pub fn resolve_fingerprint(s: Option<&str>) -> (Option<FingerprintId>, bool) {
+    match s {
+        None | Some("" | "unsafe") => (None, false),
+        Some(id) => parse_fingerprint_id(id).map_or((None, true), |fp| (Some(fp), false)),
     }
 }
 
@@ -175,11 +205,10 @@ mod tests {
         }
     }
 
-    /// xray's own preset ids: the ones with an engine hello are accepted, the
-    /// rest stay refused (they would have to be probed with a shape the link
-    /// did not ask for).
+    /// xray's own preset ids: `parse_fingerprint_id` accepts exactly the ids
+    /// the roster carries a row for.
     #[test]
-    fn presets_split_into_served_and_refused() {
+    fn parser_accepts_exactly_the_roster_ids() {
         for fp in [
             "chrome",
             "chrome-randomized",
@@ -195,8 +224,53 @@ mod tests {
         for fp in ["android", "360", "qq", "randomizednoalpn", "unsafe", ""] {
             assert!(
                 parse_fingerprint_id(fp).is_err(),
-                "{fp} has no engine hello and must stay refused"
+                "{fp} has no engine hello"
             );
+        }
+    }
+
+    /// The policy: only an id that WAS requested and has no roster row is an
+    /// approximation. The three spellings of "no fingerprint requested" are
+    /// not — the engine default is the shape they asked for.
+    #[test]
+    fn resolve_marks_only_unrosterable_ids_as_approximated() {
+        for fp in [None, Some(""), Some("unsafe")] {
+            assert_eq!(resolve_fingerprint(fp), (None, false), "{fp:?}");
+        }
+        for fp in [
+            "chrome",
+            "chrome-randomized",
+            "randomized",
+            "firefox",
+            "safari",
+            "edge",
+            "ios",
+            "random",
+        ] {
+            let (id, approximated) = resolve_fingerprint(Some(fp));
+            assert_eq!(id, Some(parse_fingerprint_id(fp).unwrap()), "{fp}");
+            assert!(!approximated, "{fp} has a roster row and is honoured");
+        }
+        for fp in ["android", "360", "qq", "randomizednoalpn", "chrome-130"] {
+            assert_eq!(
+                resolve_fingerprint(Some(fp)),
+                (None, true),
+                "{fp} must resolve to the engine default, marked approximated"
+            );
+        }
+    }
+
+    /// "Approximated" means the same identity an absent `fp` produces, so the
+    /// resolver cannot silently invent a third shape. The flag is the only
+    /// difference — that is what makes the marker meaningful.
+    #[test]
+    fn approximated_and_absent_resolve_to_the_same_identity() {
+        let (absent_id, absent_marked) = resolve_fingerprint(None);
+        assert!(!absent_marked, "an absent fp is not an approximation");
+        for fp in ["android", "360", "qq", "randomizednoalpn", "chrome-130"] {
+            let (id, approximated) = resolve_fingerprint(Some(fp));
+            assert_eq!(id, absent_id, "{fp} must probe the absent-fp identity");
+            assert!(approximated, "{fp} differs only by the marker");
         }
     }
 }
