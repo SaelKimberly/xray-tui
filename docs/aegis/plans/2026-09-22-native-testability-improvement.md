@@ -185,16 +185,13 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 
 **Verify**: that test; the 09-21 shape (`untestable=0 … config=173`) is no longer producible.
 
-### T8 — removed transport: build-time refusal + downgrade · `strict`
+### T8 — removed transport: build-time refusal · `strict` (landed)
 
-**Files**: `crates/xray-tui-proto/src/proto_spec/common.rs`, `crates/xray-tui-native/src/capability.rs`, `crates/xray-tui/src/ops/connect.rs`
+**Landed 2026-09-22.** `validate_xray_transport` in `proto_spec/common.rs` refuses `Http`/`Quic` with `SupportError::Config`, called from the three `inject_xray` arms that emit a *variable* transport (`vless`, `vmess`, `trojan` — the others hardcode `Tcp`, except hysteria2 which sets `"hysteria"`). Same shape and placement as `validate_xray_reality`, so the build fails with a named reason instead of handing the core a config it refuses to load.
 
-**Change**: `inject_to` refuses `Http`/`Quic` for xray with a `SupportError`; the connect path downgrades such a link to native with a named `warn`.
+**The second half needed no code, and the reason is structural.** The plan said "the connect path downgrades such a link to native with a named `warn`" — but `capability::supported` already accepts `TransportConfig::Http(_)` for the native engine, and `resolve_runtime_core` (`ops/connect.rs:95-121`) sends every native-capable kind to native *before* any build. So a `type=http` vless/vmess/trojan link already goes native, and the refusal is reachable only when the user explicitly overrides the core to xray — which decision 20 handles by warning that the override was not honoured, not by silently overriding the user back. Adding a downgrade would have contradicted that decision for no gain.
 
-**RED**: a build test asserting an xray build of an `Http`/`Quic` transport returns `BuildError::Support`, not a config xray-core would reject.
-**GREEN**: implement the refusal and the downgrade.
-
-**Verify**: that test plus T2's re-run showing a named downgrade.
+**Tests**: `xray_build_refuses_the_removed_http_and_quic_transports` (all three spellings — `http`, `h2`, `quic` — refuse, the reason names the transport, and no partial config is left behind); `the_removed_transports_are_still_buildable_for_singbox` (the refusal is scoped to the core that removed them, not to the transport); and `the_removed_transports_emit_the_names_xray_refuses` in `common.rs`, which pins the coupling the validator exists for — `ws`/`httpupgrade`/`splithttp` were already pinned, these two were the unpinned pair, which is why nothing failed when xray-core removed them.
 
 ### T9 — mlkem differential · `strict`
 

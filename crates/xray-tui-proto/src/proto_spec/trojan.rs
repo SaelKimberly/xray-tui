@@ -45,7 +45,7 @@ use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
     should_skip_endpoint_param, to_singbox_tls, to_singbox_transport, to_xray_stream_settings,
-    validate_xray_reality,
+    validate_xray_reality, validate_xray_transport,
 };
 use super::core_mapping;
 use super::identity::IdentityWriter;
@@ -571,6 +571,9 @@ impl TrojanConfig {
             .transport
             .clone()
             .with_host(Some(ep.host.clone()), None, None);
+        // An `http`/`quic` transport would emit a config xray-core refuses to
+        // load (a removed feature, not a warning) — refuse the BUILD instead.
+        validate_xray_transport(&transport)?;
         let security = security_force_insecure(&self.security, opts.skip_cert_verify);
         let stream = to_xray_stream_settings(&security, &transport);
         *core_conf = json!({

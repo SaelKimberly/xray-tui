@@ -50,7 +50,7 @@ use super::ProtoIdentity;
 use super::common::{
     RealityOpts, SecurityConfig, TlsConfig, TlsOpts, TransportConfig, security_force_insecure,
     should_skip_endpoint_param, to_singbox_tls, to_singbox_transport, to_xray_stream_settings,
-    validate_xray_reality,
+    validate_xray_reality, validate_xray_transport,
 };
 use super::core_mapping;
 use super::identity::IdentityWriter;
@@ -666,6 +666,9 @@ impl VlessConfig {
             .transport
             .clone()
             .with_host(Some(ep.host.clone()), None, None);
+        // An `http`/`quic` transport would emit a config xray-core refuses to
+        // load (a removed feature, not a warning) — refuse the BUILD instead.
+        validate_xray_transport(&transport)?;
         let security = security_force_insecure(&self.security, opts.skip_cert_verify);
         let stream = to_xray_stream_settings(&security, &transport);
         let flow = self.flow.as_deref().unwrap_or("");
@@ -1704,6 +1707,67 @@ mod tests {
             "error must mention kcp: {err}"
         );
         assert!(matches!(err, SupportError::Config(_)));
+    }
+
+    /// xray-core REMOVED the `http`/`h2` and `quic` transports, and refuses a
+    /// config that names them at LOAD time (`PrintRemovedFeatureError` returns
+    /// an error, not a warning). Before this, the build happily emitted
+    /// `network: "http"` and handed the core a config it would not start — a
+    /// failure with nothing to do with the link's quality. The refusal is
+    /// what lets the connect path route the link to the native engine (which
+    /// serves both) instead.
+    #[test]
+    fn xray_build_refuses_the_removed_http_and_quic_transports() {
+        for (url, named) in [
+            (
+                format!("vless://{UUID}@example.com:443?type=http&path=/x&security=tls"),
+                "http",
+            ),
+            (
+                format!("vless://{UUID}@example.com:443?type=h2&path=/x&security=tls"),
+                "http",
+            ),
+            (
+                format!("vless://{UUID}@example.com:443?type=quic&security=tls"),
+                "quic",
+            ),
+        ] {
+            let cfg = config(parse(&url));
+            let mut conf = serde_json::json!({});
+            let err = cfg
+                .inject_to(
+                    &mut conf,
+                    CoreType::Xray,
+                    Some(&EndpointEssentials::new("example.com", 443)),
+                    InjectOptions::default(),
+                )
+                .expect_err("xray must refuse a transport it removed");
+            assert!(matches!(err, SupportError::Config(_)), "{url}: {err:?}");
+            assert!(
+                err.to_string().contains(named),
+                "the reason must name the transport: {err}"
+            );
+            // And nothing was written: a half-built config must not survive.
+            assert_eq!(conf, serde_json::json!({}), "{url} left a partial config");
+        }
+    }
+
+    /// The same transports stay BUILDABLE for sing-box, which still implements
+    /// both — so the refusal is scoped to the core that removed them, not to
+    /// the transport.
+    #[test]
+    fn the_removed_transports_are_still_buildable_for_singbox() {
+        let cfg = config(parse(&format!(
+            "vless://{UUID}@example.com:443?type=http&path=/x&security=tls"
+        )));
+        let mut conf = serde_json::json!({});
+        cfg.inject_to(
+            &mut conf,
+            CoreType::SingBox,
+            Some(&EndpointEssentials::new("example.com", 443)),
+            InjectOptions::default(),
+        )
+        .expect("sing-box still implements the http transport");
     }
 
     #[test]

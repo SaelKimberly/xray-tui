@@ -521,6 +521,46 @@ pub(crate) fn clash_tls_to_security(
     }
 }
 
+/// Reject a transport xray-core has REMOVED.
+///
+/// `TransportConfig::Http` reaches `to_xray_stream_settings` as
+/// `network: "http"` and `Quic` as `"network": "quic"`, and xray-core 26
+/// refuses BOTH at config load — `PrintRemovedFeatureError` returns an error,
+/// not a warning (`thirdparty/Xray-core/common/errors/feature_errors.go:25-27`).
+/// Verified against the pinned binary:
+///
+/// ```text
+/// network: "http" -> Failed to start: … The feature HTTP transport (without
+///                    header padding, etc.) has been removed and migrated to
+///                    XHTTP stream-one H2 & H3.
+/// network: "quic" -> Failed to start: … The feature QUIC transport (without
+///                    web service, etc.) has been removed and migrated to
+///                    XHTTP stream-one H3.
+/// ```
+///
+/// So emitting one produced a config the core will not start, for a reason
+/// unrelated to the link's quality. Refusing here fails the BUILD with a named
+/// reason instead, and the caller can route the link to the native engine
+/// (which serves both transports) or sing-box.
+///
+/// Returns [`SupportError::Config`], the same shape [`validate_xray_reality`]
+/// uses for a build-time refusal.
+pub(crate) fn validate_xray_transport(transport: &TransportConfig) -> Result<(), SupportError> {
+    match transport {
+        TransportConfig::Http(_) => Err(SupportError::Config(
+            "http/h2 transport has been removed from xray-core (migrated to XHTTP stream-one); \
+             this link needs the native engine or sing-box"
+                .into(),
+        )),
+        TransportConfig::Quic => Err(SupportError::Config(
+            "quic transport has been removed from xray-core (migrated to XHTTP stream-one H3); \
+             this link needs the native engine or sing-box"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Convert a `SecurityConfig` back to Clash TLS fields.
 pub(crate) fn security_to_clash_tls(security: &SecurityConfig) -> SecurityClashTls {
     match &security.tls {
@@ -1385,6 +1425,45 @@ mod tests {
             ss["wsSettings"].get("headers").is_none(),
             "headers.Host must not be emitted"
         );
+    }
+
+    /// The coupling `validate_xray_transport` exists for.
+    ///
+    /// These two transports reach xray as `network: "http"` / `"quic"`, and
+    /// xray-core 26 refuses BOTH at config load (`PrintRemovedFeatureError`
+    /// returns an error, not a warning — verified against the pinned binary).
+    /// `ws`, `httpupgrade` and `splithttp` were already pinned by tests; these
+    /// two were the unpinned pair, which is exactly why nothing failed when the
+    /// transports were removed upstream. Pinned here so a change to the emitted
+    /// name cannot silently re-open the hole the validator closes.
+    #[test]
+    fn the_removed_transports_emit_the_names_xray_refuses() {
+        for (transport, expected) in [
+            (TransportConfig::Http(HttpConfig::default()), "http"),
+            (TransportConfig::Quic, "quic"),
+        ] {
+            let ss = to_xray_stream_settings(&SecurityConfig::default(), &transport)
+                .expect("a non-tcp transport emits streamSettings");
+            assert_eq!(ss["network"], expected, "{transport:?}");
+            // And the validator refuses exactly the ones that emit those names.
+            assert!(
+                validate_xray_transport(&transport).is_err(),
+                "{transport:?} emits a name xray-core removed, so the build must refuse it"
+            );
+        }
+        // The transports xray still implements stay buildable.
+        for transport in [
+            TransportConfig::Tcp,
+            TransportConfig::Ws(WebSocketConfig::default()),
+            TransportConfig::Grpc(GrpcConfig::default()),
+            TransportConfig::HttpUpgrade(HttpUpgradeConfig::default()),
+            TransportConfig::XHttp(XHttpConfig::default()),
+        ] {
+            assert!(
+                validate_xray_transport(&transport).is_ok(),
+                "{transport:?} is still implemented by xray-core"
+            );
+        }
     }
 
     #[test]
