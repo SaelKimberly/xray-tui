@@ -80,7 +80,7 @@ Roster-mapped links (chrome/firefox/safari/edge/ios/random) never carried a refu
 
 > approximated ⟺ `security_fp` is present, is not `""` and is not `unsafe`, **and** `parse_fingerprint_id` fails.
 
-`security_fp` is already in the page projection (`crates/xray-tui-db/src/profiles_query.rs:616-617`), so the label needs no new column, no projection change, no schema-tag bump and no wipe. One predicate feeds the gate, the label and the purge rule — and all three read the same **input** too, the `security_fp` column: the batch captures it into `LoadedProtocol` at load precisely so the purge path never has to reach for the config (§5.3). The discipline `endpoint_rank::dns_unresolved(row)` already follows — one predicate, read from the row, never the cache.
+`security_fp` is already in the page projection (`crates/xray-tui-db/src/profiles_query.rs:616-617`), so the label needs no new column, no projection change, no schema-tag bump and no wipe. One predicate feeds three consumers — `security::wrap` (where the substitution happens), the row label, and the purge rule — and all three read the same **input** too, the `security_fp` column: the batch captures it into `LoadedProtocol` at load precisely so the purge path never has to reach for the config (§5.3). The capability GATE is not among them: after T3 it refuses no fingerprint id at all. The discipline `endpoint_rank::dns_unresolved(row)` already follows — one predicate, read from the row, never the cache.
 
 The fallback hello reuses `SpecProvisioner` / `FixedChrome133` (`crates/xray-tui-tls/src/reality/mod.rs:158-201`); no new hello mechanism is introduced.
 
@@ -371,7 +371,19 @@ Identical at both revisions — so the version-delta hypothesis was dead. But th
 | pinned 26.3.27 | pinned 26.3.27 | **HTTP 200** in 86 ms (control — validates the harness) |
 | **HEAD 26.7.28** | pinned 26.3.27 | **HTTP 200** in 107 ms |
 
-**The reference client works in every pairing; ours works in none.** So the older server *does* accept the newer client wire, the wire is not the problem, and our `mlkem768x25519plus` implementation is the broken side — an interop bug in our sealing/padding/framing, not a pin and not a version gap. That is the bounded target the fix round needed: capture the reference client's first flight for a fixed pair and diff it against ours.
+**The reference client works in every pairing; ours works in none.** So the older server *does* accept the newer client wire, the wire is not the problem, and our `mlkem768x25519plus` implementation is the broken side — an interop bug in our sealing/padding/framing, not a pin and not a version gap.
+
+*Third pass — the hedge's concrete candidate, eliminated.* The verdict above still allowed one alternative: *our client's wire **or this case's server config***, and that alternative had a concrete form — the case's keypair comes from `e2e/config.rs::mlkem_enc_pair`, which derives the ML-KEM keypair from a 64-byte seed via OUR `Mlkem768::keypair_from_seed`, while the server's decryption string carries that seed for Go's `mlkem.NewDecapsulationKey768` to expand. If our expansion differed, the client's `ek` would target a key the server never holds, and the symptom would be exactly this one.
+
+So the row was run again with a pair the **reference itself generated** (`xray vlessenc`), supplied through a new `CaseSpec::with_pq_enc_pair`:
+
+| client | pair | server | result |
+|---|---|---|---|
+| pinned 26.3.27 | `vlessenc` | pinned 26.3.27 | **HTTP 200** (pass 2's control) |
+| HEAD 26.7.28 | `vlessenc` | pinned 26.3.27 | **HTTP 200** (pass 2) |
+| ours | `vlessenc` | pinned 26.3.27 | **fails** — `probe status 0 body ""`, 5/5 |
+
+The pair and the server are therefore both known-good, and our client fails with them anyway. **The fault is our client's wire alone** — not the test's key generator, not the pin, not the version delta. (Useful by-product: our parser *accepts* the reference's shape, which is one 1184-byte `ek` segment with no X25519 public half — so the divergence is in the sealing/framing, not in the parse.) That is the bounded target the fix round needed: capture the reference client's first flight for a fixed pair and diff it against ours.
 
 **Acceptance, per §5.8's stated branch:** the pq-enc row **stays ignored**, its reason now naming both passes; the gate stays closed. A HEAD-only pass would have been a narrower claim than the suite's, and this is the other branch — *"both fail → the client is at fault"* — now sharpened to *"the reference works everywhere, so the fault is ours"*.
 

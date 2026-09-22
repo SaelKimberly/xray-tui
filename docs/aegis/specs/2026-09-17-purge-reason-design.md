@@ -406,13 +406,14 @@ variant, no CHECK change, no schema bump, no wipe** — every change is inside
    needed no change here at all — the defect was upstream, where the error was created.
 
 2. **An approximated probe earns no verdict.** `reason_for` gains an `fp` parameter and returns
-   `None` when that fingerprint is an approximation, decided by the SAME predicate the capability
-   gate and the row label use (`security::fingerprint::resolve_fingerprint`). The input is the
-   CONFIG's `fp`, not the `security_fp` column: no `reason_for` call site holds a `Protocol` row.
-   The row label reads the column, so the two-accessor agreement is asserted
-   (`the_security_fp_column_agrees_with_the_config_field` in `state.rs`) rather than assumed.
-   A lookup miss fails **closed** — no verdict — because failing open would let an approximated
-   probe earn exactly the permanent verdict the rule exists to prevent.
+   `None` when that fingerprint is an approximation, decided by the SAME predicate the row label
+   and `security::wrap` use (`security::fingerprint::resolve_fingerprint`). The input is the
+   `security_fp` COLUMN, read from the row on every path — the single-ping site has its own
+   `Protocol` row, and the two batch sites read `LoadedProtocol.fp`, captured at that struct's one
+   construction site from `row.security.fp`. So the predicate and its INPUT are shared: the label
+   and the purge rule cannot disagree. A lookup miss fails **closed** — no verdict — because
+   failing open would let an approximated probe earn exactly the permanent verdict the rule
+   exists to prevent.
 
 `reason_for` is no longer `const`: the check goes through a non-`const` predicate, and
 re-implementing it inline would duplicate the single decision point.

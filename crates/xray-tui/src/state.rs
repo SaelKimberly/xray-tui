@@ -1049,13 +1049,12 @@ mod tests {
         })
     }
 
-    /// The `security_fp` column is the purge rule's ONLY input — the capability
-    /// gate, the row label and `reason_for` all read it (the two `self.protocols`
-    /// sites capture it into `LoadedProtocol` at load, so nothing reaches for the
-    /// config instead). `security_embed` is the projection that produces it, so
-    /// this test guards the rule's input rather than an agreement between two
-    /// accessors: a projection bug would silently change what the rule sees, and
-    /// the rule's own tests would still pass.
+    /// The `security_fp` column is the purge rule's ONLY input, and it is read
+    /// from the row on every path — the row label, `reason_for`, and
+    /// `security::wrap` (where the substitution actually happens) all read the
+    /// same field. `security_embed` is the projection that produces it, so this
+    /// test guards the rule's input: a projection bug would silently change what
+    /// the rule sees, and the rule's own tests would still pass.
     #[test]
     fn the_security_fp_column_agrees_with_the_config_field() {
         for fp in [

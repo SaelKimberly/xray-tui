@@ -258,6 +258,19 @@ impl CaseSpec {
         self
     }
 
+    /// [`Self::with_pq_enc`], but with a pair the CALLER supplies.
+    ///
+    /// Exists to run the pq-enc row against a keypair the REFERENCE generated
+    /// (`xray vlessenc`), which is the one experiment that separates "our
+    /// client's wire is wrong" from "our test's key generator is wrong": the
+    /// reference pair is self-consistent on the server side, so a red row with
+    /// it indicts the client, and a green one indicts [`config::mlkem_enc_pair`].
+    #[must_use]
+    pub fn with_pq_enc_pair(mut self, client: String, server: String) -> Self {
+        self.vless_enc = Some((client, server));
+        self
+    }
+
     /// Assert PQ negotiation: the runner requires the outer TLS handshake's
     /// `ServerHello` to have selected a hybrid key-share group.
     #[must_use]

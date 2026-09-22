@@ -279,25 +279,31 @@ async fn vless_against_cores(
 // `settings.decryption` the PRIVATE halves (X25519 priv + the 64-B seed);
 // the PQ handshake wraps the whole session before the request header.
 //
-// BLOCKED, and localized to OUR CLIENT by two passes.
+// BLOCKED, and localized to OUR CLIENT's WIRE by three passes.
 //
 // Pass 1: against real xray the client's PQ handshake COMPLETES (connect Ok,
 // request sealed and written) but the tunnel EOFs before the response header.
 // `vless_pq_enc_against_head` ran the same case against a SECOND pinned peer
-// built from `thirdparty/Xray-core` HEAD (26.7.28) to test the version-delta
-// hypothesis: IDENTICAL - connect Ok, `probe status 0 body ""` on all 5
-// attempts, no server-side error at either revision.
+// built from `thirdparty/Xray-core` HEAD (26.7.28): IDENTICAL - connect Ok,
+// `probe status 0 body ""` on all 5 attempts, no server-side error at either.
 //
-// Pass 2 (the sharper A/B, both ends real xray, keypair from `xray vlessenc`):
+// Pass 2 (both ends real xray, keypair from `xray vlessenc`):
 //   pinned client -> pinned server: HTTP 200   (control)
 //   HEAD   client -> pinned server: HTTP 200
-// So the reference client works in EVERY pairing and the older server accepts
-// the newer client wire. Ours works in none => our `mlkem768x25519plus`
-// sealing/padding/framing is the broken side. Not a pin, not a version gap.
+// The reference client works in EVERY pairing, and the older server accepts the
+// newer client wire.
 //
-// The fix round's method: capture the reference client's first flight for a
-// fixed pair and diff it against ours. The gate stays closed until then.
-#[ignore = "our mlkem768x25519plus interop: the reference client works against both revisions while ours works against neither, so the fault is ours (differential recorded in the spec's §8.1)"]
+// Pass 3 (`vless_pq_enc_with_a_reference_pair`) eliminated the last hedge -
+// that OUR keypair generator (`mlkem_enc_pair`'s seed expansion) might differ
+// from Go's, leaving the client's ek targeting a key the server never holds.
+// Ours fails with a reference-generated pair too, so the pair and the server are
+// both known-good and the fault is our wire alone.
+//
+// Fix round's method: capture the reference client's first flight for a fixed
+// pair and diff it against ours. Our parser ACCEPTS the reference's shape (one
+// 1184-byte ek segment, no X25519 half), so the divergence is in sealing or
+// framing, not in the parse. The gate stays closed until then.
+#[ignore = "our mlkem768x25519plus wire: the reference client works against both revisions and with a reference-generated pair, while ours works with neither pair, so the fault is ours (three passes recorded in the spec's §8.1)"]
 #[case::tcp_pq_enc(vless("tcp").with_pq_enc(), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(
@@ -325,6 +331,28 @@ async fn vless_single_core(
 /// The acceptance stays the release's, not HEAD's: a HEAD-only pass is a
 /// narrower claim than the suite's, and the gate stays closed until the release
 /// is satisfied.
+#[rstest]
+#[ignore = "differential: needs XRAY_TUI_CORE_BIN_DIR (26.3.27) plus XRAY_TUI_PQ_ENC / XRAY_TUI_PQ_DEC from `xray vlessenc`"]
+#[tokio::test]
+async fn vless_pq_enc_with_a_reference_pair(
+    cores: &(CoreUnderTest, CoreUnderTest),
+    certs: &Certs,
+    echo: EchoServer,
+    tls_echo: TlsEchoServer,
+) {
+    let (Ok(enc), Ok(dec)) = (
+        std::env::var("XRAY_TUI_PQ_ENC"),
+        std::env::var("XRAY_TUI_PQ_DEC"),
+    ) else {
+        eprintln!("SKIP: set XRAY_TUI_PQ_ENC / XRAY_TUI_PQ_DEC from `xray vlessenc`");
+        return;
+    };
+    let case = vless("tcp").with_pq_enc_pair(enc, dec);
+    run_against(&case, pick(cores, CoreKind::Xray), certs, &echo, &tls_echo)
+        .await
+        .expect("pq-enc with a reference-generated pair");
+}
+
 #[ignore = "needs a HEAD-built peer: XRAY_TUI_CORE_HEAD_BIN_DIR"]
 #[rstest]
 #[tokio::test]

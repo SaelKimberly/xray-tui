@@ -15,11 +15,15 @@
 //! combo both cores reject (equal-failure) stays `true` per brief D5; only
 //! native-worse/deferred markers return `false`.
 //!
-//! Unknown values fail CLOSED. A row carrying an id or field native cannot
-//! parse (an xray-only uTLS fingerprint, an mKCP seed) returns `false`: a
-//! false positive is a connection that dies (or worse, hangs) where the
-//! subprocess would have worked, while a false negative costs only the
-//! in-process fast path.
+//! Unknown values fail CLOSED. A row carrying a field native cannot parse (an
+//! mKCP seed, an unimplemented transport) returns `false`: a false positive is
+//! a connection that dies (or worse, hangs) where the subprocess would have
+//! worked, while a false negative costs only the in-process fast path.
+//!
+//! A TLS fingerprint id is **no longer a refusal**: an id with no roster row is
+//! probed with the engine default and marked approximated
+//! (`security::fingerprint::resolve_fingerprint`, read by `security::wrap`
+//! where the substitution happens), so this gate does not consult one.
 
 use xray_tui_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use xray_tui_proto::proto_spec::{
@@ -192,8 +196,7 @@ fn kcp_reason(cfg: &KcpConfig, path: Option<&str>) -> Option<&'static str> {
 // can quietly re-introduce a divergence between this gate and
 // `security::wrap`: both now read the same resolver.
 
-/// VLESS row: no deferred account encryption or flow, a fingerprint native
-/// parses, implemented transport.
+/// VLESS row: no deferred account encryption or flow, implemented transport.
 ///
 /// Any non-empty `encryption` other than `"none"` is refused as `"vless
 /// account encryption is not implemented"` — in particular
@@ -201,7 +204,7 @@ fn kcp_reason(cfg: &KcpConfig, path: Option<&str>) -> Option<&'static str> {
 /// (fails where xray works), so it must never be Auto-selected. Flows are
 /// limited to the vision pair native encodes (`connect_vision`); any other
 /// non-empty flow is a `NotImplemented` guard, refused as `"vless flow is
-/// not implemented"`. A fingerprint or transport refusal appends the
+/// not implemented"`. A transport refusal appends the
 /// [`transport_reason`] string.
 ///
 /// Both vision flows stay supported even though a native session cannot
@@ -225,8 +228,7 @@ fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
     transport_reason(&cfg.transport, cfg.path.as_deref())
 }
 
-/// `VMess` row: modern AEAD payload security only, a fingerprint native
-/// parses, implemented transport.
+/// `VMess` row: modern AEAD payload security only, implemented transport.
 ///
 /// Native maps `security.enc` to the header security byte
 /// (`protocol::vmess::security_byte`): absent/`auto`/`aes-128-gcm`/
@@ -235,7 +237,7 @@ fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
 /// native has no arm at all), refused as `"legacy vmess payload security is
 /// not implemented"`. A non-zero `alter_id` selects the legacy pre-AEAD
 /// session scheme native never implemented, refused as `"vmess alter_id is
-/// not implemented"`. A fingerprint or transport refusal appends the
+/// not implemented"`. A transport refusal appends the
 /// [`transport_reason`] string.
 fn vmess_reason(cfg: &VmessConfig) -> Option<&'static str> {
     if let Some(enc) = cfg.security.enc.as_deref()
@@ -291,7 +293,7 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 
 /// Shadowsocks row (both kinds share this payload type): a native method
 /// family matching `kind`, no SIP003 plugin, a key the connect path can
-/// derive, a fingerprint native parses.
+/// derive.
 ///
 /// SS has no transport dimension — `SsConfig` carries no transport field, so
 /// the row always rides a plain TCP dial, plus optional `security` applied by
@@ -813,8 +815,7 @@ mod tests {
     fn hysteria2_ignores_fingerprint_and_stays_supported() {
         // quinn's internal rustls never reads `fp` (`quic_tls_config` looks
         // at `insecure` only), so an xray-only id is inert here — the test
-        // pins that the fingerprint gate does not over-reach onto the QUIC
-        // dial. (A `false` here WOULD downgrade to xray-core, which builds
+        // pins that no fingerprint handling over-reaches onto the QUIC dial. (A `false` here WOULD downgrade to xray-core, which builds
         // hysteria2 outbounds — the gate is simply never triggered.)
         let mut cfg = hysteria2_cfg();
         cfg.security = tls_fp("ios");

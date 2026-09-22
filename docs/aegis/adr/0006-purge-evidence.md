@@ -107,7 +107,9 @@ schema-tag bump, and a bump makes `Database::open` delete the file).
    the misclassification this ADR's typed-evidence rule exists to prevent.
 2. `reason_for` takes the link's `fp` and returns `None` when it is an approximation: the probe
    dialled a shape the link did not ask for, so its failure is evidence about a config that was
-   never tried. The predicate is shared with the capability gate and the row label.
+   never tried. The predicate — and its input, the `security_fp` column, read from the row on
+   every path — is shared with the row label and with `security::wrap`, which is where the
+   substitution actually happens.
 
 ## Note — 2026-09-22: the class names the STAGE, not the wrapper
 
