@@ -529,6 +529,45 @@ mod tests {
         assert_eq!(json["outbounds"][0]["server_port"], 443);
     }
 
+    /// T2's re-run, at the level the connect path actually uses.
+    ///
+    /// Before T8, a `type=http` link forced to xray-core produced a config the
+    /// core **refused to load** — verified against the pinned binary, which
+    /// answers `PrintRemovedFeatureError` (an error, not a warning) for
+    /// `network: "http"`. The builder now refuses the BUILD with a named reason
+    /// instead, so the failure surfaces where the link is known rather than as a
+    /// core that will not start, and the connect path can route the link to the
+    /// native engine (which serves the transport).
+    #[test]
+    fn build_xray_refuses_the_removed_http_transport() {
+        let endpoint = endpoint("example.com", 443);
+        let ProtocolConfig::Vless(mut vless) = vless_config() else {
+            unreachable!("fixture is vless")
+        };
+        vless.transport = TransportConfig::Http(xray_tui_proto::proto_spec::common::HttpConfig {
+            path: Some("/x".into()),
+            ..Default::default()
+        });
+        let config = ProtocolConfig::Vless(vless);
+        let protocol = protocol(ProtocolKind::Vless, config);
+        let xray_link = link(ProtoCoreType::Xray);
+        let (params, rules, dns) = default_params();
+
+        let err = ConfigBuilder::build(&endpoint, &xray_link, &protocol, &params, &rules, &dns)
+            .expect_err("xray-core removed the http transport, so the build must refuse it");
+        assert!(matches!(err, BuildError::Support(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("http"),
+            "the reason must name the transport, not the core's load error: {err}"
+        );
+
+        // The refusal is scoped to the core that removed it: the SAME config
+        // still builds for sing-box, which implements the transport.
+        let singbox_link = link(ProtoCoreType::SingBox);
+        ConfigBuilder::build(&endpoint, &singbox_link, &protocol, &params, &rules, &dns)
+            .expect("sing-box still implements the http transport");
+    }
+
     #[test]
     fn build_with_unloaded_config_returns_clear_error() {
         // Deferred config rows (default DB read paths) must error clearly,
