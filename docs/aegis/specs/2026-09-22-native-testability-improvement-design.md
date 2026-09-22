@@ -285,6 +285,24 @@ ok=0 of 40 — distribution:
 
 **The A/B's candidate population is the 31 HTTP-layer refusals**, not the 40: the 7 timeouts, 1 dial refusal and 1 TLS EOF never reached an HTTP response, so no request-header change can move them. `405 Method Not Allowed` (4 rows) is notable — our method defaults to **PUT** (`transport/v2rayhttp.rs:52-56`, matching sing-box), so a 405 on PUT means the server does not accept it at that path; since sing-box also failed on the earlier sample, the method is not the discriminator and item 7's remaining hypothesis is the **default request headers**, which is what the A/B will test.
 
+**M3 — the removed-transport path, proven deterministically (measured 2026-09-22).** No TUI connect needed: the claim is that xray-core *refuses* the config we emit, and that is decidable offline with the pinned binary. Three minimal outbounds, `xray run -c`:
+
+```
+network: "http"  -> Failed to start: ... common/errors: The feature HTTP transport (without header
+                    padding, etc.) has been removed and migrated to XHTTP stream-one H2 & H3.
+network: "h2"    -> same (HTTP transport removed)
+network: "quic"  -> Failed to start: ... The feature QUIC transport (without web service, etc.) has
+                    been removed and migrated to XHTTP stream-one H3.
+```
+
+A **fatal** config-load failure, not a warning: `PrintRemovedFeatureError` returns an error (`thirdparty/Xray-core/common/errors/feature_errors.go:25-27`).
+
+**And our builder emits exactly those strings** — `to_xray_stream_settings` remaps `XHttp` → `"splithttp"` and sends everything else through `transport.type_str()` (`proto_spec/common.rs:935-950`), so `TransportConfig::Http` → `"http"` and `TransportConfig::Quic` → `"quic"`.
+
+**The sharper finding:** the emitted network IS pinned by tests for `ws` (`common.rs:1378`), `httpupgrade` (`:1411`) and `splithttp` (`:1399`, with the comment *"xray-core only recognizes \"splithttp\" as the network name"*) — and **not for `http` or `quic`**, the only two whose emitted name xray-core has removed. The two broken cases are precisely the two without a pin, so nothing failed when xray-core removed them. T8's RED test closes that by asserting the build refuses them.
+
+**Path status: latent, not live.** `config.json` carries no `protocol_core_overrides`, and `routing_rules` and `dns_settings` are empty tables, so decision 20 sends every link to the native attempt first and `capability.rs::transport_reason` calls `TransportConfig::Http(_)` supported (`=> None`) — the xray builder is never reached for a `type=http` link today. One routing rule or one override away from firing.
+
 **M0b — basis 2: the non-hang attempt spans (measured 2026-09-22).** Same slice, `XRAY_TUI_MEASURE_SAMPLE_DEADLINE_SECS=600`, sequential per-attempt probes. Failure spans are binned by class — `ProbeFailure` carries class + text only, so the sample times each attempt itself:
 
 ```
