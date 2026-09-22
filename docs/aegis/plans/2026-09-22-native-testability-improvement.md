@@ -57,18 +57,20 @@ cargo clippy --workspace --all-targets
 
 **Files**: `crates/xray-tui/src/ops/ping/flow_cost.rs`
 
-**Change**: `batch_params` takes a runner choice; the lab gains an `EngineProbeRunner` row set over a pinned slice of endpoint ids loaded from `XRAY_TUI_MEASURE_DB`. Add one table row reporting median real-probe latency and results/s at a fixed concurrency.
+**Change**: `batch_params` takes a runner choice; the lab gains an `EngineProbeRunner` row set over the **feed in ID order** (capped by `XRAY_TUI_MEASURE_MAX_LINKS`) loaded from `XRAY_TUI_MEASURE_DB`. Add one table row reporting median real-probe latency and results/s at a fixed concurrency.
 
 **Slice selection — decided here, not at execution.** The live evidence is thin (22 rows ever recorded a real success, days old, none reproducing), and the two numbers have different sample needs:
 
 - **results/s** counts *attempts*, so mostly-failing endpoints are fine and the slice can be drawn straight from the feed.
 - **the p99 of successes** needs actual successes. At the measured ~1.3 % real-ok rate a 50-endpoint slice yields ~0–1 of them — no usable p99.
 
-So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipped default, so §4's non-goal is not breached) and is **sized to a stated minimum success count** (≥200) before the p99 is read. That same pass produces the concurrency curve the §7 falsifier needs, so the raise is not extra work. If the minimum is not reached on the pinned slice, M0 reports the shortfall and T4 takes its stated fallback basis — it does not guess.
+So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipped default, so §4's non-goal is not breached) and was **intended to be sized to a stated minimum success count** (≥200) before the p99 is read. That same pass produces the concurrency curve the §7 falsifier needs, so the raise is not extra work.
+
+**Realisation (measured): the ≥200 bar is unreachable on this feed**, so the intent above was never met and does not need to be. One whole-feed pass yields **21–75** successes, and a sequential 300 s sample yielded **0 in 81 attempts** — so the fallback basis (the p99 over attempts with failures excluded by class) is what M0 actually produced, and it is recorded as the operative one rather than as a shortfall. This clause is kept as *intent* so the sizing rule and its measured outcome stay distinguishable.
 
 **Compat**: none — `#[cfg(test)]`, ignored by default.
 
-**Verify**: the harness command completes and prints the new rows. Record the baseline (command, slice ids, raw medians, success count) in the spec's §8.1.
+**Verify**: the harness command completes and prints the new rows. Record the baseline (command, slice descriptor, raw medians, success count) in the spec's §8.1.
 
 **Stop**: if the production runner cannot be driven from the lab without a live `AppState`/event loop, record the blocker and fall back to the spec's §10 clause (class-2 acceptance becomes "not verified").
 
@@ -82,11 +84,11 @@ So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipp
 
 ### T2 — M3: forced-override proof of the latent build path · `light`
 
-**Files**: none (diagnostic)
+**Files**: `crates/xray-tui-core/src/config_builder/mod.rs` (the verification test)
 
-**Change**: set one `protocol_core_overrides` entry forcing `xray` on a `type=http` link, attempt a connect, and record the observed failure. Restore the config afterwards.
+**Change**: the plan's original form was a forced `protocol_core_overrides` entry plus a connect. The reachable and stronger form is the **build**, which is what the connect path calls: drive `ConfigBuilder::build` with a `type=http` link and `CoreType::Xray`.
 
-**Verify**: the recorded observation — today an xray-core load error naming a removed feature; after T8, a named downgrade.
+**Verify**: the recorded observation — before T8, an xray-core LOAD error naming a removed feature (verified offline against the pinned binary); after T8, a named **REFUSAL** (`BuildError::Support`) at build time, **not a downgrade** — see T8, which explains why no downgrade was built: decision 20 already routes native-capable kinds to native, and an explicit xray override is answered with a warning rather than by overriding the user back. Test: `build_xray_refuses_the_removed_http_transport`, which also asserts the same config still builds for sing-box.
 
 ### T3 — fingerprint policy + derived marker · `strict`
 

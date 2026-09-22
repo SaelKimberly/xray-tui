@@ -216,7 +216,7 @@ Pinned at spec level because a plan tends to shuffle sequence, and both the fals
 
 | stage | must land | because |
 |---|---|---|
-| **M0** | `flow_cost` real `BatchProbeRunner` + pinned slice + **baseline results/s recorded** (command, slice ids, raw medians) | without a recorded "before", the §7 class-2 bar has no control and the falsifier cannot fire |
+| **M0** | `flow_cost` real `BatchProbeRunner` + the ID-ordered feed slice + **baseline results/s recorded** (command, slice descriptor, raw medians) | without a recorded "before", the §7 class-2 bar has no control and the falsifier cannot fire |
 | **M1** | header A/B **control** run (today's wire) on the pinned `403`/`409`/`530` rows | a wire change made first destroys the control |
 | **M2** | mlkem differential vs the HEAD-built peer and the pinned 26.3.27 | the fix depends on which side is wrong |
 | M3 | forced-override proof of the latent build path (§5.5) | diagnostic; order-free |
@@ -244,8 +244,8 @@ M0 is the only stage that blocks other scoped work, so it is the natural first p
 ## 8. Verification mechanics
 
 - **Harness**: `cargo test -p xray-tui --release --lib -- --ignored --nocapture flow_cost`, with `XRAY_TUI_MEASURE_DB=<copy of data.db>`. The slice descriptor and the raw medians are recorded in §8.1 for every run that was taken.
-- **Pinned slice — as actually run.** The slice is the **whole applicable feed in ID order**, capped by `XRAY_TUI_MEASURE_MAX_LINKS`, with its descriptor printed on every run (`N links over M endpoints, K distinct protocols, offsets 0..X`). The earlier form — *"a fixed list of endpoint ids chosen once from a known-live subset"* — was abandoned when M0 showed the curated form buys nothing here: the ≥200-success bar it existed to satisfy is unreachable (the whole feed yields 21–75), and an ID-ordered walk is reproducible without curating anything. `PageSort::Id` is the reason it is stable: endpoint ids are an order no write can move. The feed still churns between sessions, so a re-run after a long gap may need re-pinning — a recorded maintenance cost, not a hidden one.
-- **Not verified, stated as such**: the CDN/bot-protection hypothesis (needs live CDN-fronted servers; may be inconclusive at ~24 rows); whether the approximated hello helps or hurts in the field — class 1 proves the label exists, never that the approximation is good; the pinned slice's stability over time.
+- **Pinned slice — as actually run.** The slice is the **whole applicable feed in ID order**, capped by `XRAY_TUI_MEASURE_MAX_LINKS`, with its descriptor printed on every run (`N links over M endpoints, K distinct protocols, offsets 0..X`). The earlier form — *"a fixed list of endpoint ids chosen once from a known-live subset"* — was abandoned when M0 showed the curated form buys nothing here: the ≥200-success bar it existed to satisfy is unreachable (the whole feed yields 21–75), and an ID-ordered walk is reproducible without curating anything. `PageSort::Id` is the reason it is stable: endpoint ids are an order no write can move. The feed still churns between sessions, so a re-run after a long gap **re-records** rather than re-pins — the numbers are snapshot-bound (§12.7), not a hidden cost.
+- **Not verified, stated as such**: the CDN/bot-protection hypothesis (needs live CDN-fronted servers; may be inconclusive at ~24 rows); whether the approximated hello helps or hurts in the field — class 1 proves the label exists, never that the approximation is good; and the baseline's stability across *different* feeds (each recorded number is bound to the feed it was taken on, §12.7).
 
 ### 8.1 Results
 
@@ -486,6 +486,6 @@ Both proposed ADRs are **signals only**; they become accepted architecture memor
 3. Approximation can be wrong in both directions on the CDN leg, contained only by the purge prohibition — a wrong answer stays re-testable but is still wrong.
 4. The approximation count has no end date: `qq` is a new capture, not a roster lookup, and every new uTLS id re-opens the gap.
 5. "We interoperate with xray" holds for the release only; a HEAD-only pass is a recorded narrower claim (§5.8).
-6. The removed-transport fix is verified latent-only — one forced override, not a production path.
-7. The pinned slice decays as public endpoints churn; re-pinning is recorded maintenance.
+6. The removed-transport fix is verified at the **build** level (`build_xray_refuses_the_removed_http_transport`) and is **latent in production**: decision 20 routes native-capable kinds to native before any build, so the refusal is reachable only through an explicit override.
+7. The baseline is **snapshot-bound**, not pinned to a list: the slice is the feed in ID order, so a feed that churns between sessions makes the recorded numbers a record of *that* feed. There is nothing to "re-pin" — a later run re-records, and the before/after ratio is only valid between runs on the same feed. §8.1 states each snapshot.
 8. Class 1 proves the label exists, never that the approximation helps. Coverage is not quality.
