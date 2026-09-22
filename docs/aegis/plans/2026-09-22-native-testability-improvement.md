@@ -158,8 +158,10 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 **Still open — the approximated rule (T5's second half).** `reason_for(evidence)` is pure and has no link, so the rule "no verdict from an approximated probe" needs the fp at the decision point. Settled design (§5.3): derive it from the link's `security_fp` with T3's predicate — no engine threading. The exact change sites, so it is not re-discovered:
 
 - `reason_for(evidence)` → `reason_for(evidence, fp: Option<&str>)`, first check = approximation → `None`. It stays the module's single verdict owner, which is the property the module doc claims.
-- Three production call sites, all in `ops/ping.rs`: `:320` (single real ping), `:1968` (`stage_result`), `:2053` (the batch's staged path). Each has a `ProfileStats` link; the **protocol row** (`security_fp`) is available as `plan.protocol` in the batch paths and must be threaded to `stage_result` — that threading is the whole cost of this half.
-- Test: an approximated failure carrying any evidence variant returns `None`; the existing purge tests keep passing for non-approximated evidence.
+- **The fp lookup must stay INSIDE the `Some(evidence)` branch**, not eager at the call site: `stage_result` stages EVERY probe result, and the write-behind lab measured that path at 10.0 ms per 512-patch window. An eager `self.protocols.get(&link.protocol_id)` per staged row would add a `DashMap` lookup to a hot path the repo already optimised — including for fast probes, whose `evidence` is always `None` and which therefore never need the fp. Written as `evidence.and_then(|e| reason_for(e, fp_of(link)))` with `fp_of` called only inside.
+- **A lookup miss fails CLOSED — no verdict.** Failing open would let an approximated probe earn exactly the permanent verdict the rule exists to prevent, and Purgatory is the one output that is not cheaply reversible.
+- Three production call sites, all in `ops/ping.rs`: `:320` (single real ping, has a local `&config`), `:1968` (`stage_result`), `:2053` (the batch's staged path). The latter two reach the config through `self.protocols` keyed by `link.protocol_id` — **the fp input is `config.security.fp`, not a `Protocol` row**, which none of the sites holds (§5.3 records the two-accessor split and the agreement test it requires).
+- Test: an approximated failure carrying any evidence variant returns `None`; a lookup miss returns `None`; the existing purge tests keep passing for non-approximated evidence.
 
 ### T6 — class precision · `strict`
 
