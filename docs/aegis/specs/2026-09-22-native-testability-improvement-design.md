@@ -109,7 +109,9 @@ An attempt traverses dial → security → transport → protocol **sequentially
 
 Design: the constants become **clamps** against a caller-supplied attempt deadline — each step takes `min(step_constant, remaining)`. The clamp is a property of the caller's budget, not of the step: a caller that supplies a budget has its steps clamped; a caller that supplies none (the live proxied tunnel) keeps the constants. Under that rule `TUNNEL_READ`'s 30 s becomes **unreachable for the probe** (four clamped steps always consume the budget first), which is the intended outcome rather than an exemption, and a live connection is untouched.
 
-The budget's **value** is not fixed here; it is an output of §6 (above the p99 of *successful* attempts).
+**Status: DEFERRED with T4 — this design is not landed.** The observable contract it exists for is already met and tested by `probe.rs`'s outer wrapper (§T4 in the plan carries the reasoning and the un-defer trigger). Note also what the clamp does *not* do: because it is `min`, a step is capped DOWN and can never exceed its constant, so a budget larger than 10 s still dies at the 10 s `DIAL` cap — that is the design, not a defect it removes.
+
+The budget's **value** IS settled, contrary to the earlier text here: M0b measured basis 2's p99 at 3,251 ms, so the shipped **5 s default stays** and no success-based p99 exists to justify a raise. §6 records the measurement.
 
 ### 5.3 Evidence → verdict table
 
@@ -232,7 +234,7 @@ M0 is the only stage that blocks other scoped work, so it is the natural first p
 **Class 2 — the falsifiable speed claim.** Median results/s at fixed concurrency improves by **≥1.5×** in `flow_cost` with the real runner, before vs after. **Below 1.5×, the speed stage is dropped** and items 1/3/4/6 still ship. The bar is a **same-machine relative** claim — the lab's rows are medians "on this machine" — and must never be quoted as an absolute.
 
 **Class 3 — correctness, survives a flat curve.**
-- *No path outlives the budget*: unit assertion that each clamped step is `≤ remaining` at point of use, plus an integration assertion that no attempt exceeds the budget.
+- *No path outlives the budget* — **deferred with T4, not met, and not needed**: the outer wrapper (`probe.rs:73-96`) already enforces it, and `probe::tests::a_stalled_handshake_is_bounded_by_the_attempt_budget` pins that. The clamp assertion (each step `≤ remaining`) would only restate it, which is why T4 is deferred rather than landed. M0b's `Timeout` bin pinned at 5,001 ms is the wrapper firing, measured.
 - *No verdict from an approximated probe*: `reason_for` returns `None` for approximated evidence carrying any variant; existing purge tests keep passing for non-approximated evidence.
 - *Class mis-attribution = 0*: the VLESS response-header EOF lands in `ProbeClass::Protocol`; `ProbeClass::Tls` is proven unreachable from a tunnel-payload error.
 - *`config_invalid` mapping*: missing-pbk / malformed-sid evidence produces `config_invalid`; a genuine server-auth failure still produces `reality_fallback`.
