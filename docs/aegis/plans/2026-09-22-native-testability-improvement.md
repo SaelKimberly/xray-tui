@@ -209,7 +209,9 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 
 The reference client works in **every** pairing and the older server accepts the newer client wire; ours works in **none**. So the fault is our `mlkem768x25519plus` sealing/padding/framing — not the pin, not a version gap. The fix round's method is now bounded: capture the reference client's first flight for a fixed pair and diff it against ours.
 
-**That is the plan's stated branch, and it is recorded rather than papered over:** the pq-enc row stays ignored (its reason now names the differential), and the gate stays closed. Its acceptance — the row green against the release users run — is **not met**, and a HEAD-only pass would have been the narrower claim §5.8 refused.
+**That is the plan's stated branch, recorded rather than papered over:** the pq-enc row stays ignored (its reason now naming the differential), and the gate stays closed. Its acceptance — the row green against the release users run — is **not met**, and a HEAD-only pass would have been the narrower claim §5.8 refused.
+
+**Disposition: item 2 RETURNS TO DESIGN**, per the spec's §10 recovery clause — *"the mlkem differential says the client is at fault: item 2 returns to design; it is not quietly closed"*. That clause fired, so T9's second half (the fix) is **unfinished by design, not deferred**: the localization is complete and the next design cycle starts from it, with the bounded method (diff our first flight against the reference's for one fixed pair) and its harness already in place (`vless_pq_enc_with_a_reference_pair`, plus the hermetic `keypair_from_seed_matches_the_reference_expansion`). No partial fix ships: the gate stays closed until the row is green against the release peer.
 
 **What T9 delivered despite that:** the leading hypothesis (stale pin) is eliminated, so the fix round starts from the client. The spec's §5.8 acceptance and this plan's trigger both now say that, instead of pointing at a re-pin that would have changed nothing.
 

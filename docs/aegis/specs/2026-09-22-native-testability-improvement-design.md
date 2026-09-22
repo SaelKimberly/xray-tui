@@ -454,7 +454,12 @@ Mlkem768::keypair_from_seed(reference seed) == reference ek    →  PASSES
 ## 10. Failure and recovery
 
 - **Harness extension infeasible** (a real runner cannot be isolated from the batch's global state): class-2 acceptance drops to "not verified" and is recorded; correctness items still ship.
-- **mlkem differential says the client is at fault**: item 2 returns to design; it is not quietly closed.
+- **mlkem differential says the client is at fault**: **this fired.** Item 2 **returns to design** — it is not quietly closed, and its current state is *designed, localized, unfixed*. What the next design cycle has to work with, all measured:
+  - the fault is the client's **sealing or framing** — not the pin, not the version, not the key derivation, not the parse (four passes, §8.1);
+  - the bounded method: capture the **reference client's first flight** for a fixed pair and diff it against ours, byte for byte, at the same pair;
+  - the harness for it already exists: `vless_pq_enc_with_a_reference_pair` (any `vlessenc` pair via env) and `keypair_from_seed_matches_the_reference_expansion` (hermetic, no cores);
+  - the gate stays closed until the row is green against the release peer, so no partial fix ships as a capability claim.
+  The spec's §7 class 4 records this as an **unmet** acceptance item, not a dropped one.
 - **Header A/B inconclusive**: resolve to out-of-scope with a recorded negative result, not to a wire change.
 - **Budget value absurd**: the p99 is taken over *successes*, so hangs are excluded by construction. If it still lands above a sane ceiling, the ceiling wins and the discrepancy is recorded.
 - **Rollback is clean, and no path can lose data**: the budget value is a user-overridable config default; the approximation marker is derived, so removing the fallback restores today's refusal with no migration; the purge change is one function; the build-time refusal is one match arm. **No schema change anywhere in this spec.**

@@ -32,5 +32,5 @@
 | 2026-09-18 | plan | `plans/2026-09-18-crypto-dependency-hardening.md` | Cryptographic dependency hardening — implementation | executed (T1-T9; zstd→ruzstd deliberately deferred) |
 | 2026-09-18 | adr | `adr/0007-cryptographic-dependency-posture.md` | Cryptographic dependency posture: RustCrypto ML-KEM, ctr and ring retained, hazmat governance | accepted |
 | 2026-09-18 | adr | `adr/0008-batch-feed-scaling.md` | Batch-feed scaling: id-ordered walk, per-protocol loads, throttled page refetch | accepted |
-| 2026-09-22 | spec | `specs/2026-09-22-native-testability-improvement-design.md` | Native testability: trustworthy verdicts on a real feed | implemented (T3/T5–T10 landed; T4 deferred on measurement; item 7 reverted on a measured negative) |
-| 2026-09-22 | plan | `plans/2026-09-22-native-testability-improvement.md` | Native testability — implementation | executed (T0–T3, T5–T11; T4 deferred with its trigger recorded) |
+| 2026-09-22 | spec | `specs/2026-09-22-native-testability-improvement-design.md` | Native testability: trustworthy verdicts on a real feed | implemented, with two recorded dispositions: T4 deferred (trigger unmet), and mlkem item 2 **returned to design** (client-side wire, localized) |
+| 2026-09-22 | plan | `plans/2026-09-22-native-testability-improvement.md` | Native testability — implementation | executed: T0–T3, T5–T11 landed; T4 deferred on measurement; T9's fix unfinished-by-design (§10 clause) |
