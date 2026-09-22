@@ -1083,6 +1083,14 @@ async fn flow_cost_network() {
     // clear. Sequential on purpose: the point is the span, not throughput.
     let mut latencies: Vec<u64> = Vec::new();
     let mut failures = 0usize;
+    // Failure spans, binned by class. Basis 2 needs the p99 over attempts that
+    // failed for a reason OTHER than a deadline, and nothing else records a
+    // failure's duration (`ProbeFailure` carries class + text only), so the
+    // sample times each attempt itself. `Timeout` is the only hang class —
+    // every other variant is a peer or local answer, so its span is bounded by
+    // the work rather than by the budget.
+    let mut failure_spans: std::collections::BTreeMap<ProbeClass, Vec<u64>> =
+        std::collections::BTreeMap::new();
     // The sample pass is SEQUENTIAL on purpose — concurrent attempts contend for
     // the CPU-bound handshake and would inflate every span. Sequential makes its
     // wall time the sum of its attempts, and most attempts here are failures
@@ -1115,9 +1123,16 @@ async fn flow_cost_network() {
             // `protocol_config` uses, so an unloaded row fails here exactly as
             // it fails on the production path.
             let config = protocol.config.get().0.clone();
+            let attempt = Instant::now();
             match crate::ops::ping_native::real_ping(&row.endpoint, &config, &req).await {
                 Ok(r) => latencies.push(r.latency_ms),
-                Err(_) => failures += 1,
+                Err(failure) => {
+                    failures += 1;
+                    failure_spans
+                        .entry(failure.class)
+                        .or_default()
+                        .push(attempt.elapsed().as_millis() as u64);
+                }
             }
         }
     }
@@ -1132,15 +1147,56 @@ async fn flow_cost_network() {
             pct(0.90),
             pct(0.99)
         );
-        if latencies.len() < 200 {
-            println!(
-                "[network] WARNING: {} successes is below the 200 the budget rule needs — \
-                 raise XRAY_TUI_MEASURE_SAMPLE or the slice",
-                latencies.len()
-            );
-        }
     } else {
         println!("[network] per-attempt sample produced no successes (failures {failures})");
+    }
+
+    // ── basis 2: the p99 over NON-hang failures ────────────────────────
+    //
+    // The budget default must clear the span of an attempt that did real work,
+    // so the population is every failure class except `Timeout` — a deadline
+    // span says nothing about how long the work takes. This is the basis that
+    // works on a feed where successes are ~1 %.
+    let mut non_hang: Vec<u64> = Vec::new();
+    for (class, spans) in &failure_spans {
+        let mut sorted = spans.clone();
+        sorted.sort_unstable();
+        let pct = |p: f64| sorted[((sorted.len() as f64 - 1.0) * p) as usize];
+        let tag = if *class == ProbeClass::Timeout {
+            "hang"
+        } else {
+            non_hang.extend_from_slice(spans);
+            "counts"
+        };
+        println!(
+            "[network] failure spans {class:?} ({tag}): n={} median {} ms p90 {} ms max {} ms",
+            sorted.len(),
+            pct(0.50),
+            pct(0.90),
+            sorted[sorted.len() - 1]
+        );
+    }
+    if non_hang.is_empty() {
+        println!("[network] basis 2: no non-hang failures sampled — no p99 available");
+    } else {
+        non_hang.sort_unstable();
+        let pct = |p: f64| non_hang[((non_hang.len() as f64 - 1.0) * p) as usize];
+        println!(
+            "[network] basis 2 (p99 over non-hang attempt spans, n={}): median {} ms | \
+             p90 {} ms | p99 {} ms | max {} ms",
+            non_hang.len(),
+            pct(0.50),
+            pct(0.90),
+            pct(0.99),
+            non_hang[non_hang.len() - 1]
+        );
+        if non_hang.len() < 100 {
+            println!(
+                "[network] WARNING: n={} is thin for a p99 — raise \
+                 XRAY_TUI_MEASURE_SAMPLE_DEADLINE_SECS",
+                non_hang.len()
+            );
+        }
     }
 }
 

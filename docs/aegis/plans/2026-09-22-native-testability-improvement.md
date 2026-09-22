@@ -116,6 +116,13 @@ So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipp
 
 Whichever applies is recorded in §8.1 with its sample count. **T4 must not land a guessed number**: if no basis is available, T4 ships the clamp structure only (a single authoritative budget with the shipped default left unchanged) and says so.
 
+**Basis 2 is now measured, and it is a FLOOR.** Non-hang attempt spans over 67 samples: median 214 ms, p90 369 ms, **p99 3,251 ms**, max 4,007 ms. The `Timeout` bin (n=116) is pinned at 5,001 ms — the budget itself — which is why it is excluded: a deadline span says nothing about how long work takes.
+
+Two consequences, both settled here rather than at execution:
+
+- **The shipped 5 s default already clears basis 2's p99** with ~1.5× headroom, and no success-based p99 is obtainable on this feed (0 successes in 183 sample attempts; 21–75 over a whole pass). So **T4 lands the clamp structure and leaves the budget value unchanged** — the escape hatch above, not a guess. What T4 fixes is the relationship: the engine's 10 s steps become unreachable clamps instead of independent constants.
+- **A success does strictly more work than any failure** (tunnel → target TCP + TLS → HTTP exchange → reverse), so a failure p99 can only under-estimate the span a success needs. The budget's *true* requirement stays unmeasured until a success-based sample exists, and §8.1 records it as such.
+
 **M0's span figures are not an attempt duration.** The run's `(35..56,455 ms)` is the real **level's** start..settle span (inside `wall=56800 ms`), and the sequential pass's 3.7 s/attempt averages mostly fast failures — neither measures a single attempt, so neither is cited as one. T4's justification is code-level and needs no measurement: the budget is 5 s while the engine's steps are 10 s each plus a 30 s read (`error.rs:174-181`), so **no engine step deadline can be reached under the probe budget** — the outer budget always fires first, and a legitimate authorization needing more than 5 s is truncated by it rather than bounded by the step that should have governed. The clamp makes that relationship explicit instead of accidental.
 
 **Verify**: the clamp tests; the budget value recorded in §8.1 with its p99 basis.

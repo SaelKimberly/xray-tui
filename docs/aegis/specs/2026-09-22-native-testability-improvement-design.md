@@ -285,7 +285,27 @@ ok=0 of 40 — distribution:
 
 **The A/B's candidate population is the 31 HTTP-layer refusals**, not the 40: the 7 timeouts, 1 dial refusal and 1 TLS EOF never reached an HTTP response, so no request-header change can move them. `405 Method Not Allowed` (4 rows) is notable — our method defaults to **PUT** (`transport/v2rayhttp.rs:52-56`, matching sing-box), so a 405 on PUT means the server does not accept it at that path; since sing-box also failed on the earlier sample, the method is not the discriminator and item 7's remaining hypothesis is the **default request headers**, which is what the A/B will test.
 
-*Pending*: the M0/M1 after-numbers, and the item-7 wire decision they feed.
+**M0b — basis 2: the non-hang attempt spans (measured 2026-09-22).** Same slice, `XRAY_TUI_MEASURE_SAMPLE_DEADLINE_SECS=600`, sequential per-attempt probes. Failure spans are binned by class — `ProbeFailure` carries class + text only, so the sample times each attempt itself:
+
+```
+per-attempt sample: 0 successes, 183 failures
+Timeout  (hang):     n=116  median 5001 ms  p90 5001 ms  max 5002 ms
+Dial     (counts):   n= 26  median   32 ms  p90   99 ms  max 4007 ms
+Tls      (counts):   n= 18  median  289 ms  p90  970 ms  max 3251 ms
+Reality  (counts):   n= 21  median  222 ms  p90  231 ms  max  405 ms
+Transport(counts):   n=  2  median  122 ms              max  214 ms
+basis 2 (non-hang, n=67): median 214 ms | p90 369 ms | p99 3251 ms | max 4007 ms
+```
+
+Three readings:
+
+1. **The `Timeout` bin is pinned at the budget** — n=116, median = p90 = max ≈ 5001 ms. So the outer 5 s budget *is* enforced, and the hang class is purely deadline-shaped: it carries no information about how long work takes, which is why it is excluded.
+2. **Non-hang work is fast**: median 214 ms, p90 369 ms, p99 3,251 ms. Real work that fails completes in a few hundred ms, with a ~3–4 s tail.
+3. **Basis 2 is a FLOOR, not a ceiling.** A *successful* attempt does strictly more work than any failure — it completes the tunnel, then the target's TCP + TLS, then the HTTP exchange, then the reverse. With **0 successes** in the sample, the span a success needs is still unmeasured; the failure p99 can only under-estimate it.
+
+**Consequence for T4.** The shipped 5 s default already clears basis 2's p99 (3,251 ms) with ~1.5× headroom, and no success-based p99 is obtainable on this feed. So T4 lands the **clamp structure and leaves the budget value unchanged**, recording that the value awaits a success-based sample — the plan's stated escape hatch rather than a guess. What T4 fixes is the relationship (the engine's 10 s steps become unreachable clamps instead of independent constants), not the number.
+
+**Run-to-run variance, for reading the falsifier:** two identical batch passes gave **79.19** and **83.94 results/s** (≈6 % apart) but **75** and **21** real successes — the rate is stable because failures dominate; the success *count* is not, so no acceptance may rest on it.
 
 ## 9. Evidence base
 
