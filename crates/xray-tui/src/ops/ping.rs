@@ -19,7 +19,7 @@ use xray_tui_db::models::{
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_native::capability;
-use xray_tui_proto::proto_spec::ProtocolConfig;
+use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig};
 
 use crate::AppState;
 use crate::ops::ping_native::{self, NativeProbeReq, ProbeClass};
@@ -317,7 +317,11 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 None,
                 None,
                 Some(e.text),
-                e.evidence.and_then(crate::ops::purge::reason_for),
+                // The fp from the CONFIG (this site's own local), not the
+                // `security_fp` column: the rule reads one input on every path.
+                e.evidence.and_then(|ev| {
+                    crate::ops::purge::reason_for(ev, config.security().and_then(|s| s.fp()))
+                }),
             ),
         };
 
@@ -1965,7 +1969,24 @@ impl BatchShared {
                 None,
                 None,
                 Some(text.as_str()),
-                evidence.and_then(crate::ops::purge::reason_for),
+                evidence.and_then(|ev| {
+                    // Lazy AND fail-closed. Lazy: a fast probe's evidence is
+                    // always `None`, so the lookup must not run for it — this
+                    // path is the write-behind hot path (10.0 ms per 512-patch
+                    // window). Fail-closed: a cache miss means we cannot tell
+                    // whether the shape was approximated, and failing open
+                    // would let an approximated probe earn exactly the
+                    // permanent verdict the rule exists to prevent.
+                    let loaded = self.protocols.get(&link.protocol_id);
+                    let fp = loaded
+                        .as_ref()
+                        .and_then(|p| p.config.security())
+                        .and_then(|s| s.fp());
+                    match loaded {
+                        None => None,
+                        Some(_) => crate::ops::purge::reason_for(ev, fp),
+                    }
+                }),
             ),
         };
         let mut row = link.clone();
@@ -2050,7 +2071,19 @@ impl BatchShared {
                 None,
                 None,
                 Some(text.clone()),
-                evidence.and_then(crate::ops::purge::reason_for),
+                evidence.and_then(|ev| {
+                    // Same rule as `stage_result`: lazy (this path is hot) and
+                    // fail-closed (a miss must not earn a permanent verdict).
+                    let loaded = self.protocols.get(&link.protocol_id);
+                    let fp = loaded
+                        .as_ref()
+                        .and_then(|p| p.config.security())
+                        .and_then(|s| s.fp());
+                    match loaded {
+                        None => None,
+                        Some(_) => crate::ops::purge::reason_for(ev, fp),
+                    }
+                }),
             ),
         };
         let endpoint_id = link.endpoint_id.get();

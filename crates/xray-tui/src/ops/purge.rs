@@ -18,8 +18,24 @@ use xray_tui_native::error::FailureEvidence;
 /// Each is either indistinguishable from a transient network condition or a
 /// rate-limit/bot-management answer from the CDN, and none of them is a
 /// statement the origin made about this config (spec §7).
+///
+/// `fp` is the link's TLS fingerprint as the CONFIG carries it (never the
+/// `security_fp` column — no call site holds a `Protocol` row, and the row
+/// label reads the column from the page projection; spec §5.3 records the
+/// split and the agreement test it owes). When it is an approximation, the
+/// probe dialled a shape the link did not ask for, so the failure is about a
+/// config that was never tried and earns NO verdict.
+///
+/// Not `const` any more: the approximation check goes through the SAME
+/// predicate the capability gate and the row label use
+/// (`security::fingerprint::resolve_fingerprint`), and that predicate is not
+/// `const`. Re-implementing the check inline to keep `const` would duplicate
+/// the single decision point this rule exists to share.
 #[must_use]
-pub const fn reason_for(evidence: FailureEvidence) -> Option<PurgeReason> {
+pub fn reason_for(evidence: FailureEvidence, fp: Option<&str>) -> Option<PurgeReason> {
+    if xray_tui_native::security::fingerprint::resolve_fingerprint(fp).1 {
+        return None;
+    }
     match evidence {
         FailureEvidence::RealityFallback => Some(PurgeReason::RealityFallback),
         FailureEvidence::CertNotValidForName => Some(PurgeReason::CertificateMismatch),
@@ -44,6 +60,10 @@ mod tests {
     use xray_tui_db::models::PurgeReason;
     use xray_tui_native::error::FailureEvidence;
 
+    /// A roster-mapped fingerprint: the probe dialled the shape the link asked
+    /// for, so its failures are statements about the config.
+    const HONOURED: Option<&str> = Some("chrome");
+
     #[test]
     fn every_typed_evidence_maps_to_its_reason() {
         let cases = [
@@ -66,7 +86,50 @@ mod tests {
             ),
         ];
         for (evidence, expected) in cases {
-            assert_eq!(reason_for(evidence), expected, "for {evidence:?}");
+            assert_eq!(
+                reason_for(evidence, HONOURED),
+                expected,
+                "for {evidence:?}"
+            );
+        }
+    }
+
+    /// An approximated probe proves NOTHING about the config: the shape dialled
+    /// is not the shape the link asked for, so a verdict would be about a config
+    /// that was never tried. Every evidence variant, including the ones that
+    /// otherwise purge permanently.
+    #[test]
+    fn an_approximated_probe_earns_no_verdict_at_all() {
+        let approximated = ["qq", "android", "360", "hellochrome_120", "unknown-id"];
+        for fp in approximated {
+            for evidence in [
+                FailureEvidence::RealityFallback,
+                FailureEvidence::CertNotValidForName,
+                FailureEvidence::CertExpired,
+                FailureEvidence::CleartextPeer,
+                FailureEvidence::ConfigDefect,
+                FailureEvidence::HttpRejected(404),
+                FailureEvidence::HttpRejected(521),
+            ] {
+                assert_eq!(
+                    reason_for(evidence, Some(fp)),
+                    None,
+                    "{fp} + {evidence:?} must not purge"
+                );
+            }
+        }
+    }
+
+    /// The three spellings of "no fingerprint requested" are NOT approximations:
+    /// the engine default IS the shape they asked for, so their verdicts stand.
+    #[test]
+    fn no_fingerprint_requested_still_earns_a_verdict() {
+        for fp in [None, Some(""), Some("unsafe")] {
+            assert_eq!(
+                reason_for(FailureEvidence::RealityFallback, fp),
+                Some(PurgeReason::RealityFallback),
+                "{fp:?} requested no fingerprint, so the default is the shape asked for"
+            );
         }
     }
 
@@ -74,7 +137,7 @@ mod tests {
     fn the_origin_errors_are_their_own_reason() {
         for status in [521_u16, 522, 526, 530] {
             assert_eq!(
-                reason_for(FailureEvidence::HttpRejected(status)),
+                reason_for(FailureEvidence::HttpRejected(status), HONOURED),
                 Some(PurgeReason::OriginUnreachable),
                 "status {status} means the CDN could not reach the origin"
             );
@@ -85,7 +148,7 @@ mod tests {
     fn the_proxy_refusing_our_request_is_evidence() {
         for status in [301_u16, 302, 400, 403, 404, 405, 409, 410] {
             assert_eq!(
-                reason_for(FailureEvidence::HttpRejected(status)),
+                reason_for(FailureEvidence::HttpRejected(status), HONOURED),
                 Some(PurgeReason::TransportRejected),
                 "status {status} is the server's answer to our exact request"
             );
@@ -98,7 +161,7 @@ mod tests {
     fn transient_and_client_side_statuses_never_purge() {
         for status in [200_u16, 204, 412, 429, 500, 502, 503, 520, 525] {
             assert_eq!(
-                reason_for(FailureEvidence::HttpRejected(status)),
+                reason_for(FailureEvidence::HttpRejected(status), HONOURED),
                 None,
                 "status {status} must not purge"
             );

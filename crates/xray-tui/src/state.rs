@@ -1018,3 +1018,69 @@ impl AppState {
         subscriptions::spawn_auto_update(self);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::security_embed;
+    use xray_tui_native::security::fingerprint::resolve_fingerprint;
+    use xray_tui_proto::proto_spec::{
+        Hysteria2Config, ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts,
+    };
+    use xray_tui_proto::urlx::TinyText;
+
+    fn config_with_fp(fp: Option<&str>) -> ProtocolConfig {
+        ProtocolConfig::Hysteria2(Hysteria2Config {
+            auth: "secret".into(),
+            security: SecurityConfig {
+                tls: Some(TlsConfig::Tls(TlsOpts {
+                    sni: Some(TinyText::from("example.com")),
+                    fp: fp.map(TinyText::from),
+                    ..TlsOpts::default()
+                })),
+                enc: None,
+            },
+            obfs: None,
+            obfs_password: None,
+            up: None,
+            down: None,
+            hop_interval: None,
+            pin_sha256: None,
+            remarks: None,
+        })
+    }
+
+    /// Spec §5.3: the purge rule reads the CONFIG's `fp` while the row label
+    /// reads the `security_fp` COLUMN — one predicate over two inputs. That is
+    /// only safe while the two agree, and `security_embed` is the projection
+    /// that makes them agree. This test is the guard, because a divergence would
+    /// silently make the label and the purge rule read different fingerprints —
+    /// and both would still compile.
+    #[test]
+    fn the_security_fp_column_agrees_with_the_config_field() {
+        for fp in [
+            None,
+            Some(""),
+            Some("unsafe"),
+            Some("chrome"),
+            Some("qq"),
+            Some("android"),
+            Some("hellochrome_120"),
+        ] {
+            let config = config_with_fp(fp);
+            let column = security_embed(&config);
+            let from_config = config.security().and_then(|s| s.fp());
+
+            assert_eq!(
+                column.fp.as_deref(),
+                from_config,
+                "{fp:?}: the column must carry the config's fp verbatim"
+            );
+            assert_eq!(
+                resolve_fingerprint(column.fp.as_deref()),
+                resolve_fingerprint(from_config),
+                "{fp:?} must resolve identically through both accessors, or the \
+                 label and the purge rule disagree about the same link"
+            );
+        }
+    }
+}
