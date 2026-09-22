@@ -32,8 +32,21 @@ impl CoreUnderTest {
     /// Resolve from `XRAY_TUI_CORE_BIN_DIR/<bin_name>`, probe its version,
     /// and sanity-check it against `expected_version` (substring match).
     pub fn resolve(kind: CoreKind, expected_version: &str) -> Result<Self, String> {
-        let dir = std::env::var("XRAY_TUI_CORE_BIN_DIR")
-            .map_err(|_| "XRAY_TUI_CORE_BIN_DIR is not set".to_string())?;
+        Self::resolve_from(kind, expected_version, "XRAY_TUI_CORE_BIN_DIR")
+    }
+
+    /// Resolve from an arbitrary env-named directory.
+    ///
+    /// Exists so a SECOND pinned peer can coexist with the suite's baseline
+    /// without re-pinning it: the pq-enc differential targets a peer built from
+    /// `thirdparty/Xray-core` HEAD, and pointing the baseline env at it would
+    /// re-baseline every row in the suite (and restate its compatibility claim).
+    pub fn resolve_from(
+        kind: CoreKind,
+        expected_version: &str,
+        dir_env: &str,
+    ) -> Result<Self, String> {
+        let dir = std::env::var(dir_env).map_err(|_| format!("{dir_env} is not set"))?;
         let bin = PathBuf::from(dir).join(kind.bin_name());
         if !bin.is_file() {
             return Err(format!(

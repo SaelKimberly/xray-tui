@@ -193,13 +193,15 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 
 **Tests**: `xray_build_refuses_the_removed_http_and_quic_transports` (all three spellings — `http`, `h2`, `quic` — refuse, the reason names the transport, and no partial config is left behind); `the_removed_transports_are_still_buildable_for_singbox` (the refusal is scoped to the core that removed them, not to the transport); and `the_removed_transports_emit_the_names_xray_refuses` in `common.rs`, which pins the coupling the validator exists for — `ws`/`httpupgrade`/`splithttp` were already pinned, these two were the unpinned pair, which is why nothing failed when xray-core removed them.
 
-### T9 — mlkem differential · `strict`
+### T9 — mlkem differential · `strict` (landed — verdict: the client, not the pin)
 
-**Files**: `crates/xray-tui-native/tests/vless.rs`, `crates/xray-tui-native/src/e2e/config.rs`
+**Landed 2026-09-22.** Built the HEAD peer (`thirdparty/Xray-core` → **Xray 26.7.28**, go 1.27.1) and added `vless_pq_enc_against_head` — an ignored test that resolves the SECOND pin and runs the same pq-enc case against it. `XRAY_VERSION` is untouched, so the suite's baseline and its 136 rows are unchanged.
 
-**Change**: build `thirdparty/Xray-core` HEAD; run the pq-enc row against it and against the pinned 26.3.27; assert `native.1rtt` and `native.0rtt` behave identically on a fresh dial. Fix whatever the differential localizes.
+**The differential's verdict: not a version delta.** Both revisions behave identically — `connect()` Ok, probe `status 0 body ""` on all 5 attempts, and no server-side error line at either. So the client's `mlkem768x25519plus` wire (or this case's server config) is wrong against real xray at both 26.3.27 and 26.7.28.
 
-**Verify**: the pq-enc row green against the release peer, version recorded. If only HEAD passes, the gate stays closed and that is the recorded outcome.
+**That is the plan's stated branch, and it is recorded rather than papered over:** the pq-enc row stays ignored (its reason now names the differential), and the gate stays closed. Its acceptance — the row green against the release users run — is **not met**, and a HEAD-only pass would have been the narrower claim §5.8 refused.
+
+**What T9 delivered despite that:** the leading hypothesis (stale pin) is eliminated, so the fix round starts from the client. The spec's §5.8 acceptance and this plan's trigger both now say that, instead of pointing at a re-pin that would have changed nothing.
 
 ### T10 — after-numbers and the header decision
 

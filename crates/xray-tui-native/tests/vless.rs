@@ -21,7 +21,7 @@ use common::{
 use rstest::rstest;
 use xray_tui_native::e2e::{
     AppKind, CaseSpec, Certs, CoreKind, CoreUnderTest, EchoServer, Flow, TlsEchoServer, TlsVariant,
-    run_against,
+    XRAY_HEAD_BIN_DIR, XRAY_HEAD_VERSION, run_against,
 };
 use xray_tui_native::protocol::vless::PacketMode;
 
@@ -279,14 +279,20 @@ async fn vless_against_cores(
 // `settings.decryption` the PRIVATE halves (X25519 priv + the 64-B seed);
 // the PQ handshake wraps the whole session before the request header.
 //
-// BLOCKED: against real xray 26.3.27 the client's PQ handshake COMPLETES
-// (connect Ok, request sealed and written) but the tunnel EOFs before the
-// response header — the server closes without logging an error. The native
-// impl mirrors xray's client.go wire (relays per key, pfs = mlkem||x25519,
-// server pfs ct-first — verified in source) and passes the T3 hermetic
-// double; the divergence from the real server is unresolved. Left ignored
-// with the harness wired so the fix round can flip it to green.
-#[ignore = "client handshake completes but the real-xray tunnel EOFs pre-response; needs interop debugging against xray encryption/server.go"]
+// BLOCKED, and the differential has now localized it. Against real xray the
+// client's PQ handshake COMPLETES (connect Ok, request sealed and written) but
+// the tunnel EOFs before the response header — the server closes without
+// logging an error.
+//
+// `vless_pq_enc_against_head` (below) ran the same case against a SECOND pinned
+// peer built from `thirdparty/Xray-core` HEAD (26.7.28) to test the version-delta
+// hypothesis. Result: IDENTICAL — connect Ok, `probe status 0 body ""` on all 5
+// attempts, no server-side error line. So this is NOT the baseline pin being
+// older than the implementation; the client's wire (or this case's server
+// config) is wrong against real xray at BOTH revisions. The gate stays closed
+// until the release is satisfied; the fix round starts from the client, not the
+// pin.
+#[ignore = "client handshake completes but real xray (26.3.27 AND HEAD 26.7.28) EOFs the tunnel pre-response; the differential ruled out a version delta, so the client is at fault"]
 #[case::tcp_pq_enc(vless("tcp").with_pq_enc(), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(
@@ -300,4 +306,32 @@ async fn vless_single_core(
     run_against(&case, pick(cores, core), certs, &echo, &tls_echo)
         .await
         .expect("vless single-core e2e failed");
+}
+
+/// T9's differential: the pq-enc case against the SECOND pinned peer — an
+/// `xray` built from `thirdparty/Xray-core` HEAD — while `XRAY_VERSION` stays
+/// the suite's baseline.
+///
+/// It exists to answer the one question the ignored row could not: is the
+/// pre-response EOF a VERSION DELTA (our client implements a revision newer
+/// than the release) or OUR CLIENT? A green HEAD row with a red baseline row
+/// means the pin is behind the implementation, not that the client is wrong.
+///
+/// The acceptance stays the release's, not HEAD's: a HEAD-only pass is a
+/// narrower claim than the suite's, and the gate stays closed until the release
+/// is satisfied.
+#[ignore = "needs a HEAD-built peer: XRAY_TUI_CORE_HEAD_BIN_DIR"]
+#[rstest]
+#[tokio::test]
+async fn vless_pq_enc_against_head(certs: &Certs, echo: EchoServer, tls_echo: TlsEchoServer) {
+    let Ok(head) =
+        CoreUnderTest::resolve_from(CoreKind::Xray, XRAY_HEAD_VERSION, XRAY_HEAD_BIN_DIR)
+    else {
+        eprintln!("SKIP: set {XRAY_HEAD_BIN_DIR} to a directory holding the HEAD-built `xray`");
+        return;
+    };
+    let case = vless("tcp").with_pq_enc();
+    run_against(&case, &head, certs, &echo, &tls_echo)
+        .await
+        .expect("pq-enc against the HEAD peer");
 }

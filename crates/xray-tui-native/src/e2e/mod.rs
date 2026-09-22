@@ -35,6 +35,16 @@ use crate::{NativeConnectParams, NativeError};
 pub const SINGBOX_VERSION: &str = "1.13.16";
 pub const XRAY_VERSION: &str = "26.3.27";
 
+/// The SECOND pinned peer: `thirdparty/Xray-core` built from source at HEAD.
+///
+/// A separate pin on purpose. Pointing `XRAY_TUI_CORE_BIN_DIR` at a HEAD build
+/// would re-baseline every row in the suite and silently restate its
+/// compatibility claim; this pin exists so one differential can target HEAD
+/// while `XRAY_VERSION` stays the baseline. Only the pq-enc row uses it.
+pub const XRAY_HEAD_VERSION: &str = "26.7.28";
+/// Env var naming the directory that holds the HEAD-built `xray` binary.
+pub const XRAY_HEAD_BIN_DIR: &str = "XRAY_TUI_CORE_HEAD_BIN_DIR";
+
 /// Environment handed to an [`E2eCase`]'s `server_config` builder.
 pub struct ServerEnv<'a> {
     pub port: u16,

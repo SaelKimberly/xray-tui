@@ -345,6 +345,21 @@ Three readings:
 
 **Run-to-run variance, for reading the falsifier:** two identical batch passes gave **79.19** and **83.94 results/s** (≈6 % apart) but **75** and **21** real successes — the rate is stable because failures dominate; the success *count* is not, so no acceptance may rest on it.
 
+**T9 — the mlkem differential (measured 2026-09-22).** Built a SECOND peer from `thirdparty/Xray-core` HEAD — **Xray 26.7.28** (go 1.27.1) — against the pinned baseline 26.3.27, and ran the same pq-enc case against both:
+
+| peer | `connect()` | probe | server log |
+|---|---|---|---|
+| pinned **26.3.27** | Ok (per the ignored row's note) | EOF pre-response | no error line |
+| HEAD **26.7.28** | **Ok** (the failure is at the probe stage, not connect) | `probe status 0 body ""`, 5/5 attempts | **no error line** |
+
+**Identical at both revisions, so the version-delta hypothesis is dead.** This is not the baseline pin being older than the implementation: our client's `mlkem768x25519plus` wire (or this case's server config) is wrong against real xray at *both* revisions. The differential's value is exactly that — it eliminates the leading hypothesis and redirects the fix to the client.
+
+**Acceptance, per §5.8's stated branch:** the pq-enc row **stays ignored**, its reason now naming the differential; the gate stays closed. A HEAD-only pass would have been a narrower claim than the suite's, and this is the other branch — *"both fail → the client is at fault"* — recorded rather than papered over.
+
+**Harness shape, as §5.8 decided:** a **second** pin (`XRAY_HEAD_VERSION = "26.7.28"` + `XRAY_TUI_CORE_HEAD_BIN_DIR`), reached through a new `CoreUnderTest::resolve_from(kind, version, dir_env)`. `XRAY_VERSION` is untouched, so the suite's 136 rows keep their baseline — pointing the baseline env at a HEAD build would have re-baselined all of them and silently restated the compatibility claim.
+
+*Pending M1's after-numbers*: the header A/B re-run and the item-7 wire decision they feed.
+
 ## 9. Evidence base
 
 **The feed, not the engine, dominates.** Two oracles, both on a `curl --socks5-hostname` harness validated against a known-good control (`freedom` outbound → `HTTP 204`).
