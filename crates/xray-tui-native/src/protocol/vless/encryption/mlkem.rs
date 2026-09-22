@@ -1002,7 +1002,7 @@ mod tests {
         x25519_sk: std::sync::Arc<X25519KeyPair>,
         mlkem_sk: xray_tui_tls::crypto::mlkem::SecretKey,
         mode: MlkemMode,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<usize> {
         let relays_len: usize = keys
             .iter()
             .map(|k| match k {
@@ -1121,7 +1121,9 @@ mod tests {
             let mut hdr = [0u8; HEADER_LEN];
             if let Err(e) = conn.read_exact(&mut hdr).await {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
-                    return Ok(());
+                    // The first flight's sealed pfs length, for the caller to
+                    // assert on (a fresh dial must never send the ticket form).
+                    return Ok(length);
                 }
                 return Err(e);
             }
@@ -1161,18 +1163,21 @@ mod tests {
         )
     }
 
-    async fn roundtrip(mode: MlkemMode, padding: &str, payload_len: usize) {
+    /// Returns the FIRST FLIGHT's sealed pfs length as the fake server read it,
+    /// so a caller can assert on the wire shape rather than on bytes (which are
+    /// randomised per connection).
+    async fn roundtrip(mode: MlkemMode, padding: &str, payload_len: usize, seconds: u32) -> usize {
         let (keys, x_sk, mlkem_sk) = test_keys();
         let cfg = EncryptionConfig {
             mode,
-            seconds: 0,
+            seconds,
             padding_lens: parse_padding(padding).expect("padding").0,
             padding_gaps: parse_padding(padding).expect("padding").1,
             keys: keys.clone(),
         };
         let (client_side, server_side) = tokio::io::duplex(1 << 16);
         let server = tokio::spawn(async move {
-            if let Err(e) = fake_server(
+            match fake_server(
                 server_side,
                 keys.clone(),
                 std::sync::Arc::clone(&x_sk),
@@ -1181,7 +1186,11 @@ mod tests {
             )
             .await
             {
-                eprintln!("FAKE SERVER ERR: {e}");
+                Ok(len) => len,
+                Err(e) => {
+                    eprintln!("FAKE SERVER ERR: {e}");
+                    0
+                }
             }
         });
 
@@ -1210,27 +1219,66 @@ mod tests {
         assert_eq!(got, payload, "roundtrip payload");
 
         drop(conn);
-        server.await.expect("server task");
+        server.await.expect("server task")
     }
 
     #[tokio::test]
     async fn roundtrip_native_default_padding() {
-        roundtrip(MlkemMode::Native, "", 10_000).await;
+        roundtrip(MlkemMode::Native, "", 10_000, 0).await;
     }
 
     #[tokio::test]
     async fn roundtrip_xorpub_custom_padding() {
-        roundtrip(MlkemMode::XorPub, "100-35-70.0-0-0.50-100-200.0-0-0", 5_000).await;
+        roundtrip(
+            MlkemMode::XorPub,
+            "100-35-70.0-0-0.50-100-200.0-0-0",
+            5_000,
+            0,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn roundtrip_random_default_padding() {
-        roundtrip(MlkemMode::Random, "", 17_345).await;
+        roundtrip(MlkemMode::Random, "", 17_345, 0).await;
     }
 
     #[tokio::test]
     async fn roundtrip_random_custom_padding() {
-        roundtrip(MlkemMode::Random, "100-35-111.0-0-0", 100).await;
+        roundtrip(MlkemMode::Random, "100-35-111.0-0-0", 100, 0).await;
+    }
+
+    /// A FRESH dial never takes the 0-RTT (ticket) path — for EITHER mode.
+    ///
+    /// The reference sends the ticket form only while it holds a live ticket
+    /// from a *previous* connection (`encryption/client.go:113-121`: `Seconds >
+    /// 0 && time.Now().Before(i.Expire) && i.Ticket`, and `i.Expire`/`i.Ticket`
+    /// are set at `:188-193` from the server's own hello). A probe dials once
+    /// per attempt, so `0rtt` and `1rtt` accounts are indistinguishable on a
+    /// fresh dial — which is why the mode is not a differential for the pq-enc
+    /// interop, and why §5.8's "they behave identically" needed a vehicle that
+    /// is not byte equality (the first flight is randomised: a per-connection
+    /// IV and a fresh ML-KEM encapsulation, so two connects can never match).
+    ///
+    /// The RNG-independent vehicle is STRUCTURAL: the sealed first-flight length
+    /// is the 1-RTT pfs length in both cases, never the ticket form's 32. A
+    /// future change that lets the mode affect the first flight fails here.
+    #[tokio::test]
+    async fn a_fresh_dial_never_takes_the_zero_rtt_path() {
+        // The sealed length field carries the CIPHERTEXT length, i.e. the pfs
+        // plaintext (1184-B ML-KEM pk + 32-B X25519 pk) plus the 16-byte tag —
+        // `PFS_EXCHANGE_LEN` minus its own 18-byte sealed length field.
+        const PFS_SEALED_LEN: usize = PFS_EXCHANGE_LEN - 18;
+        // The ticket form seals `EncodeLength(32)`: a 16-byte ticket plus tag.
+        const TICKET_FORM_LEN: usize = 32 + TAG_LEN;
+        assert_ne!(PFS_SEALED_LEN, TICKET_FORM_LEN, "the two forms differ");
+        for (seconds, label) in [(0_u32, "1rtt"), (1, "0rtt")] {
+            let observed = roundtrip(MlkemMode::Native, "", 64, seconds).await;
+            assert_eq!(
+                observed, PFS_SEALED_LEN,
+                "{label} must send the 1-RTT pfs form on a fresh dial, not the ticket form"
+            );
+        }
     }
 
     // ── Go-pinned keystream vectors (2026-09-18) ─────────────────────────

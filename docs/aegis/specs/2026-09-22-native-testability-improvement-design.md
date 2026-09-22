@@ -188,7 +188,7 @@ So the differential is **base handshake only**, and the `0rtt`/`1rtt` split is n
 
 - Build `thirdparty/Xray-core` HEAD (go 1.27.1 present; `main/main.go` exists).
 - Run our client against it **and** against the pinned 26.3.27.
-- ~~Assert `native.1rtt` and `native.0rtt` behave identically on a fresh dial~~ — **struck as unassertable, and that is the finding.** The first flight is randomised (a per-connection salt, nonce and IV), so no RNG-independent observable distinguishes the two modes; an equality assertion would be testing the RNG. What can be pinned is pinned: `parse_mlkem_encryption`'s own test asserts `0rtt → seconds = 1` — the value that reaches the wire — and the reference reading is recorded above.
+- Assert `native.1rtt` and `native.0rtt` behave identically on a fresh dial — **as a STRUCTURAL test, not byte equality** (the first flight is randomised: a per-connection IV and a fresh ML-KEM encapsulation, so two connects can never match). Vehicle: `mlkem::tests::a_fresh_dial_never_takes_the_zero_rtt_path`, which runs the hermetic fake server for a `1rtt` and a `0rtt` config alike and asserts the sealed first-flight length is the 1-RTT pfs form (`PFS_EXCHANGE_LEN - 18`) rather than the ticket form (`32 + TAG_LEN`). That is exactly the finding the reference reading gave, and a future change that lets the mode affect the first flight fails loudly.
 
 **Harness shape (decided): a second pinned peer.** `26.3.27` stays the suite's baseline — only the pq-enc row targets HEAD. Re-pinning the shared peer would re-baseline all 136 e2e rows (130 green + 6 ignored) and let an unrelated HEAD behaviour change surface as noise, while silently restating the suite's compatibility claim.
 
