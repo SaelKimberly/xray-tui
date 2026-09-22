@@ -279,20 +279,25 @@ async fn vless_against_cores(
 // `settings.decryption` the PRIVATE halves (X25519 priv + the 64-B seed);
 // the PQ handshake wraps the whole session before the request header.
 //
-// BLOCKED, and the differential has now localized it. Against real xray the
-// client's PQ handshake COMPLETES (connect Ok, request sealed and written) but
-// the tunnel EOFs before the response header — the server closes without
-// logging an error.
+// BLOCKED, and localized to OUR CLIENT by two passes.
 //
-// `vless_pq_enc_against_head` (below) ran the same case against a SECOND pinned
-// peer built from `thirdparty/Xray-core` HEAD (26.7.28) to test the version-delta
-// hypothesis. Result: IDENTICAL — connect Ok, `probe status 0 body ""` on all 5
-// attempts, no server-side error line. So this is NOT the baseline pin being
-// older than the implementation; the client's wire (or this case's server
-// config) is wrong against real xray at BOTH revisions. The gate stays closed
-// until the release is satisfied; the fix round starts from the client, not the
-// pin.
-#[ignore = "client handshake completes but real xray (26.3.27 AND HEAD 26.7.28) EOFs the tunnel pre-response; the differential ruled out a version delta, so the client is at fault"]
+// Pass 1: against real xray the client's PQ handshake COMPLETES (connect Ok,
+// request sealed and written) but the tunnel EOFs before the response header.
+// `vless_pq_enc_against_head` ran the same case against a SECOND pinned peer
+// built from `thirdparty/Xray-core` HEAD (26.7.28) to test the version-delta
+// hypothesis: IDENTICAL - connect Ok, `probe status 0 body ""` on all 5
+// attempts, no server-side error at either revision.
+//
+// Pass 2 (the sharper A/B, both ends real xray, keypair from `xray vlessenc`):
+//   pinned client -> pinned server: HTTP 200   (control)
+//   HEAD   client -> pinned server: HTTP 200
+// So the reference client works in EVERY pairing and the older server accepts
+// the newer client wire. Ours works in none => our `mlkem768x25519plus`
+// sealing/padding/framing is the broken side. Not a pin, not a version gap.
+//
+// The fix round's method: capture the reference client's first flight for a
+// fixed pair and diff it against ours. The gate stays closed until then.
+#[ignore = "our mlkem768x25519plus interop: the reference client works against both revisions while ours works against neither, so the fault is ours (differential recorded in the spec's §8.1)"]
 #[case::tcp_pq_enc(vless("tcp").with_pq_enc(), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(

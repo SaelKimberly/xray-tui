@@ -199,7 +199,15 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 
 **Landed 2026-09-22.** Built the HEAD peer (`thirdparty/Xray-core` → **Xray 26.7.28**, go 1.27.1) and added `vless_pq_enc_against_head` — an ignored test that resolves the SECOND pin and runs the same pq-enc case against it. `XRAY_VERSION` is untouched, so the suite's baseline and its 136 rows are unchanged.
 
-**The differential's verdict: not a version delta.** Both revisions behave identically — `connect()` Ok, probe `status 0 body ""` on all 5 attempts, and no server-side error line at either. So the client's `mlkem768x25519plus` wire (or this case's server config) is wrong against real xray at both 26.3.27 and 26.7.28.
+**The differential's verdict, sharpened by a second pass: OUR CLIENT.** Pass 1 (our client against both servers) showed identical behaviour at 26.3.27 and HEAD, killing the version-delta hypothesis. Pass 2 — both ends real xray, keypair from `xray vlessenc` — settled the remaining ambiguity:
+
+| client | server | result |
+|---|---|---|
+| pinned 26.3.27 | pinned 26.3.27 | **HTTP 200** (control) |
+| **HEAD 26.7.28** | pinned 26.3.27 | **HTTP 200** |
+| ours | either | reads nothing |
+
+The reference client works in **every** pairing and the older server accepts the newer client wire; ours works in **none**. So the fault is our `mlkem768x25519plus` sealing/padding/framing — not the pin, not a version gap. The fix round's method is now bounded: capture the reference client's first flight for a fixed pair and diff it against ours.
 
 **That is the plan's stated branch, and it is recorded rather than papered over:** the pq-enc row stays ignored (its reason now names the differential), and the gate stays closed. Its acceptance — the row green against the release users run — is **not met**, and a HEAD-only pass would have been the narrower claim §5.8 refused.
 
@@ -220,12 +228,6 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 | timeouts | 5 | 9 |
 
 Not one row turned green, and four got slower (a `400` became a 4 s hang) — so the headers are *seen* but do not make the transport work. Reverted via `git checkout` rather than left behind a gate. Item 7 resolves to **out of scope with a recorded negative**, the spec's stated fallback; the `405` on our PUT (matching sing-box) plus the 404s already pointed at origin answers about a missing path/method rather than edge bot-protection.
-
-**Files**: `crates/xray-tui/src/ops/ping/flow_cost.rs`, `NATIVE_CORE.md` (only if the wire changes)
-
-**Change**: re-run M0/M1; compute the ratio against the T0 baseline. If `≥1.5×`, the speed stage is accepted. If the header A/B moved rows, change the wire; if inconclusive, record the negative result and leave item 7 out of scope.
-
-**Verify**: §8.1 holds before, after, ratio, and the header verdict.
 
 ### T11 — owner-doc amendments and index
 

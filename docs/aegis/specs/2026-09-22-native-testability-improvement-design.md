@@ -188,7 +188,7 @@ So the differential is **base handshake only**, and the `0rtt`/`1rtt` split is n
 
 - Build `thirdparty/Xray-core` HEAD (go 1.27.1 present; `main/main.go` exists).
 - Run our client against it **and** against the pinned 26.3.27.
-- Assert `native.1rtt` and `native.0rtt` behave **identically** on a fresh dial, pinning the above finding as a test rather than a note.
+- ~~Assert `native.1rtt` and `native.0rtt` behave identically on a fresh dial~~ — **struck as unassertable, and that is the finding.** The first flight is randomised (a per-connection salt, nonce and IV), so no RNG-independent observable distinguishes the two modes; an equality assertion would be testing the RNG. What can be pinned is pinned: `parse_mlkem_encryption`'s own test asserts `0rtt → seconds = 1` — the value that reaches the wire — and the reference reading is recorded above.
 
 **Harness shape (decided): a second pinned peer.** `26.3.27` stays the suite's baseline — only the pq-enc row targets HEAD. Re-pinning the shared peer would re-baseline all 136 e2e rows (130 green + 6 ignored) and let an unrelated HEAD behaviour change surface as noise, while silently restating the suite's compatibility claim.
 
@@ -230,7 +230,9 @@ M0 is the only stage that blocks other scoped work, so it is the natural first p
 - *Class mis-attribution = 0*: the VLESS response-header EOF lands in `ProbeClass::Protocol`; `ProbeClass::Tls` is proven unreachable from a tunnel-payload error.
 - *`config_invalid` mapping*: missing-pbk / malformed-sid evidence produces `config_invalid`; a genuine server-auth failure still produces `reality_fallback`.
 
-**Class 4 — pass/fail.** The pq-enc e2e row green against the release peer, version recorded; and the removed-transport refusal proven by one forced `protocol_core_overrides` entry on a `type=http` link.
+**Class 4 — pass/fail.**
+- *mlkem:* the pq-enc e2e row green against the release peer, version recorded. **Not met, and recorded as such:** the differential localized the fault to our client (§8.1), so the row stays ignored and the gate stays closed. This is §5.8's stated branch, not a dropped criterion.
+- *Removed transport:* proven by one forced `protocol_core_overrides` entry on a `type=http` link. **Met at the build level** — the refusal is asserted for all three spellings (`http`/`h2`/`quic`) with no partial config left behind — and the *connect-path* half needed no code: `resolve_runtime_core` already sends native-capable kinds to native before any build, so the refusal is reachable only through an explicit override, which decision 20 answers by warning.
 
 ## 8. Verification mechanics
 
@@ -351,18 +353,29 @@ Three readings:
 
 **Run-to-run variance, for reading the falsifier:** two identical batch passes gave **79.19** and **83.94 results/s** (≈6 % apart) but **75** and **21** real successes — the rate is stable because failures dominate; the success *count* is not, so no acceptance may rest on it.
 
-**T9 — the mlkem differential (measured 2026-09-22).** Built a SECOND peer from `thirdparty/Xray-core` HEAD — **Xray 26.7.28** (go 1.27.1) — against the pinned baseline 26.3.27, and ran the same pq-enc case against both:
+**T9 — the mlkem differential (measured 2026-09-22).**
 
-| peer | `connect()` | probe | server log |
-|---|---|---|---|
-| pinned **26.3.27** | Ok (per the ignored row's note) | EOF pre-response | no error line |
-| HEAD **26.7.28** | **Ok** (the failure is at the probe stage, not connect) | `probe status 0 body ""`, 5/5 attempts | **no error line** |
+*First pass — our client against both servers.* Built a SECOND peer from `thirdparty/Xray-core` HEAD (**Xray 26.7.28**, go 1.27.1) and ran the pq-enc case against both:
 
-**Identical at both revisions, so the version-delta hypothesis is dead.** This is not the baseline pin being older than the implementation: our client's `mlkem768x25519plus` wire (or this case's server config) is wrong against real xray at *both* revisions. The differential's value is exactly that — it eliminates the leading hypothesis and redirects the fix to the client.
+| server | our client |
+|---|---|
+| pinned **26.3.27** | `connect()` Ok, probe reads nothing, no server-side error |
+| HEAD **26.7.28** | `connect()` Ok, `probe status 0 body ""` 5/5, **no server-side error** |
 
-**Acceptance, per §5.8's stated branch:** the pq-enc row **stays ignored**, its reason now naming the differential; the gate stays closed. A HEAD-only pass would have been a narrower claim than the suite's, and this is the other branch — *"both fail → the client is at fault"* — recorded rather than papered over.
+Identical at both revisions — so the version-delta hypothesis was dead. But that leaves two readings: our client is broken, or the pairing cannot work at all.
 
-**Harness shape, as §5.8 decided:** a **second** pin (`XRAY_HEAD_VERSION = "26.7.28"` + `XRAY_TUI_CORE_HEAD_BIN_DIR`), reached through a new `CoreUnderTest::resolve_from(kind, version, dir_env)`. `XRAY_VERSION` is untouched, so the suite's 136 rows keep their baseline — pointing the baseline env at a HEAD build would have re-baselined all of them and silently restated the compatibility claim.
+*Second pass — the reference client against the reference server (the sharper A/B).* Both ends are real xray, and the keypair comes from the reference's own generator (`xray vlessenc`), so nothing in the experiment is ours:
+
+| client | server | result |
+|---|---|---|
+| pinned 26.3.27 | pinned 26.3.27 | **HTTP 200** in 86 ms (control — validates the harness) |
+| **HEAD 26.7.28** | pinned 26.3.27 | **HTTP 200** in 107 ms |
+
+**The reference client works in every pairing; ours works in none.** So the older server *does* accept the newer client wire, the wire is not the problem, and our `mlkem768x25519plus` implementation is the broken side — an interop bug in our sealing/padding/framing, not a pin and not a version gap. That is the bounded target the fix round needed: capture the reference client's first flight for a fixed pair and diff it against ours.
+
+**Acceptance, per §5.8's stated branch:** the pq-enc row **stays ignored**, its reason now naming both passes; the gate stays closed. A HEAD-only pass would have been a narrower claim than the suite's, and this is the other branch — *"both fail → the client is at fault"* — now sharpened to *"the reference works everywhere, so the fault is ours"*.
+
+**Harness shape, as §5.8 decided:** a **second** pin (`XRAY_HEAD_VERSION = "26.7.28"` + `XRAY_TUI_CORE_HEAD_BIN_DIR`), reached through `CoreUnderTest::resolve_from(kind, version, dir_env)`. `XRAY_VERSION` is untouched, so the suite's 136 rows keep their baseline. The sharper A/B itself was a throwaway script (`/tmp/xr_logs/ab_mlkem.py`, two configs + curl through a socks inbound); its method is recorded here because the in-suite row cannot express it.
 
 **T10 — the after-run, and item 7's A/B (measured 2026-09-22).**
 
