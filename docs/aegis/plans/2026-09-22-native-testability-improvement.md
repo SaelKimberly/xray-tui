@@ -29,7 +29,7 @@ Rust 2024, tokio, the in-process native engine (`xray-tui-native`), the TLS engi
 ## Compatibility boundary
 
 - **Unchanged**: the SQLite schema (tag 12), every `PurgeReason` variant, every tuning default, the `profile_stats` column set, the `TransportConfig`/`SecurityConfig` serde shapes.
-- **Changed, user-visible**: the probe budget default (a correctness default — the one named exception to "no default change"), the fingerprint capability verdict for 1,165 links, and the class a failure is counted under.
+- **Changed, user-visible**: the probe budget default (a correctness default — the one named exception to "no default change"), the fingerprint capability verdict for 1,165 links (2026-09-21 audit snapshot), and the class a failure is counted under.
 - **Retained deliberately**: `NullRunner` stays in the lab (it is the fast, network-free baseline for flow/DB rows).
 
 ## TDD Route
@@ -59,7 +59,7 @@ cargo clippy --workspace --all-targets
 
 **Change**: `batch_params` takes a runner choice; the lab gains an `EngineProbeRunner` row set over the **feed in ID order** (capped by `XRAY_TUI_MEASURE_MAX_LINKS`) loaded from `XRAY_TUI_MEASURE_DB`. Add one table row reporting median real-probe latency and results/s at a fixed concurrency.
 
-**Slice selection — decided here, not at execution.** The live evidence is thin (22 rows ever recorded a real success, days old, none reproducing), and the two numbers have different sample needs:
+**Slice selection — decided here, not at execution.** The live evidence is thin (22 rows had ever recorded a real success at the 2026-09-21 snapshot, days old, none reproducing), and the two numbers have different sample needs:
 
 - **results/s** counts *attempts*, so mostly-failing endpoints are fine and the slice can be drawn straight from the feed.
 - **the p99 of successes** needs actual successes. At the measured ~1.3 % real-ok rate a 50-endpoint slice yields ~0–1 of them — no usable p99.

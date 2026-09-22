@@ -13,7 +13,7 @@ Coverage alone is explicitly **not** the criterion. The chosen fingerprint polic
 
 ## 2. Why this exists
 
-A read-only audit of a real two-subscription feed (8,071 endpoints / 10,264 links, `data.db`; 162,875 heed log entries) produced seven findings. The dominant cause of failure is the feed, not the engine — two oracles established that (§9). But a measurable subset fails for reasons under our control, and several persisted verdicts do not mean what they say.
+A read-only audit of a real two-subscription feed — **8,071 endpoints / 10,264 links at the 2026-09-21 snapshot** (the feed grew during the work; §8.1 records each measurement's own snapshot) — produced seven findings. The dominant cause of failure is the feed, not the engine — two oracles established that (§9). But a measurable subset fails for reasons under our control, and several persisted verdicts do not mean what they say.
 
 Audit run analysed: `2026-09-21 17:30:59 → 17:40:55` (quit at 598 s):
 
@@ -61,7 +61,7 @@ skipped-unreachable=5554 | wall=598230 ms
 
 `360` appears in the table for completeness; the measured feed carries none. The subtotals below are the measured populations.
 
-Today's capability-refused population is **1,165 links**, split:
+The audit's capability-refused population was **1,165 links** (2026-09-21 snapshot; **1,181** once the feed grew, §8.1 — the figures below are that snapshot's), split:
 
 | population | links | disposition after this spec |
 |---|---|---|
@@ -442,14 +442,14 @@ Mlkem768::keypair_from_seed(reference seed) == reference ek    →  PASSES
 
 ## 9. Evidence base
 
-**The feed, not the engine, dominates.** Two oracles, both on a `curl --socks5-hostname` harness validated against a known-good control (`freedom` outbound → `HTTP 204`).
+**The feed, not the engine, dominates.** Two oracles, both on a `curl --socks5-hostname` harness validated against a known-good control (`freedom` outbound → `HTTP 204`). **Every figure in this section is the 2026-09-21 audit snapshot** (8,071 endpoints / 10,264 links); the feed grew during the work, so §8.1's run-level figures carry their own snapshots.
 
-- **REALITY fallback — 710 rows (38 % of 1,882 real failures).** 16/16 sampled fallback configs (distinct `pbk` each) also fail under a real xray-core client. Our auth is separately e2e-proven interoperable against real xray 26.3.27 / sing-box 1.13.16 (`tests/vless.rs:88-107`, `e2e/variant.rs:223-296,344-370`). → stale/rotated `pbk`/`sid`, or a host that is not REALITY.
+- **REALITY fallback — 710 rows (38 % of 1,882 real failures) at the 2026-09-21 snapshot.** 16/16 sampled fallback configs (distinct `pbk` each) also fail under a real xray-core client. Our auth is separately e2e-proven interoperable against real xray 26.3.27 / sing-box 1.13.16 (`tests/vless.rs:88-107`, `e2e/variant.rs:223-296,344-370`). → stale/rotated `pbk`/`sid`, or a host that is not REALITY.
 - **`type=http` — 144 rows.** The raw subscription links say `type=http` (verified by re-fetching `groups.url`), and xray-core removed that transport. sing-box 1.13.16 fails 8/8 on the same sample. No engine can serve them.
 - **Fast timeouts — 4,712.** 4,120 are bare IPv4 literals: dead servers, not a multi-address artefact.
 - **Parse layer is faithful** — `raw`→Tcp (715 links), `http|h2|https`→Http, `xhttp|splithttp`→XHttp, malformed `type=` values prefix-recovered (`proto_spec/common.rs:64-133`). No action.
 
-**Feed-wide capability populations.** Fingerprint refusals 913 protocols / 1,165 links; mlkem 113 / 131; `type=http` 569 protocols; `quic` 53 links / 48 protocols (hysteria2 only, so sing-box).
+**Feed-wide capability populations** (2026-09-21 audit snapshot; the feed grew afterwards, §8.1). Fingerprint refusals 913 protocols / 1,165 links; mlkem 113 / 131; `type=http` 569 protocols; `quic` 53 links / 48 protocols (hysteria2 only, so sing-box).
 
 **Throughput.** 1.81 real results/s at `real_ping_concurrency: 5` (code default 100); 1,083 real results in 598 s. 531 of 535 real-timeout rows had a sub-second fast latency, i.e. the server answered TCP instantly and the probe still blew its budget.
 
