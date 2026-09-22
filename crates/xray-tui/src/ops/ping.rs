@@ -71,7 +71,17 @@ pub fn untestable_marker_text(reason: &str) -> String {
 /// engine cannot serve this row) rather than "the probe ran and failed".
 #[must_use]
 pub fn is_untestable_marker(error: &xray_tui_db::models::ErrorInfo) -> bool {
-    error.text.starts_with(UNTESTABLE_PREFIX)
+    is_untestable_text(&error.text)
+}
+
+/// The text-level twin of [`is_untestable_marker`], for the paths that hold the
+/// failure text before any row exists — the batch's counters.
+///
+/// One prefix check for both, so the marker's discriminator cannot drift between
+/// the Test cell, the Remove-Bad-Servers guard and the counters.
+#[must_use]
+fn is_untestable_text(text: &str) -> bool {
+    text.starts_with(UNTESTABLE_PREFIX)
 }
 
 /// A link counts as "failed" for the Remove-Bad-Servers sweep only when a probe
@@ -2057,9 +2067,20 @@ impl BatchShared {
             (_, ProbeOutcome::Ok { .. }) => {
                 self.counters.real_ok.fetch_add(1, Ordering::Relaxed);
             }
-            (_, ProbeOutcome::Failed { class, .. }) => {
-                self.counters.real_failed.fetch_add(1, Ordering::Relaxed);
-                bump_class(&self.counters.real_fail, *class);
+            (_, ProbeOutcome::Failed { text, class, .. }) => {
+                // One counter, one meaning. A config-level refusal is
+                // UNTESTABLE, not a failed probe: it used to land in
+                // `real_failed`/`real_fail[Config]` while the plan-time
+                // kind-level refusal incremented `untestable`, so one fact was
+                // booked twice and a run line could read
+                // `untestable=0 ... config=173` (2026-09-21, where the 173 were
+                // exactly the persisted untestable markers).
+                if is_untestable_text(text) {
+                    self.counters.untestable.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.counters.real_failed.fetch_add(1, Ordering::Relaxed);
+                    bump_class(&self.counters.real_fail, *class);
+                }
             }
         }
         let (latency_ms, ip_info, error, purge) = match outcome {
@@ -3091,6 +3112,57 @@ mod tests {
         ] {
             assert!(line.contains(expected), "missing {expected:?} in: {line}");
         }
+    }
+
+    /// T7: one counter, one meaning. A config-level refusal is UNTESTABLE, not
+    /// a failed probe. Both used to be booked — the plan-time kind gate
+    /// incremented `untestable` while a config-level refusal incremented
+    /// `real_failed` and `real_fail[Config]` — which is why the 2026-09-21 run
+    /// line read `untestable=0 … config=173` where the 173 were exactly the
+    /// persisted untestable markers.
+    #[tokio::test]
+    async fn a_config_level_refusal_counts_as_untestable_not_as_a_failed_probe() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let h = harness(rows.clone()).await;
+        let params = build_params(&h, plan_from_rows(&rows), true, false);
+        let shared = BatchShared::new(params);
+        let link = rows[0].links[0].clone();
+
+        shared.emit_result(
+            &link,
+            TestType::RealPing,
+            &ProbeOutcome::soft_failure(untestable_marker_text(
+                "vless account encryption is not implemented",
+            )),
+        );
+        assert_eq!(
+            shared.counters.untestable.load(Ordering::Relaxed),
+            1,
+            "a config-level refusal is untestability"
+        );
+        assert_eq!(
+            shared.counters.real_failed.load(Ordering::Relaxed),
+            0,
+            "and it is NOT a failed probe — one fact, one counter"
+        );
+        assert!(
+            shared.counters.real_fail.lock().is_empty(),
+            "so it contributes no failure class either"
+        );
+
+        // A genuine failure still counts as one, so the fix cannot be "count
+        // everything as untestable".
+        shared.emit_result(
+            &link,
+            TestType::RealPing,
+            &ProbeOutcome::soft_failure("timeout on probe attempt (limit 5s)"),
+        );
+        assert_eq!(shared.counters.real_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shared.counters.untestable.load(Ordering::Relaxed),
+            1,
+            "and the untestable count did not move"
+        );
     }
 
     // ── error-TTL sweep at batch completion ──────────────────────────────
