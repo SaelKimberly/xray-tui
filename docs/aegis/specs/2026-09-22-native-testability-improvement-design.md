@@ -358,7 +358,24 @@ Three readings:
 
 **Harness shape, as §5.8 decided:** a **second** pin (`XRAY_HEAD_VERSION = "26.7.28"` + `XRAY_TUI_CORE_HEAD_BIN_DIR`), reached through a new `CoreUnderTest::resolve_from(kind, version, dir_env)`. `XRAY_VERSION` is untouched, so the suite's 136 rows keep their baseline — pointing the baseline env at a HEAD build would have re-baselined all of them and silently restated the compatibility claim.
 
-*Pending M1's after-numbers*: the header A/B re-run and the item-7 wire decision they feed.
+**T10 — the after-run, and item 7's A/B (measured 2026-09-22).**
+
+**M0 reproduces.** Three passes of the same slice at the same harness-only concurrency: **79.19**, **83.94**, **84.55 results/s** — a ~7 % spread across three runs, and the last one *after* T5/T6/T7/T8 landed, so none of them regressed the real level. That stability is what the falsifier needs; the samples are the baseline.
+
+**The ≥1.5× bar has no candidate change in this spec.** The only task that targeted per-attempt cost is T4, and it was deferred on measurement (the outer budget already binds, so its observable effect is nil). T3 was already in the M0 baseline; T5–T8 change bookkeeping, a class label, and a build-time refusal. So the bar is **not met**, and the reason is structural rather than a failed optimisation — recorded so a later reader does not read it as the engine having been tried and found wanting.
+
+**Item 7 — the header A/B: a measured NEGATIVE, and the change is reverted.** Implemented xray's `utils.TryDefaultHeadersWith` set (chrome identity + `Sec-Fetch-*` + `Cache-Control`/`Pragma`/`Accept`, per variant `ws`/`fetch`) behind an env gate so control and treatment shared one binary, then ran the pinned 40-link control twice:
+
+| | control (no headers) | treatment (headers) |
+|---|---|---|
+| `ok` | **0** | **0** |
+| `v2rayhttp 400 Bad Request` | 6 | **2** |
+| timeouts | 5 | **9** |
+| total HTTP-layer refusals | 33 | 29 |
+
+**Not one row turned green**, and four got *slower* — a `400` became a 4 s hang, so the headers ARE seen (the server's answer changed) but they do not make the transport work. The hypothesis "the CDN refuses us for lacking browser defaults" is falsified as a fix. The change was reverted (`git checkout`), not left in behind a gate: a wire change that fixes nothing and slows four rows is not worth carrying.
+
+**Item 7 resolves to out-of-scope with a recorded negative**, which is the spec's stated fallback for an inconclusive-or-negative A/B. The `405 Method Not Allowed` on our PUT (matching sing-box) plus the 404s already pointed the same way: these look like ORIGIN answers about a path/method that does not exist there, not edge bot-protection — so no request-header set would help.
 
 ## 9. Evidence base
 

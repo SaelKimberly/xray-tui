@@ -203,7 +203,21 @@ Two tests updated/added, both asserting **what the failure proves** (`err.eviden
 
 **What T9 delivered despite that:** the leading hypothesis (stale pin) is eliminated, so the fix round starts from the client. The spec's §5.8 acceptance and this plan's trigger both now say that, instead of pointing at a re-pin that would have changed nothing.
 
-### T10 — after-numbers and the header decision
+### T10 — after-numbers and the header decision · **landed (negative result, reverted)**
+
+**M0 reproduces:** three passes at the same harness-only concurrency — **79.19**, **83.94**, **84.55 results/s**, ~7 % spread, the last one *after* T5–T8, so none regressed the real level.
+
+**The ≥1.5× bar has no candidate change in this spec.** The only task targeting per-attempt cost is T4, deferred on measurement; T3 was already in the M0 baseline and T5–T8 change bookkeeping, a class label and a build-time refusal. The bar is not met, and the reason is structural — recorded so it is not read as a tried-and-failed optimisation.
+
+**Item 7's A/B is a measured negative, and the change is reverted.** Implemented xray's `utils.TryDefaultHeadersWith` set behind an env gate (so control and treatment shared one binary) and ran the pinned 40-link control twice:
+
+| | control | treatment |
+|---|---|---|
+| `ok` | 0 | 0 |
+| `v2rayhttp 400` | 6 | 2 |
+| timeouts | 5 | 9 |
+
+Not one row turned green, and four got slower (a `400` became a 4 s hang) — so the headers are *seen* but do not make the transport work. Reverted via `git checkout` rather than left behind a gate. Item 7 resolves to **out of scope with a recorded negative**, the spec's stated fallback; the `405` on our PUT (matching sing-box) plus the 404s already pointed at origin answers about a missing path/method rather than edge bot-protection.
 
 **Files**: `crates/xray-tui/src/ops/ping/flow_cost.rs`, `NATIVE_CORE.md` (only if the wire changes)
 
