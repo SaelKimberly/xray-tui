@@ -107,9 +107,16 @@ pub const TUNNEL_READ: Duration = Duration::from_secs(30);
 
 An attempt traverses dial → security → transport → protocol **sequentially**, so its legitimate window is their sum (~40 s), while the probe budget is **5 s** — smaller than a single one of the engine's own steps. The 5 s is our shipped default, not a user choice (`crates/xray-tui-config/src/app_config.rs`, `default_real_ping_timeout_secs`).
 
-Design: the constants become **clamps** against a caller-supplied attempt deadline — each step takes `min(step_constant, remaining)`. The clamp is a property of the caller's budget, not of the step: a caller that supplies a budget has its steps clamped; a caller that supplies none (the live proxied tunnel) keeps the constants. Under that rule `TUNNEL_READ`'s 30 s becomes **unreachable for the probe** (four clamped steps always consume the budget first), which is the intended outcome rather than an exemption, and a live connection is untouched.
+Design: the constants become **clamps** against a caller-supplied attempt deadline — each step takes `min(step_constant, remaining)`. The clamp is a property of the caller's budget, not of the step: a caller that supplies a budget has its steps clamped; a caller that supplies none (the live proxied tunnel) keeps the constants. Under that rule `TUNNEL_READ`'s 30 s is unreachable for the probe **while the budget is below the four caps' sum (~40 s)** — which is every default and every plausible setting; a budget above ~40 s would make it reachable. A live connection is untouched either way.
 
-**Status: DEFERRED with T4 — this design is not landed.** The observable contract it exists for is already met and tested by `probe.rs`'s outer wrapper (§T4 in the plan carries the reasoning and the un-defer trigger). Note also what the clamp does *not* do: because it is `min`, a step is capped DOWN and can never exceed its constant, so a budget larger than 10 s still dies at the 10 s `DIAL` cap — that is the design, not a defect it removes.
+**What the clamp does and does not change — and the overstatement the design line above contains.** That line framed the constants as *unreachable dead configuration* (the budget is "smaller than a single one of the engine's own steps"). Two readings follow, and only one survives:
+
+- *"The budget is authoritative and the step constants are dead."* **False under `min`.** A step is capped DOWN and can never exceed its constant, so a 20 s budget still dies at the 10 s `DIAL` cap — the caps remain authoritative *per step*, and the budget bounds the total. (This is also why a user-settable budget above 10 s is not a reason to un-defer: it makes the caps bind, which is the design, not a defect the clamp removes.)
+- *"The steps are per-step caps inside the budget."* **This is what `min` implements**, and it is coherent policy: a 15 s dial is a dead server whether the total budget is 5 s or 20 s.
+
+So there is **no defect here for T4 to fix**: the outer wrapper already prevents any step outliving the budget, and the caps binding above 10 s is the design. T4's remaining value is hygiene — the constants become *derived* rather than independent — which is exactly why it is deferred. "The budget is the only authoritative number" was the overstatement.
+
+**Status: DEFERRED with T4 — this design is not landed.** The observable contract it exists for is already met and tested by `probe.rs`'s outer wrapper; the plan's T4 carries the reasoning, the un-defer trigger and the measured 58-site scope.
 
 The budget's **value** IS settled, contrary to the earlier text here: M0b measured basis 2's p99 at 3,251 ms, so the shipped **5 s default stays** and no success-based p99 exists to justify a raise. §6 records the measurement.
 
