@@ -99,33 +99,29 @@ So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipp
 
 **Verify**: class-1 static check — refusal count 0, approximated count 923 over the feed.
 
-### T4 — budget authority: steps clamp to the attempt budget · `strict`
+### T4 — budget authority: steps clamp to the attempt budget · **DEFERRED**
 
-**Files**: `crates/xray-tui-native/src/error.rs`, `crates/xray-tui-native/src/context.rs`, `crates/xray-tui/src/ops/ping_native.rs`, plus the probe-path call sites in `security/`, `transport/`, `protocol/` (see the corrected design below).
+**Deferred 2026-09-22, before implementation.** The observable contract this task exists to provide is **already met and already tested**, so what remained was inner-constant hygiene with an unobservable effect.
 
-**Change**: `timeouts` constants become **caps** against a caller-supplied attempt deadline; the probe supplies the deadline; callers without one (a live proxied connection) keep the constants unchanged.
+`probe.rs:73-96` already wraps the WHOLE attempt in one caller-supplied deadline:
 
-**RED**: a test asserting every clamped step is `≤ remaining`, and that an attempt cannot exceed its budget.
-**GREEN**: implement the clamp. **The budget VALUE is unchanged** — settled by M0b below.
+```rust
+let attempt = async move {
+    let tunnel = crate::connect(params).await?;
+    fetch_over(tunnel, req).await
+};
+let response = Box::pin(tokio::time::timeout(req.timeout, attempt)).await …
+```
 
-#### Corrected design — the plan's original file list was wrong
+and its own doc states the engine's per-step limits are *"defence in depth, **not the contract** — without this wrapper a 5 s setting let a probe spend 10 s in the dial alone and report `timeout on tcp dial (limit 10s)`"*. A test already pins it: `probe::tests::a_stalled_handshake_is_bounded_by_the_attempt_budget` (`probe.rs:235-239`), green in every run. M0b's `Timeout` bin pinned at **5,001 ms** is that same wrapper firing — the empirical confirmation.
 
-The first draft assumed three files. Measuring the call sites first (`timeouts::*` has **~40 uses across 23 files**) showed that threading a budget **by signature** would add an `Option<AttemptBudget>` parameter to ~40 functions, most of which do not need it — and several of which are not on the probe path at all:
+What T4 would still add is making the inner constants caps rather than independent values. Under the current 5 s budget every clamp resolves to the same value the outer wrapper already imposes, so the change is unobservable — and a *partially* threaded budget is worse than none: some steps clamped and others on bare constants would make the relationship look explicit while being incomplete, and no test distinguishes that from a complete threading.
 
-- `inbound/*` — the local SOCKS5/HTTP server's own handshakes, bounded by `PROTOCOL`. Not an attempt.
-- `outbound.rs::relay` — `TUNNEL_READ` there is documented as *"bounds inactivity of the TUNNEL, not of one direction"*. A live-relay concern, not an attempt bound.
+**Un-defer trigger**: land T4 in its own slice when a budget value **exceeding 10 s** exists — that is the only condition under which the inner clamps have a job. M0b showed no success-based p99 is obtainable on this feed, so that trigger is not currently reachable, and §5.2's rationale is satisfied by the existing wrapper meanwhile.
 
-So the budget goes where this repo already keeps per-link policy: **`LinkContext`**, the documented *"per-link policy decision surface — every phase reads its policy from the context, never re-derives it"*. It is already in scope at every engine site (e.g. `context.rs::server_socket` reads `timeouts::DIAL` internally). The change is therefore **signature-free**:
+**Scope if un-deferred** (measured, so it is not re-discovered): ~23 files — `context.rs`, `probe.rs`, `inbound/*`, `transport/{tcp,quic,httpupgrade,http/conn}.rs`, `security/*` — with the budget carried on `LinkContext` (the per-link policy surface, already in scope at every engine site) rather than threaded by signature. Two sites are deliberate exemptions and a reviewer must confirm both: `inbound/*` (the local server's own handshake, not an attempt) and `outbound.rs::relay`'s `TUNNEL_READ` (*"bounds inactivity of the TUNNEL, not of one direction"*).
 
-- `LinkContext` gains an `Option<AttemptBudget>` field and `fn step_limit(&self, cap: Duration) -> Duration` — `cap.min(budget.remaining())` when a budget is present, else `cap`.
-- Each probe-path site substitutes `timeouts::X` → `ctx.step_limit(timeouts::X)`. The `inbound/*` and relay sites keep the bare constant, deliberately.
-- `probe.rs` sets the budget from `NativeProbeReq::timeout`; nothing else changes.
-
-**Consequence for the task boundary.** T4 is a *mechanical per-site substitution with a per-site judgement* (is this site on the attempt path?), not a three-file edit. The per-site review is part of the task, and the two deliberate exemptions above are the ones a reviewer must confirm.
-
-**Observable effect today is nil**, and that is expected: the outer budget already binds at 5 s, so the engine's step constants are currently unreachable. T4 makes the relationship explicit and makes the constants meaningful as per-step caps; it does not change any measured outcome. That is why it must not be credited with the throughput baseline's 79–84 results/s.
-
-**Verify**: the clamp tests; the two exemptions asserted (an inbound handshake and a relay read are NOT clamped).
+**The value decision is settled regardless**: the shipped 5 s default stays (basis 2's p99 is 3,251 ms; no success-based p99 exists to justify a raise).
 
 **Budget basis — stated, because the naive form is unexecutable.** M0 measured it rather than leaving it a contingency: one whole-feed pass yields **75** real successes (1.67 %) and a sequential 300 s sample yielded **0 in 81 attempts**, so a p99 over successes needs the whole feed several times over. Basis 1 is therefore **unreachable on this feed** and the operative basis is:
 
@@ -146,16 +142,24 @@ Two consequences, both settled here rather than at execution:
 
 **Verify**: the clamp tests; the budget value recorded in §8.1 with its p99 basis.
 
-### T5 — purge mapping + approximated evidence · `strict`
+### T5 — purge mapping + the approximated rule · `strict` (half landed)
 
-**Files**: `crates/xray-tui/src/ops/purge.rs`, `crates/xray-tui-native/src/error.rs`
+**Files**: `crates/xray-tui-native/src/security/{mod.rs,reality.rs}`, `crates/xray-tui/src/ops/purge.rs`, `crates/xray-tui/src/ops/ping.rs`
 
-**Change**: missing-pbk / malformed-sid evidence maps to `config_invalid`; `FailureEvidence` gains the approximated carrier; `reason_for` returns `None` for approximated evidence. No new `PurgeReason` variant.
+**Landed 2026-09-22 — the config-defect mapping.** Four sites created a malformed REALITY config as `NativeError::Reality`, and `evidence()` maps that variant to `FailureEvidence::RealityFallback` (`error.rs:75-76`) — so a broken config was permanently purged as *"the server is not REALITY / a possible MITM"*, a verdict about the peer when the peer was never reached. All four now raise `NativeError::Config` → `ConfigDefect` → `config_invalid`:
 
-**RED**: `reason_for` tests — config-defect evidence ⇒ `config_invalid`; genuine server-auth failure ⇒ `reality_fallback`; approximated evidence ⇒ `None` for every variant.
-**GREEN**: implement the mapping and the carrier.
+- `security/mod.rs` — missing `pbk`
+- `security/reality.rs` — non-base64 `pbk`, `pbk` not 32 bytes, malformed `short_id` (two sites)
 
-**Verify**: those tests, plus the existing purge tests unchanged.
+**`reason_for` needed no change**: `FailureEvidence::ConfigDefect => PurgeReason::ConfigInvalid` already existed and already fired (1 row). The defect was upstream, where the error was *created* — which is why this half is 4 one-line changes and not a taxonomy revision.
+
+Two tests updated/added, both asserting **what the failure proves** (`err.evidence()`), not which variant carries it: `security::reality::tests::malformed_reality_material_proves_a_config_defect_not_a_peer_verdict` and the rewritten `security::tests::reality_connect_rejects_short_pbk`.
+
+**Still open — the approximated rule (T5's second half).** `reason_for(evidence)` is pure and has no link, so the rule "no verdict from an approximated probe" needs the fp at the decision point. Settled design (§5.3): derive it from the link's `security_fp` with T3's predicate — no engine threading. The exact change sites, so it is not re-discovered:
+
+- `reason_for(evidence)` → `reason_for(evidence, fp: Option<&str>)`, first check = approximation → `None`. It stays the module's single verdict owner, which is the property the module doc claims.
+- Three production call sites, all in `ops/ping.rs`: `:320` (single real ping), `:1968` (`stage_result`), `:2053` (the batch's staged path). Each has a `ProfileStats` link; the **protocol row** (`security_fp`) is available as `plan.protocol` in the batch paths and must be threaded to `stage_result` — that threading is the whole cost of this half.
+- Test: an approximated failure carrying any evidence variant returns `None`; the existing purge tests keep passing for non-approximated evidence.
 
 ### T6 — class precision · `strict`
 

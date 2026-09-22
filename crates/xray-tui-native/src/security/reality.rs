@@ -38,20 +38,30 @@ impl std::fmt::Debug for HelloProvisionerChoice {
 
 /// Decode a REALITY `pbk` (base64url, no padding — Xray's `privateKey`
 /// encoding) to its 32 bytes.
+///
+/// Every failure here is a CONFIG defect (`NativeError::Config` →
+/// `FailureEvidence::ConfigDefect` → `PurgeReason::ConfigInvalid`), never a
+/// `Reality` error: the server was never reached, so the row proves nothing
+/// about the peer. A `Reality` error would be purged as `RealityFallback` —
+/// "the server is not REALITY / a possible MITM" — which is a verdict about the
+/// wrong thing entirely.
 pub(crate) fn decode_pbk(s: &str) -> Result<[u8; 32], NativeError> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
-        .map_err(|e| NativeError::Reality(format!("invalid pbk base64url: {e}")))?;
+        .map_err(|e| NativeError::Config(format!("invalid pbk base64url: {e}")))?;
     let pbk: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| NativeError::Reality("pbk must decode to 32 bytes".into()))?;
+        .map_err(|_| NativeError::Config("pbk must decode to 32 bytes".into()))?;
     Ok(pbk)
 }
 
 /// Decode a REALITY short id (hex, ≤8 bytes) to its bytes.
+///
+/// Same rule as [`decode_pbk`]: a malformed short id is a config defect, not a
+/// peer verdict.
 pub(crate) fn decode_sid(s: &str) -> Result<Vec<u8>, NativeError> {
     if s.len() > 16 || !s.len().is_multiple_of(2) {
-        return Err(NativeError::Reality(format!(
+        return Err(NativeError::Config(format!(
             "short id {s:?} must be hex, at most 8 bytes"
         )));
     }
@@ -59,7 +69,7 @@ pub(crate) fn decode_sid(s: &str) -> Result<Vec<u8>, NativeError> {
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|e| NativeError::Reality(format!("invalid short id {s:?}: {e}")))
+                .map_err(|e| NativeError::Config(format!("invalid short id {s:?}: {e}")))
         })
         .collect()
 }
@@ -67,6 +77,29 @@ pub(crate) fn decode_sid(s: &str) -> Result<Vec<u8>, NativeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A malformed `pbk`/`sid` is a CONFIG defect, and the test asserts what
+    /// the failure *proves* rather than which variant carries it: these rows
+    /// used to report `RealityFallback`, so a broken config was permanently
+    /// purged as "the server is not REALITY / a possible MITM" — a verdict
+    /// about the peer when the peer was never reached.
+    #[test]
+    fn malformed_reality_material_proves_a_config_defect_not_a_peer_verdict() {
+        use crate::error::FailureEvidence;
+        for err in [
+            decode_pbk("!!!").expect_err("not base64"),
+            decode_pbk("Zm9vYmFy").expect_err("6 bytes"),
+            decode_sid("abc").expect_err("odd length"),
+            decode_sid("001122334455667788").expect_err("9 bytes"),
+            decode_sid("zz").expect_err("not hex"),
+        ] {
+            assert_eq!(
+                err.evidence(),
+                Some(FailureEvidence::ConfigDefect),
+                "{err:?} must not be read as a peer verdict"
+            );
+        }
+    }
 
     #[test]
     fn decode_pbk_accepts_base64url_32_bytes() {

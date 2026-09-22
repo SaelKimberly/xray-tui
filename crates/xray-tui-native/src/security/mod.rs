@@ -76,9 +76,14 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
             Ok(Box::new(tls))
         }
         Some(TlsConfig::Reality(opts)) => {
+            // A missing `pbk` is a CONFIG defect, not a server verdict: the
+            // row cannot dial as written. It was a `Reality` error, which
+            // `evidence()` maps to `RealityFallback` — so a broken config was
+            // permanently purged as "the server is not REALITY / a possible
+            // MITM". `Config` maps to `ConfigDefect` → `config_invalid`.
             let pbk = sec
                 .pbk()
-                .ok_or_else(|| NativeError::Reality("reality config missing pbk".into()))?;
+                .ok_or_else(|| NativeError::Config("reality config missing pbk".into()))?;
             let provisioner: Arc<dyn HelloProvisioner> = match &ctx.params.reality_provisioner {
                 HelloProvisionerChoice::Custom(p) => p.clone(),
                 HelloProvisionerChoice::FixedChrome133 => {
@@ -358,10 +363,20 @@ mod tests {
     #[tokio::test]
     async fn reality_connect_rejects_short_pbk() {
         // A `pbk` that decodes to ≠32 bytes is a config error, not a hang.
+        // Asserted on what the failure PROVES, not on its variant: the point of
+        // the mapping is that a broken config must not be purged as a verdict
+        // about the peer (it was `NativeError::Reality`, i.e. `RealityFallback`).
         let ctx = ctx_for(vless_with_reality_short_pbk());
         let (a, _) = tokio::io::duplex(64);
         let out = wrap(&ctx, Box::new(a)).await;
-        assert!(matches!(out, Err(NativeError::Reality(_))));
+        let Err(err) = out else {
+            panic!("a short pbk must not dial");
+        };
+        assert_eq!(
+            err.evidence(),
+            Some(crate::error::FailureEvidence::ConfigDefect),
+            "{err:?} must be a config defect, not a peer verdict"
+        );
     }
 
     #[tokio::test]

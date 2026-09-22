@@ -114,9 +114,18 @@ The budget's **value** is not fixed here; it is an output of §6 (above the p99 
 | missing `pbk` / malformed `sid` | `reality_fallback` | **`config_invalid`** |
 | peer answered cleartext | `not_tls` | unchanged |
 | HTTP-layer refusal on a transport the peer's core removed | `transport_rejected` | unchanged verdict; cause named in `error_text` |
-| **any failure from an approximated probe** | a verdict was possible | **no verdict** — evidence carries "shape approximated"; `reason_for` returns `None` |
+| **any failure from an approximated probe** | a verdict was possible | **no verdict** — the link's `security_fp` is an approximation, so `reason_for` returns `None` |
 
-The last row is expressed as **evidence**, not as a special case in the taxonomy: `FailureEvidence` gains the carrier and the decision function declines it. ADR 0006's premise holds — a taxonomy revision still costs one function, not a schema change.
+The last row is expressed as a **rule read from the link's own column**, not as a new taxonomy variant and not by threading a flag through the engine. `reason_for` declines to classify when the link's `security_fp` is an approximation — decided by the **same predicate T3 introduced** (`security::fingerprint::resolve_fingerprint`), so the gate, the row label and the purge rule cannot disagree.
+
+Two reasons this beats the evidence-carrier form the earlier draft implied:
+
+- **Blast radius.** An evidence carrier has to travel from where the flag is produced (`security::wrap`'s `resolve_fingerprint(...).1`, per connection) up through `ProbeFailure` → `FailureEvidence` → `reason_for` — an engine-wide threading job on the very surface T4 was just deferred for, which would have made T5 depend on engine work instead of standing alone.
+- **Coverage.** Deriving it at purge time applies to failures **already persisted**, not only to ones probed after this change. The carrier would have exempted every historical verdict from the rule it exists to impose.
+
+It is also stable: `fp` participates in identity, so a changed `fp` is a different `Protocol` row — never a silent reclassification of an old verdict. And it costs nothing to read: `security_fp` is a plain `String` column already on every page row (`profiles_query.rs:616-617`).
+
+ADR 0006's premise holds — this is a mapping refinement inside `reason_for`, the one function that decides verdicts. No new variant, no CHECK change, no schema bump, no wipe.
 
 ### 5.4 The measurement stage — three numbers, one home
 
