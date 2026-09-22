@@ -101,12 +101,31 @@ So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipp
 
 ### T4 — budget authority: steps clamp to the attempt budget · `strict`
 
-**Files**: `crates/xray-tui-native/src/error.rs`, `crates/xray-tui-native/src/probe.rs`, `crates/xray-tui/src/ops/ping_native.rs`
+**Files**: `crates/xray-tui-native/src/error.rs`, `crates/xray-tui-native/src/context.rs`, `crates/xray-tui/src/ops/ping_native.rs`, plus the probe-path call sites in `security/`, `transport/`, `protocol/` (see the corrected design below).
 
-**Change**: `timeouts` constants become clamps against a caller-supplied deadline; the probe passes its budget down. Callers without a budget (the live tunnel) keep the constants.
+**Change**: `timeouts` constants become **caps** against a caller-supplied attempt deadline; the probe supplies the deadline; callers without one (a live proxied connection) keep the constants unchanged.
 
 **RED**: a test asserting every clamped step is `≤ remaining`, and that an attempt cannot exceed its budget.
-**GREEN**: implement the clamp; set the budget default from T0's p99 of *successful* attempts.
+**GREEN**: implement the clamp. **The budget VALUE is unchanged** — settled by M0b below.
+
+#### Corrected design — the plan's original file list was wrong
+
+The first draft assumed three files. Measuring the call sites first (`timeouts::*` has **~40 uses across 23 files**) showed that threading a budget **by signature** would add an `Option<AttemptBudget>` parameter to ~40 functions, most of which do not need it — and several of which are not on the probe path at all:
+
+- `inbound/*` — the local SOCKS5/HTTP server's own handshakes, bounded by `PROTOCOL`. Not an attempt.
+- `outbound.rs::relay` — `TUNNEL_READ` there is documented as *"bounds inactivity of the TUNNEL, not of one direction"*. A live-relay concern, not an attempt bound.
+
+So the budget goes where this repo already keeps per-link policy: **`LinkContext`**, the documented *"per-link policy decision surface — every phase reads its policy from the context, never re-derives it"*. It is already in scope at every engine site (e.g. `context.rs::server_socket` reads `timeouts::DIAL` internally). The change is therefore **signature-free**:
+
+- `LinkContext` gains an `Option<AttemptBudget>` field and `fn step_limit(&self, cap: Duration) -> Duration` — `cap.min(budget.remaining())` when a budget is present, else `cap`.
+- Each probe-path site substitutes `timeouts::X` → `ctx.step_limit(timeouts::X)`. The `inbound/*` and relay sites keep the bare constant, deliberately.
+- `probe.rs` sets the budget from `NativeProbeReq::timeout`; nothing else changes.
+
+**Consequence for the task boundary.** T4 is a *mechanical per-site substitution with a per-site judgement* (is this site on the attempt path?), not a three-file edit. The per-site review is part of the task, and the two deliberate exemptions above are the ones a reviewer must confirm.
+
+**Observable effect today is nil**, and that is expected: the outer budget already binds at 5 s, so the engine's step constants are currently unreachable. T4 makes the relationship explicit and makes the constants meaningful as per-step caps; it does not change any measured outcome. That is why it must not be credited with the throughput baseline's 79–84 results/s.
+
+**Verify**: the clamp tests; the two exemptions asserted (an inbound handshake and a relay read are NOT clamped).
 
 **Budget basis — stated, because the naive form is unexecutable.** M0 measured it rather than leaving it a contingency: one whole-feed pass yields **75** real successes (1.67 %) and a sequential 300 s sample yielded **0 in 81 attempts**, so a p99 over successes needs the whole feed several times over. Basis 1 is therefore **unreachable on this feed** and the operative basis is:
 
