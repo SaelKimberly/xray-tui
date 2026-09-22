@@ -238,7 +238,33 @@ M0 is the only stage that blocks other scoped work, so it is the natural first p
 
 The endpoint Test cell and the panel sub-row both carry `~`; rows whose representative link is roster-mapped or carries no fingerprint do not. Column alignment holds across the widened Test column (the Outbound `[` sits in the same cell on every row). Unit coverage: `approximation_marker_follows_the_representative_link` (a sibling's unrosterable `fp` must NOT mark the row) and `approximation_marker_composes_with_the_verdict`.
 
-*Pending M0 / M1*: the baseline results/s, the derived budget value, and the M0/M1 after-numbers are recorded here, with the harness command, the pinned slice ids and the raw medians. This section is the acceptance evidence for §7 class 2; a plan that begins with an engine change has skipped it.
+**M0 — the real level's network baseline (measured 2026-09-22).** First run of the lab's production-runner pass:
+
+```
+cargo test -p xray-tui --release --lib -- --ignored --nocapture flow_cost_network
+XRAY_TUI_MEASURE_DB=<copy of data.db>
+```
+
+Slice: the whole applicable feed in **ID order** (10,358 links over 8,127 endpoints, 7,340 distinct protocols; page offsets 0..8,200). Harness-only knobs: **concurrency 256**, budget 5 s. Everything else production — `dedup_endpoints` OFF, `real_phase` true.
+
+```
+links=10358 plan=20 ms untestable=0 queue-full=0 deferred=0
+fast ok=4498 hard-fail=5860 [timeout=4985 dns=196 refused=639 no-route=35 unreachable=5] (11..42404 ms)
+real ok=75  failed=4423 [timeout=2172 dial=7 tls=985 reality=825 transport=291 config=143]
+skipped-unreachable=5860 (35..56455 ms) | wall=56800 ms flushes=21 staged-left=0
+real results 4498 in 56.8 s = 79.19 results/s
+```
+
+**The baseline the falsifier reads: 79.19 results/s at concurrency 256**, against **1.81 results/s at concurrency 5** in the user's 09-21 run — a **43.7×** ratio, consistent with the 51× concurrency ratio minus overhead. This is the harness-only concurrency effect, not an engine improvement; the after-run must be compared at the same 256.
+
+**Two findings this run produced that change T4:**
+
+1. **The per-attempt span far exceeds its budget.** The real level's own span is `35..56,455 ms` — an attempt ran **56.5 s against a 5 s budget**, because the engine's step deadlines (4×10 s + a 30 s read, `error.rs:174-181`) are independent of the caller's budget. This is the measured, at-scale form of the contradiction §5.2 fixes, and it is why the sequential sample took 3.7 s/attempt.
+2. **The ≥200-success minimum is unreachable on this feed.** One whole-feed pass yields **75** real successes (1.67 %), and a sequential 300 s sample yielded **0 successes in 81 attempts**. So T4's basis 1 cannot be met at any practical sample size, and **basis 2 — the p99 over attempts with failures excluded by class — is the operative one.** That is now a measured fact rather than a contingency.
+
+Fresh class distribution at scale, for reference: timeout 49.1 %, tls 22.3 %, **reality 18.6 %**, transport 6.6 %, config 3.2 %.
+
+*Pending M1*: the header A/B control (the probe's failure class/text distribution over the CDN-refused rows) and the M0/M1 after-numbers.
 
 ## 9. Evidence base
 

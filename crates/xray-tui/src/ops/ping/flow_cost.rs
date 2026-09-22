@@ -179,13 +179,14 @@ fn batch_params(
     plan: Vec<PlanLink>,
     real_phase: bool,
     page_size: usize,
+    runner: Arc<dyn BatchProbeRunner>,
 ) -> BatchParams {
     BatchParams {
         scheduler: state.scheduler.clone(),
         db: state.db.clone(),
         writer: state.link_writer.clone(),
         tx,
-        runner: Arc::new(NullRunner),
+        runner,
         stop: state.speed_test_stop.clone(),
         meters: Arc::new(crate::types::BatchMeters::default()),
         plan: PlanSource::Links(plan),
@@ -321,7 +322,7 @@ async fn flow_cost_report() {
 
     // ── 3. per-result staging through the batch's own path ─────────────
     let (tx, rx) = mpsc::channel::<CoreEvent>(1 << 16);
-    let params = batch_params(&state, tx, Vec::new(), true, 200);
+    let params = batch_params(&state, tx, Vec::new(), true, 200, Arc::new(NullRunner));
     let shared = Arc::new(BatchShared::new(params));
     let outcome_ok = ProbeOutcome::Ok {
         latency_ms: Some(37),
@@ -599,7 +600,7 @@ async fn flow_cost_report() {
             let plan: Vec<PlanLink> = feed.iter().flat_map(plan_row_links).collect();
             let planned = plan.len();
             let (tx, rx) = mpsc::channel::<CoreEvent>(1 << 16);
-            let params = batch_params(&state, tx, plan, real_phase, 500);
+            let params = batch_params(&state, tx, plan, real_phase, 500, Arc::new(NullRunner));
             // The batch publishes its shared state here at start: after the run it
             // carries the level spans, the wall time and the flush count, which is
             // what says whether the tail sits in the probes or in `finish_batch`.
@@ -640,6 +641,7 @@ async fn flow_cost_report() {
         Vec::new(),
         false,
         500,
+        Arc::new(NullRunner),
     )));
     for link in &links_all {
         end_shared.stage_result(link, TestType::TcpPing, &outcome_ok);
@@ -936,6 +938,219 @@ async fn flow_cost_report() {
     }
 
     print_table("fast + real ping flow", &rows_out);
+}
+
+/// The one row the lab could not produce: the REAL level's network cost.
+///
+/// Every other section probes through `NullRunner`, so the real level's cost —
+/// the long pole a batch is bound by — is measured nowhere. This runs the
+/// PRODUCTION runner (`EngineProbeRunner`) over a pinned slice of a real feed,
+/// and a direct per-attempt pass for the latency distribution.
+///
+/// Knobs (all optional except the DB; the slice descriptor is printed so a run
+/// is reproducible):
+///   `XRAY_TUI_MEASURE_DB`           path to a COPY of data.db (required)
+///   `XRAY_TUI_MEASURE_MAX_LINKS`    slice size in links (default 15000)
+///   `XRAY_TUI_MEASURE_CONCURRENCY`  real level concurrency (default 256)
+///   `XRAY_TUI_MEASURE_BUDGET_SECS`  per-attempt budget (default 5)
+///   `XRAY_TUI_MEASURE_SAMPLE`       links in the latency sample (default 400)
+///
+/// **What the measured span includes.** The batch's real half caches a loaded
+/// protocol per batch, so a run pays one `load_protocol_with_config` per
+/// distinct protocol it touches — that is inside the timed region and is part
+/// of what a production batch pays too, but it means the absolute is not "probe
+/// only". The before/after ratio stays valid because the slice and its protocol
+/// count are pinned. The per-attempt pass (below) has no such term, which is
+/// why the budget rule reads its distribution and not the batch's wall time.
+///
+/// **The harness-only knobs are the only difference from production**:
+/// `real_concurrency`/`fast_concurrency` are raised here and nowhere else;
+/// `dedup_endpoints` stays OFF and `real_phase` stays true, so the run is the
+/// batch's own shape rather than a tuned variant.
+#[ignore = "perf lab: run explicitly with --ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flow_cost_network() {
+    let Ok(path) = std::env::var("XRAY_TUI_MEASURE_DB") else {
+        println!("SKIP flow_cost_network: set XRAY_TUI_MEASURE_DB=<copy of data.db>");
+        return;
+    };
+    let max_links = env_usize("XRAY_TUI_MEASURE_MAX_LINKS", 15_000);
+    let concurrency = env_usize("XRAY_TUI_MEASURE_CONCURRENCY", 256);
+    let budget = Duration::from_secs(env_usize("XRAY_TUI_MEASURE_BUDGET_SECS", 5) as u64);
+    let sample_size = env_usize("XRAY_TUI_MEASURE_SAMPLE", 400);
+    const PING_URL: &str = "https://www.gstatic.com/generate_204";
+
+    let db = Arc::new(
+        xray_tui_db::Database::open(&path)
+            .await
+            .expect("open measure db"),
+    );
+
+    // Pin the slice: page in ID order — an order no write can move — until the
+    // cap. The descriptor is printed so the same slice can be re-run.
+    let mut rows: Vec<EndpointRow> = Vec::new();
+    let mut links = 0usize;
+    let mut offset = 0usize;
+    loop {
+        if links >= max_links {
+            break;
+        }
+        let request = PageRequest {
+            view: PurgatoryView::All,
+            active_threshold: 0,
+            scope: PlanScope::All,
+            search: None,
+            group_id: None,
+            sort: PageSort::Id,
+            ascending: true,
+            offset,
+            limit: PROFILES_PAGE_SIZE,
+        };
+        let ids = db.profiles_page(&request).await.expect("page").ids;
+        if ids.is_empty() {
+            break;
+        }
+        let page = db.load_page_projection(&ids, true).await.expect("hydrate");
+        links += page.iter().map(|r| r.links.len()).sum::<usize>();
+        rows.extend(page);
+        offset += PROFILES_PAGE_SIZE;
+    }
+    let plan: Vec<PlanLink> = rows
+        .iter()
+        .flat_map(plan_row_links)
+        .take(max_links)
+        .collect();
+    let planned = plan.len();
+    let protocols: std::collections::HashSet<_> = plan.iter().map(|p| p.link.protocol_id).collect();
+    println!(
+        "[network] slice: {planned} links over {} endpoints, {} distinct protocols \
+         (ID order, offset 0..{offset})",
+        rows.len(),
+        protocols.len()
+    );
+    println!(
+        "[network] harness-only knobs: concurrency {concurrency} (production default 100, \
+         this lab's other sections 64), budget {}s; dedup_endpoints OFF, real_phase true",
+        budget.as_secs()
+    );
+
+    // ── the batch's own shape, through the production runner ───────────
+    let mut state = test_state(rows.clone()).await;
+    // The feed for the protocol loads; the run's own writes land in the lab's
+    // temp db through the writer, which is what a lab run wants.
+    state.db = Arc::clone(&db);
+    let (tx, rx) = mpsc::channel::<CoreEvent>(1 << 16);
+    let mut params = batch_params(
+        &state,
+        tx,
+        plan,
+        true,
+        PROFILES_PAGE_SIZE,
+        Arc::new(EngineProbeRunner),
+    );
+    params.real_concurrency = concurrency;
+    params.fast_concurrency = concurrency;
+    params.real_timeout = budget;
+    params.dedup_endpoints = false;
+    params.ping_url = PING_URL.to_owned();
+    params.ip_provider = IpProvider::IpApi;
+    let slot = Arc::clone(&params.batch_slot);
+    let started = Instant::now();
+    run_batch(params).await;
+    let elapsed = started.elapsed();
+    drop(rx);
+    // The batch's own summary line, not a re-derivation: the lab and the app
+    // then report the same numbers by construction.
+    if let Some(shared) = slot.get() {
+        use std::sync::atomic::Ordering;
+        println!("[summary] {}", summary_line(shared));
+        let done = u64::from(shared.counters.real_ok.load(Ordering::Relaxed))
+            + u64::from(shared.counters.real_failed.load(Ordering::Relaxed));
+        println!(
+            "[network] real results {done} in {:.1} s = {:.2} results/s",
+            elapsed.as_secs_f64(),
+            done as f64 / elapsed.as_secs_f64()
+        );
+    } else {
+        println!("[network] no batch handle published — the run never started");
+    }
+
+    // ── the per-attempt distribution (the budget rule's input) ─────────
+    //
+    // `real_ping` with `retries: 1` measures ONE attempt's span — dial →
+    // protocol → target → response head — with no batch, no writer and no
+    // per-protocol cache term, so this is the number the budget default must
+    // clear. Sequential on purpose: the point is the span, not throughput.
+    let mut latencies: Vec<u64> = Vec::new();
+    let mut failures = 0usize;
+    // The sample pass is SEQUENTIAL on purpose — concurrent attempts contend for
+    // the CPU-bound handshake and would inflate every span. Sequential makes its
+    // wall time the sum of its attempts, and most attempts here are failures
+    // that run to the full budget, so it gets a deadline of its own: the
+    // distribution is what matters, not how many samples fit.
+    let sample_deadline = Duration::from_secs(
+        env_usize("XRAY_TUI_MEASURE_SAMPLE_DEADLINE_SECS", 300) as u64,
+    );
+    let sample_started = Instant::now();
+    let req = NativeProbeReq {
+        ping_url: PING_URL,
+        ip_provider: IpProvider::IpApi,
+        timeout: budget,
+        retries: 1,
+    };
+    'sample: for row in rows.iter() {
+        if latencies.len() >= sample_size {
+            break;
+        }
+        for link in row.links.iter() {
+            if latencies.len() >= sample_size || sample_started.elapsed() >= sample_deadline {
+                break 'sample;
+            }
+            let Ok(Some(protocol)) =
+                crate::state::load_protocol_with_config(&db, link.protocol_id).await
+            else {
+                continue;
+            };
+            // `Deferred<Json<_>>::get()` — the same accessor the batch's
+            // `protocol_config` uses, so an unloaded row fails here exactly as
+            // it fails on the production path.
+            let config = protocol.config.get().0.clone();
+            match crate::ops::ping_native::real_ping(&row.endpoint, &config, &req).await {
+                Ok(r) => latencies.push(r.latency_ms),
+                Err(_) => failures += 1,
+            }
+        }
+    }
+    latencies.sort_unstable();
+    if let (Some(min), Some(max)) = (latencies.first(), latencies.last()) {
+        let pct = |p: f64| latencies[((latencies.len() as f64 - 1.0) * p) as usize];
+        println!(
+            "[network] per-attempt successes: {} (failures {failures}) | min {min} ms | \
+             median {} ms | p90 {} ms | p99 {} ms | max {max} ms",
+            latencies.len(),
+            pct(0.50),
+            pct(0.90),
+            pct(0.99)
+        );
+        if latencies.len() < 200 {
+            println!(
+                "[network] WARNING: {} successes is below the 200 the budget rule needs — \
+                 raise XRAY_TUI_MEASURE_SAMPLE or the slice",
+                latencies.len()
+            );
+        }
+    } else {
+        println!("[network] per-attempt sample produced no successes (failures {failures})");
+    }
+}
+
+/// `XRAY_TUI_MEASURE_*` knob: a positive integer, or the default.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 /// A 64-bit FNV-1a hash: the no-allocation dedup key a `(u64, u16)` map needs.

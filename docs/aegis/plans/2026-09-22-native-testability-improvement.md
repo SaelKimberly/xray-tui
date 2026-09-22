@@ -108,13 +108,15 @@ So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipp
 **RED**: a test asserting every clamped step is `≤ remaining`, and that an attempt cannot exceed its budget.
 **GREEN**: implement the clamp; set the budget default from T0's p99 of *successful* attempts.
 
-**Budget basis — stated, because the naive form is unexecutable.** A p99 over successes cannot be read off a bounded slice at the measured ~1.3 % real-ok rate without order 10³ successes, which is the hours-long whole-feed run §4 excludes. So the basis is one of, in order:
+**Budget basis — stated, because the naive form is unexecutable.** M0 measured it rather than leaving it a contingency: one whole-feed pass yields **75** real successes (1.67 %) and a sequential 300 s sample yielded **0 in 81 attempts**, so a p99 over successes needs the whole feed several times over. Basis 1 is therefore **unreachable on this feed** and the operative basis is:
 
-1. **T0's p99 of successes**, when M0 reached its stated minimum success count (≥200) on the pinned slice at the harness-only concurrency — the intended path.
-2. **T0's p99 over attempts with the failure class excluded** (hangs and hard failures removed by class, not by duration) — used when the success count falls short.
-3. A curated known-live set built by a short fresh pass — used only if both above are unavailable.
+1. ~~T0's p99 of successes, at ≥200~~ — unreachable: the whole feed yields 75.
+2. **T0's p99 over attempts with the failure class excluded** (hangs and hard failures removed by class, not by duration) — the operative basis.
+3. A curated known-live set built by a short fresh pass — only if (2) is unavailable.
 
 Whichever applies is recorded in §8.1 with its sample count. **T4 must not land a guessed number**: if no basis is available, T4 ships the clamp structure only (a single authoritative budget with the shipped default left unchanged) and says so.
+
+**M0 also measured the defect T4 fixes:** the real level's own span was `35..56,455 ms` — an attempt ran **56.5 s against a 5 s budget**, because the engine's step deadlines are independent of the caller's. The clamp is therefore not a tuning change; the budget is currently advisory.
 
 **Verify**: the clamp tests; the budget value recorded in §8.1 with its p99 basis.
 
