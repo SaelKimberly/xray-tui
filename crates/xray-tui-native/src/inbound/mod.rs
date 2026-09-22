@@ -1290,7 +1290,8 @@ fn reply_for(error: &NativeError) -> socks5::ReplyCode {
         | NativeError::Reality(_)
         | NativeError::Transport(_)
         | NativeError::TransportRejected { .. }
-        | NativeError::Protocol { .. } => socks5::ReplyCode::GeneralFailure,
+        | NativeError::Protocol { .. }
+        | NativeError::TunnelClosed { .. } => socks5::ReplyCode::GeneralFailure,
     }
 }
 

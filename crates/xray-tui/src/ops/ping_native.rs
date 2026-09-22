@@ -118,7 +118,11 @@ impl ProbeFailure {
             NativeError::Transport(_) | NativeError::TransportRejected { .. } => {
                 ProbeClass::Transport
             }
-            NativeError::Protocol { .. } => ProbeClass::Protocol,
+            // `TunnelClosed`: the stage that failed is the tunnel under a later
+            // phase, so the class is the protocol exchange that never completed
+            // — not `Tls`, which is what the engine's `TlsError::Io` wrap used
+            // to produce.
+            NativeError::Protocol { .. } | NativeError::TunnelClosed { .. } => ProbeClass::Protocol,
             NativeError::Io(_) => ProbeClass::Io,
             NativeError::Timeout { .. } => ProbeClass::Timeout,
         };
@@ -461,8 +465,41 @@ async fn fetch_ip_info_once(
 #[cfg(test)]
 mod tests {
     use super::{
-        IP_INFO_ATTEMPTS, IpInfoOutcome, IpInfoStep, next_step, parse_probe_url, refusal_reason,
+        IP_INFO_ATTEMPTS, IpInfoOutcome, IpInfoStep, ProbeClass, ProbeFailure, next_step,
+        parse_probe_url, refusal_reason,
     };
+
+    /// T6: the class names the STAGE that failed. A tunnel that ended under a
+    /// later phase is a protocol-stage failure, and the engine now says so with
+    /// a typed variant — the target leg's record layer reads the tunnel with
+    /// `read_exact`, so the EOF used to arrive as `TlsError::Io` → `Tls`.
+    /// Measured: 151 rows of the 2026-09-21 run (`vless response header
+    /// truncated (EOF)`, `early eof`) were counted as TLS problems.
+    #[test]
+    fn a_tunnel_that_ended_is_classed_by_the_stage_not_by_its_wrapper() {
+        for detail in [
+            "the tunnel ended during the target handshake: early eof",
+            "the tunnel ended during the target handshake: Connection reset by peer (os error 104)",
+        ] {
+            let err = xray_tui_native::error::NativeError::TunnelClosed {
+                detail: detail.to_owned(),
+            };
+            let failure = ProbeFailure::from_engine(&err);
+            assert_eq!(
+                failure.class,
+                ProbeClass::Protocol,
+                "a tunnel that ended must not be counted as a TLS failure: {err}"
+            );
+            assert_eq!(
+                failure.evidence, None,
+                "the class changed; the verdict must not: {err}"
+            );
+        }
+        // And the TLS class still owns real TLS failures, so the fix cannot be
+        // "send everything to Protocol".
+        let tls = xray_tui_native::error::NativeError::Tls("alert 2 40".into());
+        assert_eq!(ProbeFailure::from_engine(&tls).class, ProbeClass::Tls);
+    }
 
     /// The provider's refusal shapes are what tell a rate limit (or a broken
     /// endpoint) apart from a dead tunnel — without this the row's `—` is

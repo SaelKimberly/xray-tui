@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use http::header::{HOST, USER_AGENT};
 use hyper::body::Incoming;
 use xray_tui_tls::client::{self, TlsConfig};
+use xray_tui_tls::error::TlsError;
 use xray_tui_tls::verify::WebPkiVerifier;
 
 use crate::BoxStream;
@@ -120,7 +121,7 @@ pub async fn fetch_over<S: crate::Stream + 'static>(
         // instead of purging healthy configs.
         let tls = client::connect(Box::new(io) as BoxStream, &tls_config(req.host))
             .await
-            .map_err(|e| NativeError::Tls(e.to_string()))?;
+            .map_err(target_leg_error)?;
         Box::new(tls)
     } else {
         Box::new(io)
@@ -155,6 +156,43 @@ pub async fn fetch_over<S: crate::Stream + 'static>(
         body,
         elapsed,
     })
+}
+
+/// Classify a TARGET-leg TLS failure by the stage that actually failed.
+///
+/// The engine's record layer reads the tunnel with `read_exact`, so an EOF from
+/// the stream underneath surfaces as `TlsError::Io` — and mapping that to
+/// [`NativeError::Tls`] counted a PROTOCOL-stage EOF as a TLS problem (measured:
+/// 151 rows of the 2026-09-21 run, e.g. `vless response header truncated
+/// (EOF)`). An `UnexpectedEof` here means the tunnel ended before the peer
+/// answered, which is [`NativeError::TunnelClosed`] → `ProbeClass::Protocol`.
+///
+/// Classified from the io error's KIND, never its message: re-parsing text is
+/// what the class system exists to avoid.
+///
+/// The target leg must still never carry the typed PROXY causes (a target
+/// certificate says nothing about the config) — `TunnelClosed` proves nothing
+/// either, so `target_leg_tls_failure_carries_no_evidence` keeps holding.
+fn target_leg_error(e: TlsError) -> NativeError {
+    match e {
+        TlsError::Io(io)
+            if matches!(
+                io.kind(),
+                // A graceful close: `read_exact` sees 0 bytes.
+                std::io::ErrorKind::UnexpectedEof
+                    // An abrupt close (a reset, e.g. the peer closing with unread
+                    // data pending). Measured: the probe's own test server produced
+                    // this rather than an EOF, and the field data carries both
+                    // (`early eof` and `Connection reset by peer`).
+                    | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            NativeError::TunnelClosed {
+                detail: format!("the tunnel ended during the target handshake: {io}"),
+            }
+        }
+        other => NativeError::Tls(other.to_string()),
+    }
 }
 
 /// Plain TLS to the destination, WebPKI-verified, `http/1.1` only.
@@ -397,6 +435,46 @@ mod tests {
             err.evidence(),
             None,
             "a target-leg failure proves nothing about the config"
+        );
+        server.abort();
+    }
+
+    /// A tunnel that ENDS during the target handshake is a PROTOCOL-stage
+    /// failure, not a TLS one. The engine's record layer reads the tunnel with
+    /// `read_exact`, so the EOF arrives as `TlsError::Io` — and mapping that to
+    /// `Tls` counted 151 rows of the 2026-09-21 run as TLS problems when the
+    /// peer had simply closed the tunnel before answering (the VLESS
+    /// response-header peel reports exactly this). The CLASS is asserted in
+    /// `ops::ping_native`; this pins the variant that carries it.
+    #[tokio::test]
+    async fn a_tunnel_that_ends_during_the_target_handshake_is_not_a_tls_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Read the ClientHello, then close: the client sees a FIN (a clean
+            // EOF) rather than a reset, which is the kind this case pins.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hello = [0u8; 512];
+            let _ = sock.read(&mut hello).await;
+            drop(sock);
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut req = request(ProbeMethod::Head, "/generate_204");
+        req.port = addr.port();
+        req.https = true;
+        req.timeout = Duration::from_millis(400);
+        let err = fetch_over(stream, &req)
+            .await
+            .expect_err("an immediate EOF must fail the target handshake");
+        assert!(
+            matches!(err, crate::error::NativeError::TunnelClosed { .. }),
+            "an EOF from the tunnel is a protocol-stage failure, not TLS: {err:?}"
+        );
+        assert_eq!(
+            err.evidence(),
+            None,
+            "and it still proves nothing about the config"
         );
         server.abort();
     }

@@ -34,6 +34,20 @@ pub enum NativeError {
     TransportRejected { detail: String, status: u16 },
     #[error("protocol {kind} error: {detail}")]
     Protocol { kind: ProtocolKind, detail: String },
+    /// The stream UNDER a later phase ended before it answered.
+    ///
+    /// Distinct from [`Self::Tls`] because the class must name the stage that
+    /// failed: when the target leg's TLS handshake reads an EOF from the tunnel
+    /// beneath it, the tunnel ended — the proxy never delivered a protocol
+    /// response. The engine's record layer reports that as `TlsError::Io`
+    /// (`read_exact` over the tunnel), so without this variant the failure
+    /// surfaces as `Tls` and a protocol-stage EOF is counted as a TLS problem
+    /// (measured: 151 rows of the 2026-09-21 run).
+    ///
+    /// Proves nothing about the endpoint — `evidence()` is `None`, exactly as
+    /// for [`Self::Tls`] — so this changes the reported CLASS, never a verdict.
+    #[error("tunnel closed: {detail}")]
+    TunnelClosed { detail: String },
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
     #[error("I/O error: {0}")]
@@ -82,6 +96,7 @@ impl NativeError {
             | Self::Tls(_)
             | Self::Transport(_)
             | Self::Protocol { .. }
+            | Self::TunnelClosed { .. }
             | Self::NotImplemented { .. }
             | Self::Io(_)
             | Self::Timeout { .. } => None,
@@ -129,6 +144,14 @@ mod tests {
             ),
             (NativeError::Dial("refused".into()), None),
             (NativeError::Tls("alert 2 40".into()), None),
+            (
+                // The class changes, the verdict does not: a tunnel that ended
+                // during a later phase proves nothing about the endpoint.
+                NativeError::TunnelClosed {
+                    detail: "the tunnel ended during the target handshake".into(),
+                },
+                None,
+            ),
             (NativeError::Transport("ws framing".into()), None),
             (
                 NativeError::NotImplemented {
