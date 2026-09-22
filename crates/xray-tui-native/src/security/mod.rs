@@ -88,9 +88,7 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 HelloProvisionerChoice::Custom(p) => p.clone(),
                 HelloProvisionerChoice::FixedChrome133 => {
                     match fingerprint::resolve_fingerprint(opts.fp.as_deref()).0 {
-                        Some(id) => {
-                            Arc::new(SpecProvisioner::from(&fingerprint::profile_for(id)?))
-                        }
+                        Some(id) => Arc::new(SpecProvisioner::from(&fingerprint::profile_for(id)?)),
                         // No fingerprint requested (absent, `""` or `unsafe`), or
                         // an id with no roster row: the fixed provisioner shapes
                         // the surviving wire-exact chrome_130 spec (the

@@ -86,11 +86,7 @@ mod tests {
             ),
         ];
         for (evidence, expected) in cases {
-            assert_eq!(
-                reason_for(evidence, HONOURED),
-                expected,
-                "for {evidence:?}"
-            );
+            assert_eq!(reason_for(evidence, HONOURED), expected, "for {evidence:?}");
         }
     }
 

@@ -994,10 +994,10 @@ fn render_data_grid(
         Column::new("Protocol Info", ColumnWidth::Fixed(24)), // 9 — protocol/transport/security
         Column::new("", ColumnWidth::Fixed(3)),  // 10 — }=> arrow
         Column::new("Test", ColumnWidth::Fixed(7)), // 11 — [delay]/[name]/[fast]/[real] + `~` approximation
-        Column::new("", ColumnWidth::Fixed(1)),  // 12 — [ outbound opener
+        Column::new("", ColumnWidth::Fixed(1)),     // 12 — [ outbound opener
         Column::new("Outbound", ColumnWidth::Fixed(16)), // 13
         Column::new("Country", ColumnWidth::Fixed(7)), // 14
-        Column::new("", ColumnWidth::Fixed(1)),  // 15 — ]
+        Column::new("", ColumnWidth::Fixed(1)),     // 15 — ]
     ];
 
     // Scroll offset: keep the selected row roughly centered, in line units —
@@ -1425,13 +1425,18 @@ mod tests {
         let palette =
             crate::ui::palette_bridge::palette_from_name(&ratatui_themes::ThemeName::TokyoNight);
         let mut row = fake_row(1, "1.2.3.4", 3); // p100, p101, p102
-        let rep = row.representative_link_index(true).expect("a representative");
+        let rep = row
+            .representative_link_index(true)
+            .expect("a representative");
         let rep_id = row.links[rep].protocol_id;
         let sibling_id = row.links[(rep + 1) % row.links.len()].protocol_id;
 
         // A sibling carrying an unrosterable id must NOT mark the row.
-        row.protocols.get_mut(&sibling_id).expect("sibling").security.fp =
-            Some(String::from("qq"));
+        row.protocols
+            .get_mut(&sibling_id)
+            .expect("sibling")
+            .security
+            .fp = Some(String::from("qq"));
         let (text, _) = compute_test_cell(&row, true, &palette);
         assert!(!text.contains('~'), "sibling-only: {text:?}");
 
@@ -1443,8 +1448,7 @@ mod tests {
         // A roster id, and the two spellings of "no fingerprint requested", are
         // honoured as specified and unmarked.
         for fp in ["chrome", "firefox", "", "unsafe"] {
-            row.protocols.get_mut(&rep_id).expect("rep").security.fp =
-                Some(String::from(fp));
+            row.protocols.get_mut(&rep_id).expect("rep").security.fp = Some(String::from(fp));
             let (text, _) = compute_test_cell(&row, true, &palette);
             assert!(!text.contains('~'), "fp={fp:?} honoured: {text:?}");
         }

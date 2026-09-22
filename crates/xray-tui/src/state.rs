@@ -1049,12 +1049,13 @@ mod tests {
         })
     }
 
-    /// Spec §5.3: the purge rule reads the CONFIG's `fp` while the row label
-    /// reads the `security_fp` COLUMN — one predicate over two inputs. That is
-    /// only safe while the two agree, and `security_embed` is the projection
-    /// that makes them agree. This test is the guard, because a divergence would
-    /// silently make the label and the purge rule read different fingerprints —
-    /// and both would still compile.
+    /// The `security_fp` column is the purge rule's ONLY input — the capability
+    /// gate, the row label and `reason_for` all read it (the two `self.protocols`
+    /// sites capture it into `LoadedProtocol` at load, so nothing reaches for the
+    /// config instead). `security_embed` is the projection that produces it, so
+    /// this test guards the rule's input rather than an agreement between two
+    /// accessors: a projection bug would silently change what the rule sees, and
+    /// the rule's own tests would still pass.
     #[test]
     fn the_security_fp_column_agrees_with_the_config_field() {
         for fp in [

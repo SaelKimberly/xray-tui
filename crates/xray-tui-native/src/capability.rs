@@ -23,8 +23,7 @@
 
 use xray_tui_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use xray_tui_proto::proto_spec::{
-    Hysteria2Config, ProtocolConfig, ProtocolKind, SsConfig, TrojanConfig,
-    VlessConfig, VmessConfig,
+    Hysteria2Config, ProtocolConfig, ProtocolKind, SsConfig, TrojanConfig, VlessConfig, VmessConfig,
 };
 
 use crate::protocol::ss::method::password_key;

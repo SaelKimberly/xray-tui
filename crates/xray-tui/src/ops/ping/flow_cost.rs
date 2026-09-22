@@ -1096,9 +1096,8 @@ async fn flow_cost_network() {
     // wall time the sum of its attempts, and most attempts here are failures
     // that run to the full budget, so it gets a deadline of its own: the
     // distribution is what matters, not how many samples fit.
-    let sample_deadline = Duration::from_secs(
-        env_usize("XRAY_TUI_MEASURE_SAMPLE_DEADLINE_SECS", 300) as u64,
-    );
+    let sample_deadline =
+        Duration::from_secs(env_usize("XRAY_TUI_MEASURE_SAMPLE_DEADLINE_SECS", 300) as u64);
     let sample_started = Instant::now();
     let req = NativeProbeReq {
         ping_url: PING_URL,
@@ -1264,7 +1263,10 @@ async fn flow_cost_transport_control() {
         if page_ids.is_empty() {
             break;
         }
-        let page = db.load_page_projection(&page_ids, true).await.expect("hydrate");
+        let page = db
+            .load_page_projection(&page_ids, true)
+            .await
+            .expect("hydrate");
         for row in &page {
             for link in &row.links {
                 let raw = link.protocol_id.get();
@@ -1300,7 +1302,8 @@ async fn flow_cost_transport_control() {
         timeout: budget,
         retries: 1,
     };
-    let mut histogram: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut histogram: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut ok = 0usize;
     for (endpoint, protocol_id, config) in &found {
         let key = match crate::ops::ping_native::real_ping(endpoint, config, &req).await {

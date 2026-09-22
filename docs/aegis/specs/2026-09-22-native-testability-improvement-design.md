@@ -80,7 +80,7 @@ Roster-mapped links (chrome/firefox/safari/edge/ios/random) never carried a refu
 
 > approximated ⟺ `security_fp` is present, is not `""` and is not `unsafe`, **and** `parse_fingerprint_id` fails.
 
-`security_fp` is already in the page projection (`crates/xray-tui-db/src/profiles_query.rs:616-617`), so the label needs no new column, no projection change, no schema-tag bump and no wipe. One predicate feeds the gate and the label — and, once §5.3 lands, the purge rule as a third consumer. The first two read the same input; the third reads the config field rather than the column (the two-accessor split §5.3 records), so the "cannot drift" claim rests on an **asserted** agreement between the column and the config field, not on sharing a single input. The discipline `endpoint_rank::dns_unresolved(row)` already follows — one predicate, read from the row, never the cache — applies to the predicate; the inputs need their own guard.
+`security_fp` is already in the page projection (`crates/xray-tui-db/src/profiles_query.rs:616-617`), so the label needs no new column, no projection change, no schema-tag bump and no wipe. One predicate feeds the gate, the label and the purge rule — and all three read the same **input** too, the `security_fp` column: the batch captures it into `LoadedProtocol` at load precisely so the purge path never has to reach for the config (§5.3). The discipline `endpoint_rank::dns_unresolved(row)` already follows — one predicate, read from the row, never the cache.
 
 The fallback hello reuses `SpecProvisioner` / `FixedChrome133` (`crates/xray-tui-tls/src/reality/mod.rs:158-201`); no new hello mechanism is introduced.
 
@@ -116,18 +116,24 @@ The budget's **value** is not fixed here; it is an output of §6 (above the p99 
 | HTTP-layer refusal on a transport the peer's core removed | `transport_rejected` | unchanged verdict; cause named in `error_text` |
 | **any failure from an approximated probe** | a verdict was possible | **no verdict** — the link's `security_fp` is an approximation, so `reason_for` returns `None` |
 
-The last row is expressed as a **rule read through one predicate from two accessors** — and the two-accessor split is *forced*, not a choice:
+The last row is expressed as a **rule read from the link's `security_fp` column on every path** — decided by the **same predicate T3 introduced** (`security::fingerprint::resolve_fingerprint`), so the gate, the row label and the purge rule cannot disagree over the predicate *or* over the input.
 
-| path | what is in scope | accessor |
-|---|---|---|
-| the purge decision (`reason_for`, three sites in `ops/ping.rs`) | the loaded `ProtocolConfig` — never a `Protocol` row | `config.security.fp` |
-| the row label (Test cell, panel) | the `security_fp` **column** (the page projection returns unloaded carriers) | `p.security.fp` |
+The column is reachable at all three sites, so there is no second accessor:
 
-No `reason_for` call site holds a `Protocol` row: `ping.rs:320` has a local `&config`, and `:1968`/`:2053` reach the config through `self.protocols: DashMap<ProtocolId, Arc<LoadedProtocol>>` keyed by `link.protocol_id`, where `LoadedProtocol` carries only `{ kind, config }` (`ping.rs:722-725`). So the predicate is shared but its **input** differs by path.
+| site | where the column comes from |
+|---|---|
+| the single real ping (`ops/ping.rs`) | its own `Protocol` row, a live local beside the config |
+| `stage_result` / `emit_result` | `LoadedProtocol.fp`, captured at the struct's ONE construction site from `row.security.fp` |
 
-**Therefore the agreement must be asserted, not assumed.** §5.1's *"the gate, the label and the purge rule cannot disagree"* holds over one predicate but two inputs, so the claim is only true while the column and the config field carry the same value — the column is written from that same config field at parse time, and that is a test, not a comment. A divergence would silently make the label and the purge rule read different fingerprints.
+`LoadedProtocol` gained the field for exactly this reason: the two `self.protocols` sites would otherwise have had to reach the config (`config.security().fp()`), which is a *different* input, and "one predicate" would then have held over the predicate but not over the input. Capturing the column once at load is cheaper than that traversal and strictly stronger — and it means §5.1's original *"the gate, the label and the purge rule cannot disagree"* holds without qualification.
 
-Both accessors resolve to the same `Option<&str>`, so `resolve_fingerprint` is unchanged and T3's predicate remains the single decision point.
+The projection that produces the column (`state::security_embed`) is still guarded by `the_security_fp_column_agrees_with_the_config_field`, now justified as guarding the rule's **only** input rather than an agreement between two.
+
+**Lazy and fail-closed**, and both live in one function (`BatchShared::purge_for`, extracted because the closure had been duplicated verbatim at two sites, where a test at one would not have covered the other):
+- *Lazy*: the lookup runs only inside the `Some(evidence)` branch — a fast probe's evidence is always `None`, and this is the write-behind hot path (10.0 ms per 512-patch window).
+- *Fail-closed*: a cache **miss** returns `None`, not a verdict. Failing open would let an approximated probe earn exactly the permanent verdict the rule exists to prevent, and Purgatory is the one output that is not cheaply reversible.
+
+ADR 0006's premise holds — this is a mapping refinement inside `reason_for`, the one function that decides verdicts. No new variant, no CHECK change, no schema bump, no wipe.
 
 Two reasons this beats the evidence-carrier form the earlier draft implied:
 

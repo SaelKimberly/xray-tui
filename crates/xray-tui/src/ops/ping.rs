@@ -19,7 +19,7 @@ use xray_tui_db::models::{
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_native::capability;
-use xray_tui_proto::proto_spec::{ProtoSpec, ProtocolConfig};
+use xray_tui_proto::proto_spec::ProtocolConfig;
 
 use crate::AppState;
 use crate::ops::ping_native::{self, NativeProbeReq, ProbeClass};
@@ -327,10 +327,10 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                 None,
                 None,
                 Some(e.text),
-                // The fp from the CONFIG (this site's own local), not the
-                // `security_fp` column: the rule reads one input on every path.
+                // The `security_fp` COLUMN from this site's own `Protocol` row
+                // — the same input every other path reads.
                 e.evidence.and_then(|ev| {
-                    crate::ops::purge::reason_for(ev, config.security().and_then(|s| s.fp()))
+                    crate::ops::purge::reason_for(ev, protocol.security.fp.as_deref())
                 }),
             ),
         };
@@ -736,6 +736,15 @@ impl BatchProbeRunner for EngineProbeRunner {
 struct LoadedProtocol {
     kind: xray_tui_proto::proto_spec::ProtocolKind,
     config: ProtocolConfig,
+    /// The `security_fp` COLUMN, captured once here.
+    ///
+    /// The purge rule's input is the column on every path — this is the row's
+    /// own field, and this struct is built from that row, so the rule never
+    /// reads a second source. Without it the two `self.protocols` call sites
+    /// would have to reach the config instead, and "the gate, the label and the
+    /// purge rule cannot disagree" would hold over the predicate but not over
+    /// the input.
+    fp: Option<String>,
 }
 
 /// Shared per-batch state, cloned into every spawned probe task.
@@ -1957,9 +1966,37 @@ impl BatchShared {
         let loaded = Arc::new(LoadedProtocol {
             kind: row.proto_kind,
             config: row.config.get().0.clone(),
+            // The COLUMN, from the row this struct is built out of — so the
+            // purge rule reads the row's own field on every path, never a
+            // second source.
+            fp: row.security.fp.clone(),
         });
         self.protocols.insert(id, Arc::clone(&loaded));
         Ok(loaded)
+    }
+
+    /// The purge verdict for one result, or `None`.
+    ///
+    /// Extracted because it sat verbatim at two sites (`stage_result` and
+    /// `emit_result`), so a test at one would not have covered the other and a
+    /// future `unwrap_or_default()` on the guard would have flipped the rule to
+    /// fail-open with nothing failing.
+    ///
+    /// **Lazy AND fail-closed.** Lazy: the lookup runs only when there is
+    /// evidence — a fast probe's evidence is always `None`, and this is the
+    /// write-behind hot path (10.0 ms per 512-patch window). Fail-closed: a
+    /// cache MISS returns `None` rather than a verdict, because we cannot tell
+    /// whether the shape was approximated, and failing open would let an
+    /// approximated probe earn exactly the permanent Purgatory verdict the rule
+    /// exists to prevent.
+    fn purge_for(
+        &self,
+        link: &ProfileStats,
+        evidence: xray_tui_native::error::FailureEvidence,
+    ) -> Option<xray_tui_db::models::PurgeReason> {
+        let loaded = self.protocols.get(&link.protocol_id);
+        let loaded = loaded.as_ref()?;
+        crate::ops::purge::reason_for(evidence, loaded.fp.as_deref())
     }
 
     /// Stage one link's RESULT columns from a probe outcome.
@@ -1979,24 +2016,7 @@ impl BatchShared {
                 None,
                 None,
                 Some(text.as_str()),
-                evidence.and_then(|ev| {
-                    // Lazy AND fail-closed. Lazy: a fast probe's evidence is
-                    // always `None`, so the lookup must not run for it — this
-                    // path is the write-behind hot path (10.0 ms per 512-patch
-                    // window). Fail-closed: a cache miss means we cannot tell
-                    // whether the shape was approximated, and failing open
-                    // would let an approximated probe earn exactly the
-                    // permanent verdict the rule exists to prevent.
-                    let loaded = self.protocols.get(&link.protocol_id);
-                    let fp = loaded
-                        .as_ref()
-                        .and_then(|p| p.config.security())
-                        .and_then(|s| s.fp());
-                    match loaded {
-                        None => None,
-                        Some(_) => crate::ops::purge::reason_for(ev, fp),
-                    }
-                }),
+                evidence.and_then(|ev| self.purge_for(link, ev)),
             ),
         };
         let mut row = link.clone();
@@ -2092,19 +2112,7 @@ impl BatchShared {
                 None,
                 None,
                 Some(text.clone()),
-                evidence.and_then(|ev| {
-                    // Same rule as `stage_result`: lazy (this path is hot) and
-                    // fail-closed (a miss must not earn a permanent verdict).
-                    let loaded = self.protocols.get(&link.protocol_id);
-                    let fp = loaded
-                        .as_ref()
-                        .and_then(|p| p.config.security())
-                        .and_then(|s| s.fp());
-                    match loaded {
-                        None => None,
-                        Some(_) => crate::ops::purge::reason_for(ev, fp),
-                    }
-                }),
+                evidence.and_then(|ev| self.purge_for(link, ev)),
             ),
         };
         let endpoint_id = link.endpoint_id.get();
@@ -3112,6 +3120,68 @@ mod tests {
         ] {
             assert!(line.contains(expected), "missing {expected:?} in: {line}");
         }
+    }
+
+    /// T5's fail-closed arm, which sat untested inside a closure that was
+    /// duplicated verbatim at two sites — so a test at one would not have
+    /// covered the other, and a future `unwrap_or_default()` on the guard would
+    /// have flipped the rule to fail-open with nothing failing.
+    ///
+    /// A cache MISS must earn NO verdict: failing open would let an approximated
+    /// probe earn exactly the permanent Purgatory verdict the rule exists to
+    /// prevent, and Purgatory is the one output that is not cheaply reversible.
+    #[tokio::test]
+    async fn a_protocol_cache_miss_earns_no_verdict_and_a_cached_fp_decides_it() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let h = harness(rows.clone()).await;
+        let params = build_params(&h, plan_from_rows(&rows), true, false);
+        let shared = BatchShared::new(params);
+        let link = rows[0].links[0].clone();
+        let config = rows[0].protocols[&link.protocol_id].config.get().0.clone();
+        let evidence = xray_tui_native::error::FailureEvidence::RealityFallback;
+        let cache = |fp: Option<&str>| {
+            shared.protocols.insert(
+                link.protocol_id,
+                Arc::new(LoadedProtocol {
+                    kind: xray_tui_proto::proto_spec::ProtocolKind::Vless,
+                    config: config.clone(),
+                    fp: fp.map(str::to_string),
+                }),
+            );
+        };
+
+        // A miss: no verdict at all, even for evidence that otherwise purges.
+        assert_eq!(
+            shared.purge_for(&link, evidence),
+            None,
+            "a cache miss must fail CLOSED"
+        );
+
+        // Cached and honoured: the verdict stands.
+        cache(Some("chrome"));
+        assert_eq!(
+            shared.purge_for(&link, evidence),
+            Some(xray_tui_db::models::PurgeReason::RealityFallback)
+        );
+
+        // Cached and approximated: no verdict, because the shape dialled is not
+        // the shape the link asked for.
+        for fp in ["qq", "android", "hellochrome_120"] {
+            cache(Some(fp));
+            assert_eq!(
+                shared.purge_for(&link, evidence),
+                None,
+                "{fp} must earn no verdict"
+            );
+        }
+
+        // Cached with no fingerprint requested: honoured, so the verdict stands.
+        cache(Some(""));
+        assert_eq!(
+            shared.purge_for(&link, evidence),
+            Some(xray_tui_db::models::PurgeReason::RealityFallback),
+            "an empty fp requested no fingerprint, so the default is the shape asked for"
+        );
     }
 
     /// T7: one counter, one meaning. A config-level refusal is UNTESTABLE, not
