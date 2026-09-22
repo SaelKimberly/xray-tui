@@ -1269,8 +1269,11 @@ mod tests {
         // plaintext (1184-B ML-KEM pk + 32-B X25519 pk) plus the 16-byte tag —
         // `PFS_EXCHANGE_LEN` minus its own 18-byte sealed length field.
         const PFS_SEALED_LEN: usize = PFS_EXCHANGE_LEN - 18;
-        // The ticket form seals `EncodeLength(32)`: a 16-byte ticket plus tag.
-        const TICKET_FORM_LEN: usize = 32 + TAG_LEN;
+        // The ticket form seals `EncodeLength(32)` and the server reads exactly
+        // 32 bytes and `Open`s them, so 32 IS ciphertext-plus-tag: the sealed
+        // ticket already contains it (`TICKET_LEN`, the server flight's own
+        // constant). Not `32 + TAG_LEN` — that double-counts.
+        const TICKET_FORM_LEN: usize = TICKET_LEN;
         assert_ne!(PFS_SEALED_LEN, TICKET_FORM_LEN, "the two forms differ");
         for (seconds, label) in [(0_u32, "1rtt"), (1, "0rtt")] {
             let observed = roundtrip(MlkemMode::Native, "", 64, seconds).await;
@@ -1279,6 +1282,70 @@ mod tests {
                 "{label} must send the 1-RTT pfs form on a fresh dial, not the ticket form"
             );
         }
+    }
+
+    /// Does our ML-KEM keypair expansion match Go's?
+    ///
+    /// `mlkem_enc_pair` derives the account keypair from a 64-byte FIPS 203 seed
+    /// (`d || z`) through OUR `keypair_from_seed`, while the server's decryption
+    /// string carries that same seed for Go's `mlkem.NewDecapsulationKey768` to
+    /// expand. If the two expansions differ, the client's `ek` targets a key the
+    /// server never holds — and the symptom would be exactly the one the pq-enc
+    /// row shows: the handshake appears to complete one way, then the tunnel
+    /// EOFs before the response header.
+    ///
+    /// The constants are ONE MATCHED PAIR from the reference's own generator
+    /// (`xray vlessenc`), so they are fixed evidence rather than anything we
+    /// produced: `decryption` carries the 64-byte seed, `encryption` the
+    /// 1184-byte encapsulation key expanded from it. Equal means our expansion
+    /// agrees with Go's and the pq-enc divergence is in the client's sealing or
+    /// framing; unequal means `keypair_from_seed` itself is the bug — and that
+    /// would also explain why `mlkem_enc_pair`'s own server string never matches
+    /// the `ek` its client string carries.
+    ///
+    /// Hermetic: no cores, no e2e case, no network.
+    #[test]
+    fn keypair_from_seed_matches_the_reference_expansion() {
+        const SEED_HEX: &str = concat!(
+            "5c3f1db5c450330cc7cf63372b58aa3b3f774d741d837410fa82e906e48645caf9efa7611e4fe60becd1e9caffb2bda4",
+            "b9c7ae9bf6f7204153155c0b01345a80"
+        );
+        const EK_HEX: &str = concat!(
+            "01275a02ec24b4133372859569fa6058d2350c5252cca6640ecc6c10663f148577f21b66c4a230ec78b38db737c9d1a5",
+            "c5fb3d28f095b8b0a726b377bde9433bd3c7960274d873507d53763b8b8c850b938ac3235510394ca37c99d2ba1beb09",
+            "b1d2c5eb32986df658eefb32f0048556a2c70af59dd4034784eba7b6a4b9412a100aac2aebb347100a88ea7baf098849",
+            "fd63b0870ac332e52d98ab51cdf5a0a571530c41a65919965e66862bd693e0964341857ab6413d58b7459c206969aa5f",
+            "9f558bc17a806927c7690205e8063b9ee477baeba6fef06f1f4c361e261a9f69ab8670a425b0b5a99025f2d86ea8a03b",
+            "55e330bd0086cfb65147452aa6877625e527de2995e6559262aa167f520df26156569893ed34cdd266554df11f26bb28",
+            "3242cb89e95cd393964b74cf85d7589a40c999e233c558862a043e83e601e3f3ce98f81ec587ba8ddb387a727064202c",
+            "af32abad338535d78a59a362c30c72da5933189c15df778f7e41159951bb74e38a15e91c7c36646fd84cbe95156d333c",
+            "194a61bd4940fcc4a4d5700bd9050b7037b2f65b16d97b9de0b89a040102223b899e32aa31c857aa8684694530126244",
+            "1a3bc7496648b40589df76083c49cb2767469ac84e9403497dc33c4e43b5e3ba09f2db200e22bd2411c9893c298ff437",
+            "6b22b77fc765b8b85386e653700055ae56bfe8dc06bd8229830bc83c36c4abb6ba3377997c94a2790ccbe3081a68a850",
+            "d093aa8812c933672c3f20b0299930a40b22f57694f40870d9746867ba1dbe0c69821ac275c52898d9cb5171a9c5ca91",
+            "7f9308b0541bfb19ba667959ca21236c81cb0a681c84db490a3a69469a7745a5afca28951e561b8a009f21009a5bfacd",
+            "fca87335b9cfa5bb50727bb029f294460b16c8b0328e927fb1419252f924b8bbaf4a8cc16e809cf825c5fea3bbedf2c4",
+            "2820a249e22b6373c4a6026bb157507866002e21388660613080707be12abf27111cd5c3e6ecba84314f90216877e18c",
+            "e62c38c77157d7b0bbe917c4d3502e0839590f9b99be877f5276bfcaa8a4d7082a4502850ea50abd4290de35ac600870",
+            "641ac39c71699a3a003a63b161965e3c6a2d50cb0f17c125a0748af3023c040466aa86159570a755128289f66dcd6278",
+            "055109bb267c1a82106b922759b015debcbc1012aec76c770c16cf8aec4c2619bbfbb244bb55a124b435f9420c0b25c5",
+            "f644500e71a0a5c3097cc10bfc3c8870e49f4355c9e32bca88147575258fdeb316b6728c3fbc74706ab0697c5bfcf124",
+            "53d9a3ac2ba634f56d3509510d06b6bbf15ddbe1cf87610a56c1471b217d0ca7c7668a81c8541c697283547b15dda342",
+            "2e6c7c8fd992597741c3881683aaacd4bb670bb804701bcdd5c414dab75dcc928aecd0a89ff0b22d95b0c4356a04560e",
+            "657645ee26877a98882a137b9972ca5a739c161790ef87ce9e00b0cd449f877651e083234cb3009b3a4ec0eb06534422",
+            "e15b621b06a9eb152eec61624fe3a390e41fec371477c3b7fb993c05711d455640ed544d2891c3d2e51ebc216e3b8579",
+            "3f6a0ecccc1b36c44cf01745d8d32fb04a67d32820d3aa7f93b9aea46b257fc11d488124e7187535d353b01a28ab9991",
+            "f8e12c49e76b73553c000e9104c0a1aa49ae7cb2e57a9b516359706772bc9e4f"
+        );
+        let seed: [u8; 64] = unhex(SEED_HEX).try_into().expect("64-byte FIPS 203 seed");
+        let expected = unhex(EK_HEX);
+        assert_eq!(expected.len(), 1184, "ML-KEM-768 ek length");
+        let (ek, _) = Mlkem768::keypair_from_seed(&seed);
+        assert_eq!(
+            ek.as_bytes(),
+            expected.as_slice(),
+            "our keypair_from_seed must expand the reference's seed to the reference's ek"
+        );
     }
 
     // ── Go-pinned keystream vectors (2026-09-18) ─────────────────────────

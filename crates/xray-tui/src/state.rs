@@ -1049,12 +1049,16 @@ mod tests {
         })
     }
 
-    /// The `security_fp` column is the purge rule's ONLY input, and it is read
-    /// from the row on every path — the row label, `reason_for`, and
-    /// `security::wrap` (where the substitution actually happens) all read the
-    /// same field. `security_embed` is the projection that produces it, so this
-    /// test guards the rule's input: a projection bug would silently change what
-    /// the rule sees, and the rule's own tests would still pass.
+    /// The `security_fp` column and the config's `tls.fp` are TWO inputs to one
+    /// predicate, and this test is what holds them together.
+    ///
+    /// `security::wrap` — the dial — resolves `opts.fp` off the loaded CONFIG;
+    /// the row label and `reason_for` read the `security_fp` COLUMN.
+    /// `security_embed` is the projection that writes the column from that same
+    /// `tls.fp`, so the two agree today only because of it. A projection bug
+    /// would silently make the label and the purge rule describe a different
+    /// fingerprint from the one the engine dialled with — and both would still
+    /// compile, which is exactly why this is asserted rather than commented.
     #[test]
     fn the_security_fp_column_agrees_with_the_config_field() {
         for fp in [

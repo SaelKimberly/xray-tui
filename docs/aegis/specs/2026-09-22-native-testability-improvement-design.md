@@ -80,7 +80,14 @@ Roster-mapped links (chrome/firefox/safari/edge/ios/random) never carried a refu
 
 > approximated ⟺ `security_fp` is present, is not `""` and is not `unsafe`, **and** `parse_fingerprint_id` fails.
 
-`security_fp` is already in the page projection (`crates/xray-tui-db/src/profiles_query.rs:616-617`), so the label needs no new column, no projection change, no schema-tag bump and no wipe. One predicate feeds three consumers — `security::wrap` (where the substitution happens), the row label, and the purge rule — and all three read the same **input** too, the `security_fp` column: the batch captures it into `LoadedProtocol` at load precisely so the purge path never has to reach for the config (§5.3). The capability GATE is not among them: after T3 it refuses no fingerprint id at all. The discipline `endpoint_rank::dns_unresolved(row)` already follows — one predicate, read from the row, never the cache.
+`security_fp` is already in the page projection (`crates/xray-tui-db/src/profiles_query.rs:616-617`), so the label needs no new column, no projection change, no schema-tag bump and no wipe. One predicate feeds three consumers, and it takes **two inputs that must agree**:
+
+| consumer | input |
+|---|---|
+| `security::wrap` — the dial, where the substitution happens | the CONFIG's `tls.fp` (`resolve_fingerprint(opts.fp.as_deref())` in both arms) |
+| the row label, and `reason_for` | the `security_fp` COLUMN |
+
+The column is written from that same `tls.fp` at parse time (`state::security_embed`), so the two agree only because of that projection — which is what `the_security_fp_column_agrees_with_the_config_field` asserts. The capability GATE is not among the consumers: after T3 it refuses no fingerprint id at all. The discipline `endpoint_rank::dns_unresolved(row)` already follows — one predicate, and one guard on where its input comes from.
 
 The fallback hello reuses `SpecProvisioner` / `FixedChrome133` (`crates/xray-tui-tls/src/reality/mod.rs:158-201`); no new hello mechanism is introduced.
 
@@ -251,7 +258,15 @@ M0 is the only stage that blocks other scoped work, so it is the natural first p
 
 **The claim is invariant; the absolutes are snapshot-bound.** The feed grows while the app runs (subscription imports), so a durable figure must name its snapshot. What does not move: **no `security_fp` value reaches a refusal arm**, and every unrosterable id is marked approximated. Produced by the same rule the gate applies — no network, no run.
 
-**Data-safety note, stated rather than left open.** The verification launches ran the TUI against a *copy* of `data.db` under a throwaway `XDG_CONFIG_HOME`; that isolation is **proven for the wrapper-launched session** (the copy's row count moved 7,584 → 7,811 while the wrapper ran). It is **not** proven for the first launch, which the harness ran as a bare binary path with no way to set the environment. The live database was in fact written during this session — endpoints 8,071 → 8,127, protocols 7,268 → 7,340, links 10,264 → 10,358, mtime 13:17:50 — and that pattern (new endpoints *and* protocols *and* links) cannot come from enrichment, which writes only `endpoint_ip`/`resolved_at`/country. It matches the TUI's 60-second subscription auto-update, i.e. an import. The user's feed was therefore mutated (additively, by a refresh) rather than left untouched, and the first launch's config target is unverified.
+**Data-safety note — the live database was NOT left alone, and the mechanism is only partly identified.** Corrected after the fact; the earlier version of this note claimed isolation.
+
+- **Intentional measurement isolation held**: the lab always ran on a *copy* (`XRAY_TUI_MEASURE_DB=/tmp/xr_logs/measure.db`), and the TUI visual check ran under a throwaway `XDG_CONFIG_HOME` (proven: that copy's row count moved while the wrapper ran). The live `data.db` mtime was unchanged across every measurement run — verified repeatedly, at 13:17:50.
+- **It was written twice anyway, by processes that were not doing measurement work.** The feed grew from 8,071 → 8,127 endpoints and then 8,127 → **8,303** (protocols 7,268 → 7,728, links 10,264 → **10,798**), with a 4.1 MB `data.db-wal` and a write lock held at one point. That pattern — new endpoints *and* protocols *and* links — cannot come from enrichment, which writes only `endpoint_ip`/`resolved_at`/country. It is a subscription import, i.e. a live TUI's 60-second auto-update.
+- **Two stray processes were found and killed**: an `xray` server from my aborted 23-hour-old oracle run (`/tmp/xr_logs/oracle/fb002…`, debris from the invalid urllib harness), and a `target/release/xray-tui` process that had been running ~25 minutes and held the live DB.
+- **The release binary's origin is UNIDENTIFIED.** It is *not* established as mine: every launch I made used the **debug** binary (the `tui-test` harness, and `/tmp/tui_visual/run.sh` which execs `target/debug/xray-tui`). Nothing in the workspace spawns the release path — grepped `crates/**/tests`, `crates/**/src`, the `justfile`, `.cargo/config.toml` and every non-`target/` file — and the one updater test that runs a binary writes its own fake `xray` shell script. Its argv was `target/release/xray-tui xray-tui`, i.e. a relative path with its own name as an argument, which no human invocation produces — so a programmatic spawn is likelier than a manual one, but that is a likelihood, not a finding.
+- **Killing it may have interrupted something the user was doing.** It was defensible for the lock and the writes, but it was not mine to stop on that evidence, and the user should correct this if it was theirs.
+
+The actionable part is not the identity but the pattern: `data.db` is reachable from anything that resolves `dirs::config_dir()`, so a dev or test run can mutate a real feed. The `XDG_CONFIG_HOME` isolation used for the visual check is the mitigation that worked.
 
 **Defect found and fixed while doing this:** the column geometry was hardcoded in **two** test literals (`vec![…, 24, 3, 6, 1, …]`, commented *"Real column geometry (117 cells) so the panel draws at its production width"*). Widening Test to 7 made production 118 while the copies still said 117 — and the tests passed, because the literal is a copy, so the assertion had silently stopped describing production. All copies and the `118 cells` comment updated. **Follow-up:** derive the test vectors from the `Column::new` widths (or a shared const) — two copies have already drifted once.
 
@@ -353,9 +368,7 @@ Three readings:
 
 **Run-to-run variance, for reading the falsifier:** two identical batch passes gave **79.19** and **83.94 results/s** (≈6 % apart) but **75** and **21** real successes — the rate is stable because failures dominate; the success *count* is not, so no acceptance may rest on it.
 
-**T9 — the mlkem differential (measured 2026-09-22).**
-
-*First pass — our client against both servers.* Built a SECOND peer from `thirdparty/Xray-core` HEAD (**Xray 26.7.28**, go 1.27.1) and ran the pq-enc case against both:
+**T9 — the mlkem differential (measured 2026-09-22).** Built a SECOND peer from `thirdparty/Xray-core` HEAD (**Xray 26.7.28**, go 1.27.1) and ran the pq-enc case against both:
 
 | server | our client |
 |---|---|
@@ -385,7 +398,22 @@ So the row was run again with a pair the **reference itself generated** (`xray v
 
 The pair and the server are therefore both known-good, and our client fails with them anyway. **The fault is our client's wire alone** — not the test's key generator, not the pin, not the version delta. (Useful by-product: our parser *accepts* the reference's shape, which is one 1184-byte `ek` segment with no X25519 public half — so the divergence is in the sealing/framing, not in the parse.) That is the bounded target the fix round needed: capture the reference client's first flight for a fixed pair and diff it against ours.
 
-**Acceptance, per §5.8's stated branch:** the pq-enc row **stays ignored**, its reason now naming both passes; the gate stays closed. A HEAD-only pass would have been a narrower claim than the suite's, and this is the other branch — *"both fail → the client is at fault"* — now sharpened to *"the reference works everywhere, so the fault is ours"*.
+*Fourth pass — the derivation itself, hermetic.* The third pass eliminated the hedge with a reference-generated pair, but that test needs cores. The same question is answerable with **no cores at all**, because a `vlessenc` pair is self-consistent: its `decryption` carries a 64-byte FIPS 203 seed and its `encryption` the 1184-byte `ek` expanded from it. So `keypair_from_seed_matches_the_reference_expansion` (in `mlkem.rs`'s tests, both values pinned as hex) derives our `ek` from the reference's seed and compares:
+
+```
+Mlkem768::keypair_from_seed(reference seed) == reference ek    →  PASSES
+```
+
+**Our expansion matches Go's.** So `mlkem_enc_pair` is not the bug, and the divergence is in the client's **sealing or framing** — which is what the third pass already pointed at. The verdict now rests on four independent results, three of them hermetic:
+
+| what | result |
+|---|---|
+| our seed expansion vs the reference's `ek` | **matches** (hermetic) |
+| the reference's first-flight shape, both modes | **1-RTT, never the ticket form** (hermetic) |
+| our parser vs the reference's string shape | **accepts it** |
+| our client vs a reference pair on a reference server | **fails** |
+
+**Acceptance, per §5.8's stated branch:** the pq-enc row **stays ignored**, its reason naming all four passes; the gate stays closed. A HEAD-only pass would have been a narrower claim than the suite's, and this is the other branch — *"both fail → the client is at fault"* — now sharpened to *"the reference works everywhere, so the fault is ours"*, with the derivation ruled out hermetically.
 
 **Harness shape, as §5.8 decided:** a **second** pin (`XRAY_HEAD_VERSION = "26.7.28"` + `XRAY_TUI_CORE_HEAD_BIN_DIR`), reached through `CoreUnderTest::resolve_from(kind, version, dir_env)`. `XRAY_VERSION` is untouched, so the suite's 136 rows keep their baseline. The sharper A/B itself was a throwaway script (`/tmp/xr_logs/ab_mlkem.py`, two configs + curl through a socks inbound); its method is recorded here because the in-suite row cannot express it.
 

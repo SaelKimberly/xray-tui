@@ -319,18 +319,46 @@ async fn vless_single_core(
         .expect("vless single-core e2e failed");
 }
 
-/// T9's differential: the pq-enc case against the SECOND pinned peer — an
+/// T9's first differential: the pq-enc case against the SECOND pinned peer — an
 /// `xray` built from `thirdparty/Xray-core` HEAD — while `XRAY_VERSION` stays
 /// the suite's baseline.
 ///
-/// It exists to answer the one question the ignored row could not: is the
-/// pre-response EOF a VERSION DELTA (our client implements a revision newer
-/// than the release) or OUR CLIENT? A green HEAD row with a red baseline row
-/// means the pin is behind the implementation, not that the client is wrong.
+/// It answers the question the ignored row could not: is the pre-response EOF a
+/// VERSION DELTA (our client implements a revision newer than the release) or
+/// OUR CLIENT? A green HEAD row with a red baseline row would mean the pin is
+/// behind the implementation, not that the client is wrong. Measured: both fail
+/// identically, so it is not a version delta.
+#[ignore = "needs a HEAD-built peer: XRAY_TUI_CORE_HEAD_BIN_DIR"]
+#[rstest]
+#[tokio::test]
+async fn vless_pq_enc_against_head(certs: &Certs, echo: EchoServer, tls_echo: TlsEchoServer) {
+    let Ok(head) =
+        CoreUnderTest::resolve_from(CoreKind::Xray, XRAY_HEAD_VERSION, XRAY_HEAD_BIN_DIR)
+    else {
+        eprintln!("SKIP: set {XRAY_HEAD_BIN_DIR} to a directory holding the HEAD-built `xray`");
+        return;
+    };
+    let case = vless("tcp").with_pq_enc();
+    run_against(&case, &head, certs, &echo, &tls_echo)
+        .await
+        .expect("pq-enc against the HEAD peer");
+}
+
+/// T9's second differential, and the one that removes the last hedge: does OUR
+/// client work with a pair the REFERENCE generated?
 ///
-/// The acceptance stays the release's, not HEAD's: a HEAD-only pass is a
-/// narrower claim than the suite's, and the gate stays closed until the release
-/// is satisfied.
+/// The first differential left *"our client's wire **or this case's server
+/// config**"*, and that alternative had a concrete form — the case's keypair
+/// comes from `mlkem_enc_pair`, which expands a 64-byte seed through OUR
+/// `Mlkem768::keypair_from_seed` where the server's decryption string expects
+/// Go's `mlkem.NewDecapsulationKey768` to do it. If the two expansions differed,
+/// the client's `ek` would target a key the server never holds, and the symptom
+/// would be exactly the one observed.
+///
+/// A `vlessenc`-generated pair is self-consistent on the server side (and a real
+/// HEAD client demonstrably works with one), so a GREEN row here would indict
+/// `mlkem_enc_pair` rather than the client, and a RED one indicts the client's
+/// sealing/framing. Measured: RED.
 #[rstest]
 #[ignore = "differential: needs XRAY_TUI_CORE_BIN_DIR (26.3.27) plus XRAY_TUI_PQ_ENC / XRAY_TUI_PQ_DEC from `xray vlessenc`"]
 #[tokio::test]
@@ -351,20 +379,4 @@ async fn vless_pq_enc_with_a_reference_pair(
     run_against(&case, pick(cores, CoreKind::Xray), certs, &echo, &tls_echo)
         .await
         .expect("pq-enc with a reference-generated pair");
-}
-
-#[ignore = "needs a HEAD-built peer: XRAY_TUI_CORE_HEAD_BIN_DIR"]
-#[rstest]
-#[tokio::test]
-async fn vless_pq_enc_against_head(certs: &Certs, echo: EchoServer, tls_echo: TlsEchoServer) {
-    let Ok(head) =
-        CoreUnderTest::resolve_from(CoreKind::Xray, XRAY_HEAD_VERSION, XRAY_HEAD_BIN_DIR)
-    else {
-        eprintln!("SKIP: set {XRAY_HEAD_BIN_DIR} to a directory holding the HEAD-built `xray`");
-        return;
-    };
-    let case = vless("tcp").with_pq_enc();
-    run_against(&case, &head, certs, &echo, &tls_echo)
-        .await
-        .expect("pq-enc against the HEAD peer");
 }
