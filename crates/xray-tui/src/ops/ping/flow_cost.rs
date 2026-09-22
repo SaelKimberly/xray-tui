@@ -1144,6 +1144,125 @@ async fn flow_cost_network() {
     }
 }
 
+/// The control instrument for the HTTP-transport divergence (item 7).
+///
+/// Records what the PROBE reports for a pinned set of links — the failure CLASS
+/// and TEXT, not an HTTP status. The CDN 403/409 is a transport-handshake
+/// failure surfacing as `ProbeOutcome::Failed { class: Transport, text:
+/// "httpupgrade: expected 101, got 403" }`; the probe's own HTTP status is the
+/// *target's* (gstatic's 204), so a status distribution would read the wrong
+/// layer and the A/B would have no usable control.
+///
+/// Per-attempt and sequential, exactly like the budget sample: the question is
+/// what the wire produces, not how fast.
+///
+/// Knobs:
+///   `XRAY_TUI_MEASURE_DB`         path to a COPY of data.db (required)
+///   `XRAY_TUI_MEASURE_PROTO_IDS`  comma-separated protocol ids (required)
+///   `XRAY_TUI_MEASURE_BUDGET_SECS` per-attempt budget (default 5)
+#[ignore = "perf lab: run explicitly with --ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flow_cost_transport_control() {
+    let Ok(path) = std::env::var("XRAY_TUI_MEASURE_DB") else {
+        println!("SKIP flow_cost_transport_control: set XRAY_TUI_MEASURE_DB");
+        return;
+    };
+    let Ok(ids_raw) = std::env::var("XRAY_TUI_MEASURE_PROTO_IDS") else {
+        println!("SKIP flow_cost_transport_control: set XRAY_TUI_MEASURE_PROTO_IDS");
+        return;
+    };
+    let budget = Duration::from_secs(env_usize("XRAY_TUI_MEASURE_BUDGET_SECS", 5) as u64);
+    const PING_URL: &str = "https://www.gstatic.com/generate_204";
+
+    let wanted: std::collections::HashSet<i64> = ids_raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect();
+    assert!(!wanted.is_empty(), "no parsable ids in {ids_raw:?}");
+
+    let db = Arc::new(
+        xray_tui_db::Database::open(&path)
+            .await
+            .expect("open measure db"),
+    );
+
+    // Find each wanted protocol's (endpoint, link) by paging the feed. The
+    // walk stops as soon as every id is accounted for, so a pinned set costs a
+    // few pages, not a feed scan.
+    let mut found: Vec<(Endpoint, ProtocolId, ProtocolConfig)> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut offset = 0usize;
+    'walk: loop {
+        let request = PageRequest {
+            view: PurgatoryView::All,
+            active_threshold: 0,
+            scope: PlanScope::All,
+            search: None,
+            group_id: None,
+            sort: PageSort::Id,
+            ascending: true,
+            offset,
+            limit: PROFILES_PAGE_SIZE,
+        };
+        let page_ids = db.profiles_page(&request).await.expect("page").ids;
+        if page_ids.is_empty() {
+            break;
+        }
+        let page = db.load_page_projection(&page_ids, true).await.expect("hydrate");
+        for row in &page {
+            for link in &row.links {
+                let raw = link.protocol_id.get();
+                if !wanted.contains(&raw) || !seen.insert(raw) {
+                    continue;
+                }
+                let Ok(Some(protocol)) =
+                    crate::state::load_protocol_with_config(&db, link.protocol_id).await
+                else {
+                    continue;
+                };
+                found.push((
+                    row.endpoint.clone(),
+                    link.protocol_id,
+                    protocol.config.get().0.clone(),
+                ));
+                if seen.len() == wanted.len() {
+                    break 'walk;
+                }
+            }
+        }
+        offset += PROFILES_PAGE_SIZE;
+    }
+    println!(
+        "[control] requested {} protocol id(s), resolved {}",
+        wanted.len(),
+        found.len()
+    );
+
+    let req = NativeProbeReq {
+        ping_url: PING_URL,
+        ip_provider: IpProvider::IpApi,
+        timeout: budget,
+        retries: 1,
+    };
+    let mut histogram: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut ok = 0usize;
+    for (endpoint, protocol_id, config) in &found {
+        let key = match crate::ops::ping_native::real_ping(endpoint, config, &req).await {
+            Ok(_) => {
+                ok += 1;
+                "OK".to_owned()
+            }
+            Err(failure) => format!("{:?}: {}", failure.class, failure.text),
+        };
+        println!("[control] {} -> {key}", protocol_id.get());
+        *histogram.entry(key).or_default() += 1;
+    }
+    println!("[control] ok={ok} of {} — distribution:", found.len());
+    for (key, n) in &histogram {
+        println!("[control]   {n:>4}  {key}");
+    }
+}
+
 /// `XRAY_TUI_MEASURE_*` knob: a positive integer, or the default.
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)

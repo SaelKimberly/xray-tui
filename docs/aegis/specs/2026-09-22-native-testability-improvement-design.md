@@ -259,12 +259,33 @@ real results 4498 in 56.8 s = 79.19 results/s
 
 **Two findings this run produced that change T4:**
 
-1. **The per-attempt span far exceeds its budget.** The real level's own span is `35..56,455 ms` — an attempt ran **56.5 s against a 5 s budget**, because the engine's step deadlines (4×10 s + a 30 s read, `error.rs:174-181`) are independent of the caller's budget. This is the measured, at-scale form of the contradiction §5.2 fixes, and it is why the sequential sample took 3.7 s/attempt.
+1. **The engine's step deadlines are unreachable under the probe's budget — by construction, not by measurement.** The budget is 5 s; the engine's steps are `DIAL`/`TRANSPORT`/`SECURITY`/`PROTOCOL` at 10 s each plus a 30 s `TUNNEL_READ` (`error.rs:174-181`). The outer budget therefore always fires first, so no engine step deadline is ever reached on this path, and any authorization needing more than 5 s is truncated by the outer budget rather than bounded by the step that should have governed it. (The run's `(35..56,455 ms)` is the real **level's** start..settle span — inside `wall=56800 ms` — and measures no single attempt; the sequential pass's 3.7 s/attempt is an average over mostly fast failures, so neither is cited as an attempt duration.)
 2. **The ≥200-success minimum is unreachable on this feed.** One whole-feed pass yields **75** real successes (1.67 %), and a sequential 300 s sample yielded **0 successes in 81 attempts**. So T4's basis 1 cannot be met at any practical sample size, and **basis 2 — the p99 over attempts with failures excluded by class — is the operative one.** That is now a measured fact rather than a contingency.
 
 Fresh class distribution at scale, for reference: timeout 49.1 %, tls 22.3 %, **reality 18.6 %**, transport 6.6 %, config 3.2 %.
 
-*Pending M1*: the header A/B control (the probe's failure class/text distribution over the CDN-refused rows) and the M0/M1 after-numbers.
+**M1 — the transport control (measured 2026-09-22).** 40 pinned protocol ids whose links failed with a transport error on the `http`/`httpupgrade`/`x_http` transports, probed per-attempt on today's wire (the control the Q12-C A/B needs):
+
+```
+cargo test -p xray-tui --release --lib -- --ignored --nocapture flow_cost_transport_control
+XRAY_TUI_MEASURE_DB=<copy> XRAY_TUI_MEASURE_PROTO_IDS=<40 ids> XRAY_TUI_MEASURE_BUDGET_SECS=4
+ok=0 of 40 — distribution:
+  14  Transport: v2rayhttp: expected 200, got 404 Not Found
+   6  Transport: v2rayhttp: expected 200, got 400 Bad Request
+   4  Transport: v2rayhttp: expected 200, got 405 Method Not Allowed
+   7  Timeout:   timeout on probe attempt (limit 4s)
+   2  Transport: httpupgrade: expected 101, got 400 Bad Request
+   2  Transport: httpupgrade: expected 101, got 403 Forbidden
+   1  Transport: v2rayhttp: expected 200, got 403 Forbidden
+   1  Transport: v2rayhttp: expected 200, got 410 Gone
+   1  Transport: httpupgrade: expected 101, got 404 Not Found
+   1  Dial:      Connection refused
+   1  Tls:       I/O error: early eof
+```
+
+**The A/B's candidate population is the 31 HTTP-layer refusals**, not the 40: the 7 timeouts, 1 dial refusal and 1 TLS EOF never reached an HTTP response, so no request-header change can move them. `405 Method Not Allowed` (4 rows) is notable — our method defaults to **PUT** (`transport/v2rayhttp.rs:52-56`, matching sing-box), so a 405 on PUT means the server does not accept it at that path; since sing-box also failed on the earlier sample, the method is not the discriminator and item 7's remaining hypothesis is the **default request headers**, which is what the A/B will test.
+
+*Pending*: the M0/M1 after-numbers, and the item-7 wire decision they feed.
 
 ## 9. Evidence base
 

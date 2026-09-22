@@ -32,5 +32,5 @@
 | 2026-09-18 | plan | `plans/2026-09-18-crypto-dependency-hardening.md` | Cryptographic dependency hardening — implementation | executed (T1-T9; zstd→ruzstd deliberately deferred) |
 | 2026-09-18 | adr | `adr/0007-cryptographic-dependency-posture.md` | Cryptographic dependency posture: RustCrypto ML-KEM, ctr and ring retained, hazmat governance | accepted |
 | 2026-09-18 | adr | `adr/0008-batch-feed-scaling.md` | Batch-feed scaling: id-ordered walk, per-protocol loads, throttled page refetch | accepted |
-| 2026-09-22 | spec | `specs/2026-09-22-native-testability-improvement-design.md` | Native testability: trustworthy verdicts on a real feed | approved; implementation in progress (T3 complete; M0 baseline recorded) |
-| 2026-09-22 | plan | `plans/2026-09-22-native-testability-improvement.md` | Native testability — implementation | executing (T3 complete, T0 baseline recorded; T1 next) |
+| 2026-09-22 | spec | `specs/2026-09-22-native-testability-improvement-design.md` | Native testability: trustworthy verdicts on a real feed | approved; implementation in progress (T3 complete; M0 + M1 recorded) |
+| 2026-09-22 | plan | `plans/2026-09-22-native-testability-improvement.md` | Native testability — implementation | executing (T3, T0, T1 done; T2/T5 next) |

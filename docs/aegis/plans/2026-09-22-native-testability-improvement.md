@@ -116,7 +116,7 @@ So M0 runs at a **harness-only raised concurrency** (a lab override, not a shipp
 
 Whichever applies is recorded in §8.1 with its sample count. **T4 must not land a guessed number**: if no basis is available, T4 ships the clamp structure only (a single authoritative budget with the shipped default left unchanged) and says so.
 
-**M0 also measured the defect T4 fixes:** the real level's own span was `35..56,455 ms` — an attempt ran **56.5 s against a 5 s budget**, because the engine's step deadlines are independent of the caller's. The clamp is therefore not a tuning change; the budget is currently advisory.
+**M0's span figures are not an attempt duration.** The run's `(35..56,455 ms)` is the real **level's** start..settle span (inside `wall=56800 ms`), and the sequential pass's 3.7 s/attempt averages mostly fast failures — neither measures a single attempt, so neither is cited as one. T4's justification is code-level and needs no measurement: the budget is 5 s while the engine's steps are 10 s each plus a 30 s read (`error.rs:174-181`), so **no engine step deadline can be reached under the probe budget** — the outer budget always fires first, and a legitimate authorization needing more than 5 s is truncated by it rather than bounded by the step that should have governed. The clamp makes that relationship explicit instead of accidental.
 
 **Verify**: the clamp tests; the budget value recorded in §8.1 with its p99 basis.
 
