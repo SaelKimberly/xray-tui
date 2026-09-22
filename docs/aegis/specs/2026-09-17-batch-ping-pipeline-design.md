@@ -561,3 +561,18 @@ so a full fast+real batch left every real failure looking like a working fast
 result, with no visible reason. The cell now follows the per-link tier the
 ordering key uses: a marker-carrying link contributes no displayable delay.
 See ADR 0003's 2026-09-18 amendment.
+
+
+## Amendment — 2026-09-22: one untestability counter
+
+Spec: `2026-09-22-native-testability-improvement-design.md` (T7).
+
+`counters.untestable` counted only the plan-time KIND gate (`capability::kind_supported`), while
+a config-level refusal — the capability gate's `support_reason` inside the real probe — incremented
+`real_failed` and `real_fail[Config]`. One fact, two buckets, which is why the 2026-09-21 run line
+read `untestable=0 … config=173` where the 173 were exactly the persisted untestable markers.
+
+`emit_result` now routes a failure whose text carries the untestable prefix to `untestable`
+instead. The discriminator stays in one place: a new `is_untestable_text` is the text-level twin
+of `is_untestable_marker`, and the latter delegates to it, so the Test cell, the
+Remove-Bad-Servers guard and the counters cannot drift on what "untestable" means.

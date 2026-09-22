@@ -90,3 +90,30 @@ snapshot taken mid-re-run — the number moves with every probe run).
   `PageRequest.stale_threshold`, and the never-read `PurgatoryConfig.enabled`.
 - ADR 0002's group contract is now three groups wide, and
   `apply_link_patches_isolates_column_groups` pins the new one.
+
+
+## Note — 2026-09-22: two refinements inside `reason_for`, no taxonomy change
+
+Spec: `2026-09-22-native-testability-improvement-design.md` (T5).
+
+This ADR's premise — "a taxonomy revision costs one function, not a schema change" — held
+exactly: both refinements landed inside `reason_for(FailureEvidence)`, with **no new
+`PurgeReason` variant** (the column is a `TEXT CHECK` over 7 variants, so a new one is a
+schema-tag bump, and a bump makes `Database::open` delete the file).
+
+1. A malformed REALITY config (missing/!32-byte `pbk`, malformed `short_id`) now raises
+   `NativeError::Config` instead of `Reality`, so it maps to `ConfigDefect` → `config_invalid`
+   rather than `RealityFallback`. A verdict about the peer when the peer was never reached is
+   the misclassification this ADR's typed-evidence rule exists to prevent.
+2. `reason_for` takes the link's `fp` and returns `None` when it is an approximation: the probe
+   dialled a shape the link did not ask for, so its failure is evidence about a config that was
+   never tried. The predicate is shared with the capability gate and the row label.
+
+## Note — 2026-09-22: the class names the STAGE, not the wrapper
+
+Spec: `2026-09-22-native-testability-improvement-design.md` (T6).
+
+`FailureEvidence` did not change. What changed is the CLASS a failure is counted under: a tunnel
+that ends under a later phase is now `NativeError::TunnelClosed` → `ProbeClass::Protocol`, not
+`Tls` (which is what the engine's `TlsError::Io` wrap produced). `evidence()` is `None` for it,
+exactly as for `Tls`, so this refines reporting without touching what a failure proves.

@@ -388,3 +388,31 @@ ImpactStatementDraft
   source-of-truth fact, the view predicate, the ordering law's new input, three
   retirements. Status: proposed, to be written when the plan lands.
 ```
+
+
+## Amendment — 2026-09-22: two mapping refinements and the approximated rule
+
+Spec: `2026-09-22-native-testability-improvement-design.md` (T5). **No new `PurgeReason`
+variant, no CHECK change, no schema bump, no wipe** — every change is inside
+`reason_for(FailureEvidence)`, the one function that decides verdicts.
+
+1. **A config defect is not a peer verdict.** Four sites created a malformed REALITY config
+   (`missing pbk`, non-base64 `pbk`, `pbk` not 32 bytes, malformed `short_id`) as
+   `NativeError::Reality`, and `NativeError::evidence()` maps that variant to
+   `FailureEvidence::RealityFallback` — so a broken config was purged as *"the server is not
+   REALITY / a possible MITM"*, a verdict about a peer that was never reached (21 rows on the
+   live feed). They now raise `NativeError::Config` → `ConfigDefect` → `config_invalid`.
+   `FailureEvidence::ConfigDefect => PurgeReason::ConfigInvalid` already existed, so this half
+   needed no change here at all — the defect was upstream, where the error was created.
+
+2. **An approximated probe earns no verdict.** `reason_for` gains an `fp` parameter and returns
+   `None` when that fingerprint is an approximation, decided by the SAME predicate the capability
+   gate and the row label use (`security::fingerprint::resolve_fingerprint`). The input is the
+   CONFIG's `fp`, not the `security_fp` column: no `reason_for` call site holds a `Protocol` row.
+   The row label reads the column, so the two-accessor agreement is asserted
+   (`the_security_fp_column_agrees_with_the_config_field` in `state.rs`) rather than assumed.
+   A lookup miss fails **closed** — no verdict — because failing open would let an approximated
+   probe earn exactly the permanent verdict the rule exists to prevent.
+
+`reason_for` is no longer `const`: the check goes through a non-`const` predicate, and
+re-implementing it inline would duplicate the single decision point.

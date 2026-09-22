@@ -759,3 +759,41 @@ Notes on the matrix:
 5. **TLS 1.2 CBC / static-RSA suites** — the engine's TLS 1.2 path is ECDHE +
    AEAD only; servers that require CBC encryption or RSA key exchange remain
    unreachable.
+
+
+## Amendment — 2026-09-22: fingerprint policy, removed transports, and a second e2e pin
+
+Spec: `docs/aegis/specs/2026-09-22-native-testability-improvement-design.md`.
+
+**TLS fingerprints: an id with no roster row is approximated and marked, never refused.**
+`security::fingerprint::resolve_fingerprint` is the single decision point, read by the capability
+gate and by the row label, so the two cannot drift:
+
+| `fp` | reading | approximation |
+|---|---|---|
+| absent / `""` / `unsafe` | no fingerprint requested — the engine default IS the shape asked for | no |
+| `chrome` / `firefox` / `safari` / `edge` / `ios` / `random(ized)` | resolves to a roster row | no |
+| `qq` / `android` / `360` / `hellochrome_120` / unknown | requested, no roster row | **yes** — probes with the default hello |
+
+The capability gate no longer refuses any fingerprint id (the old `security_reason` is deleted,
+not left returning `None`). On the reference feed that moved **1,165 previously-refused links**
+to 924 approximated + 257 honoured, with **0 refusals remaining**. The marker renders as a
+trailing `~` on the Test cell and on the panel's per-link shape cell, derived from the
+`security_fp` column — no new persistence.
+
+**Transports: `http`/`h2` and `quic` are refused at BUILD time for xray-core.**
+`validate_xray_transport` (`proto_spec/common.rs`) rejects `TransportConfig::Http`/`Quic` with
+`SupportError::Config`, called from the three `inject_xray` arms that emit a variable transport
+(vless, vmess, trojan). xray-core 26 REMOVED both (`PrintRemovedFeatureError` returns an error,
+not a warning — verified against the pinned binary), so emitting one produced a config the core
+refuses to load. The native engine serves both, and `resolve_runtime_core` already sends every
+native-capable kind to native before any build, so the refusal is reachable only through an
+explicit xray override — which decision 20 answers by warning that the override was not honoured.
+
+**E2E: a SECOND pinned peer for differentials.** `XRAY_HEAD_VERSION` (26.7.28) +
+`XRAY_TUI_CORE_HEAD_BIN_DIR`, resolved through `CoreUnderTest::resolve_from`. `XRAY_VERSION`
+(26.3.27) stays the suite's baseline, so its 136 rows are not re-baselined. First use:
+`vless_pq_enc_against_head` ran the pq-enc case against HEAD and found it behaves **identically**
+to the baseline (connect Ok, probe reads nothing, no server-side error at either) — so the
+`mlkem768x25519plus` divergence is **the client, not a stale pin**, and that row stays ignored
+with the gate closed.

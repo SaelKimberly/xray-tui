@@ -110,3 +110,17 @@ Every row is the median of its samples (`Acc`), because the first sample of a se
 page-cache, statement compilation and pool setup that steady state never pays. After this
 change: `stage` 1,120 → 54 ns, `stage_result` 1,128 → 80 ns, walk 12.1 → 3.0 ms/page,
 `PlanLink` 472 → 336 B, and `run_batch` (stub probes, 2,000 links) 55–70 µs/link.
+
+
+## Note — 2026-09-22: the untestability counter is one counter
+
+Spec: `2026-09-22-native-testability-improvement-design.md` (T7).
+
+`counters.untestable` counted only the plan-time kind gate, while a config-level capability
+refusal incremented `real_failed`/`real_fail[Config]` — one fact booked twice, which is why a
+run line could read `untestable=0 … config=173` where the 173 were the persisted untestable
+markers. `emit_result` now routes both to `untestable`, off a single shared predicate
+(`is_untestable_text`, which `is_untestable_marker` delegates to).
+
+The run line's other counters are unchanged, and the batch's `summary_line` remains the only
+record a run writes.

@@ -286,3 +286,35 @@ alternatives considered (in-process SOCKS stub / keep subprocess). Document amen
 accept: `docs/native-core-integration.md` §6 + D6 + work item 7 + the out-of-scope bullet,
 `AGENTS.md` decisions 15 and 20, `TUI_MANUAL.md` test-label section,
 `docs/aegis/INDEX.md`.
+
+
+## Amendment — 2026-09-22: three deltas from the native-testability workstream
+
+Spec: `2026-09-22-native-testability-improvement-design.md` (T3/T5/T6).
+
+**T3 — the fingerprint gate is retired; an unrosterable id is approximated and marked.**
+`security_reason` used to refuse an `fp` id with no roster row (`qq`, `android`, `360`,
+`hellochrome_120`) and an empty `fp`, deferring those links to the subprocess — 1,165 links on
+the reference feed. `security::fingerprint::resolve_fingerprint` is now the single predicate:
+`None`/`""`/`unsafe` mean "no fingerprint requested" and resolve to the engine default unmarked;
+a roster id resolves to its own profile; an id with no roster row resolves to the default and
+reports `approximated`. The gate reads it, so does the row label (a trailing `~` on the Test cell
+and on the panel's per-link shape cell). `security_reason` is **deleted**, not left returning
+`None`, so the gate and `security::wrap` cannot drift. Measured: 0 refusals remain, 924 links
+approximated, 257 honoured.
+
+**T5 — a config defect is not a peer verdict, and an approximated probe earns none.**
+Four sites created a malformed REALITY config as `NativeError::Reality`, which `evidence()` maps
+to `RealityFallback` — so a missing `pbk` was purged as "the server is not REALITY / a possible
+MITM". They now raise `NativeError::Config` → `ConfigDefect` → `config_invalid`
+(`reason_for` needed no change: that mapping already existed). And `reason_for(evidence, fp)`
+returns `None` when the link's fingerprint is an approximation — the shape dialled is not the
+shape the link asked for, so the failure is about a config that was never tried.
+
+**T6 — a tunnel that ended is a protocol-stage failure, not a TLS one.**
+`NativeError::TunnelClosed` is raised at the target-leg boundary when the tunnel under it ends
+(`UnexpectedEof` or `ConnectionReset`, classified from the io error's KIND, never its message),
+and maps to `ProbeClass::Protocol`. Before, the engine's `TlsError::Io` wrap made it
+`ProbeClass::Tls`, which counted 151 rows of the 2026-09-21 run as TLS problems when the peer had
+simply closed the tunnel. `evidence()` is `None` for it, exactly as for `Tls`: the class changes,
+no verdict does.
