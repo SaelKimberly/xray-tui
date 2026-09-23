@@ -167,6 +167,13 @@ So the design keeps **both**, one owner per direction:
    (`ws_path_for_xray`) — the Clash-import and Add/Edit-form cases, which xray's
    JSON has no other way to express. A share-URL config's path is emitted
    untouched.
+5. **The sing-box emitter defaults the header name**, not just the hoist. The
+   hoist's pin only covers the share-URL source; a Clash import or the form sets
+   `max_early_data` with no name, and `to_singbox_transport` would then emit the
+   size alone — sing-box's path-append route again. The field is `Option`, so
+   `None` means "unset" and never "explicitly empty": no caller can want the
+   append route, so the emitter pins `EARLY_DATA_HEADER` for every source. The
+   hoist's own pin stays as the identity-visible declaration.
 
 This closes a live defect: `max_early_data` is in the identity
 (`write_transport` → `TR_MAX_EARLY_DATA`), is emitted to sing-box and is
@@ -250,7 +257,7 @@ Purgatory. **No `IDENTITY_VERSION` bump:** the wire *format* is unchanged
 | A literal `?` or `#` that was *meant* as a path byte | Split-first is the rule (§4.1): `?` starts the query (mirroring Go's `url.Parse` inside xray's dialer), `#` is a fragment and is dropped — which is what `into_client_request` already does today, so this invents no new loss. Falsifier: a real server configured with a literal-`?`/`#` path. |
 | Canonicalizing a mirror that is not a URI path (grpc service name, a pathless transport's legacy `host`-as-path) | Prevented by the gate: the mirror is canonicalized only when `canonicalize_paths` reports a URI-path transport (§4.1 coverage). Falsifier: `canonicalize_transport_paths_leaves_a_non_uri_transport_mirror_alone`. |
 | Early data against a peer that does not honour the convention | Both references remove the first bytes from the socket by design, so a mismatched peer loses the first flight. `hoist_early_data` pins `Sec-WebSocket-Protocol` (§4.6), the convention the link's `ed` implies and the one xray's hub reads; a sing-box server in *path* mode remains exposed. **Unmeasured** — no fixture carries `ed=`. Falsifier: one real sing-box link with `ed=` against an early-data-capable and a plain ws server. |
-| Re-key produces a duplicate pair for the retention window | Stated in §4.3/§6 as the disposition's cost; bounded by the purge TTL. |
+| A value re-key would strand old rows | **Moot — the wipe subsumes it.** `SCHEMA_VERSION` 12 → 13 makes the next `open` delete the file, so every row is re-imported fresh and no duplicate pair can arise (§4.3/§4.6). Without the wipe this would have been the affected-subset re-key aged out through Purgatory (7 d → 30 d). |
 | `identity_format_is_frozen_for_every_kind` trips on a fixture with a non-canonical path | Expected if it fires — re-pin that fixture and record why; the format itself is unchanged. |
 | Canonicalizing grpc's service name | Prevented by the **runtime gate**, not by scope: `common::canonicalize_config_paths` canonicalizes the config's `path` mirror only through `TransportConfig::uri_path_mut`, which returns `None` for `Grpc`. Falsifier: `grpc_service_name_is_not_a_path` + the export pinned via `reconstruct_proto`. |
 | A path the canonicalizer still cannot frame (e.g. control bytes) | Falls through to today's `Config`/`config_invalid` path — fail-closed, unchanged. |

@@ -1320,8 +1320,21 @@ pub(crate) fn to_singbox_transport(
             }
             if let Some(med) = cfg.max_early_data {
                 obj.insert("max_early_data".into(), serde_json::json!(med));
-            }
-            if let Some(name) = &cfg.early_data_header_name {
+                // The header route is not optional here, and defaulting it in
+                // the EMITTER (not only in the hoist) is what covers every
+                // source — a Clash import or the Add/Edit form sets the size
+                // without a name. Our field is `Option`, so `None` means
+                // "unset" and never "explicitly empty": no caller can want the
+                // path-append route.
+                obj.insert(
+                    "early_data_header_name".into(),
+                    serde_json::json!(
+                        cfg.early_data_header_name
+                            .as_deref()
+                            .unwrap_or(EARLY_DATA_HEADER)
+                    ),
+                );
+            } else if let Some(name) = &cfg.early_data_header_name {
                 obj.insert(
                     "early_data_header_name".into(),
                     serde_json::json!(name.as_str()),
@@ -1386,6 +1399,15 @@ pub(crate) fn to_singbox_transport(
     Ok(Some(serde_json::Value::Object(obj)))
 }
 
+/// The early-data header xray's client sends (`websocket/dialer.go:153`) and the
+/// only one its hub reads back (`hub.go:55-58`).
+///
+/// Pinned rather than left to sing-box's default, which **appends** the payload
+/// to the request path (`transport/v2raywebsocket/conn.go:170-175`) — a
+/// convention only a sing-box server configured the same way understands, so
+/// every other peer sees a mutated path and 404s.
+pub(crate) const EARLY_DATA_HEADER: &str = "Sec-WebSocket-Protocol";
+
 /// The `ed` value in a request-target's query, if any.
 ///
 /// xray reads the FIRST `ed` (`url.Values.Get`), so this does too.
@@ -1435,7 +1457,7 @@ pub(crate) fn hoist_early_data(transport: &mut TransportConfig) {
         // subprotocol at `client.go:92-96`), which is byte-identical to what
         // xray's hub reads.
         if cfg.early_data_header_name.is_none() {
-            cfg.early_data_header_name = Some(TinyText::from("Sec-WebSocket-Protocol"));
+            cfg.early_data_header_name = Some(TinyText::from(EARLY_DATA_HEADER));
         }
     }
 }
@@ -1794,6 +1816,23 @@ mod tests {
         assert_eq!(
             sb["early_data_header_name"], "Sec-WebSocket-Protocol",
             "the header route, not sing-box's path-append default"
+        );
+
+        // Every source, not just the hoisted one: a Clash import or the Add/Edit
+        // form sets the size with no name, and the emitter must still pin the
+        // route — the hoist never ran on this shape.
+        let from_clash = TransportConfig::Ws(WebSocketConfig {
+            path: Some(TinyText::from("/ws")),
+            max_early_data: Some(2048),
+            ..Default::default()
+        });
+        let sb = to_singbox_transport(&from_clash)
+            .expect("ws is in the vendored set")
+            .expect("a ws transport emits a transport object");
+        assert_eq!(sb["max_early_data"], 2048);
+        assert_eq!(
+            sb["early_data_header_name"], "Sec-WebSocket-Protocol",
+            "a field-set source must not fall back to the path-append route"
         );
     }
 
