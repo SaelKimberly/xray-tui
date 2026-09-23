@@ -483,10 +483,10 @@ Mlkem768::keypair_from_seed(reference seed) == reference ek    →  PASSES
 |---|---|
 | ADR 0006 — purge evidence and verdicts | doc note: two mapping refinements + the approximated-evidence rule. No variant, no CHECK change, no wipe. |
 | ADR 0008 — batch-feed scaling | doc note: the counter split, and whether the budget clamp moves the measured flow cost. |
-| **new ADR (proposed)** — *unhonourable capability is approximated and marked, never silently substituted* | durable policy with a real alternative (refuse vs approximate) and a trust boundary. Source refs: §5.1, §5.3, `security/fingerprint.rs`, `reality/mod.rs:158-201`. Expected baseline-sync question: which capability gaps are approximated vs refused, and who may change that list? |
-| **new ADR (proposed)** — *one authoritative attempt budget; engine step limits are clamps* | runtime-boundary decision replacing five independent constants (`error.rs:174-181`). Source refs: §5.2, `probe.rs`, `ping_native.rs`. |
+| **new ADR — `0009-fingerprint-approximation.md`** — *unhonourable capability is approximated and marked, never silently substituted* | **ACCEPTED 2026-09-22** — its work (item 1) executed, so it left the signals table and became architecture memory. Source refs: §5.1, §5.3, `security/fingerprint.rs`, `reality/mod.rs:158-201`. |
+| **new ADR — *one authoritative attempt budget; engine step limits are clamps*** | **still a SIGNAL**: T4 was deferred by user decision, so this design is unexecuted and no accepted ADR is written from it. The plan's T4 carries the reasoning, the `min` semantics that were kept, and the measured scope if it is ever un-deferred. |
 
-Both proposed ADRs are **signals only**; they become accepted architecture memory after the work executes.
+The two ADR signals resolved differently, as the rule above requires: item 1's work executed, so it became **accepted** ADR 0009; the budget-clamp design did not execute (T4 deferred by user decision), so it stays a **signal** and no accepted ADR is written from an unexecuted idea.
 
 ## 12. Residual risks
 
