@@ -60,6 +60,25 @@ impl TransportConfig {
             Self::XHttp(_) => "xhttp",
         }
     }
+
+    /// The URI-path field of a transport whose `path` is a request-target, if
+    /// any.
+    ///
+    /// **The one place that decides which transports carry a URI path.**
+    /// `Grpc`'s `path` is a service name, and the pathless kinds have none.
+    /// Everything that needs that decision goes through here — including the
+    /// config-level `path` mirror, which is a URI path exactly when the
+    /// transport is one.
+    const fn uri_path_mut(&mut self) -> Option<&mut Option<TinyText>> {
+        match self {
+            Self::Ws(c) => Some(&mut c.path),
+            Self::Http(c) => Some(&mut c.path),
+            Self::HttpUpgrade(c) => Some(&mut c.path),
+            Self::XHttp(c) => Some(&mut c.path),
+            Self::Tcp | Self::Grpc(_) | Self::Quic | Self::Kcp(_) => None,
+        }
+    }
+
     fn recover_transport_type(input: &str) -> Option<&'static str> {
         // Sorted by length descending, so longest prefix matches first
         const KNOWN: &[&str] = &[
@@ -1038,7 +1057,13 @@ pub fn to_xray_stream_settings(
         TransportConfig::Ws(cfg) => {
             let mut w = serde_json::Map::new();
             if let Some(p) = &cfg.path {
-                w.insert("path".into(), serde_json::json!(p.as_str()));
+                // xray's JSON has no `maxEarlyData` key, so the typed size is
+                // expressed as the `?ed=NNNN` query its `Build()` reads — a
+                // no-op when the path already carries it.
+                w.insert(
+                    "path".into(),
+                    serde_json::json!(ws_path_for_xray(p, cfg.max_early_data)),
+                );
             }
             if let Some(h) = &cfg.host {
                 // Top-level `host` — xray-core deprecates `headers.Host`
@@ -1361,11 +1386,519 @@ pub(crate) fn to_singbox_transport(
     Ok(Some(serde_json::Value::Object(obj)))
 }
 
+/// The `ed` value in a request-target's query, if any.
+///
+/// xray reads the FIRST `ed` (`url.Values.Get`), so this does too.
+fn early_data_from_path(path: &str) -> Option<u32> {
+    let (_, query) = path.split_once('?')?;
+    query
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("ed="))
+        .find_map(|v| v.parse::<u32>().ok())
+}
+
+/// Hoist the legacy `?ed=NNNN` ws-path query into the typed early-data field.
+///
+/// Mirrors xray's own `WebSocketConfig::Build`
+/// (`thirdparty/Xray-core/infra/conf/transport_method.go:622-651`), which reads
+/// `ed` out of the path query into `Config.Ed`.
+///
+/// **The path is left byte-identical, and the path's query is authoritative.**
+/// xray's JSON `WebSocketConfig` (`transport_method.go:611-617`) has exactly
+/// five keys — `host`, `path`, `headers`, `acceptProxyProtocol`,
+/// `heartbeatPeriod` — and **no `maxEarlyData`**: the query is its only carrier,
+/// so removing it would silently drop early data for the xray subprocess. The
+/// typed field is the derived mirror: it is what sing-box reads
+/// (`max_early_data`), what the native ws will read, and what
+/// [`ws_path_for_xray`] re-derives the query from when the path carries none.
+///
+/// Reading the path rather than only filling an empty field is what keeps the
+/// two consistent in every flow: a form that sets both gets the path's value
+/// (the one xray honours), and a form that sets only the field keeps it.
+pub(crate) fn hoist_early_data(transport: &mut TransportConfig) {
+    let TransportConfig::Ws(cfg) = transport else {
+        return;
+    };
+    let Some(path) = cfg.path.as_deref() else {
+        return;
+    };
+    if let Some(ed) = early_data_from_path(path) {
+        cfg.max_early_data = Some(ed);
+        // Pin the header route. `ed` is xray's convention and xray delivers the
+        // payload in `Sec-WebSocket-Protocol` (`websocket/dialer.go:153`),
+        // never by rewriting the path. With the name unset, sing-box instead
+        // APPENDS the base64 payload to the request path
+        // (`transport/v2raywebsocket/conn.go:170-175`) — a convention private to
+        // a sing-box server configured the same way (`server.go:75-96`); every
+        // other peer sees a mutated path and 404s. Setting the name makes
+        // sing-box take its header branch (`conn.go:176-179`, moved into the WS
+        // subprotocol at `client.go:92-96`), which is byte-identical to what
+        // xray's hub reads.
+        if cfg.early_data_header_name.is_none() {
+            cfg.early_data_header_name = Some(TinyText::from("Sec-WebSocket-Protocol"));
+        }
+    }
+}
+
+/// The ws path to **emit to xray**, with the typed early-data size re-derived as
+/// the `?ed=NNNN` query its config builder reads.
+///
+/// A share-URL config already carries the query, so this is a no-op for it. It
+/// exists for the cases where `max_early_data` was set with no query to match —
+/// a Clash import or the Add/Edit form — which xray's JSON has no other way to
+/// express.
+fn ws_path_for_xray(path: &str, ed: Option<u32>) -> String {
+    let Some(n) = ed else {
+        return path.to_owned();
+    };
+    if early_data_from_path(path).is_some() {
+        // The path already carries the carrier xray reads; leave it untouched.
+        return path.to_owned();
+    }
+    let sep = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{sep}ed={n}")
+}
+
+/// Canonicalize a transport's URI path **and** a config's top-level `path`
+/// mirror, under the transport's own match.
+///
+/// vless/vmess/trojan carry the path twice — the transport's (which
+/// `write_transport` hashes into the identity) and a top-level mirror
+/// (`write_identity` deliberately excludes it, `reconstruct_proto` emits it) —
+/// so the two must be canonicalized together or the stored config, its exported
+/// share URL and its uid describe different paths.
+///
+/// The mirror is a URI path exactly when the transport is one, and that is
+/// decided by [`TransportConfig::uri_path_mut`] — the single match. A mirror
+/// that travelled on its own is how a grpc service name got a leading `/`.
+///
+/// Idempotent: a canonical path is recognized without allocating.
+pub(crate) fn canonicalize_config_paths(
+    transport: &mut TransportConfig,
+    mirror: &mut Option<TinyText>,
+) {
+    let Some(path) = transport.uri_path_mut() else {
+        return;
+    };
+    canonicalize_target_opt(path);
+    canonicalize_target_opt(mirror);
+}
+
+/// Canonicalize an optional stored request-target in place.
+///
+/// The fast path is the point: a canonical value (`/ws`, `/?ed=2560`, …) is
+/// recognized without allocating, so an import pays nothing for the common
+/// case. Shared by the transport path AND the config's top-level `path` mirror
+/// (vless/vmess/trojan) so the two can never disagree.
+pub(crate) fn canonicalize_target_opt(path: &mut Option<TinyText>) {
+    let Some(stored) = path.as_deref() else {
+        return;
+    };
+    if is_canonical_request_target(stored) {
+        return;
+    }
+    let canonical = canonical_request_target(stored);
+    if canonical != stored {
+        *path = Some(TinyText::from(canonical.as_str()));
+    }
+}
+
+/// True when `stored` is already a canonical request-target, so the caller can
+/// skip the decode/encode pass — and its allocations — entirely.
+///
+/// The rule preserves the query verbatim, so only the path part is inspected.
+/// `%` is not a `pchar`, so any escape forces the full pass; likewise a missing
+/// leading `/` and any `#`.
+fn is_canonical_request_target(stored: &str) -> bool {
+    if stored.contains('#') {
+        return false;
+    }
+    let path = stored.split_once('?').map_or(stored, |(p, _)| p);
+    path.starts_with('/') && path.bytes().all(is_pchar)
+}
+
+/// Canonicalize one stored request-target (spec §4.1).
+///
+/// The value is a request-target — `path ["?" query]` — so it is split at the
+/// FIRST `?` before anything else; everything from a `#` is a fragment, which
+/// is not sent (`into_client_request` already behaves this way). The path part
+/// gets one extra percent-decode (`RawUrlX::query` already decoded once, so a
+/// double-encoded source still carries its escapes here), a leading `/` when
+/// missing, and a re-encode to `pchar`. The query rides through verbatim.
+fn canonical_request_target(stored: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let target = stored.split('#').next().unwrap_or_default();
+    let (path_part, query_part) = target
+        .split_once('?')
+        .map_or((target, None), |(p, q)| (p, Some(q)));
+    // Malformed escapes stay as stored; the encode pass below normalizes them
+    // (`%` is not a pchar).
+    let path = urlencoding::decode(path_part).map_or_else(|_| path_part.to_owned(), Into::into);
+    let mut wire = String::with_capacity(path.len() + 8);
+    if !path.starts_with('/') {
+        wire.push('/');
+    }
+    for &b in path.as_bytes() {
+        if is_pchar(b) {
+            wire.push(char::from(b));
+        } else {
+            wire.push('%');
+            wire.push(char::from(HEX[usize::from(b >> 4)]));
+            wire.push(char::from(HEX[usize::from(b & 0x0F)]));
+        }
+    }
+    if let Some(q) = query_part {
+        wire.push('?');
+        wire.push_str(q);
+    }
+    wire
+}
+
+/// RFC 3986 `pchar`: `unreserved` / `sub-delims` / `:` / `@` / `/`.
+const fn is_pchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'/'
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto_spec::{ProtoSpec, VlessConfig};
+    use crate::proto_spec::{ProtoSpec, ProtocolConfig, SecurityConfig, VlessConfig};
     use crate::urlx::RawUrlX;
+
+    /// vless/vmess/trojan carry the ws path **twice**: the transport's (which
+    /// `write_transport` hashes into the identity) and a top-level mirror that
+    /// `reconstruct_proto` EMITS while `write_identity` deliberately excludes.
+    /// Canonicalizing one without the other would leave the stored config, its
+    /// exported share URL and its uid describing different paths.
+    #[test]
+    fn canonicalize_transport_paths_covers_the_top_level_mirror() {
+        let raw = "%2Ftr%20x";
+        let mut config = ProtocolConfig::Vless(VlessConfig {
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+            uuid_origin: None,
+            security: SecurityConfig::default(),
+            transport: TransportConfig::Ws(WebSocketConfig {
+                path: Some(TinyText::from(raw)),
+                ..Default::default()
+            }),
+            path: Some(TinyText::from(raw)),
+            encryption: None,
+            flow: None,
+            splice: None,
+            remarks: None,
+        });
+        config.normalize_transport();
+        let ProtocolConfig::Vless(c) = &config else {
+            unreachable!("built a vless config");
+        };
+        let transport_path = match &c.transport {
+            TransportConfig::Ws(ws) => ws.path.as_deref(),
+            other => panic!("expected ws transport, got {other:?}"),
+        };
+        assert_eq!(transport_path, Some("/tr%20x"));
+        assert_eq!(
+            c.path.as_deref(),
+            Some("/tr%20x"),
+            "the mirror must agree with the transport path"
+        );
+    }
+
+    /// The mirror is a URI path ONLY when the transport is a URI-path kind.
+    /// For `Grpc` the top-level `path` is the SERVICE NAME (a real share link
+    /// is `?type=grpc&path=svc`, no leading slash), and `reconstruct_proto`
+    /// emits `path=` from this mirror — so canonicalizing it would export
+    /// `/svc`, and reimporting that hands the transport a different grpc path,
+    /// which `write_transport` hashes into a different uid.
+    #[test]
+    fn canonicalize_transport_paths_leaves_a_non_uri_transport_mirror_alone() {
+        let vless = |transport: TransportConfig, mirror: &str| {
+            ProtocolConfig::Vless(VlessConfig {
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+                uuid_origin: None,
+                security: SecurityConfig::default(),
+                transport,
+                path: Some(TinyText::from(mirror)),
+                encryption: None,
+                flow: None,
+                splice: None,
+                remarks: None,
+            })
+        };
+
+        // grpc: the mirror IS the service name.
+        let mut grpc = vless(
+            TransportConfig::Grpc(GrpcConfig {
+                service_name: Some(TinyText::from("svc")),
+                path: Some(TinyText::from("svc")),
+                ..Default::default()
+            }),
+            "svc",
+        );
+        let before = grpc.clone();
+        grpc.normalize_transport();
+        assert_eq!(grpc, before, "a grpc service name must not move");
+        // The export shape, pinned: `reconstruct_proto` emits `path=` from the
+        // mirror, so an unchanged mirror is what keeps export → reimport
+        // identity-stable.
+        let endpoint = EndpointEssentials::new("example.com", 443);
+        let ProtocolConfig::Vless(c) = &grpc else {
+            unreachable!("built a vless config");
+        };
+        let url = c
+            .reconstruct_proto(&endpoint)
+            .expect("grpc config reconstructs");
+        assert!(url.contains("path=svc"), "exported mirror stays raw: {url}");
+        assert!(!url.contains("%2Fsvc"), "no leading slash was added: {url}");
+
+        // A pathless transport with a mirror (vmess's legacy host-as-path form):
+        // not a URI path either, so it is left as stored.
+        let mut tcp = vless(TransportConfig::Tcp, "foo");
+        tcp.normalize_transport();
+        let ProtocolConfig::Vless(c) = &tcp else {
+            unreachable!("built a vless config");
+        };
+        assert_eq!(c.path.as_deref(), Some("foo"));
+    }
+
+    /// A `#` begins a fragment: it is not part of a request-target and is
+    /// dropped by the rule, exactly as `into_client_request` does today.
+    #[test]
+    fn ws_path_canonicalization_drops_a_fragment() {
+        assert_eq!(canon("/a#frag").as_deref(), Some("/a"));
+        assert_eq!(canon("/a/b#f").as_deref(), Some("/a/b"));
+        assert_eq!(canon("/a?x=1#f").as_deref(), Some("/a?x=1"));
+    }
+
+    /// The legacy `?ed=NNNN` ws-path query is hoisted into the typed field
+    /// (xray's own `WebSocketConfig::Build` shape) — and the path stays
+    /// **byte-identical**, because xray's JSON has no `maxEarlyData` key and the
+    /// query is its only carrier.
+    #[test]
+    fn hoist_early_data_fills_the_field_and_leaves_the_path_alone() {
+        let mut t = TransportConfig::Ws(WebSocketConfig {
+            path: Some(TinyText::from("/ws?ed=2560")),
+            ..Default::default()
+        });
+        hoist_early_data(&mut t);
+        let TransportConfig::Ws(c) = &t else {
+            unreachable!("built a ws transport");
+        };
+        assert_eq!(c.max_early_data, Some(2560));
+        assert_eq!(
+            c.early_data_header_name.as_deref(),
+            Some("Sec-WebSocket-Protocol"),
+            "the header route is pinned, so sing-box does not rewrite the path"
+        );
+        assert_eq!(
+            c.path.as_deref(),
+            Some("/ws?ed=2560"),
+            "the path keeps the carrier xray reads"
+        );
+
+        // An explicit header name is respected (the Clash/form case).
+        let mut t = TransportConfig::Ws(WebSocketConfig {
+            path: Some(TinyText::from("/ws?ed=2560")),
+            early_data_header_name: Some(TinyText::from("X-Custom-Early")),
+            ..Default::default()
+        });
+        hoist_early_data(&mut t);
+        let TransportConfig::Ws(c) = &t else {
+            unreachable!("built a ws transport");
+        };
+        assert_eq!(c.early_data_header_name.as_deref(), Some("X-Custom-Early"));
+
+        // The path's query is authoritative when present: it is what xray's
+        // `Build()` reads, so a form that sets both cannot make them disagree.
+        let mut t = TransportConfig::Ws(WebSocketConfig {
+            path: Some(TinyText::from("/ws?ed=2048")),
+            max_early_data: Some(9999),
+            ..Default::default()
+        });
+        hoist_early_data(&mut t);
+        let TransportConfig::Ws(c) = &t else {
+            unreachable!("built a ws transport");
+        };
+        assert_eq!(c.max_early_data, Some(2048));
+
+        // No query: an explicit field is kept as-is (the Clash/form case).
+        let mut t = TransportConfig::Ws(WebSocketConfig {
+            path: Some(TinyText::from("/ws")),
+            max_early_data: Some(512),
+            ..Default::default()
+        });
+        hoist_early_data(&mut t);
+        let TransportConfig::Ws(c) = &t else {
+            unreachable!("built a ws transport");
+        };
+        assert_eq!(c.max_early_data, Some(512));
+
+        // Not a ws transport: untouched.
+        let mut t = TransportConfig::Tcp;
+        hoist_early_data(&mut t);
+        assert_eq!(t, TransportConfig::Tcp);
+    }
+
+    /// The xray emitter re-derives the carrier **only** when the path has none,
+    /// so a share-URL config's path comes back byte-identical (no double `ed`).
+    #[test]
+    fn xray_ws_path_carries_the_early_data_only_when_it_must() {
+        assert_eq!(ws_path_for_xray("/ws?ed=2560", Some(2560)), "/ws?ed=2560");
+        assert_eq!(ws_path_for_xray("/ws", Some(2048)), "/ws?ed=2048");
+        assert_eq!(ws_path_for_xray("/ws?a=1", Some(2048)), "/ws?a=1&ed=2048");
+        assert_eq!(ws_path_for_xray("/ws", None), "/ws");
+    }
+
+    /// End to end through the emitters, on the shape production builds: a
+    /// share-URL path carrying `ed`, put through the hoist.
+    #[test]
+    fn the_early_data_size_reaches_both_core_configs() {
+        let mut transport = TransportConfig::Ws(WebSocketConfig {
+            path: Some(TinyText::from("/ws?ed=2048")),
+            ..Default::default()
+        });
+        hoist_early_data(&mut transport);
+
+        // xray: the path keeps the carrier its `Build()` hoists; there is no
+        // `maxEarlyData` key to emit.
+        let ss = to_xray_stream_settings(&SecurityConfig::default(), &transport)
+            .expect("a ws transport emits streamSettings");
+        assert_eq!(ss["wsSettings"]["path"], "/ws?ed=2048");
+
+        // sing-box: the typed fields, on the HEADER route — not its
+        // path-append default, which only a sing-box server would understand.
+        let sb = to_singbox_transport(&transport)
+            .expect("ws is in the vendored set")
+            .expect("a ws transport emits a transport object");
+        assert_eq!(sb["max_early_data"], 2048);
+        assert_eq!(
+            sb["early_data_header_name"], "Sec-WebSocket-Protocol",
+            "the header route, not sing-box's path-append default"
+        );
+    }
+
+    fn ws_path(t: &TransportConfig) -> Option<&str> {
+        match t {
+            TransportConfig::Ws(c) => c.path.as_deref(),
+            other => panic!("expected ws transport, got {other:?}"),
+        }
+    }
+
+    fn canon(input: &str) -> Option<String> {
+        let mut t = TransportConfig::Ws(WebSocketConfig {
+            path: Some(TinyText::from(input)),
+            ..Default::default()
+        });
+        canonicalize_config_paths(&mut t, &mut None);
+        ws_path(&t).map(str::to_owned)
+    }
+
+    /// The two measured spellings of ONE logical path (spec §2 rows 2 and 4)
+    /// must canonicalize to the same request-target — that is the dedup, since
+    /// the ws path is identity-bearing (`write_transport`).
+    #[test]
+    fn ws_path_canonicalization_merges_the_two_spellings_of_one_path() {
+        // row 2: what a single-encoded source leaves after RawUrlX's one decode
+        let single = canon("/trTelegram🇨🇳 @WangCai2");
+        // row 4: what a double-encoded source leaves
+        let doubled = canon("%2FtrTelegram%F0%9F%87%A8%F0%9F%87%B3%20%40WangCai2");
+        assert_eq!(single, doubled);
+        // `@` is an RFC 3986 pchar, so it stays bare — Go's EscapedPath does
+        // the same, and leaving it is what keeps the target decodable.
+        assert_eq!(
+            single.as_deref(),
+            Some("/trTelegram%F0%9F%87%A8%F0%9F%87%B3%20@WangCai2")
+        );
+        // The invariant: the target decodes server-side to the configured path.
+        let decoded = urlencoding::decode(single.as_deref().unwrap()).unwrap();
+        assert_eq!(decoded.as_ref(), "/trTelegram🇨🇳 @WangCai2");
+    }
+
+    /// Distinct logical paths must NOT be merged — a merge-happy canonicalizer
+    /// would be as wrong as today's behaviour, in the other direction
+    /// (spec §2 rows 1 and 3 are genuinely different channels).
+    #[test]
+    fn ws_path_canonicalization_does_not_merge_distinct_paths() {
+        let no_emoji = canon("/trTelegram @WangCai2");
+        let plus = canon("%2FtrTelegram%F0%9F%87%A8%F0%9F%87%B3%2B%40WangCai2");
+        let emoji = canon("/trTelegram🇨🇳 @WangCai2");
+        assert_ne!(no_emoji, emoji);
+        assert_ne!(plus, emoji);
+        assert_ne!(no_emoji, plus);
+    }
+
+    /// The early-data form is stored INSIDE `path`; its query must ride
+    /// through verbatim or a config that dials today would move and re-key
+    /// (spec §4.1 — `vless.rs` pins `/?ed=2560`).
+    #[test]
+    fn ws_path_canonicalization_preserves_the_query() {
+        for same in ["/?ed=2560", "/?ed=2048", "/ws", "/", "/a/b?x=1&y=2", "/x?a"] {
+            assert_eq!(canon(same).as_deref(), Some(same), "moved: {same}");
+        }
+    }
+
+    /// Idempotent: re-canonicalizing a canonical path changes nothing.
+    #[test]
+    fn ws_path_canonicalization_is_idempotent() {
+        for input in [
+            "/trTelegram🇨🇳 @WangCai2",
+            "%2FtrTelegram%F0%9F%87%A8%F0%9F%87%B3%20%40WangCai2",
+            "/?ed=2560",
+        ] {
+            let once = canon(input).unwrap();
+            assert_eq!(canon(&once).as_deref(), Some(once.as_str()), "{input}");
+        }
+        // An absent path stays absent.
+        let mut t = TransportConfig::Ws(WebSocketConfig::default());
+        canonicalize_config_paths(&mut t, &mut None);
+        assert_eq!(ws_path(&t), None);
+    }
+
+    #[test]
+    fn ws_path_canonicalization_prepends_the_leading_slash() {
+        for (input, expected) in [
+            ("trTelegram x", "/trTelegram%20x"),
+            ("/trTelegram x", "/trTelegram%20x"),
+            // `%2F` decodes to `/`, so the slash is already there
+            ("%2Ftr", "/tr"),
+        ] {
+            assert_eq!(canon(input).as_deref(), Some(expected), "{input}");
+        }
+    }
+
+    /// `Grpc`'s `path` is a service name, not a URI path — it must not move.
+    #[test]
+    fn grpc_service_name_is_not_a_path() {
+        let mut t = TransportConfig::Grpc(GrpcConfig {
+            path: Some(TinyText::from("my.Service")),
+            ..Default::default()
+        });
+        canonicalize_config_paths(&mut t, &mut None);
+        match t {
+            TransportConfig::Grpc(c) => assert_eq!(c.path.as_deref(), Some("my.Service")),
+            other => panic!("expected grpc, got {other:?}"),
+        }
+    }
     #[test]
     fn parse_curve_names_maps_all_seven_xray_names() {
         use super::curve_id::{

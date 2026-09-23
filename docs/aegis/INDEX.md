@@ -35,3 +35,5 @@
 | 2026-09-22 | adr | `adr/0009-fingerprint-approximation.md` | Unhonourable TLS fingerprints are approximated and marked, never refused | accepted |
 | 2026-09-22 | spec | `specs/2026-09-22-native-testability-improvement-design.md` | Native testability: trustworthy verdicts on a real feed | implemented, with two dispositions **decided terminal by the user (2026-09-22)**: T4 deferred (`min` semantics kept), and mlkem item 2 returned to design (localized to our client's wire) |
 | 2026-09-22 | plan | `plans/2026-09-22-native-testability-improvement.md` | Native testability — implementation | executed: T0–T3, T5–T11 landed; T4 and T9's fix terminal by user decision, each with its reasoning and scope recorded |
+| 2026-09-23 | spec | `specs/2026-09-23-ws-path-canonicalization-design.md` | WS path canonicalization at parse: dialable configs, one uid per logical path | implemented |
+| 2026-09-23 | plan | `plans/2026-09-23-ws-path-canonicalization.md` | WS path canonicalization — implementation | executed (T1–T6; e2e green against a real xray-core server; `SCHEMA_VERSION` 12 → 13) |

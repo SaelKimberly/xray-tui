@@ -309,14 +309,35 @@ pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
 /// would serialize 3×.
 #[must_use]
 pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
-    let (sig, _cred_hash, uid) = parsed.identity_once();
+    // Canonicalize the transport paths ONCE, before the identity is computed
+    // AND before the stored columns are built: the stored `config` is what the
+    // dial reads, and the identity must hash that same canonical value — a raw
+    // path would both fail to frame (`ws request: HTTP format error`) and split
+    // one logical path across two uids. This is the single application owner:
+    // every flow (share URL, Clash, Add/Edit form, stream import) reaches the
+    // `protocols` table through here.
+    // See docs/aegis/specs/2026-09-23-ws-path-canonicalization-design.md §4.2.
+    // Identity is computed from `ProtocolEssentials` alone, so the endpoints
+    // are NOT cloned: a temporary holder carries the canonical config through
+    // `identity_once` and is then moved on, so the config is cloned exactly
+    // once — the same single clone the Json column needed before.
+    let mut holder = ParsedProto {
+        endpoints: Vec::new(),
+        protocol: parsed.protocol.clone(),
+    };
+    holder.protocol.config.normalize_transport();
+    let (sig, _cred_hash, uid) = holder.identity_once();
+    let essentials = holder.protocol;
+
+    let transport = transport_embed(&essentials.config);
+    let security = security_embed(&essentials.config);
     Protocol {
         id: ProtocolId::new(uid),
         sig,
-        proto_kind: parsed.protocol.proto_kind,
-        transport: transport_embed(&parsed.protocol.config),
-        security: security_embed(&parsed.protocol.config),
-        config: Deferred::from(Json(parsed.protocol.config.clone())),
+        proto_kind: essentials.proto_kind,
+        transport,
+        security,
+        config: Deferred::from(Json(essentials.config)),
         created_at: xray_tui_db::models::now_epoch(),
         links: Deferred::default(),
     }
@@ -1047,6 +1068,91 @@ mod tests {
             pin_sha256: None,
             remarks: None,
         })
+    }
+
+    /// The `ed` hoist must be **reached in production**, not merely correct in
+    /// isolation: `hoist_early_data` runs only inside `normalize_transport`, and
+    /// every proto-level fixture parses without it — so deleting the call from
+    /// the owner would otherwise be silent.
+    ///
+    /// The second assertion is the path that must not regress: the stored path
+    /// keeps `ed=2560` (xray's only carrier, so its `Build()` still hoists it),
+    /// and the xray emitter's no-op branch leaves it byte-identical.
+    #[test]
+    fn protocol_from_parsed_hoists_the_early_data_and_keeps_the_carrier() {
+        use super::protocol_from_parsed;
+        use xray_tui_proto::proto_spec::SecurityConfig;
+        use xray_tui_proto::proto_spec::common::{TransportConfig, to_xray_stream_settings};
+        use xray_tui_proto::urlx::RawUrlX;
+
+        // The share-URL `path` value is itself percent-encoded, so `?`/`=`
+        // arrive as part of the PATH (`RawUrlX` decodes the query value once).
+        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?security=tls&type=ws&path=%2Fws%3Fed%3D2560";
+        let raw = ProtocolConfig::try_parse_proto(&RawUrlX::from(url)).expect("parse vless url");
+
+        let row = protocol_from_parsed(&raw);
+        let stored = serde_json::to_value(&row.config).expect("serialize stored config");
+        assert_eq!(
+            stored["transport"]["max_early_data"], 2560,
+            "the owner must hoist `ed` into the typed field: {stored}"
+        );
+        assert_eq!(
+            stored["transport"]["path"], "/ws?ed=2560",
+            "the path keeps the carrier xray reads: {stored}"
+        );
+        assert_eq!(
+            stored["transport"]["early_data_header_name"], "Sec-WebSocket-Protocol",
+            "sing-box is pinned to the header route, not the path-append one: {stored}"
+        );
+
+        // The xray emitter's no-op branch: the carrier is already there, so the
+        // emitted path is byte-identical (no double `ed`).
+        let transport: TransportConfig =
+            serde_json::from_value(stored["transport"].clone()).expect("transport round-trips");
+        let ss = to_xray_stream_settings(&SecurityConfig::default(), &transport)
+            .expect("a ws transport emits streamSettings");
+        assert_eq!(
+            ss["wsSettings"]["path"], "/ws?ed=2560",
+            "the xray carrier must not regress"
+        );
+    }
+
+    /// The canonicalizer has ONE application owner — `protocol_from_parsed`
+    /// (`docs/aegis/specs/2026-09-23-ws-path-canonicalization-design.md` §4.2).
+    /// This asserts the owner APPLIES it: a raw path and its canonical form must
+    /// land on the same row id, and the stored transport payload must carry the
+    /// canonical string the dial will frame.
+    #[test]
+    fn protocol_from_parsed_canonicalizes_the_transport_path() {
+        use super::protocol_from_parsed;
+        use xray_tui_db::models::ProtocolId;
+        use xray_tui_proto::urlx::RawUrlX;
+
+        // A double-encoded ws path: `RawUrlX::query` decodes once, so this
+        // survives as the escaped form — the shape the feed actually carries.
+        let url = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@example.com:443?security=tls&type=ws&path=%252FtrTelegram%2520x";
+        let raw = ProtocolConfig::try_parse_proto(&RawUrlX::from(url)).expect("parse vless url");
+
+        let mut canonical_input = raw.clone();
+        canonical_input.protocol.config.normalize_transport();
+        // Non-vacuous: the raw input alone hashes to a different id, or the
+        // equality below would hold for any implementation.
+        assert_ne!(
+            ProtocolId::new(raw.identity_once().2),
+            ProtocolId::new(canonical_input.identity_once().2)
+        );
+
+        let row = protocol_from_parsed(&raw);
+        assert_eq!(
+            row.id,
+            protocol_from_parsed(&canonical_input).id,
+            "the owner must canonicalize before hashing"
+        );
+        let stored = serde_json::to_string(&row.transport.data).expect("serialize transport");
+        assert!(
+            stored.contains("/trTelegram%20x"),
+            "stored transport carries the canonical path: {stored}"
+        );
     }
 
     /// The `security_fp` column and the config's `tls.fp` are TWO inputs to one

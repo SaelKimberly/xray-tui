@@ -254,6 +254,25 @@ cannot dial as stored, which is exactly what `Config` means now — so they carr
 Active view forever. The same honesty pass moved `now_unix_secs` from `Config`
 to `Io`.
 
+**2026-09-23 amendment — the class splits, and the path half stops reaching this
+site.** The paragraph above treats "cannot compose a request" as one class. It is
+two, and only one of them is a config defect:
+
+- **invalid authority** — a `host` carrying `/` or `?`, or an empty host. The row
+  genuinely cannot dial as stored. **Unchanged**: `Config` → `config_invalid`.
+- **path encoding** — a raw space or emoji in the path, a missing leading `/`, or
+  a double-encoded path. The row *can* dial: it failed only because our request
+  builder was handed a string the strict URI parser rejects, where the reference
+  (`xray`'s `GetNormalizedPath` + Go's lenient `url.Parse`) accepts it. These rows
+  are now canonicalized at the single row-build owner **before** the config is
+  composed (`2026-09-23-ws-path-canonicalization-design.md` §4.2), so they never
+  reach the request-BUILD site and no longer carry `ConfigDefect`.
+
+The measured `ConfigInvalid 27` above was taken before the split; like every
+count in this spec it moves with each run and is not a target. The example list
+is narrowed accordingly: `ws request: HTTP format error: invalid authority`
+remains evidence, `invalid uri character` does not.
+
 ## 8. Write path and lifecycle
 
 - **Purge gets its own `LinkGroups::PURGE` bit** (`0b010`; `ALL` becomes

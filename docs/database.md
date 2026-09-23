@@ -455,6 +455,16 @@ flowchart LR
    writes), also bump `IDENTITY_VERSION` in `xray-tui-proto` and re-pin the
    identity goldens: stored uids become unrelated values, so the wipe in step 2
    is mandatory, not optional.
+
+   **Format vs value — the rule above is about the FORMAT.** What the writer
+   writes (tags, order, which values are elided) decides the version. A change
+   that only alters a stored **value** for a subset of configs is a different
+   case: the format and the goldens are untouched, so no `IDENTITY_VERSION` bump
+   and no wipe. Only the configs whose value actually differs re-key, and their
+   old rows age out through Purgatory (7 d) to `purge_expired` (30 d) instead of
+   being deleted. `specs/2026-09-23-ws-path-canonicalization-design.md` §4.3 is
+   the worked example: a canonicalized transport path, where the format held and
+   the version tag did not move.
 4. **Raw SQL stays exceptional.** Add it only where the engine's cost model
    forces it (the page, the id-inlined rank reads, the bulk patch writes), keep
    it parameterised-or-integer-inlined, keep it read-only where possible, and

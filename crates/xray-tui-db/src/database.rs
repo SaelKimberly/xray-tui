@@ -129,7 +129,16 @@ impl Database {
         // be added to a pushed table here; the verdicts are re-derived by the
         // next Real run, and the reference classification is kept beside the
         // dataset copy the design spec names).
-        const SCHEMA_VERSION: i64 = 12;
+        //
+        // 13 = no column change at all. The ws `?ed=NNNN` path query is now
+        // hoisted into the typed `max_early_data`, which is IN the identity
+        // stream (`write_transport` → `TR_MAX_EARLY_DATA`), so every ws config
+        // carrying the query re-keys. The bump is the user's call (2026-09-23)
+        // to wipe rather than carry the transient duplicate set the re-key
+        // would otherwise age out through Purgatory — the stored shapes are
+        // unchanged, so a v12 file would open fine; it is dropped for the
+        // clean re-import.
+        const SCHEMA_VERSION: i64 = 13;
 
         let path_str = path
             .as_ref()

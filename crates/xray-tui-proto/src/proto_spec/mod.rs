@@ -187,6 +187,36 @@ macro_rules! dispatch {
 }
 
 impl ProtocolConfig {
+    /// Normalize the transport into its stored form.
+    ///
+    /// Two normalizations, both mirroring the reference: the URI paths (the
+    /// transport's and the config's `path` mirror) become canonical
+    /// request-targets, and the legacy `?ed=NNNN` query is hoisted into the
+    /// typed early-data field.
+    ///
+    /// Called from the single row-build owner (`state::protocol_from_parsed`),
+    /// before the identity is computed and before the stored columns are built,
+    /// so a non-canonical stored path can neither break the dial nor split one
+    /// logical path into two uids. Idempotent.
+    ///
+    /// See `docs/aegis/specs/2026-09-23-ws-path-canonicalization-design.md`.
+    pub fn normalize_transport(&mut self) {
+        // These three carry the path TWICE: the transport's (hashed into the
+        // identity) and a top-level mirror (`write_identity` excludes it,
+        // `reconstruct_proto` emits it) — they travel together, under the
+        // transport's own match.
+        let (transport, mirror) = match self {
+            Self::Vless(c) => (&mut c.transport, &mut c.path),
+            Self::Vmess(c) => (&mut c.transport, &mut c.path),
+            Self::Trojan(c) => (&mut c.transport, &mut c.path),
+            // Every other kind is transport-less: only vless/vmess/trojan carry
+            // a `TransportConfig`.
+            _ => return,
+        };
+        common::hoist_early_data(transport);
+        common::canonicalize_config_paths(transport, mirror);
+    }
+
     /// Full parse boundary: scheme dispatch + fallback chain, returning the
     /// complete [`ParsedProto`] (endpoints + protocol essentials) of the
     /// FIRST parser that succeeds.
