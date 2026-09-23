@@ -607,20 +607,22 @@ and returns the next.
     bidirectional relay. `Proxy-Authorization: Basic` is optional
     (`HttpInboundConfig::with_auth`) and transient accept errors are absorbed.
 - `capability.rs` — the predicate that decides whether native may serve a row at
-  all. `NATIVE_KINDS` = `[Vless, Vmess, Trojan, Hysteria2]`;
-  `kind_supported(kind)` is the cheap config-blind gate (display/sort paths),
-  `supported(kind, config)` the config-aware one (connect). It mirrors the native
-  dispatch arms, not xray's feature set, and fails CLOSED — a row native serves
-  *worse* than the subprocess defers. Deferred: VLESS account `encryption`
-  (notably `mlkem768x25519plus`, where the native handshake diverges from real
-  xray) and any flow outside the vision pair, legacy VMess payload ciphers and a
-  non-zero `alter_id`, TLS fingerprint ids outside the five
-  `security::fingerprint::parse_fingerprint_id` parses (gating on the SAME parser
-  the dial uses keeps the lists from drifting), mKCP `seed`/`header_type` (wire
-  format, not pacing — including the share-link `path` seed carrier), and bare
-  `TransportConfig::Quic`. The transport match is a POSITIVE, wildcard-free
-  match: a new `TransportConfig` variant breaks it at compile time instead of
-  inheriting `true`.
+  all. `NATIVE_KINDS` = `[Vless, Vmess, Trojan, Hysteria2, Shadowsocks,
+  Shadowsocks2022]`; `kind_supported(kind)` is the cheap config-blind gate
+  (display/sort paths), `supported(kind, config)` the config-aware one (connect).
+  It mirrors the native dispatch arms, not xray's feature set, and fails CLOSED —
+  a row native serves *worse* than the subprocess defers. Deferred: VLESS account
+  `encryption` the connect path cannot dial — `mlkem_encryption_supported` runs
+  the codec's OWN parser (`parse_mlkem_encryption` →
+  `EncryptionConfig::try_from_parsed`), so only an unknown or malformed scheme
+  defers and never `mlkem768x25519plus` itself (which native serves; the
+  `pq-enc` row is green) — and any flow outside the vision pair, legacy VMess
+  payload ciphers, a non-zero `alter_id`, and mKCP `seed`/`header_type` (wire
+  format, not pacing — including the share-link `path` seed carrier). A TLS
+  fingerprint id is NOT a refusal: an id with no roster row is dialled with the
+  engine default and marked approximated (`security::fingerprint`). The
+  transport match is a POSITIVE, wildcard-free match: a new `TransportConfig`
+  variant breaks it at compile time instead of inheriting `true`.
 - `server/` — `NativeCoreServer`, the in-process equivalent of a spawned core.
   `ServerConfig { socks, http: Option<SocketAddr>, proxy: ProxyOutbound,
   telemetry, udp }`; `start()` compiles a proxy-all engine (no rules,
@@ -647,7 +649,9 @@ and returns the next.
   26.3.27 / sing-box 1.13.16 server inbounds, dials with the native client,
   probes HTTP through the tunnel. Transport matrix (VLESS/VMess ×
   TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/QUIC × TLS variants) + Trojan +
-  Hysteria2 axes; 136 tests = 130 green + 6 documented ignored.
+  Hysteria2 + Shadowsocks axes; 185 test fns = 177 green + 8 ignored
+  (vless 85+7, vmess 53, trojan 14, hysteria2 3, shadowsocks 22,
+  probe_e2e 0+1).
   Version-pinned: a core binary version mismatch is a hard fail, not a skip.
 
 Per-protocol roadmap and capability tables: `NATIVE_CORE.md`. Session wiring and

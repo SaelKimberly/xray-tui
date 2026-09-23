@@ -164,9 +164,11 @@ native cannot parse defers to the subprocess instead of dying mid-dial):
 
 - Kind ∉ {Vless, Vmess, Trojan, Hysteria2, Shadowsocks, Shadowsocks2022}, or a
   `ProtocolConfig` variant that does not match `kind` → false.
-- VLESS: any non-empty account `encryption` other than `none` → false — this is
-  what excludes `mlkem768x25519plus.*` (native diverges from real xray:
-  NATIVE_CORE.md SP7 pq-enc, native fails where xray works). Flow must be
+- VLESS: account `encryption` is `none`, empty, or an `mlkem768x25519plus`
+  value the connect path can dial — the gate runs the codec's OWN parser
+  (`mlkem_encryption_supported`) so anything it would reject at dial time (an
+  unknown scheme, a malformed base64 key segment, a bad padding spec) → false,
+  while every dialable PQ account is Auto-selectable. Flow must be
   empty, `xtls-rprx-vision` or `xtls-rprx-vision-udp443`; any other non-empty
   flow → false.
 - VMess: payload security absent/`auto`/`aes-128-gcm`/`chacha20-poly1305` only

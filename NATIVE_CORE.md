@@ -267,11 +267,12 @@ X25519/P256/P384, hybrid key share) now works end-to-end.
 ## E2E coverage (tier 3)
 
 The suite has twelve subsections. **Transport matrix** (`tests/vless.rs` + `tests/vmess.rs`): every
-VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/XHTTP-h3(QUIC) × serving core(s) — 137
-tests = 131 green + 6 documented ignored (vless 78+6, vmess 53; ignored: the 4 ws/grpc
-plain-into-reality-server semantic rows × both cores + reality-pq + pq-enc (ML-KEM axis,
-below); single-core rows run only on the serving core: xhttp + xhttp-h3 + kcp + pq-enc on
-xray, v2rayhttp + ws/httpupgrade-reality + mux-vision + vision-udp443 on sing-box). **TLS-variant cases**, each run against both cores (xray
+VLESS/VMess case × TCP/WS/gRPC/HTTPUpgrade/XHTTP/h2/KCP/XHTTP-h3(QUIC) × serving core(s) — 145
+test fns = 138 green + 7 ignored (vless 85+7, vmess 53+0; the vless ignores are the 4 ws/grpc
+plain-into-reality-server semantic rows + reality-pq (ML-KEM axis, below) + the 2 env-gated
+HEAD/reference-pair differentials; single-core rows run only on the serving core: xhttp + xhttp-h3
++ kcp + pq-enc on xray, v2rayhttp + ws/httpupgrade-reality + mux-vision + vision-udp443 on
+sing-box). **TLS-variant cases**, each run against both cores (xray
 26.3.27, sing-box 1.13.16), each
 spawning a real server inbound + dialing it with the native client. The
 two-servers scenarios are rows 4-6: the REALITY server's `dest` is a second
@@ -409,18 +410,28 @@ classical regardless of the client's hybrid offer; a PQ reality row needs a
 PQ-capable dest (Go 1.24+ / OpenSSL 3.5 echo) — the client's REALITY 4588
 support is proven hermetically (T4 fake REALITY PQ server with real
 encapsulation + HMAC-stamped Ed25519 cert + encrypted echo).
-`tcp_pq_enc` IGNORED — the VLESS `mlkem768x25519plus` account encryption
-end to end (client outbound `encryption` = server's PUBLIC halves
+`tcp_pq_enc` GREEN (2026-09-23) — the VLESS `mlkem768x25519plus` account
+encryption end to end (client outbound `encryption` = server's PUBLIC halves
 (X25519 pub + ML-KEM ek); xray inbound `settings.decryption` = PRIVATE
 halves (X25519 priv + 64-B seed), bridged by `keypair_from_seed` (FIPS 203
-d‖z derand)): against real xray 26.3.27 the client's PQ handshake COMPLETES
-(connect Ok, request sealed + written) but the tunnel EOFs before the
-response header with zero server logs — an unresolved interop divergence
-(the native impl mirrors xray `encryption/client.go` wire and passes the
-T3 hermetic double); left ignored with the harness wired (`XRAY_TUI_CORE_LOG`
-gate) for a dedicated fix round. pq-enc is xray-single-core in any case
-(sing-box has no VLESS account encryption). The vmess
-`tcp_aes128gcm_tls_pq` row mirrors `tcp_tls_pq` on both cores.
+d‖z derand)). It was IGNORED for a long stretch as an "unresolved interop
+divergence"; the PQ WIRE was in fact byte-correct the whole time (the server
+decoded the request — `firstLen = 26` — and dialed the echo on every
+attempt, and the client received the full `200 OK` body). The real defect
+was the RECORD LAYER's EOF classification: `CommonConn::poll_read` raised
+`UnexpectedEof` on a CLEAN end of stream at a record/padding-field
+boundary, so the probe's `read_to_end` discarded an already-complete
+response and reported `status 0 body ""`. Go's `io.ReadFull` (xray's
+framing) yields bare `io.EOF` when zero bytes were read into a field and
+`ErrUnexpectedEOF` only mid-field; the reader now mirrors that, pinned by
+the hermetic `eof_at_a_record_boundary_is_clean`. Verified against the real
+Go `encryption.ServerInstance` by a standalone probe (`native`/`xorpub`/
+`random` modes + the `0rtt` window, all green) and by the reference client
+over TLS (`ab_tls.py`). The capability gate no longer defers this shape —
+`mlkem_encryption_supported` accepts every value the connect-path parser
+dialable, so Auto resolution now picks the in-process core for a PQ account.
+pq-enc is xray-single-core (sing-box has no VLESS account encryption). The
+vmess `tcp_aes128gcm_tls_pq` row mirrors `tcp_tls_pq` on both cores.
 
 **VLESS XHTTP/3 axis** (spec §7.3): 1 row — `xhttp_h3_tls`
 (`vless("xhttp3")`, xray single-core — sing-box has no xhttp-over-QUIC): a
@@ -536,7 +547,7 @@ Notes on the matrix:
 | UDP | `cmd 0x02` UDP command path ✅ — `[2B BE len][payload]` datagram framing both directions over the tunnel stream (`protocol/vless/udp.rs`), `PacketConn` datagram API with the response-header peel (`packet.rs`), packetaddr mode (`packetaddr.rs`; sing-box-style: header dest = magic fqdn `sp.packet-addr.v2fly.arpa`, per-packet frame header `atyp|addr|port`, no magic in the frame). XUDP ✅ (SP3) — UDP over the mux tunnel (`PacketConn::xudp` over `UdpSession`, per-packet dests + the tunnel's 8-byte `GlobalID`; see Mux). e2e 10 rows: Raw × {tls-standard, reality} × both cores + packetaddr/tls/sing-box (xray has no packetaddr registration) + XUDP × {tls-standard, reality} × both cores + vision-udp443/sing-box. Vision+UDP rejected on the RAW path only — the flow guard refuses UDP under the vision flows over the direct cmd-0x02 tunnel (mirrors xray's UDP/443 rejection); under the mux path the rejection lifts (XUDP). |
 | Flow | `xtls-rprx-vision` ✅ — padded camouflage frames + inner-TLS filter + Direct splice state machine (`protocol/vless/vision.rs`, protobuf flow addon in the request header). TCP transport only; UDP app traffic under the vision flows rides the mux tunnel (XUDP, SP3) — the raw-path guard rejects UDP under vision (mirrors xray's UDP/443 rejection). `xtls-rprx-vision-udp443` ✅ (SP3) — the client config carries the full name (selects the XUDP path: mux-forced, guard lifted), the wire addon truncates to the first 16 bytes (`xtls-rprx-vision`, xray `requestAddons.Flow[:16]`), and the server validates against that truncated name. Requires outer TLS1.3/REALITY over raw TCP (guards in `connect_vision` mirror xray's rejection). Inner TLS1.3 → `Direct` raw splice — both directions abandon the outer TLS after the Direct frame (the Direct frame is the last outer-TLS record); non-1.3 inner traffic → `End`, padding stops, outer TLS continues. Deviations (spec §9): no 500 ms camouflage timer (the empty Continue long-padding frame is emitted immediately after the header — same wire bytes, deterministic), per-direction direct flags (`TlsStream::set_write_direct`/`set_read_direct`) instead of Go's unsafe `tls.Conn` reflection. |
 | Mux | `cmd 0x03` v1.mux.cool multiplexer ✅ — one tunnel (fixed `v1.mux.cool:9527` header destination, NO destination bytes on the wire — the no-addr rule) carrying concurrent TCP sessions + XUDP datagram sessions: `MuxClient` (demux + writer + keepalive tasks, eager `New`, event-driven `Keep`/`End` frames, tunnel-level `KeepAlive` every 10 s, 8 KiB chunks) + `SessionStream` app streams + `UdpSession` (XUDP, SP3: `open_udp_session` with a fresh random 8-byte `GlobalID` — network=UDP New frame — then `Keep` frames carrying each packet's own destination; wrapped by `PacketConn::xudp`) (`protocol/vless/mux.rs`). Vision+mux composition ✅ — peel-inside (response header peeled before the vision codec, mirroring xray `outbound.go`), mux frames ride the vision-padded stream; sing-box server only (xray rejects vision+mux TCP by server design — its vision+mux is the XUDP path). e2e 10 rows: mux-tls + mux-reality × both cores, mux-vision/sing-box, xudp-tls + xudp-reality × both cores, vision-udp443/sing-box. |
-| Status | Native client complete + e2e (tls-standard, tls-chrome, reality, vision-tls, vision-reality, udp-raw, udp-packetaddr, mux-tls, mux-reality, mux-vision, xudp-tls, xudp-reality, vision-udp443, kcp-plain, kcp-chrome, xhttp-h3-tls, xhttp-stream-one-tls, xhttp-stream-one-reality) × both cores where the transport allows (kcp + xhttp-h3 rows xray-only), full transport matrix e2e (137-test sweep = 131 green + 6 documented ignored: vless 78+6, vmess 53). Deferred: HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux (mux v2) / connection-reuse pooling, browser-masquerade header set, and the general QUIC client transport for Hysteria1/2 + TUIC (quinn landed for xhttp h3, SP5).
+| Status | Native client complete + e2e (tls-standard, tls-chrome, reality, vision-tls, vision-reality, udp-raw, udp-packetaddr, mux-tls, mux-reality, mux-vision, xudp-tls, xudp-reality, vision-udp443, kcp-plain, kcp-chrome, xhttp-h3-tls, xhttp-stream-one-tls, xhttp-stream-one-reality) × both cores where the transport allows (kcp + xhttp-h3 rows xray-only), full transport matrix e2e (145-test sweep = 138 green + 7 ignored: vless 85+7, vmess 53+0). Deferred: HTTPUpgrade `ed` early-data, h2 PING keepalive, xmux (mux v2) / connection-reuse pooling, browser-masquerade header set, and the general QUIC client transport for Hysteria1/2 + TUIC (quinn landed for xhttp h3, SP5).
 
 **VMess** — ✅ native
 | Capability | Detail |
@@ -792,8 +803,10 @@ explicit xray override — which decision 20 answers by warning that the overrid
 
 **E2E: a SECOND pinned peer for differentials.** `XRAY_HEAD_VERSION` (26.7.28) +
 `XRAY_TUI_CORE_HEAD_BIN_DIR`, resolved through `CoreUnderTest::resolve_from`. `XRAY_VERSION`
-(26.3.27) stays the suite's baseline, so its 136 rows are not re-baselined. First use:
+(26.3.27) stays the suite's baseline, so its rows are not re-baselined. First use:
 `vless_pq_enc_against_head` ran the pq-enc case against HEAD and found it behaves **identically**
-to the baseline (connect Ok, probe reads nothing, no server-side error at either) — so the
-`mlkem768x25519plus` divergence is **the client, not a stale pin**, and that row stays ignored
-with the gate closed.
+to the baseline (connect Ok, probe reads nothing, no server-side error at either) — which
+correctly ruled out a version delta, but the "the client's wire is wrong" reading drawn from it
+was wrong: the wire was byte-correct, and the shared symptom was the record layer turning a
+CLEAN EOF into an error (see the `tcp_pq_enc` note above). Both differentials now pass, and the
+row is green.

@@ -116,10 +116,13 @@ once:
 - A regression in the VLESS mask, the ML-KEM seed derivation, or the REALITY
   HMAC comparison now fails a pinned vector or the audited `subtle` path instead
   of agreeing with a mirror.
-- The VLESS account-encryption path still has no real-peer e2e coverage
-  (`pq-enc` is `#[ignore]`d); that gap is stated in
-  `docs/crypto-dependencies.md` and covered by the KATs + Go vectors rather than
-  assumed closed.
+- The VLESS account-encryption path's real-peer e2e coverage is now GREEN
+  (`tcp_pq_enc`, 2026-09-23): the row was `#[ignore]`d on a mis-diagnosis — the
+  PQ wire was byte-correct and the defect was the record layer raising
+  `UnexpectedEof` on a CLEAN end of stream at a field boundary (so a completed
+  response was discarded). `CommonConn::poll_read` mirrors Go's `io.ReadFull`
+  EOF rules, pinned hermetically by `eof_at_a_record_boundary_is_clean`. The
+  KATs + Go vectors still cover the mask and the seed derivation.
 - Accepted advisories remain visible; their re-evaluation triggers are the
   turso/tantivy bump (`lru`), the heed bump (`bincode`), and the driver-chain
   removal (`rsa`, `rustls-pemfile`).

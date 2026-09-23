@@ -797,10 +797,22 @@ impl AsyncRead for CommonConn {
                         let mut slice = ReadBuf::new(&mut padding[*pad_pos..]);
                         match Pin::new(&mut **inner).poll_read(cx, &mut slice)? {
                             Poll::Ready(()) if slice.filled().is_empty() => {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "vless mlkem: eof in server padding",
-                                )));
+                                // EOF at a field boundary is a CLEAN end of
+                                // stream, not a truncation: Go's
+                                // `io.ReadFull` (xray's padding drain) yields
+                                // bare `io.EOF` when zero bytes were read and
+                                // `ErrUnexpectedEOF` only mid-field. Raising
+                                // here made `read_to_end` discard an
+                                // already-complete response.
+                                *peer_padding = Some(padding);
+                                return if *pad_pos == 0 {
+                                    Poll::Ready(Ok(()))
+                                } else {
+                                    Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "vless mlkem: eof in server padding",
+                                    )))
+                                };
                             }
                             Poll::Ready(()) => *pad_pos += slice.filled().len(),
                             Poll::Pending => {
@@ -820,10 +832,17 @@ impl AsyncRead for CommonConn {
                         let mut slice = ReadBuf::new(&mut byte);
                         match Pin::new(&mut **inner).poll_read(cx, &mut slice)? {
                             Poll::Ready(()) if slice.filled().is_empty() => {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "vless mlkem: eof in record header",
-                                )));
+                                // Clean end of stream when no header byte has
+                                // been read yet (Go `io.ReadFull` semantics);
+                                // a partial header is genuine truncation.
+                                return if *header_pos == 0 {
+                                    Poll::Ready(Ok(()))
+                                } else {
+                                    Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "vless mlkem: eof in record header",
+                                    )))
+                                };
                             }
                             Poll::Ready(()) => {
                                 header[*header_pos] = byte[0];
@@ -991,17 +1010,41 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
+    /// [`fake_server`] with an echo limit: after `max_echoes` records the
+    /// server returns (dropping the socket), so the peer's close lands exactly
+    /// on a record boundary — the shape the clean-EOF test needs.
+    async fn fake_server_bounded(
+        conn: DuplexStream,
+        keys: Vec<ServerKey>,
+        x25519_sk: std::sync::Arc<X25519KeyPair>,
+        mlkem_sk: xray_tui_tls::crypto::mlkem::SecretKey,
+    ) -> std::io::Result<usize> {
+        fake_server_limited(conn, keys, x25519_sk, mlkem_sk, MlkemMode::Native, 1).await
+    }
+
     /// An independent server-side implementation of xray
     /// `ServerInstance.Handshake` + the record layer (server.go semantics,
     /// NOT a `CommonConn` twin — the framing is re-derived from the Go
     /// source so symmetric bugs surface). Echoes every received record
     /// back until the client disconnects.
     async fn fake_server(
+        conn: DuplexStream,
+        keys: Vec<ServerKey>,
+        x25519_sk: std::sync::Arc<X25519KeyPair>,
+        mlkem_sk: xray_tui_tls::crypto::mlkem::SecretKey,
+        mode: MlkemMode,
+    ) -> std::io::Result<usize> {
+        fake_server_limited(conn, keys, x25519_sk, mlkem_sk, mode, usize::MAX).await
+    }
+
+    /// The shared body of [`fake_server`]/[`fake_server_bounded`].
+    async fn fake_server_limited(
         mut conn: DuplexStream,
         keys: Vec<ServerKey>,
         x25519_sk: std::sync::Arc<X25519KeyPair>,
         mlkem_sk: xray_tui_tls::crypto::mlkem::SecretKey,
         mode: MlkemMode,
+        max_echoes: usize,
     ) -> std::io::Result<usize> {
         let relays_len: usize = keys
             .iter()
@@ -1117,7 +1160,12 @@ mod tests {
         // xray `XorConn`; payloads clear, keystream +5 B/record) ──
         let mut out_ctr = (mode == MlkemMode::Random).then(|| new_ctr(&united, &ticket_plain));
         let mut in_ctr = (mode == MlkemMode::Random).then(|| new_ctr(&united, &iv));
+        let mut echoes = 0usize;
         loop {
+            if echoes >= max_echoes {
+                // Deliberate close on a record boundary (the clean-EOF test).
+                return Ok(length);
+            }
             let mut hdr = [0u8; HEADER_LEN];
             if let Err(e) = conn.read_exact(&mut hdr).await {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -1143,6 +1191,7 @@ mod tests {
             record.extend_from_slice(&wire_hdr);
             record.extend_from_slice(&sealed);
             conn.write_all(&record).await?;
+            echoes += 1;
         }
     }
 
@@ -1246,6 +1295,55 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_random_custom_padding() {
         roundtrip(MlkemMode::Random, "100-35-111.0-0-0", 100, 0).await;
+    }
+
+    /// A peer that EOFs at a RECORD BOUNDARY is a clean end of stream, not a
+    /// truncation.
+    ///
+    /// The reference frames with `io.ReadFull`, which returns bare `io.EOF`
+    /// when zero bytes were read into a field and `ErrUnexpectedEOF` only
+    /// mid-field. Our reader used to raise `UnexpectedEof` in both cases, so a
+    /// caller doing `read_to_end` (the probe; any collect-the-body consumer)
+    /// threw away an ALREADY COMPLETE response — the pq-enc e2e row's
+    /// `status 0 body ""` for a tunnel that had delivered `HTTP/1.1 200 OK`.
+    ///
+    /// The fake server echoes ONE record and closes; the client must read the
+    /// payload back and then see a clean EOF that loses nothing.
+    #[tokio::test]
+    async fn eof_at_a_record_boundary_is_clean() {
+        let (keys, x_sk, mlkem_sk) = test_keys();
+        let cfg = EncryptionConfig {
+            mode: MlkemMode::Native,
+            seconds: 0,
+            padding_lens: Vec::new(),
+            padding_gaps: Vec::new(),
+            keys: keys.clone(),
+        };
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        // The stock fake server loops until the CLIENT closes. This variant
+        // stops right after the first echo, so the close lands on a record
+        // boundary — exactly the shape a real core produces when it finishes
+        // a response and tears the tunnel down.
+        let server = tokio::spawn(fake_server_bounded(server_side, keys, x_sk, mlkem_sk));
+
+        let mut conn = handshake(Box::new(client_side), &cfg)
+            .await
+            .expect("handshake");
+        let payload = b"clean-eof-body".to_vec();
+        conn.write_all(&payload).await.expect("write");
+        conn.flush().await.expect("flush");
+
+        // `read_to_end` MUST return the payload rather than an error.
+        let mut got = Vec::new();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_to_end(&mut got),
+        )
+        .await
+        .expect("read_to_end timeout");
+        assert!(res.is_ok(), "clean EOF must not error: {res:?}");
+        assert_eq!(got, payload, "the complete body must survive the EOF");
+        server.abort();
     }
 
     /// A FRESH dial never takes the 0-RTT (ticket) path — for EITHER mode.

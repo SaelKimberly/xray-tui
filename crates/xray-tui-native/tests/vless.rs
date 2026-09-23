@@ -279,31 +279,17 @@ async fn vless_against_cores(
 // `settings.decryption` the PRIVATE halves (X25519 priv + the 64-B seed);
 // the PQ handshake wraps the whole session before the request header.
 //
-// BLOCKED, and localized to OUR CLIENT's WIRE by three passes.
-//
-// Pass 1: against real xray the client's PQ handshake COMPLETES (connect Ok,
-// request sealed and written) but the tunnel EOFs before the response header.
-// `vless_pq_enc_against_head` ran the same case against a SECOND pinned peer
-// built from `thirdparty/Xray-core` HEAD (26.7.28): IDENTICAL - connect Ok,
-// `probe status 0 body ""` on all 5 attempts, no server-side error at either.
-//
-// Pass 2 (both ends real xray, keypair from `xray vlessenc`):
-//   pinned client -> pinned server: HTTP 200   (control)
-//   HEAD   client -> pinned server: HTTP 200
-// The reference client works in EVERY pairing, and the older server accepts the
-// newer client wire.
-//
-// Pass 3 (`vless_pq_enc_with_a_reference_pair`) eliminated the last hedge -
-// that OUR keypair generator (`mlkem_enc_pair`'s seed expansion) might differ
-// from Go's, leaving the client's ek targeting a key the server never holds.
-// Ours fails with a reference-generated pair too, so the pair and the server are
-// both known-good and the fault is our wire alone.
-//
-// Fix round's method: capture the reference client's first flight for a fixed
-// pair and diff it against ours. Our parser ACCEPTS the reference's shape (one
-// 1184-byte ek segment, no X25519 half), so the divergence is in sealing or
-// framing, not in the parse. The gate stays closed until then.
-#[ignore = "our mlkem768x25519plus wire: the reference client works against both revisions and with a reference-generated pair, while ours works with neither pair, so the fault is ours (three passes recorded in the spec's §8.1)"]
+// GREEN since 2026-09-23. The three "passes" above localized the symptom
+// correctly but their conclusion ("the fault is our wire") was wrong: the
+// PQ wire was byte-correct ALL ALONG (server decoded the request —
+// `firstLen = 26` — and dialed the echo on every attempt, and the client
+// received the full `200 OK` body). The real defect was the RECORD LAYER's
+// EOF classification: `CommonConn::poll_read` raised `UnexpectedEof` on a
+// CLEAN end of stream at a record/padding-field boundary, so the probe's
+// `read_to_end` threw away an already-complete response and reported
+// `status 0 body ""`. Go's `io.ReadFull` (xray's framing) yields bare
+// `io.EOF` when zero bytes were read into a field and `ErrUnexpectedEOF`
+// only mid-field; the reader now mirrors that. See `mlkem.rs` `poll_read`.
 #[case::tcp_pq_enc(vless("tcp").with_pq_enc(), CoreKind::Xray)]
 #[tokio::test]
 async fn vless_single_core(

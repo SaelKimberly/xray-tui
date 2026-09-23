@@ -5,10 +5,11 @@
 //! cannot load the full config); [`support_reason`] is the config-aware
 //! runtime gate (connect/ping paths) and [`supported`] its bool form, so the
 //! reason it returns doubles as the user-visible `[real]` marker text. A row
-//! native serves *worse* than a subprocess — notably VLESS
-//! `mlkem768x25519plus` account encryption, where native diverges from
-//! real-xray interop (`NATIVE_CORE.md` `SP7` pq-enc) — is refused so Auto
-//! resolution falls back to the subprocess.
+//! native serves *worse* than a subprocess is refused so Auto resolution falls
+//! back to the subprocess. VLESS `mlkem768x25519plus` account encryption was
+//! such a row until 2026-09-23; it is now supported and gated on the connect
+//! path's own parser (`mlkem_encryption_supported`), which refuses only a
+//! value that is not that scheme or that the codec would reject at dial time.
 //!
 //! The predicate mirrors the native dispatch arms, not xray's feature set:
 //! [`crate::protocol`], [`crate::transport`], and [`crate::security`]. A
@@ -32,6 +33,7 @@ use xray_tui_proto::proto_spec::{
 
 use crate::protocol::ss::method::password_key;
 use crate::protocol::ss::resolve_method;
+use crate::protocol::vless::encryption::EncryptionConfig;
 
 /// The protocols with a native implementation, in canonical order.
 ///
@@ -196,16 +198,16 @@ fn kcp_reason(cfg: &KcpConfig, path: Option<&str>) -> Option<&'static str> {
 // can quietly re-introduce a divergence between this gate and
 // `security::wrap`: both now read the same resolver.
 
-/// VLESS row: no deferred account encryption or flow, implemented transport.
+/// VLESS row: implemented account encryption and flow, implemented transport.
 ///
-/// Any non-empty `encryption` other than `"none"` is refused as `"vless
-/// account encryption is not implemented"` — in particular
-/// `mlkem768x25519plus.*`, whose native handshake diverges from real xray
-/// (fails where xray works), so it must never be Auto-selected. Flows are
-/// limited to the vision pair native encodes (`connect_vision`); any other
-/// non-empty flow is a `NotImplemented` guard, refused as `"vless flow is
-/// not implemented"`. A transport refusal appends the
-/// [`transport_reason`] string.
+/// Account encryption: any non-empty `encryption` other than `"none"` must be
+/// an `mlkem768x25519plus` value the CONNECT PATH can actually dial
+/// ([`mlkem_encryption_supported`] runs the codec's own parser, so the gate
+/// cannot drift from it) — anything else is refused as `"vless account
+/// encryption is not implemented"`. Flows are limited to the vision pair native
+/// encodes (`connect_vision`); any other non-empty flow is a `NotImplemented`
+/// guard, refused as `"vless flow is not implemented"`. A transport refusal
+/// appends the [`transport_reason`] string.
 ///
 /// Both vision flows stay supported even though a native session cannot
 /// carry their UDP leg (`xtls-rprx-vision-udp443` forces XUDP, and the proxy
@@ -217,6 +219,7 @@ fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
     if let Some(enc) = cfg.encryption.as_deref()
         && !enc.is_empty()
         && enc != "none"
+        && !mlkem_encryption_supported(enc)
     {
         return Some("vless account encryption is not implemented");
     }
@@ -226,6 +229,24 @@ fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
         return Some("vless flow is not implemented");
     }
     transport_reason(&cfg.transport, cfg.path.as_deref())
+}
+
+/// Whether a non-`none` VLESS `encryption` value is one native can serve.
+///
+/// `mlkem768x25519plus` IS implemented (`protocol/vless/encryption`), so the
+/// only refusal left is a value that is not that scheme at all. The check runs
+/// the CONNECT PATH'S OWN PARSER (`parse_mlkem_encryption` then
+/// [`EncryptionConfig::try_from_parsed`]) rather than a string test, so the
+/// gate and the codec cannot drift: anything the codec would reject at dial
+/// time (a malformed base64 key segment, an out-of-range padding spec, an
+/// unknown mode/window) is refused here, and anything it accepts is offered to
+/// the fast path. Fails closed — a lowercased or otherwise unrecognised scheme
+/// yields `Ok(None)` and is refused.
+fn mlkem_encryption_supported(enc: &str) -> bool {
+    xray_tui_proto::proto_spec::parse_mlkem_encryption(enc)
+        .ok()
+        .flatten()
+        .is_some_and(|parsed| EncryptionConfig::try_from_parsed(&parsed).is_ok())
 }
 
 /// `VMess` row: modern AEAD payload security only, implemented transport.
@@ -524,12 +545,38 @@ mod tests {
         ));
     }
 
+    /// `mlkem768x25519plus` IS served natively (the record-layer EOF
+    /// classification was the bug, fixed 2026-09-23 — see `encryption/mlkem.rs`
+    /// `poll_read`). The gate now accepts every value the CONNECT PATH accepts.
     #[test]
-    fn pq_enc_vless_deferred() {
+    fn pq_enc_vless_supported() {
+        // A valid 32-byte X25519 key segment (base64url, raw) — a `<20`-char
+        // segment would be parsed as padding, not a key.
+        const KEY32: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+        for enc in [
+            format!("mlkem768x25519plus.native.1rtt.{KEY32}"),
+            // Padding + key (the shape a padded account carries).
+            format!("mlkem768x25519plus.native.1rtt.100-35-70.0-0-0.{KEY32}"),
+            // Every mode is implemented.
+            format!("mlkem768x25519plus.xorpub.1rtt.{KEY32}"),
+            format!("mlkem768x25519plus.random.1rtt.{KEY32}"),
+        ] {
+            let mut cfg = vless_cfg();
+            cfg.encryption = Some(TinyText::from(enc.as_str()));
+            assert!(
+                supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)),
+                "must be served natively: {enc}"
+            );
+        }
+    }
+
+    /// A malformed `mlkem768x25519plus` value stays REFUSED — the gate runs the
+    /// connect path's own parser, so anything the codec would reject at dial
+    /// time never reaches the native fast path.
+    #[test]
+    fn malformed_pq_enc_vless_deferred() {
         let mut cfg = vless_cfg();
-        cfg.encryption = Some(TinyText::from(
-            "mlkem768x25519plus.native.1rtt.100-35-70.0-0-0.a2V5",
-        ));
+        cfg.encryption = Some(TinyText::from("mlkem768x25519plus.xor.1rtt.a2V5"));
         assert!(!supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)));
     }
 
