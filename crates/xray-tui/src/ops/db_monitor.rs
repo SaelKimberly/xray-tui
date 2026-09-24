@@ -78,7 +78,8 @@ impl MethodStat {
         }
         let mut sorted = self.samples.clone();
         sorted.sort_by(f64::total_cmp);
-        let idx = (((p / 100.0) * ((sorted.len() - 1) as f64)).round() as usize).min(sorted.len() - 1);
+        let idx =
+            (((p / 100.0) * ((sorted.len() - 1) as f64)).round() as usize).min(sorted.len() - 1);
         sorted[idx]
     }
 
@@ -147,7 +148,11 @@ impl Registry {
                 s.invocations,
                 s.retries,
                 s.fail_count,
-                if slow.is_empty() { String::new() } else { format!("\n{slow}") },
+                if slow.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{slow}")
+                },
             ));
         }
         out
@@ -179,7 +184,13 @@ impl DbMonitor {
         Self::default()
     }
 
-    pub fn fold_query(&self, method: &str, duration_ms: f64, is_err: bool, statement: Option<&str>) {
+    pub fn fold_query(
+        &self,
+        method: &str,
+        duration_ms: f64,
+        is_err: bool,
+        statement: Option<&str>,
+    ) {
         if let Ok(mut reg) = self.0.lock() {
             reg.fold_query(method, duration_ms, is_err, statement);
         }
@@ -310,7 +321,8 @@ where
         }
         if let Some(span) = ctx.span(id) {
             let name = span.metadata().name();
-            span.extensions_mut().insert(MethodSpan { name, retries: 0 });
+            span.extensions_mut()
+                .insert(MethodSpan { name, retries: 0 });
         }
     }
 
@@ -335,7 +347,9 @@ where
 
         let method: &str = ctx
             .event_scope(event)
-            .and_then(|mut scope| scope.find_map(|s| s.extensions().get::<MethodSpan>().map(|m| m.name)))
+            .and_then(|mut scope| {
+                scope.find_map(|s| s.extensions().get::<MethodSpan>().map(|m| m.name))
+            })
             .unwrap_or(UNATTRIBUTED);
 
         self.monitor
@@ -447,8 +461,7 @@ mod tests {
     async fn attributes_query_events_across_await_and_folds_retries() {
         use tracing_subscriber::layer::SubscriberExt;
         let monitor = DbMonitor::new();
-        let subscriber =
-            tracing_subscriber::registry().with(DbMonitorLayer::new(monitor.clone()));
+        let subscriber = tracing_subscriber::registry().with(DbMonitorLayer::new(monitor.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
 
         instrumented_op().await;
@@ -462,8 +475,14 @@ mod tests {
 
         let dump = monitor.dump(10).join("\n");
         assert!(dump.contains("test_method"), "attributed to method: {dump}");
-        assert!(dump.contains("retries=2"), "final retry count folded: {dump}");
-        assert!(dump.contains(UNATTRIBUTED), "unattributed bucket present: {dump}");
+        assert!(
+            dump.contains("retries=2"),
+            "final retry count folded: {dump}"
+        );
+        assert!(
+            dump.contains(UNATTRIBUTED),
+            "unattributed bucket present: {dump}"
+        );
     }
 
     #[tokio::test]
@@ -476,8 +495,7 @@ mod tests {
             .expect("in-memory db");
 
         let monitor = DbMonitor::new();
-        let subscriber =
-            tracing_subscriber::registry().with(DbMonitorLayer::new(monitor.clone()));
+        let subscriber = tracing_subscriber::registry().with(DbMonitorLayer::new(monitor.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
 
         // A real instrumented `Database` method issues real `toasty::query`

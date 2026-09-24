@@ -376,8 +376,7 @@ fn base_select(sql: &mut Sql, req: &PageRequest, projection: &str, join_endpoint
 /// Whether a query needs the `endpoints` row: the search predicate reads the
 /// host/port, and the Address/Port sorts order by them.
 fn needs_endpoints(req: &PageRequest) -> bool {
-    req.search.as_ref().is_some_and(|s| !s.is_empty())
-        || matches!(req.sort, PageSort::Port)
+    req.search.as_ref().is_some_and(|s| !s.is_empty()) || matches!(req.sort, PageSort::Port)
 }
 
 // ── Value decoding ──────────────────────────────────────────────────────

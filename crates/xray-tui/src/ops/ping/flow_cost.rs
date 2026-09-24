@@ -1061,7 +1061,9 @@ async fn measure_page_scale() {
     let sizes: Vec<usize> = if spec.trim().is_empty() || spec.trim() == "1" {
         vec![7686, 50000, 200000]
     } else {
-        spec.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        spec.split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
     };
     let now = xray_tui_db::models::now_epoch();
     let ttl = 7 * 86400_i64;
@@ -1087,14 +1089,22 @@ async fn measure_page_scale() {
         }
         for chunk in rows.chunks(5000) {
             let endpoints: Vec<_> = chunk.iter().map(|r| r.endpoint.clone()).collect();
-            let protocols: Vec<_> =
-                chunk.iter().flat_map(|r| r.protocols.values().cloned()).collect();
+            let protocols: Vec<_> = chunk
+                .iter()
+                .flat_map(|r| r.protocols.values().cloned())
+                .collect();
             let links: Vec<_> = chunk.iter().flat_map(|r| r.links.iter().cloned()).collect();
             let mut conn = db.connection().await.expect("conn");
             let mut tx = conn.transaction().await.expect("tx");
-            xray_tui_db::upsert_endpoints_bulk(&mut tx, &endpoints).await.expect("ep");
-            xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await.expect("pr");
-            xray_tui_db::upsert_links_bulk(&mut tx, &links).await.expect("lk");
+            xray_tui_db::upsert_endpoints_bulk(&mut tx, &endpoints)
+                .await
+                .expect("ep");
+            xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols)
+                .await
+                .expect("pr");
+            xray_tui_db::upsert_links_bulk(&mut tx, &links)
+                .await
+                .expect("lk");
             tx.commit().await.expect("commit");
         }
         db.repair_endpoint_ranks().await.expect("ranks");
@@ -1112,7 +1122,10 @@ async fn measure_page_scale() {
                 offset: 0,
                 limit: PROFILES_PAGE_SIZE,
             };
-            db.profiles_page(&req).await.map(|p| p.total as usize).unwrap_or(0)
+            db.profiles_page(&req)
+                .await
+                .map(|p| p.total as usize)
+                .unwrap_or(0)
         };
         let offsets = [
             0usize,
@@ -1208,7 +1221,10 @@ async fn measure_page_scale() {
                 }
             }
         }
-        print_table(&format!("page scale N={n} (Active total={active_total})"), &out);
+        print_table(
+            &format!("page scale N={n} (Active total={active_total})"),
+            &out,
+        );
     }
 }
 
