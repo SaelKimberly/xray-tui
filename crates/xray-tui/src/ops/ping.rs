@@ -1333,6 +1333,10 @@ const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 /// markers older than the configured TTL are cleared before the terminal event
 /// lands. Links the batch did not touch (dedup-retired siblings, queue-full/stop
 /// skips) are exactly the ones whose stale markers this clears.
+fn wal_checkpoint_enabled(concurrent_writes: bool) -> bool {
+    !concurrent_writes
+}
+
 async fn finish_batch(shared: &BatchShared) {
     // Make the batch durable before the sweeps look at the rows: the staged
     // result/task writes land in one transaction here instead of one commit
@@ -1360,11 +1364,12 @@ async fn finish_batch(shared: &BatchShared) {
             "batch flush failed after {FINAL_FLUSH_ATTEMPTS} attempts: {e}"
         );
     }
-    // Bound WAL growth: one checkpoint after the write burst, not per commit.
-    // Bounded by a timeout — an in-memory database has no WAL to checkpoint
-    // and must never stall the batch.
-    if let Ok(Ok(mut conn)) =
-        tokio::time::timeout(std::time::Duration::from_secs(2), shared.db.connection()).await
+    // WAL growth is bounded only in WAL mode. Turso MVCC rejects the current
+    // driver's `wal_checkpoint(PASSIVE)` path; MVCC owns its logical-log
+    // checkpoint policy. Do not turn a known engine error into batch noise.
+    if wal_checkpoint_enabled(shared.db.uses_concurrent_writes())
+        && let Ok(Ok(mut conn)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), shared.db.connection()).await
     {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -2367,6 +2372,11 @@ mod tests {
     use crate::ops::scheduler::TaskScheduler;
 
     use super::*;
+
+    #[test]
+    fn mvcc_skips_wal_checkpoint() {
+        assert!(!wal_checkpoint_enabled(true));
+    }
 
     /// Deterministic probe runner: fixed outcomes + call recording + an
     /// optional gate that blocks real probes (for the stop-mid-batch test).

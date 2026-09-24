@@ -39,3 +39,5 @@
 | 2026-09-23 | plan | `plans/2026-09-23-ws-path-canonicalization.md` | WS path canonicalization — implementation | executed (T1–T6; e2e green against a real xray-core server; `SCHEMA_VERSION` 12 → 13) |
 | 2026-09-24 | spec | `specs/2026-09-24-profiles-view-band-design.md` | Profiles view-band: kill the Active-view Address filesort | draft — awaiting user review |
 | 2026-09-24 | adr | `adr/0010-materialized-active-band.md` | Materialized Active band: view membership is a stored column | accepted |
+| 2026-09-24 | spec | `specs/2026-09-24-turso-mvcc-rollout-design.md` | Turso MVCC rollout: evidence and compatibility boundary | opt-in MVCC; default WAL; real-feed A/B pending |
+| 2026-09-24 | plan | `plans/2026-09-24-turso-mvcc-production-rollout.md` | Turso MVCC production rollout — implementation | T1–T3 complete; production workload benchmark open |

@@ -713,16 +713,24 @@ ciphers and stripped from `x25519-dalek` by `default-features = false`.
 ### xray-tui-db (library crate)
 
 `crates/xray-tui-db/src/lib.rs` — toasty ORM database layer. `retry.rs` adds
-`retry_on_busy`/`is_busy_error` — SQLite write contention (toasty
-`is_serialization_failure` or "database is locked") is retried with 20ms-doubling
-backoff (1.28s cap). Wired into `update_endpoint_resolution`, whose
-single-transaction commit previously dropped writes when the enrichment
-pipeline herded hundreds of concurrent writers.
+`retry_on_busy`/`is_busy_error` — SQLite write contention (`is_serialization_failure`
+or "database is locked") retries with 20ms-doubling backoff (1.28s cap). MVCC
+statement-level conflicts are included because the driver classifies `BusySnapshot`
+and conflict text as serialization failures. Public DB mutators and rank maintenance
+retry whole transaction bodies; `LinkWriter` re-stages failed drained windows.
 `Database::conn()` sets `PRAGMA busy_timeout=5000` on every pooled connection
-acquisition — the pragma in `open()` is per-connection and never reaches
-pool-created conns (deadpool default max_size 10), so concurrent writers now
-queue at the SQLite level instead of failing instantly; all write paths use
-`conn()`.
+acquisition; the pragma in `open()` is per-connection and never reaches
+pool-created conns. Rank DDL uses `TransactionMode::Immediate` so MVCC data
+transactions do not own schema initialization.
+
+**Journal mode:** fresh/recreated file DBs default to WAL.
+`XRAY_TUI_TURSO_CONCURRENT_WRITES=1` opts them into Turso MVCC; existing WAL
+files remain WAL, existing MVCC files retain MVCC, and intentional schema wipes
+remove `-wal`, `-shm`, and `-log` sidecars before recreation. Turso 0.7.2 cannot
+convert a WAL-header file in place. `Database::uses_concurrent_writes()` is the
+per-handle authority; batch completion skips the incompatible WAL passive
+checkpoint for MVCC handles. Real-feed contention evidence remains a benchmark
+gate, not a default-enable claim.
 
 Schema, indexes, invariants and flows are documented in **`docs/database.md`**
 (with diagrams); this section is the crate-level summary. The rule for — and the

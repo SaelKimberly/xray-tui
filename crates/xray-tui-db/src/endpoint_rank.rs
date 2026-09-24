@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use toasty_core::driver::operation::TransactionMode;
 use toasty_core::stmt::Value;
 
 use crate::models_toasty::{
@@ -36,8 +37,7 @@ pub const CONFIG_OTHER: i64 = 2;
 /// `now − this` at write and sweep time, so the DB layer needs the same ttl
 /// the page uses. Set once at startup (and on settings save) from the config;
 /// defaults to 7 days so a write before the setter runs is still sensible.
-static ACTIVE_TTL_SECS: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(7 * 86400);
+static ACTIVE_TTL_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(7 * 86400);
 
 /// Set the Active-view TTL used to materialize `band` (startup + settings save).
 pub fn set_active_ttl_secs(secs: i64) {
@@ -298,7 +298,11 @@ pub(crate) async fn ensure(conn: &mut toasty::Connection) -> crate::Result<()> {
     // them. One transaction: the indexes and the fill land together, and no
     // implicit write lock outlives the call (leaving one behind made the next
     // writer on the pool time out with "database is locked").
-    let mut tx = conn.transaction().await?;
+    let mut tx = conn
+        .transaction_builder()
+        .mode(TransactionMode::Immediate)
+        .begin()
+        .await?;
     let result = ensure_in(&mut tx).await;
     match result {
         Ok(()) => tx.commit().await?,
@@ -319,7 +323,12 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     ] {
         let _ = toasty::sql::query(alter).exec(conn).await;
     }
-    for ddl in [COVERING_INDEX, WINDOW_INDEX, BAND_HOST_INDEX, BAND_WINDOW_INDEX] {
+    for ddl in [
+        COVERING_INDEX,
+        WINDOW_INDEX,
+        BAND_HOST_INDEX,
+        BAND_WINDOW_INDEX,
+    ] {
         toasty::sql::query(ddl).exec(conn).await?;
     }
     if scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank").await? > 0 {
@@ -342,7 +351,13 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
 /// the non-destructive upgrade's one-time cost. Same derivation as `write`'s
 /// follow-up: band from the ttl membership, rank_host from the endpoint host.
 async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
-    if scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank WHERE band IS NULL").await? == 0 {
+    if scalar_i64(
+        conn,
+        "SELECT COUNT(*) FROM endpoint_rank WHERE band IS NULL",
+    )
+    .await?
+        == 0
+    {
         return Ok(());
     }
     let threshold = crate::models_toasty::now_epoch()
@@ -452,22 +467,38 @@ impl crate::Database {
     /// (fixtures, maintenance scripts).
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn repair_endpoint_ranks(&self) -> crate::Result<usize> {
-        let mut conn = self.connection().await?;
-        repair_missing(&mut conn).await
+        let db = self;
+        crate::retry_on_busy(
+            move || async move {
+                let mut conn = db.connection().await?;
+                repair_missing(&mut conn).await
+            },
+            5,
+        )
+        .await
     }
-
     /// Recompute the stored ordering keys for `endpoint_ids`.
     ///
-    /// Called by every write path that can change a link (single insert,
-    /// patch flush, bulk import, error sweep), so a stored key is never older
-    /// than the write that invalidated it.
+    /// Called by every write path that can change a link, so a stored key is
+    /// never older than the write that invalidated it.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn refresh_endpoint_ranks(
         &self,
         endpoint_ids: &[EndpointId],
     ) -> crate::Result<usize> {
-        let mut conn = self.connection().await?;
-        refresh(&mut conn, endpoint_ids).await
+        let db = self;
+        let endpoint_ids = endpoint_ids.to_vec();
+        crate::retry_on_busy(
+            move || {
+                let endpoint_ids = endpoint_ids.clone();
+                async move {
+                    let mut conn = db.connection().await?;
+                    refresh(&mut conn, &endpoint_ids).await
+                }
+            },
+            5,
+        )
+        .await
     }
 
     /// Set the Active-view TTL used to materialize `band` (startup + settings
@@ -486,15 +517,22 @@ impl crate::Database {
     /// on the retention tick.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn reband_expired(&self) -> crate::Result<()> {
-        let threshold = crate::models_toasty::now_epoch()
-            - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
-        let mut conn = self.connection().await?;
-        toasty::sql::query(format!(
-            "UPDATE endpoint_rank SET band = 1 WHERE band = 0 AND rank_newest_seen < {threshold}"
-        ))
-        .exec(&mut conn)
-        .await?;
-        Ok(())
+        let db = self;
+        crate::retry_on_busy(
+            move || async move {
+                let threshold = crate::models_toasty::now_epoch()
+                    - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+                let mut conn = db.connection().await?;
+                toasty::sql::query(format!(
+                    "UPDATE endpoint_rank SET band = 1 WHERE band = 0 AND rank_newest_seen < {threshold}"
+                ))
+                .exec(&mut conn)
+                .await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
     }
 
     /// Full reband: recompute `band` for EVERY row against the current
@@ -504,16 +542,23 @@ impl crate::Database {
     /// enough. One indexed pass, once.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn reband_all(&self) -> crate::Result<()> {
-        let threshold = crate::models_toasty::now_epoch()
-            - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
-        let mut conn = self.connection().await?;
-        toasty::sql::query(format!(
-            "UPDATE endpoint_rank SET \
-             band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END"
-        ))
-        .exec(&mut conn)
-        .await?;
-        Ok(())
+        let db = self;
+        crate::retry_on_busy(
+            move || async move {
+                let threshold = crate::models_toasty::now_epoch()
+                    - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+                let mut conn = db.connection().await?;
+                toasty::sql::query(format!(
+                    "UPDATE endpoint_rank SET \
+                     band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END"
+                ))
+                .exec(&mut conn)
+                .await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
     }
 }
 

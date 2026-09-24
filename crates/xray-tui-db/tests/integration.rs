@@ -456,28 +456,10 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     // 1: active — fresh link (>= active_threshold).
     seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, fresh).await;
     // 2: stale — both links inside [stale_threshold, active_threshold).
-    seed_endpoint(
-        &mut conn,
-        2,
-        2001,
-        "2.2.2.2",
-        HostType::Ipv4,
-        443,
-        old,
-    )
-    .await;
+    seed_endpoint(&mut conn, 2, 2001, "2.2.2.2", HostType::Ipv4, 443, old).await;
     seed_link(&mut conn, 2, 2002, old - 86_400).await;
     // 3: expired — all links older than stale_threshold.
-    seed_endpoint(
-        &mut conn,
-        3,
-        3001,
-        "3.3.3.3",
-        HostType::Ipv4,
-        443,
-        old,
-    )
-    .await;
+    seed_endpoint(&mut conn, 3, 3001, "3.3.3.3", HostType::Ipv4, 443, old).await;
     seed_link(&mut conn, 3, 3002, old - 86_400).await;
     // 4: linkless — vacuously outside both windows (never stale).
     toasty::create!(Endpoint {
@@ -492,16 +474,7 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     .await
     .expect("linkless endpoint");
     // 5: active — one stale-aged link plus one fresh link (max decides).
-    seed_endpoint(
-        &mut conn,
-        5,
-        5001,
-        "5.5.5.5",
-        HostType::Ipv4,
-        443,
-        old,
-    )
-    .await;
+    seed_endpoint(&mut conn, 5, 5001, "5.5.5.5", HostType::Ipv4, 443, old).await;
     seed_link(&mut conn, 5, 5002, fresh).await;
     // 6: boundary — max exactly == stale_threshold -> stale.
     seed_endpoint(&mut conn, 6, 6001, "6.6.6.6", HostType::Ipv4, 443, old).await;
@@ -641,19 +614,31 @@ async fn purge_expired_matches_all_links_semantics() {
     let deleted = db.purge_expired(cutoff).await.expect("purge");
     assert_eq!(deleted, 2, "linkless + all-stale are reclaimed");
     assert!(
-        db.get_endpoint(EndpointId::new(1)).await.expect("q").is_none(),
+        db.get_endpoint(EndpointId::new(1))
+            .await
+            .expect("q")
+            .is_none(),
         "linkless purged"
     );
     assert!(
-        db.get_endpoint(EndpointId::new(2)).await.expect("q").is_none(),
+        db.get_endpoint(EndpointId::new(2))
+            .await
+            .expect("q")
+            .is_none(),
         "all-stale purged"
     );
     assert!(
-        db.get_endpoint(EndpointId::new(3)).await.expect("q").is_some(),
+        db.get_endpoint(EndpointId::new(3))
+            .await
+            .expect("q")
+            .is_some(),
         "a fresh link keeps its endpoint"
     );
     assert!(
-        db.get_endpoint(EndpointId::new(4)).await.expect("q").is_some(),
+        db.get_endpoint(EndpointId::new(4))
+            .await
+            .expect("q")
+            .is_some(),
         "a fresh-but-purged link keeps its endpoint (all-links, not band)"
     );
 }
@@ -1632,6 +1617,18 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
 
     let db = Database::open(&path).await.expect("fresh open");
     let mut conn = db.connection().await.expect("connection");
+    let rows = toasty::sql::query("PRAGMA journal_mode")
+        .exec(&mut conn)
+        .await
+        .expect("read journal mode");
+    let journal_mode = rows.first().and_then(|value| match value {
+        toasty::stmt::Value::Record(fields) => fields.first().and_then(|field| match field {
+            toasty::stmt::Value::String(mode) => Some(mode.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    assert_eq!(journal_mode, Some("wal"));
 
     // Fresh open writes the typed schema AND tags it `user_version=13` so a
     // reopen can skip push_schema.

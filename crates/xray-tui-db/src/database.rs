@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 
 use toasty::Executor;
@@ -16,6 +17,7 @@ use crate::retry_on_busy;
 
 pub struct Database {
     db: toasty::Db,
+    concurrent_writes: bool,
 }
 
 /// Which mutable column groups a [`LinkPatch`] writes.
@@ -77,14 +79,102 @@ pub struct LinkPatch {
 }
 
 // ── Constructors ────────────────────────────────────────────────────────
+const CONCURRENT_WRITES_ENV: &str = "XRAY_TUI_TURSO_CONCURRENT_WRITES";
+fn concurrent_writes_enabled() -> bool {
+    concurrent_writes_from_env(std::env::var(CONCURRENT_WRITES_ENV).ok().as_deref())
+}
+
+fn concurrent_writes_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn file_journal_mode(path: &Path) -> std::io::Result<Option<u8>> {
+    if !path.exists() || std::fs::metadata(path)?.len() < 20 {
+        return Ok(None);
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0_u8; 20];
+    file.read_exact(&mut header)?;
+    Ok(Some(header[19]))
+}
+
+fn should_use_mvcc(path: &Path, requested_mvcc: bool) -> Result<bool> {
+    match file_journal_mode(path)? {
+        Some(255) => Ok(true),
+        Some(2) => {
+            if requested_mvcc {
+                tracing::warn!(
+                    path = %path.display(),
+                    "existing WAL database stays in WAL mode; Turso 0.7.2 cannot convert it in place"
+                );
+            }
+            Ok(false)
+        }
+        Some(_) => Ok(false),
+        None => Ok(requested_mvcc),
+    }
+}
+
+fn file_driver(path: &str, concurrent_writes: bool) -> toasty_driver_turso::Turso {
+    let driver = toasty_driver_turso::Turso::file(path);
+    if concurrent_writes {
+        driver.concurrent_writes()
+    } else {
+        driver
+    }
+}
+
+fn remove_stale_mvcc_log_for_wal(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let log_path = std::path::PathBuf::from(format!("{}-log", path.display()));
+    if !log_path.exists() {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0_u8; 20];
+    file.read_exact(&mut header)?;
+    if header[18] == 2 && header[19] == 2 {
+        std::fs::remove_file(log_path)?;
+    }
+    Ok(())
+}
+fn remove_all_db_sidecars(path: &Path) -> std::io::Result<()> {
+    for suffix in ["-wal", "-shm", "-log"] {
+        let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar)?;
+        }
+    }
+    Ok(())
+}
+
+async fn configure_journal_mode(
+    conn: &mut impl toasty::Executor,
+    concurrent_writes: bool,
+) -> Result<()> {
+    let mode = if concurrent_writes { "mvcc" } else { "wal" };
+    toasty::sql::query(format!("PRAGMA journal_mode='{mode}'"))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
 
 impl Database {
     /// Opens existing DB or creates fresh. Recovers from corruption by recreating.
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_concurrent_writes(path, concurrent_writes_enabled()).await
+    }
+
     #[allow(
         clippy::significant_drop_tightening,
         reason = "the Turso driver temporaries are consumed by try_open_db in the very next statement; clippy attributes their drop to the whole fn through the generic await"
     )]
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+    async fn open_with_concurrent_writes(
+        path: impl AsRef<Path>,
+        requested_mvcc: bool,
+    ) -> Result<Self> {
         // Tag for databases created by this 7-table schema. toasty 0.9's
         // push_schema emits CREATE TABLE without IF NOT EXISTS, so it can
         // only run on a database that has no tables yet; the tag lets reopen
@@ -149,17 +239,22 @@ impl Database {
         if Path::new(path_str).exists() && std::fs::metadata(path_str)?.len() == 0 {
             std::fs::remove_file(path_str)?;
         }
+        remove_stale_mvcc_log_for_wal(Path::new(path_str))?;
+        let mut concurrent_writes = should_use_mvcc(Path::new(path_str), requested_mvcc)?;
 
-        let driver = toasty_driver_turso::Turso::file(path_str);
+        let driver = file_driver(path_str, concurrent_writes);
         let mut db = match Self::try_open_db(driver).await {
             Ok(db) => db,
             Err(e) => {
                 // DB might be corrupted — log warning, delete, recreate
                 tracing::warn!(error = %e, "DB open failed, attempting recovery by recreating");
                 if Path::new(path_str).exists() {
+                    remove_stale_mvcc_log_for_wal(Path::new(path_str))?;
                     std::fs::remove_file(path_str)?;
                 }
-                let driver = toasty_driver_turso::Turso::file(path_str);
+                remove_all_db_sidecars(Path::new(path_str))?;
+                concurrent_writes = requested_mvcc;
+                let driver = file_driver(path_str, concurrent_writes);
                 Self::try_open_db(driver).await?
             }
         };
@@ -187,9 +282,12 @@ impl Database {
                     );
                     drop(conn);
                     if Path::new(path_str).exists() {
+                        remove_stale_mvcc_log_for_wal(Path::new(path_str))?;
                         std::fs::remove_file(path_str)?;
                     }
-                    let driver = toasty_driver_turso::Turso::file(path_str);
+                    remove_all_db_sidecars(Path::new(path_str))?;
+                    concurrent_writes = requested_mvcc;
+                    let driver = file_driver(path_str, concurrent_writes);
                     db = Self::try_open_db(driver).await?;
                     let mut fresh = db.connection().await?;
                     db.push_schema().await?;
@@ -201,9 +299,7 @@ impl Database {
             }
         }
 
-        let _ = toasty::sql::query("PRAGMA journal_mode=WAL")
-            .exec(&mut conn)
-            .await?;
+        configure_journal_mode(&mut conn, concurrent_writes).await?;
         toasty::sql::query("PRAGMA busy_timeout=5000")
             .exec(&mut conn)
             .await?;
@@ -235,7 +331,10 @@ impl Database {
         if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
             tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            concurrent_writes,
+        })
     }
 
     /// Open a toasty DB by constructing builder. Separate for recovery logic.
@@ -281,6 +380,11 @@ impl Database {
     /// create/update statements (Task 10 writes; integration tests).
     pub async fn connection(&self) -> Result<toasty::Connection> {
         self.conn().await
+    }
+    /// Whether this database handle was opened with Turso MVCC transactions.
+    #[must_use]
+    pub const fn uses_concurrent_writes(&self) -> bool {
+        self.concurrent_writes
     }
 
     pub async fn in_memory() -> Result<Self> {
@@ -335,7 +439,10 @@ impl Database {
         if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
             tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            concurrent_writes: false,
+        })
     }
 
     async fn init_default_groups(conn: &mut impl toasty::Executor) -> Result<()> {
@@ -859,20 +966,28 @@ impl Database {
     /// (INSERT OR IGNORE).
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_endpoint(&self, e: &Endpoint) -> Result<()> {
-        let mut conn = self.conn().await?;
-        Endpoint::upsert_by_id(e.id)
-            .host(e.host.clone())
-            .host_type(e.host_type)
-            .port(e.port)
-            .ports(e.ports.clone())
-            .last_source(e.last_source.clone())
-            .on_create(|create| {
-                // No `#[auto]` on an integer timestamp: the writer stamps it.
-                create.created_at(now_epoch())
-            })
-            .exec(&mut conn)
-            .await?;
-        Ok(())
+        let db = self;
+        let endpoint = e.clone();
+        retry_on_busy(
+            move || {
+                let endpoint = endpoint.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    Endpoint::upsert_by_id(endpoint.id)
+                        .host(endpoint.host.clone())
+                        .host_type(endpoint.host_type)
+                        .port(endpoint.port)
+                        .ports(endpoint.ports.clone())
+                        .last_source(endpoint.last_source.clone())
+                        .on_create(|create| create.created_at(now_epoch()))
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 
     /// Insert or update one protocol row by id.
@@ -893,17 +1008,28 @@ impl Database {
                     .into(),
             ));
         }
-        let mut conn = self.conn().await?;
-        Protocol::upsert_by_id(p.id)
-            .sig(p.sig)
-            .proto_kind(p.proto_kind)
-            .transport(p.transport.clone())
-            .security(p.security.clone())
-            .config(p.config.get().0.clone())
-            .on_create(|create| create.created_at(now_epoch()))
-            .exec(&mut conn)
-            .await?;
-        Ok(())
+        let db = self;
+        let protocol = p.clone();
+        retry_on_busy(
+            move || {
+                let protocol = protocol.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    Protocol::upsert_by_id(protocol.id)
+                        .sig(protocol.sig)
+                        .proto_kind(protocol.proto_kind)
+                        .transport(protocol.transport.clone())
+                        .security(protocol.security.clone())
+                        .config(protocol.config.get().0.clone())
+                        .on_create(|create| create.created_at(now_epoch()))
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 
     /// Insert or update one per-pair link row by its composite key
@@ -915,25 +1041,37 @@ impl Database {
     /// [`Self::update_last_used`] and is preserved on update.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_link(&self, s: &ProfileStats) -> Result<()> {
-        let mut conn = self.conn().await?;
-        let endpoint_id = s.endpoint_id;
-        ProfileStats::upsert_by_protocol_id_and_endpoint_id(s.protocol_id, s.endpoint_id)
-            .core_type(s.core_type)
-            .config_type(s.config_type)
-            .last_seen_at(s.last_seen_at)
-            .latency(s.latency.clone())
-            .speed_bps(s.speed_bps)
-            .error(s.error.clone())
-            .purge_reason(s.purge_reason)
-            .traffic(s.traffic)
-            .updated_at(now_epoch())
-            .on_create(|create| create.created_at(now_epoch()))
-            .exec(&mut conn)
-            .await?;
-        // The stored ordering key is derived state: refresh it for the write
-        // that just invalidated it (the page reads the key, not the link).
-        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
-        Ok(())
+        let db = self;
+        let link = s.clone();
+        retry_on_busy(
+            move || {
+                let link = link.clone();
+                async move {
+                    let endpoint_id = link.endpoint_id;
+                    let mut conn = db.conn().await?;
+                    ProfileStats::upsert_by_protocol_id_and_endpoint_id(
+                        link.protocol_id,
+                        link.endpoint_id,
+                    )
+                    .core_type(link.core_type)
+                    .config_type(link.config_type)
+                    .last_seen_at(link.last_seen_at)
+                    .latency(link.latency.clone())
+                    .speed_bps(link.speed_bps)
+                    .error(link.error.clone())
+                    .purge_reason(link.purge_reason)
+                    .traffic(link.traffic)
+                    .updated_at(now_epoch())
+                    .on_create(|create| create.created_at(now_epoch()))
+                    .exec(&mut conn)
+                    .await?;
+                    crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 
     /// Apply one patch per row inside a single transaction.
@@ -956,6 +1094,13 @@ impl Database {
     /// it cannot update), which is the contract the callers rely on.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize> {
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        retry_on_busy(|| self.apply_link_patches_once(patches), 5).await
+    }
+
+    async fn apply_link_patches_once(&self, patches: &[LinkPatch]) -> Result<usize> {
         if patches.is_empty() {
             return Ok(0);
         }
@@ -1020,35 +1165,59 @@ impl Database {
     /// `(endpoint_id, group_id)`.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_endpoint_group_link(&self, eg: &EndpointGroup) -> Result<()> {
-        let mut conn = self.conn().await?;
-        EndpointGroup::upsert_by_endpoint_id_and_group_id(eg.endpoint_id, eg.group_id.clone())
-            .last_seen_at(eg.last_seen_at)
-            .sort_order(eg.sort_order)
-            .exec(&mut conn)
-            .await?;
-        Ok(())
+        let db = self;
+        let edge = eg.clone();
+        retry_on_busy(
+            move || {
+                let edge = edge.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    EndpointGroup::upsert_by_endpoint_id_and_group_id(
+                        edge.endpoint_id,
+                        edge.group_id.clone(),
+                    )
+                    .last_seen_at(edge.last_seen_at)
+                    .sort_order(edge.sort_order)
+                    .exec(&mut conn)
+                    .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 
     /// Insert or update one group by id (replaces `insert_group` +
     /// `update_group`).
-    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_group(&self, g: &Group) -> Result<()> {
-        let mut conn = self.conn().await?;
-        Group::upsert_by_id(g.id.clone())
-            .name(g.name.clone())
-            .url(g.url.clone())
-            .enabled(g.enabled)
-            .user_agent(g.user_agent.clone())
-            .convert_target(g.convert_target)
-            .core_type(g.core_type)
-            .sort_order(g.sort_order)
-            .last_refreshed(g.last_refreshed)
-            .status(g.status)
-            .error_message(g.error_message.clone())
-            .refresh_interval(g.refresh_interval)
-            .exec(&mut conn)
-            .await?;
-        Ok(())
+        let db = self;
+        let group = g.clone();
+        retry_on_busy(
+            move || {
+                let group = group.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    Group::upsert_by_id(group.id.clone())
+                        .name(group.name.clone())
+                        .url(group.url.clone())
+                        .enabled(group.enabled)
+                        .user_agent(group.user_agent.clone())
+                        .convert_target(group.convert_target)
+                        .core_type(group.core_type)
+                        .sort_order(group.sort_order)
+                        .last_refreshed(group.last_refreshed)
+                        .status(group.status)
+                        .error_message(group.error_message.clone())
+                        .refresh_interval(group.refresh_interval)
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 
     // ── Activity ─────────────────────────────────────────────────────────
@@ -1063,17 +1232,22 @@ impl Database {
         endpoint_id: EndpointId,
         at: i64,
     ) -> Result<()> {
-        let mut conn = self.conn().await?;
-        ProfileStats::filter_by_protocol_id_and_endpoint_id(protocol_id, endpoint_id)
-            .update()
-            .last_used_at(Some(at))
-            .last_seen_at(at)
-            .exec(&mut conn)
-            .await?;
-        // `last_seen_at` is the order's recency tiebreak and the view windows'
-        // input, so a "last used" stamp moves the stored key.
-        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
-        Ok(())
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let mut conn = db.conn().await?;
+                ProfileStats::filter_by_protocol_id_and_endpoint_id(protocol_id, endpoint_id)
+                    .update()
+                    .last_used_at(Some(at))
+                    .last_seen_at(at)
+                    .exec(&mut conn)
+                    .await?;
+                crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
     }
 
     /// Persist the DNS resolution of an endpoint host: its address set
@@ -1203,16 +1377,21 @@ impl Database {
         endpoint_id: EndpointId,
         protocol_id: Option<ProtocolId>,
     ) -> Result<()> {
-        let mut conn = self.conn().await?;
-        Endpoint::filter_by_id(endpoint_id)
-            .update()
-            .manual_protocol_override(protocol_id)
-            .exec(&mut conn)
-            .await?;
-        // The override decides the endpoint's DISPLAY link, whose columns the
-        // non-Test sorts read.
-        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
-        Ok(())
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let mut conn = db.conn().await?;
+                Endpoint::filter_by_id(endpoint_id)
+                    .update()
+                    .manual_protocol_override(protocol_id)
+                    .exec(&mut conn)
+                    .await?;
+                crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
     }
 
     // ── Purge / delete ───────────────────────────────────────────────────
@@ -1227,6 +1406,10 @@ impl Database {
     /// orphan `protocol` rows (those left with zero links).
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn purge_expired(&self, cutoff: i64) -> Result<usize> {
+        retry_on_busy(|| self.purge_expired_once(cutoff), 5).await
+    }
+
+    async fn purge_expired_once(&self, cutoff: i64) -> Result<usize> {
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
@@ -1308,6 +1491,13 @@ impl Database {
         if endpoint_ids.is_empty() {
             return Ok(0);
         }
+        retry_on_busy(|| self.delete_endpoints_once(endpoint_ids), 5).await
+    }
+
+    async fn delete_endpoints_once(&self, endpoint_ids: &[EndpointId]) -> Result<usize> {
+        if endpoint_ids.is_empty() {
+            return Ok(0);
+        }
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
@@ -1326,9 +1516,6 @@ impl Database {
         .exec(&mut tx)
         .await?;
         Self::purge_orphan_protocols(&mut tx).await?;
-        // The address set is a child table, and nothing cascades on this
-        // engine (toasty's model emits no `REFERENCES`), so the deletion
-        // owners remove it here — in the same transaction as the endpoint.
         crate::endpoint_ip::delete_for(&mut tx, endpoint_ids).await?;
         Endpoint::filter(toasty::stmt::in_list(
             Endpoint::fields().id(),
@@ -1337,10 +1524,7 @@ impl Database {
         .delete()
         .exec(&mut tx)
         .await?;
-        // The page drives from `endpoint_rank`: a deleted endpoint must not
-        // leave its key behind.
         crate::endpoint_rank::prune(&mut tx, endpoint_ids).await?;
-
         tx.commit().await?;
         Ok(endpoint_ids.len())
     }
@@ -1349,17 +1533,28 @@ impl Database {
     /// returning the number of links removed. Endpoints and their links stay.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn clear_group_endpoints(&self, group_id: &str) -> Result<usize> {
-        let mut conn = self.conn().await?;
-        let rows: Vec<EndpointGroup> =
-            EndpointGroup::filter(EndpointGroup::fields().group_id().eq(group_id))
-                .exec(&mut conn)
-                .await?;
-        let count = rows.len();
-        EndpointGroup::filter(EndpointGroup::fields().group_id().eq(group_id))
-            .delete()
-            .exec(&mut conn)
-            .await?;
-        Ok(count)
+        let db = self;
+        let group_id = group_id.to_owned();
+        retry_on_busy(
+            move || {
+                let group_id = group_id.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    let rows: Vec<EndpointGroup> =
+                        EndpointGroup::filter(EndpointGroup::fields().group_id().eq(&group_id))
+                            .exec(&mut conn)
+                            .await?;
+                    let count = rows.len();
+                    EndpointGroup::filter(EndpointGroup::fields().group_id().eq(&group_id))
+                        .delete()
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(count)
+                }
+            },
+            5,
+        )
+        .await
     }
 
     /// Delete a group: its `endpoint_groups` links, then the group row.
@@ -1373,6 +1568,10 @@ impl Database {
     /// silently destroys endpoints.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn delete_group(&self, group_id: &str) -> Result<()> {
+        retry_on_busy(|| self.delete_group_once(group_id), 5).await
+    }
+
+    async fn delete_group_once(&self, group_id: &str) -> Result<()> {
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
@@ -1397,39 +1596,51 @@ impl Database {
     /// server stats + extensions' delay/speed).
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn clear_all_stats(&self) -> Result<()> {
-        let mut conn = self.conn().await?;
-        ProfileStats::all()
-            .update()
-            .traffic(TrafficStats {
-                today_up: 0,
-                today_down: 0,
-                total_up: 0,
-                total_down: 0,
-            })
-            .latency(None)
-            .error(None)
-            .speed_bps(None)
-            .exec(&mut conn)
-            .await?;
-        // Every column this clears feeds a stored key: a wholesale reset must
-        // rebuild them all, not leave the old bands in place.
-        crate::endpoint_rank::backfill_all(&mut conn).await?;
-        Ok(())
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let mut conn = db.conn().await?;
+                ProfileStats::all()
+                    .update()
+                    .traffic(TrafficStats {
+                        today_up: 0,
+                        today_down: 0,
+                        total_up: 0,
+                        total_down: 0,
+                    })
+                    .latency(None)
+                    .error(None)
+                    .speed_bps(None)
+                    .exec(&mut conn)
+                    .await?;
+                crate::endpoint_rank::backfill_all(&mut conn).await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
     }
 
     /// Restore a stale endpoint by setting `last_seen_at = now` on all its
     /// links (old `restore_endpoint`).
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn restore_endpoint(&self, endpoint_id: EndpointId) -> Result<()> {
-        let now = now_epoch();
-        let mut conn = self.conn().await?;
-        ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(endpoint_id))
-            .update()
-            .last_seen_at(now)
-            .exec(&mut conn)
-            .await?;
-        crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
-        Ok(())
+        let db = self;
+        retry_on_busy(
+            move || async move {
+                let now = now_epoch();
+                let mut conn = db.conn().await?;
+                ProfileStats::filter(ProfileStats::fields().endpoint_id().eq(endpoint_id))
+                    .update()
+                    .last_seen_at(now)
+                    .exec(&mut conn)
+                    .await?;
+                crate::endpoint_rank::refresh(&mut conn, &[endpoint_id]).await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
     }
 }
 
@@ -1470,17 +1681,27 @@ impl Database {
     /// merge's probe union.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_route_probes(&self, hosts: Vec<String>) -> Result<()> {
+        let db = self;
         let mut seen = std::collections::HashSet::new();
         let deduped: Vec<String> = hosts
             .into_iter()
             .filter(|h| seen.insert(h.to_lowercase()))
             .collect();
-        let mut conn = self.conn().await?;
-        RouteProbes::upsert_by_id("global".to_string())
-            .hosts(deduped)
-            .exec(&mut conn)
-            .await?;
-        Ok(())
+        retry_on_busy(
+            move || {
+                let deduped = deduped.clone();
+                async move {
+                    let mut conn = db.conn().await?;
+                    RouteProbes::upsert_by_id("global".to_string())
+                        .hosts(deduped)
+                        .exec(&mut conn)
+                        .await?;
+                    Ok(())
+                }
+            },
+            5,
+        )
+        .await
     }
 }
 // ── Bulk upserts (subscription import) ───────────────────────────────
@@ -1593,6 +1814,7 @@ pub async fn upsert_endpoint_group_links_bulk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::is_busy_error;
     use crate::models_toasty::HostType;
     use crate::models_toasty::{ConfigType, Latency, Security, TrafficStats, Transport};
     use toasty::{Deferred, Json};
@@ -1602,6 +1824,94 @@ mod tests {
         VlessConfig,
     };
 
+    #[test]
+    fn concurrent_writes_is_opt_in() {
+        assert!(!concurrent_writes_from_env(None));
+        assert!(concurrent_writes_from_env(Some("1")));
+        assert!(concurrent_writes_from_env(Some("true")));
+        assert!(!concurrent_writes_from_env(Some("0")));
+        assert!(!concurrent_writes_from_env(Some("false")));
+    }
+    #[tokio::test]
+    async fn in_memory_stays_wal_for_schema_lifecycle() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+        let rows = toasty::sql::query("PRAGMA journal_mode")
+            .exec(&mut conn)
+            .await
+            .expect("journal mode");
+        let mode = rows.first().and_then(|value| match value {
+            toasty::stmt::Value::Record(fields) => fields.first().and_then(|field| match field {
+                toasty::stmt::Value::String(mode) => Some(mode.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(mode, Some("wal"));
+    }
+    #[tokio::test]
+    async fn mvcc_conflict_replays_without_losing_update() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open_with_concurrent_writes(dir.path().join("mvcc.db"), true)
+            .await
+            .expect("file db");
+        assert!(db.uses_concurrent_writes());
+        let mut setup = db.connection().await.expect("setup connection");
+        toasty::sql::query(
+            "CREATE TABLE retry_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .exec(&mut setup)
+        .await
+        .expect("create probe table");
+        toasty::sql::query("INSERT INTO retry_probe(id, value) VALUES (1, 'initial')")
+            .exec(&mut setup)
+            .await
+            .expect("seed probe row");
+
+        let mut first = db.connection().await.expect("first connection");
+        let mut second = db.connection().await.expect("second connection");
+        let mut first_tx = first.transaction().await.expect("first transaction");
+        let mut second_tx = second.transaction().await.expect("second transaction");
+        toasty::sql::query("UPDATE retry_probe SET value = 'first' WHERE id = 1")
+            .exec(&mut first_tx)
+            .await
+            .expect("first update");
+        let second_update =
+            toasty::sql::query("UPDATE retry_probe SET value = 'second' WHERE id = 1")
+                .exec(&mut second_tx)
+                .await;
+        let second_error = second_update.expect_err("same-row MVCC update must conflict");
+        assert!(is_busy_error(&DatabaseError::Toasty(second_error)));
+        first_tx.commit().await.expect("first commit");
+
+        retry_on_busy(
+            || async {
+                let mut conn = db.connection().await?;
+                let mut tx = conn.transaction().await?;
+                toasty::sql::query("UPDATE retry_probe SET value = 'retry' WHERE id = 1")
+                    .exec(&mut tx)
+                    .await?;
+                tx.commit().await?;
+                Ok(())
+            },
+            5,
+        )
+        .await
+        .expect("retry update");
+
+        let rows = toasty::sql::query("SELECT value FROM retry_probe WHERE id = 1")
+            .exec(&mut setup)
+            .await
+            .expect("read retried value");
+        let value = rows.first().and_then(|value| match value {
+            toasty::stmt::Value::Record(fields) => fields.first().and_then(|field| match field {
+                toasty::stmt::Value::String(value) => Some(value.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(value, Some("retry"));
+    }
     fn ts(secs: i64) -> i64 {
         secs
     }
@@ -2008,6 +2318,59 @@ mod tests {
             1,
             "open() must recreate with the 7-table schema"
         );
+    }
+    #[tokio::test]
+    async fn existing_wal_file_stays_wal_and_reopens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal.db");
+        {
+            let driver = toasty_driver_turso::Turso::file(&path);
+            let db = Database::try_open_db(driver).await.expect("initial db");
+            db.push_schema().await.expect("initial schema");
+            let mut conn = db.connection().await.expect("initial connection");
+            toasty::sql::query("PRAGMA journal_mode='wal'")
+                .exec(&mut conn)
+                .await
+                .expect("set WAL");
+            toasty::sql::query("PRAGMA user_version=13")
+                .exec(&mut conn)
+                .await
+                .expect("set schema tag");
+        }
+        let db = Database::open(&path).await.expect("reopen WAL db");
+        assert!(!db.uses_concurrent_writes());
+        let mut conn = db.connection().await.expect("WAL connection");
+        let rows = toasty::sql::query("PRAGMA journal_mode")
+            .exec(&mut conn)
+            .await
+            .expect("read mode");
+        let mode = rows.first().and_then(|value| match value {
+            toasty::stmt::Value::Record(fields) => fields.first().and_then(|field| match field {
+                toasty::stmt::Value::String(mode) => Some(mode.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(mode, Some("wal"));
+    }
+    #[tokio::test]
+    async fn mvcc_schema_wipe_removes_log_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mvcc-stale.db");
+        {
+            let db = Database::open_with_concurrent_writes(&path, true)
+                .await
+                .expect("initial MVCC db");
+            let mut conn = db.connection().await.expect("connection");
+            toasty::sql::query("PRAGMA user_version=8")
+                .exec(&mut conn)
+                .await
+                .expect("set stale tag");
+        }
+        let db = Database::open_with_concurrent_writes(&path, true)
+            .await
+            .expect("recreate MVCC db");
+        assert!(db.uses_concurrent_writes());
     }
 
     #[derive(Debug, toasty::Model)]
