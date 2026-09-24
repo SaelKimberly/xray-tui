@@ -19,6 +19,12 @@
 //!
 //! `XRAY_TUI_MEASURE_DB=/path/to/data.db` additionally measures the per-tick
 //! profiles reload against a copy of a real feed (never the live file).
+//!
+//! `XRAY_TUI_SCALE=7686,50000,200000` (or `=1` for that default) additionally
+//! runs the synthetic page-scale lab: seed a temp feed at each N, materialize
+//! rank keys, and measure the Active page for the filesort sorts across
+//! offsets, plus the band-seek A/B (P1b before/after). Independent of a real
+//! feed file.
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, dead_code)]
 
 use std::hint::black_box;
@@ -838,7 +844,7 @@ async fn flow_cost_report() {
                 .exec(&mut conn)
                 .await;
 
-                let variants: [(&str, String); 4] = [
+                let variants: [(&str, String); 6] = [
                     (
                         "raw: Address order, endpoint_rank-driven",
                         "SELECT k.endpoint_id FROM endpoint_rank k JOIN endpoints e ON e.id = k.endpoint_id \
@@ -862,6 +868,19 @@ async fn flow_cost_report() {
                         "raw: Address order, rank-driven + host join",
                         "SELECT k.endpoint_id FROM endpoint_rank k JOIN endpoints e ON e.id = k.endpoint_id \
                          WHERE k.rank_newest_seen >= ?1 ORDER BY e.host ASC LIMIT 200"
+                            .to_owned(),
+                    ),
+                    (
+                        "raw: Port order, rank-driven (filesort)",
+                        "SELECT k.endpoint_id FROM endpoint_rank k JOIN endpoints e ON e.id = k.endpoint_id \
+                         WHERE k.rank_newest_seen >= ?1 ORDER BY e.port ASC, k.endpoint_id ASC LIMIT 200"
+                            .to_owned(),
+                    ),
+                    (
+                        "raw: Ip order, rank-driven (filesort)",
+                        "SELECT k.endpoint_id FROM endpoint_rank k WHERE k.rank_newest_seen >= ?1 \
+                         ORDER BY COALESCE((SELECT min(ip.ip_key) FROM endpoint_ip ip \
+                         WHERE ip.endpoint_id = k.endpoint_id), x'ff') ASC, k.endpoint_id ASC LIMIT 200"
                             .to_owned(),
                     ),
                 ];
@@ -932,12 +951,265 @@ async fn flow_cost_report() {
                     ns: started.elapsed().as_nanos() as f64 / f64::from(pages.max(1)),
                     n: pages,
                 });
+
+                // ── band A/B (P1b): does an equality-seek beat the Address
+                // filesort on the REAL feed's own Active/stale distribution?
+                // Scratch columns on the feed COPY (never the live file), run
+                // last so nothing measured above is affected.
+                let threshold = xray_tui_db::models::now_epoch() - 7 * 86400;
+                // Copy the feed (+ WAL sidecars) into a TempDir and mutate ONLY
+                // the copy: the ALTER/CREATE INDEX below must never touch the
+                // file the var points at, even a live data.db.
+                let scratch_dir = tempfile::tempdir().expect("tempdir");
+                let scratch_path = scratch_dir.path().join("scratch.db");
+                let mut have_copy = false;
+                for suffix in ["", "-wal", "-shm"] {
+                    let src = format!("{path}{suffix}");
+                    if std::path::Path::new(&src).exists() {
+                        let dst = scratch_dir.path().join(format!("scratch.db{suffix}"));
+                        if std::fs::copy(&src, &dst).is_ok() && suffix.is_empty() {
+                            have_copy = true;
+                        }
+                    }
+                }
+                let scratch_db = if have_copy {
+                    xray_tui_db::Database::open(&scratch_path).await.ok()
+                } else {
+                    None
+                };
+                if let Some(scratch_db) = &scratch_db
+                    && let Ok(mut conn) = scratch_db.connection().await
+                {
+                    for ddl in [
+                        "ALTER TABLE endpoint_rank ADD COLUMN mband INTEGER",
+                        "ALTER TABLE endpoint_rank ADD COLUMN rank_host TEXT",
+                    ] {
+                        let _ = toasty::sql::query(ddl).exec(&mut conn).await;
+                    }
+                    let _ = toasty::sql::query(&format!(
+                        "UPDATE endpoint_rank SET mband = CASE WHEN rank_newest_seen >= {threshold} \
+                         THEN 0 ELSE 1 END"
+                    ))
+                    .exec(&mut conn)
+                    .await;
+                    let _ = toasty::sql::query(
+                        "UPDATE endpoint_rank SET rank_host = \
+                         (SELECT host FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id)",
+                    )
+                    .exec(&mut conn)
+                    .await;
+                    let _ = toasty::sql::query(
+                        "CREATE INDEX IF NOT EXISTS idx_measure_band_host \
+                         ON endpoint_rank(mband, rank_host, endpoint_id)",
+                    )
+                    .exec(&mut conn)
+                    .await;
+                    let band_ab: [(&str, String); 2] = [
+                        (
+                            "band A/B: Address filesort (baseline)",
+                            format!(
+                                "SELECT k.endpoint_id FROM endpoint_rank k \
+                                 JOIN endpoints e ON e.id = k.endpoint_id \
+                                 WHERE k.rank_newest_seen >= {threshold} \
+                                 ORDER BY e.host ASC, k.endpoint_id ASC LIMIT 200"
+                            ),
+                        ),
+                        (
+                            "band A/B: band=0 seek (rank_host)",
+                            "SELECT endpoint_id FROM endpoint_rank WHERE mband = 0 \
+                             ORDER BY rank_host ASC, endpoint_id ASC LIMIT 200"
+                                .to_owned(),
+                        ),
+                    ];
+                    for (label, sql) in band_ab {
+                        let mut acc = Acc::new();
+                        for _ in 0..8 {
+                            let started = Instant::now();
+                            match toasty::sql::query(sql.clone()).exec(&mut conn).await {
+                                Ok(rows) => {
+                                    acc.add(started.elapsed());
+                                    black_box(rows.len());
+                                }
+                                Err(e) => {
+                                    println!("[{label}] failed: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                        if !acc.samples.is_empty() {
+                            rows_out.push(acc.row(label, 1.0));
+                        }
+                    }
+                }
             }
             Err(e) => println!("[real feed] open failed: {e}"),
         }
     }
 
+    measure_page_scale().await;
     print_table("fast + real ping flow", &rows_out);
+}
+
+/// E1/E2/E3 at synthetic scale (gated by `XRAY_TUI_SCALE`). Seeds a temp feed
+/// at each N, materializes rank keys, then measures the Active page for the
+/// filesort sorts (Address/Port) and the index sort (Test) across offsets, plus
+/// the band-seek A/B — the P1b before/after, at scale.
+async fn measure_page_scale() {
+    let Ok(spec) = std::env::var("XRAY_TUI_SCALE") else {
+        return;
+    };
+    let sizes: Vec<usize> = if spec.trim().is_empty() || spec.trim() == "1" {
+        vec![7686, 50000, 200000]
+    } else {
+        spec.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+    };
+    let now = xray_tui_db::models::now_epoch();
+    let ttl = 7 * 86400_i64;
+    let threshold = now - ttl;
+    for n in sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let db = match xray_tui_db::Database::open(dir.path().join("scale.db")).await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("[scale N={n}] open failed: {e}");
+                continue;
+            }
+        };
+        // last_seen_at spread across the Active boundary (~half Active), so the
+        // view filter and the band split are both meaningful.
+        let mut rows = synth_rows(n, 2);
+        for (i, row) in rows.iter_mut().enumerate() {
+            let age = (i as i64 % (2 * ttl / 3600)) * 3600;
+            let seen = now - age;
+            for link in &mut row.links {
+                link.last_seen_at = seen;
+            }
+        }
+        for chunk in rows.chunks(5000) {
+            let endpoints: Vec<_> = chunk.iter().map(|r| r.endpoint.clone()).collect();
+            let protocols: Vec<_> =
+                chunk.iter().flat_map(|r| r.protocols.values().cloned()).collect();
+            let links: Vec<_> = chunk.iter().flat_map(|r| r.links.iter().cloned()).collect();
+            let mut conn = db.connection().await.expect("conn");
+            let mut tx = conn.transaction().await.expect("tx");
+            xray_tui_db::upsert_endpoints_bulk(&mut tx, &endpoints).await.expect("ep");
+            xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await.expect("pr");
+            xray_tui_db::upsert_links_bulk(&mut tx, &links).await.expect("lk");
+            tx.commit().await.expect("commit");
+        }
+        db.repair_endpoint_ranks().await.expect("ranks");
+
+        let mut out: Vec<TableRow> = Vec::new();
+        let active_total = {
+            let req = PageRequest {
+                view: PurgatoryView::Active,
+                active_threshold: threshold,
+                scope: PlanScope::All,
+                search: None,
+                group_id: None,
+                sort: PageSort::Id,
+                ascending: true,
+                offset: 0,
+                limit: PROFILES_PAGE_SIZE,
+            };
+            db.profiles_page(&req).await.map(|p| p.total as usize).unwrap_or(0)
+        };
+        let offsets = [
+            0usize,
+            active_total / 2,
+            active_total.saturating_sub(PROFILES_PAGE_SIZE),
+        ];
+        for (sort, tag) in [
+            (PageSort::Address, "Address(filesort)"),
+            (PageSort::Port, "Port(filesort)"),
+            (PageSort::Test, "Test(index)"),
+        ] {
+            for &off in &offsets {
+                let req = PageRequest {
+                    view: PurgatoryView::Active,
+                    active_threshold: threshold,
+                    scope: PlanScope::All,
+                    search: None,
+                    group_id: None,
+                    sort,
+                    ascending: true,
+                    offset: off,
+                    limit: PROFILES_PAGE_SIZE,
+                };
+                let mut acc = Acc::new();
+                for _ in 0..5 {
+                    let started = Instant::now();
+                    let p = db.profiles_page(&req).await.expect("page");
+                    acc.add(started.elapsed());
+                    black_box(p.ids.len());
+                }
+                out.push(acc.row(&format!("Active {tag} offset={off}"), 1.0));
+            }
+        }
+        if let Ok(mut conn) = db.connection().await {
+            for ddl in [
+                "ALTER TABLE endpoint_rank ADD COLUMN mband INTEGER",
+                "ALTER TABLE endpoint_rank ADD COLUMN rank_host TEXT",
+            ] {
+                let _ = toasty::sql::query(ddl).exec(&mut conn).await;
+            }
+            let _ = toasty::sql::query(&format!(
+                "UPDATE endpoint_rank SET mband = CASE WHEN rank_newest_seen >= {threshold} \
+                 THEN 0 ELSE 1 END"
+            ))
+            .exec(&mut conn)
+            .await;
+            let _ = toasty::sql::query(
+                "UPDATE endpoint_rank SET rank_host = \
+                 (SELECT host FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id)",
+            )
+            .exec(&mut conn)
+            .await;
+            let _ = toasty::sql::query(
+                "CREATE INDEX IF NOT EXISTS idx_measure_band_host \
+                 ON endpoint_rank(mband, rank_host, endpoint_id)",
+            )
+            .exec(&mut conn)
+            .await;
+            let band_ab: [(String, String); 2] = [
+                (
+                    "band A/B: Address filesort".to_owned(),
+                    format!(
+                        "SELECT k.endpoint_id FROM endpoint_rank k \
+                         JOIN endpoints e ON e.id = k.endpoint_id \
+                         WHERE k.rank_newest_seen >= {threshold} \
+                         ORDER BY e.host ASC, k.endpoint_id ASC LIMIT 200"
+                    ),
+                ),
+                (
+                    "band A/B: band=0 seek".to_owned(),
+                    "SELECT endpoint_id FROM endpoint_rank WHERE mband = 0 \
+                     ORDER BY rank_host ASC, endpoint_id ASC LIMIT 200"
+                        .to_owned(),
+                ),
+            ];
+            for (label, sql) in band_ab {
+                let mut acc = Acc::new();
+                for _ in 0..8 {
+                    let started = Instant::now();
+                    match toasty::sql::query(sql.clone()).exec(&mut conn).await {
+                        Ok(r) => {
+                            acc.add(started.elapsed());
+                            black_box(r.len());
+                        }
+                        Err(e) => {
+                            println!("[{label}] failed: {e}");
+                            break;
+                        }
+                    }
+                }
+                if !acc.samples.is_empty() {
+                    out.push(acc.row(&label, 1.0));
+                }
+            }
+        }
+        print_table(&format!("page scale N={n} (Active total={active_total})"), &out);
+    }
 }
 
 /// The one row the lab could not produce: the REAL level's network cost.
