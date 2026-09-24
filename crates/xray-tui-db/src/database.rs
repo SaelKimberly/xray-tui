@@ -599,6 +599,7 @@ fn first_i64(rows: &[Value]) -> Option<i64> {
 
 impl Database {
     /// Single endpoint by id with all links and protocols.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn get_endpoint(&self, id: EndpointId) -> Result<Option<EndpointRow>> {
         let mut conn = self.conn().await?;
         let endpoint = Endpoint::filter_by_id(id).first().exec(&mut conn).await?;
@@ -610,6 +611,7 @@ impl Database {
     }
 
     /// Look up endpoint row by link protocol id (p.id not e.id).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn get_endpoint_by_protocol_id(
         &self,
         protocol_id: ProtocolId,
@@ -637,6 +639,7 @@ impl Database {
     ///
     /// The scheduler gate's `refresh` for a plain `Database` backend (the
     /// write-behind writer answers from its staged map instead).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn read_link_row(
         &self,
         protocol_id: ProtocolId,
@@ -651,6 +654,7 @@ impl Database {
         )
     }
 
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn get_all_groups(&self) -> Result<Vec<Group>> {
         let mut conn = self.conn().await?;
         let groups: Vec<Group> = Group::all()
@@ -664,6 +668,7 @@ impl Database {
     /// `last_refreshed IS NULL` or `last_refreshed + refresh_interval minutes
     /// < now` (`refresh_interval` defaults to 1440 minutes, matching the old
     /// subscription update interval). Ordered by `sort_order`.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn get_groups_due_update(&self) -> Result<Vec<Group>> {
         let mut conn = self.conn().await?;
         let candidates: Vec<Group> = Group::filter(Group::fields().enabled().eq(true))
@@ -690,6 +695,7 @@ impl Database {
         Ok(due)
     }
 
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn get_all_routing_rules(&self) -> Result<Vec<RoutingRule>> {
         let mut conn = self.conn().await?;
         let rules: Vec<RoutingRule> = RoutingRule::all()
@@ -700,6 +706,7 @@ impl Database {
     }
 
     /// The (single) DNS settings row, if any.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn get_dns_settings(&self) -> Result<Option<DnsSetting>> {
         let mut conn = self.conn().await?;
         let settings: Vec<DnsSetting> = DnsSetting::all().exec(&mut conn).await?;
@@ -714,6 +721,7 @@ impl Database {
     /// caller's `ids`. [`Self::load_page_projection`] returns the same rows
     /// from one statement; the parity test in `tests/profiles_query.rs` pins
     /// the two together, and this path stays as their oracle.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn load_page_rows(
         &self,
         ids: &[EndpointId],
@@ -849,6 +857,7 @@ impl Database {
     /// and are preserved on update — this matches the old subscription path,
     /// which never clobbered an existing endpoint's resolution state
     /// (INSERT OR IGNORE).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_endpoint(&self, e: &Endpoint) -> Result<()> {
         let mut conn = self.conn().await?;
         Endpoint::upsert_by_id(e.id)
@@ -875,6 +884,7 @@ impl Database {
     /// pass a freshly-built struct or one loaded with the deferred data
     /// included; an unloaded struct is rejected with an error instead of
     /// panicking.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_protocol(&self, p: &Protocol) -> Result<()> {
         if p.config.is_unloaded() || p.transport.data.is_unloaded() || p.security.data.is_unloaded()
         {
@@ -903,6 +913,7 @@ impl Database {
     /// `config_type`, `last_seen_at`, `latency`, `speed_bps`, `error`,
     /// `traffic`). The activity timestamp (`last_used_at`) is owned by
     /// [`Self::update_last_used`] and is preserved on update.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_link(&self, s: &ProfileStats) -> Result<()> {
         let mut conn = self.conn().await?;
         let endpoint_id = s.endpoint_id;
@@ -943,6 +954,7 @@ impl Database {
     /// link writer calls this from its flush task, never from the UI task. A row
     /// deleted mid-batch is re-created by its own patch (an upsert inserts what
     /// it cannot update), which is the contract the callers rely on.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn apply_link_patches(&self, patches: &[LinkPatch]) -> Result<usize> {
         if patches.is_empty() {
             return Ok(0);
@@ -1006,6 +1018,7 @@ impl Database {
 
     /// Insert or update one endpoint↔group link by its composite key
     /// `(endpoint_id, group_id)`.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_endpoint_group_link(&self, eg: &EndpointGroup) -> Result<()> {
         let mut conn = self.conn().await?;
         EndpointGroup::upsert_by_endpoint_id_and_group_id(eg.endpoint_id, eg.group_id.clone())
@@ -1018,6 +1031,7 @@ impl Database {
 
     /// Insert or update one group by id (replaces `insert_group` +
     /// `update_group`).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_group(&self, g: &Group) -> Result<()> {
         let mut conn = self.conn().await?;
         Group::upsert_by_id(g.id.clone())
@@ -1042,6 +1056,7 @@ impl Database {
     /// Record active use of a link: sets `last_used_at` AND `last_seen_at`
     /// to `ts`, so active use keeps a profile out of Stale/purge (old
     /// `update_last_used` semantics).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn update_last_used(
         &self,
         protocol_id: ProtocolId,
@@ -1070,6 +1085,7 @@ impl Database {
     /// The address set and the endpoint's rank keys move together: "has an
     /// address" IS part of the ordering law (decision 16 tier 5), so an
     /// endpoint leaves — or enters — the DNS-unresolved band here.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn update_endpoint_resolution(
         &self,
         endpoint_id: EndpointId,
@@ -1107,6 +1123,7 @@ impl Database {
     /// # Errors
     ///
     /// [`DatabaseError`] when the read fails.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn endpoint_resolutions(
         &self,
         ids: &[EndpointId],
@@ -1120,6 +1137,7 @@ impl Database {
     /// # Errors
     ///
     /// [`DatabaseError`] when the write fails.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn set_endpoint_ip_country(
         &self,
         endpoint_id: EndpointId,
@@ -1154,6 +1172,7 @@ impl Database {
     /// # Errors
     ///
     /// [`DatabaseError`] when the write fails.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn set_endpoint_ip_countries(
         &self,
         rows: &[(EndpointId, std::net::IpAddr, String)],
@@ -1178,6 +1197,7 @@ impl Database {
     }
 
     /// Set or clear (`None`) the manual protocol override of an endpoint — the old `set_protocol_override` + `clear_protocol_override` merged.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn set_manual_override(
         &self,
         endpoint_id: EndpointId,
@@ -1205,6 +1225,7 @@ impl Database {
     /// Cascade, in one transaction: the endpoints' `endpoint_groups` links,
     /// their `profile_stats` links, then the endpoints themselves, then
     /// orphan `protocol` rows (those left with zero links).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn purge_expired(&self, cutoff: i64) -> Result<usize> {
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
@@ -1252,6 +1273,7 @@ impl Database {
     /// Delete an endpoint and cascade: its `profile_stats` links, its
     /// `endpoint_groups` links, the endpoint row, then orphan `protocol`
     /// rows (those whose last link just died). One transaction.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn delete_endpoint(&self, endpoint_id: EndpointId) -> Result<()> {
         self.delete_endpoints(&[endpoint_id]).await.map(|_| ())
     }
@@ -1262,6 +1284,7 @@ impl Database {
     /// scans for orphan protocols and prunes rank keys per endpoint; a bulk
     /// delete ("remove failed servers" over a whole page) did all of that N
     /// times. Returns the number of endpoints deleted.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn delete_endpoints(&self, endpoint_ids: &[EndpointId]) -> Result<usize> {
         if endpoint_ids.is_empty() {
             return Ok(0);
@@ -1305,6 +1328,7 @@ impl Database {
 
     /// Remove all endpoint↔group links for `group_id` (the old `clear_group`),
     /// returning the number of links removed. Endpoints and their links stay.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn clear_group_endpoints(&self, group_id: &str) -> Result<usize> {
         let mut conn = self.conn().await?;
         let rows: Vec<EndpointGroup> =
@@ -1328,6 +1352,7 @@ impl Database {
     /// unlinks without deleting) — endpoint cleanup is left to
     /// [`Self::purge_expired`] by staleness, so deleting a group never
     /// silently destroys endpoints.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn delete_group(&self, group_id: &str) -> Result<()> {
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
@@ -1351,6 +1376,7 @@ impl Database {
     /// `latency`, `speed_bps`, and `error` on EVERY `profile_stats` row
     /// (query-based update, one statement; the old `clear_all_stats` wiped
     /// server stats + extensions' delay/speed).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn clear_all_stats(&self) -> Result<()> {
         let mut conn = self.conn().await?;
         ProfileStats::all()
@@ -1374,6 +1400,7 @@ impl Database {
 
     /// Restore a stale endpoint by setting `last_seen_at = now` on all its
     /// links (old `restore_endpoint`).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn restore_endpoint(&self, endpoint_id: EndpointId) -> Result<()> {
         let now = now_epoch();
         let mut conn = self.conn().await?;
@@ -1412,6 +1439,7 @@ impl Database {
 
 impl Database {
     /// The global probe-hostname list; an absent row yields an empty vec.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn get_route_probes(&self) -> Result<Vec<String>> {
         let mut conn = self.conn().await?;
         let rows: Vec<RouteProbes> = RouteProbes::all().exec(&mut conn).await?;
@@ -1421,6 +1449,7 @@ impl Database {
     /// Replace the global probe-hostname list (singleton `id == "global"`).
     /// Deduped case-insensitively, first spelling kept — same policy as
     /// merge's probe union.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_route_probes(&self, hosts: Vec<String>) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         let deduped: Vec<String> = hosts
@@ -1446,6 +1475,7 @@ impl Database {
 
 /// Insert-or-update many endpoints on the caller's executor (usually a
 /// `&mut Transaction`). Empty slice is a no-op.
+#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> Result<()> {
     for e in eps {
         Endpoint::upsert_by_id(e.id)
@@ -1466,6 +1496,7 @@ pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> 
 
 /// Insert-or-update many protocols on the caller's executor. Empty slice is a
 /// no-op. Same deferred-unloaded guard as `Database::upsert_protocol`.
+#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> Result<()> {
     for p in ps {
         if p.config.is_unloaded() || p.transport.data.is_unloaded() || p.security.data.is_unloaded()
@@ -1505,6 +1536,7 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
 /// a Fast+Real batch destroyed every fast latency it had just written).
 /// `last_used_at` is likewise never touched here (its owner is
 /// [`Database::update_last_used`]).
+#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -> Result<()> {
     // One multi-row upsert per chunk instead of one typed upsert per row
     // (measured 2026-09-16 over the reference feed: 2,000 links 360 ms → 48 ms).
@@ -1524,6 +1556,7 @@ pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -
 
 /// Insert-or-update many endpoint↔group links on the caller's executor.
 /// Empty slice is a no-op.
+#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_endpoint_group_links_bulk(
     tx: &mut impl Executor,
     egs: &[EndpointGroup],

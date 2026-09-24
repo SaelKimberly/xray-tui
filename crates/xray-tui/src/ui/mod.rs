@@ -557,7 +557,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 | KeyCode::End
                 | KeyCode::Delete
                 | KeyCode::Esc
-                | KeyCode::Char('c' | 't' | 'T' | 'y' | 'Y')
+                | KeyCode::Char('c' | 'd' | 't' | 'T' | 'y' | 'Y')
         ) && !key.modifiers.contains(KeyModifiers::CONTROL);
         if is_logs_key {
             logs::handle_key(state, key).await;
@@ -1092,6 +1092,7 @@ fn help_content(state: &AppState) -> Vec<(&'static str, &'static str)> {
                     ("c", "Clear log cache"),
                     ("Del", "Purge all logs from database"),
                     ("t", "Open target filter"),
+                    ("d", "Dump DB query monitor"),
                     ("Tab / Shift+Tab", "Cycle tabs"),
                     ("?", "Toggle this help"),
                     ("q / Ctrl+C", "Quit"),

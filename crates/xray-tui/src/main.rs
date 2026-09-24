@@ -24,18 +24,46 @@ struct TuiLogLayer {
     dropped_logs: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// A field visitor that captures the `message` field.
-struct LogVisitor(String);
+/// Captures the `message` field, plus the `toasty::query` structured fields
+/// (`duration_ms`, `db.statement`) so the slow-query line can be rendered
+/// with the statement and timing instead of the bare "slow query".
+#[derive(Default)]
+struct LogVisitor {
+    message: String,
+    duration_ms: Option<f64>,
+    statement: Option<String>,
+}
+
+impl LogVisitor {
+    /// The message enriched with query timing/statement when present,
+    /// otherwise the bare message.
+    fn into_message(self) -> String {
+        match (self.duration_ms, self.statement) {
+            (Some(ms), Some(sql)) => format!("{} [{ms:.1}ms]: {sql}", self.message),
+            (Some(ms), None) => format!("{} [{ms:.1}ms]", self.message),
+            _ => self.message,
+        }
+    }
+}
 
 impl Visit for LogVisitor {
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        if field.name() == "duration_ms" {
+            self.duration_ms = Some(value);
+        }
+    }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "db.statement" => self.statement = Some(format!("{value:?}")),
+            _ => {}
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.0 = value.to_string();
+        match field.name() {
+            "message" => self.message = value.to_string(),
+            "db.statement" => self.statement = Some(value.to_string()),
+            _ => {}
         }
     }
 }
@@ -60,9 +88,9 @@ where
             tracing::Level::DEBUG | tracing::Level::TRACE => return,
         };
 
-        let mut visitor = LogVisitor(String::new());
+        let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
-        let message = visitor.0;
+        let message = visitor.into_message();
         let target = event.metadata().target();
 
         let timestamp_nanos = u64::try_from(
@@ -340,6 +368,16 @@ async fn main() -> Result<()> {
             .with_writer(std::io::stderr)
             .with_filter(filter)
     });
+    // DB query monitor: aggregates toasty's `toasty::query` events with our
+    // `retry_on_busy` retry counts, keyed by `Database` method span.
+    let db_monitor = xray_tui::ops::db_monitor::DbMonitor::new();
+    xray_tui::ops::db_monitor::install(db_monitor.clone());
+    let db_monitor_layer = xray_tui::ops::db_monitor::DbMonitorLayer::new(db_monitor)
+        // Only the per-query events and the method-attribution spans; nothing
+        // else reaches this layer.
+        .with_filter(tracing_subscriber::EnvFilter::new(
+            "off,toasty::query=debug,db_method=trace",
+        ));
     if tracing_subscriber::registry()
         .with(stderr_log)
         .with(
@@ -359,6 +397,7 @@ async fn main() -> Result<()> {
                 "trace,hickory_net::h2=error",
             )),
         )
+        .with(db_monitor_layer)
         .try_init()
         .is_err()
     {
@@ -471,7 +510,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_tls_provider, stderr_mirror_enabled};
+    use super::{LogVisitor, install_tls_provider, stderr_mirror_enabled};
 
     /// Regression: release panic "Could not automatically determine the
     /// process-level `CryptoProvider` from Rustls crate" on Fast+Real ping.
@@ -502,5 +541,36 @@ mod tests {
         assert!(!stderr_mirror_enabled(Some(" ")));
         assert!(!stderr_mirror_enabled(Some("0")));
         assert!(!stderr_mirror_enabled(Some("False")));
+    }
+
+    /// Falsifier B: a populated `LogVisitor` renders the slow-query line with
+    /// its statement and timing, not the bare message.
+    #[test]
+    fn log_visitor_enriches_the_slow_query_line() {
+        let v = LogVisitor {
+            message: "slow query".to_string(),
+            duration_ms: Some(312.4),
+            statement: Some("SELECT * FROM profile_stats".to_string()),
+        };
+        assert_eq!(
+            v.into_message(),
+            "slow query [312.4ms]: SELECT * FROM profile_stats"
+        );
+
+        // Duration without a statement still gets the timing.
+        let v = LogVisitor {
+            message: "slow query".to_string(),
+            duration_ms: Some(5.0),
+            statement: None,
+        };
+        assert_eq!(v.into_message(), "slow query [5.0ms]");
+
+        // A non-query event (no structured fields) is left untouched.
+        let v = LogVisitor {
+            message: "plain log".to_string(),
+            duration_ms: None,
+            statement: None,
+        };
+        assert_eq!(v.into_message(), "plain log");
     }
 }

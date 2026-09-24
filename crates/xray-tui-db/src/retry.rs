@@ -34,7 +34,13 @@ where
                 tokio::time::sleep(Duration::from_millis(20 << attempt.min(6))).await;
                 attempt += 1;
             }
-            other => return other,
+            other => {
+                // Publish the final retry count to the enclosing `Database`
+                // method span (declared `fields(retries = Empty)`); a no-op
+                // when the caller is not instrumented.
+                tracing::Span::current().record("retries", u64::from(attempt));
+                return other;
+            }
         }
     }
 }

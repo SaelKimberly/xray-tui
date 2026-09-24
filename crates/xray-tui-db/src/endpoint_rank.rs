@@ -373,6 +373,7 @@ impl crate::Database {
     /// refresh would hide its endpoint until this ran. It runs at `open` and
     /// is available to callers that write links outside the normal paths
     /// (fixtures, maintenance scripts).
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn repair_endpoint_ranks(&self) -> crate::Result<usize> {
         let mut conn = self.connection().await?;
         repair_missing(&mut conn).await
@@ -383,6 +384,7 @@ impl crate::Database {
     /// Called by every write path that can change a link (single insert,
     /// patch flush, bulk import, error sweep), so a stored key is never older
     /// than the write that invalidated it.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn refresh_endpoint_ranks(
         &self,
         endpoint_ids: &[EndpointId],

@@ -1,5 +1,6 @@
 pub mod connect;
 pub mod core;
+pub mod db_monitor;
 pub mod enrich;
 pub mod events;
 pub mod link_writer;

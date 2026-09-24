@@ -339,6 +339,15 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
         KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.confirmation = Some(crate::ConfirmAction::ClearLogs);
         }
+        KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(monitor) = crate::ops::db_monitor::global() {
+                for line in monitor.dump(20) {
+                    for l in line.split('\n') {
+                        tracing::info!(target: "tui::db_monitor", "{l}");
+                    }
+                }
+            }
+        }
         KeyCode::Delete => {
             state.confirmation = Some(crate::ConfirmAction::PurgeLogsDatabase);
         }

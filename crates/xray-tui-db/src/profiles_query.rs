@@ -416,6 +416,7 @@ fn decode_count(row: &Value) -> Result<u64> {
 
 impl Database {
     /// One page of endpoint ids in display order, plus the filtered total.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn profiles_page(&self, req: &PageRequest) -> Result<PageMeta> {
         let mut conn = self.connection().await?;
         let total = self.profiles_count_with(&mut conn, req).await?;
@@ -442,6 +443,7 @@ impl Database {
     /// (`with_total`) and then reads ids only. Same builders, same ordering,
     /// same offset paging as the page query — the parity test pins them
     /// together.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn profiles_walk_page(
         &self,
         req: &PageRequest,
@@ -484,6 +486,7 @@ impl Database {
     /// Counts the rows that sort strictly before the target, using the SAME
     /// term expressions and directions the page orders by, so it is exact for
     /// every sort and direction rather than only the default one.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn profiles_anchor(
         &self,
         req: &PageRequest,
@@ -940,6 +943,7 @@ impl Database {
     /// come back unloaded: reading one is a bug, not a fallback, because the
     /// connect path re-reads its protocol through
     /// [`Database::load_protocol_with_config`].
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn load_page_projection(
         &self,
         ids: &[EndpointId],
