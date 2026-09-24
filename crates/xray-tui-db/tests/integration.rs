@@ -414,7 +414,7 @@ async fn manual_override_shapes_active_link() {
 async fn active_and_stale_windows() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
-    let now = 5_000i64;
+    let now = xray_tui_db::models::now_epoch();
 
     seed_endpoint(&mut conn, 1, 1001, "5.6.7.8", HostType::Ipv4, 443, now).await;
     seed_endpoint(
@@ -424,15 +424,15 @@ async fn active_and_stale_windows() {
         "9.10.11.12",
         HostType::Ipv4,
         80,
-        now - 7_200,
+        now - 8 * 86_400,
     )
     .await;
 
-    let active = page_req(PurgatoryView::Active, ts(now - 3_600), None);
+    let active = page_req(PurgatoryView::Active, ts(now - 7 * 86_400), None);
     seed_ranks(&db).await;
     assert_eq!(page_ids(&db, &active).await, vec![1]);
 
-    let stale = page_req(PurgatoryView::Purgatory, ts(now - 3_600), None);
+    let stale = page_req(PurgatoryView::Purgatory, ts(now - 7 * 86_400), None);
     assert_eq!(page_ids(&db, &stale).await, vec![2]);
     assert_eq!(
         db.profiles_page(&stale).await.expect("count").total,
@@ -440,7 +440,7 @@ async fn active_and_stale_windows() {
         "the footer count matches the stale window"
     );
 
-    let all = page_req(PurgatoryView::All, ts(now - 3_600), None);
+    let all = page_req(PurgatoryView::All, ts(now - 7 * 86_400), None);
     assert_eq!(page_ids(&db, &all).await, vec![1, 2]);
 }
 
@@ -448,12 +448,13 @@ async fn active_and_stale_windows() {
 async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
-    let now = 10_000i64;
-    let active = now - 3_600; // 6400
-    let stale = now - 7_200; // 2800
+    let now = xray_tui_db::models::now_epoch();
+    let fresh = now; // within the 7d ttl -> Active
+    let old = now - 8 * 86_400; // beyond the ttl -> stale (band 1)
+    let threshold = now - 7 * 86_400; // advisory arg; membership is the band
 
     // 1: active — fresh link (>= active_threshold).
-    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, fresh).await;
     // 2: stale — both links inside [stale_threshold, active_threshold).
     seed_endpoint(
         &mut conn,
@@ -462,10 +463,10 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
         "2.2.2.2",
         HostType::Ipv4,
         443,
-        now - 5_000,
+        old,
     )
     .await;
-    seed_link(&mut conn, 2, 2002, now - 6_000).await;
+    seed_link(&mut conn, 2, 2002, old - 86_400).await;
     // 3: expired — all links older than stale_threshold.
     seed_endpoint(
         &mut conn,
@@ -474,10 +475,10 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
         "3.3.3.3",
         HostType::Ipv4,
         443,
-        now - 10_000,
+        old,
     )
     .await;
-    seed_link(&mut conn, 3, 3002, now - 12_000).await;
+    seed_link(&mut conn, 3, 3002, old - 86_400).await;
     // 4: linkless — vacuously outside both windows (never stale).
     toasty::create!(Endpoint {
         created_at: 0,
@@ -498,14 +499,14 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
         "5.5.5.5",
         HostType::Ipv4,
         443,
-        now - 6_000,
+        old,
     )
     .await;
-    seed_link(&mut conn, 5, 5002, now - 1_000).await;
+    seed_link(&mut conn, 5, 5002, fresh).await;
     // 6: boundary — max exactly == stale_threshold -> stale.
-    seed_endpoint(&mut conn, 6, 6001, "6.6.6.6", HostType::Ipv4, 443, stale).await;
+    seed_endpoint(&mut conn, 6, 6001, "6.6.6.6", HostType::Ipv4, 443, old).await;
     // 7: boundary — max exactly == active_threshold -> NOT in Purgatory.
-    seed_endpoint(&mut conn, 7, 7001, "7.7.7.7", HostType::Ipv4, 443, active).await;
+    seed_endpoint(&mut conn, 7, 7001, "7.7.7.7", HostType::Ipv4, 443, fresh).await;
     // 8: purged-only — the link was confirmed TODAY (so staleness cannot move
     // it) but carries a verdict, so it is in Purgatory by construction: its
     // live-only `rank_newest_seen` is NO_SEEN.
@@ -522,9 +523,9 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     .exec(&mut conn)
     .await
     .expect("purged-only endpoint");
-    seed_purged_link(&mut conn, 8, 8001, now, PurgeReason::RealityFallback).await;
+    seed_purged_link(&mut conn, 8, 8001, fresh, PurgeReason::RealityFallback).await;
 
-    let stale_req = page_req(PurgatoryView::Purgatory, ts(active), None);
+    let stale_req = page_req(PurgatoryView::Purgatory, ts(threshold), None);
     // The fixture seeded with raw writes: make the stored keys follow.
     seed_ranks(&db).await;
     let stale_ids = page_ids(&db, &stale_req).await;
@@ -551,7 +552,7 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
 
     // The Active view is the effective-profiles list: the purged-only endpoint
     // is gone, and its link is not loaded even for an endpoint that stays.
-    let active_req = page_req(PurgatoryView::Active, ts(active), None);
+    let active_req = page_req(PurgatoryView::Active, ts(threshold), None);
     let mut active_ids = page_ids(&db, &active_req).await;
     active_ids.sort_unstable();
     assert_eq!(active_ids, vec![1, 5, 7], "purged-only rows leave Active");
@@ -561,6 +562,156 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
             .iter()
             .all(|r| r.endpoint.id != EndpointId::new(8)),
         "and the purged-only endpoint is not hydrated"
+    );
+}
+
+#[tokio::test]
+async fn reband_sweep_demotes_rows_that_drifted_during_downtime() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    let now = xray_tui_db::models::now_epoch();
+
+    // Fresh endpoint -> band 0 once the ranks materialize.
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
+    seed_ranks(&db).await;
+
+    let threshold = now - 7 * 86_400;
+    let active = page_req(PurgatoryView::Active, ts(threshold), None);
+    assert_eq!(page_ids(&db, &active).await, vec![1], "fresh row is Active");
+
+    // Simulate a long downtime: `now` advanced past this row's window while the
+    // app was closed, so its newest-seen is stale but its band is still 0 (no
+    // write ran to refresh it) — the exact state a fixed ±window sweep misses.
+    let stale = now - 8 * 86_400;
+    toasty::sql::query(format!(
+        "UPDATE endpoint_rank SET band = 0, rank_newest_seen = {stale} WHERE endpoint_id = 1"
+    ))
+    .exec(&mut conn)
+    .await
+    .expect("age the row");
+    assert_eq!(
+        page_ids(&db, &active).await,
+        vec![1],
+        "stuck in Active before the sweep (band frozen at 0)"
+    );
+
+    // The continuity-independent sweep finds it via (band, rank_newest_seen)
+    // and demotes it, regardless of how large the gap was.
+    db.reband_expired().await.expect("reband");
+    assert!(
+        page_ids(&db, &active).await.is_empty(),
+        "swept out of Active"
+    );
+    let stale_req = page_req(PurgatoryView::Purgatory, ts(threshold), None);
+    assert_eq!(page_ids(&db, &stale_req).await, vec![1], "now in Purgatory");
+}
+
+#[tokio::test]
+async fn purge_expired_matches_all_links_semantics() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    let now = xray_tui_db::models::now_epoch();
+    let cutoff = now - 7 * 86_400;
+    let old = now - 8 * 86_400; // < cutoff (stale)
+    let fresh = now; // >= cutoff
+
+    // 1: linkless -> vacuously all-stale -> purged.
+    toasty::create!(Endpoint {
+        created_at: 0,
+        id: EndpointId::new(1),
+        host: "1.1.1.1".to_string(),
+        host_type: HostType::Ipv4,
+        port: 443,
+        ports: Vec::<u16>::new(),
+    })
+    .exec(&mut conn)
+    .await
+    .expect("linkless endpoint");
+    // 2: all links stale -> purged.
+    seed_endpoint(&mut conn, 2, 2001, "2.2.2.2", HostType::Ipv4, 443, old).await;
+    seed_link(&mut conn, 2, 2002, old).await;
+    // 3: one fresh link -> kept.
+    seed_endpoint(&mut conn, 3, 3001, "3.3.3.3", HostType::Ipv4, 443, old).await;
+    seed_link(&mut conn, 3, 3002, fresh).await;
+    // 4: fresh-but-PURGED link + stale LIVE link -> kept. This is the case the
+    // live-only band would wrongly reclaim; all-links purge keeps it.
+    seed_endpoint(&mut conn, 4, 4001, "4.4.4.4", HostType::Ipv4, 443, old).await;
+    seed_purged_link(&mut conn, 4, 4002, fresh, PurgeReason::RealityFallback).await;
+
+    let deleted = db.purge_expired(cutoff).await.expect("purge");
+    assert_eq!(deleted, 2, "linkless + all-stale are reclaimed");
+    assert!(
+        db.get_endpoint(EndpointId::new(1)).await.expect("q").is_none(),
+        "linkless purged"
+    );
+    assert!(
+        db.get_endpoint(EndpointId::new(2)).await.expect("q").is_none(),
+        "all-stale purged"
+    );
+    assert!(
+        db.get_endpoint(EndpointId::new(3)).await.expect("q").is_some(),
+        "a fresh link keeps its endpoint"
+    );
+    assert!(
+        db.get_endpoint(EndpointId::new(4)).await.expect("q").is_some(),
+        "a fresh-but-purged link keeps its endpoint (all-links, not band)"
+    );
+}
+
+#[tokio::test]
+async fn reband_all_promotes_rows_the_default_backfill_demoted() {
+    let db = test_db().await;
+    let mut conn = db.connection().await.expect("connection");
+    let now = xray_tui_db::models::now_epoch();
+    seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
+    seed_ranks(&db).await;
+    // The wrong-backfill state: a fresh row banded 1, as the open-time 7d
+    // default leaves it when the configured ttl is larger. A directional demote
+    // sweep can NEVER undo this (it only moves 0→1); only the full reband can.
+    toasty::sql::query("UPDATE endpoint_rank SET band = 1 WHERE endpoint_id = 1")
+        .exec(&mut conn)
+        .await
+        .expect("mis-band");
+    let active = page_req(PurgatoryView::Active, ts(now - 7 * 86_400), None);
+    assert!(
+        page_ids(&db, &active).await.is_empty(),
+        "mis-banded fresh row is wrongly hidden"
+    );
+    db.reband_all().await.expect("reband_all");
+    assert_eq!(
+        page_ids(&db, &active).await,
+        vec![1],
+        "full reband promotes it back to Active"
+    );
+}
+
+#[tokio::test]
+async fn backfill_bands_fills_null_band_rows_on_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.db");
+    let now = xray_tui_db::models::now_epoch();
+    {
+        let db = Database::open(&path).await.expect("open");
+        let mut conn = db.connection().await.expect("connection");
+        seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
+        db.repair_endpoint_ranks().await.expect("ranks");
+        // A pre-columns rank row: band + rank_host NULL — the state every
+        // upgrading user's rows are in before the first reopen.
+        toasty::sql::query(
+            "UPDATE endpoint_rank SET band = NULL, rank_host = NULL WHERE endpoint_id = 1",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("null the band");
+    }
+    // Reopen: ensure_in sees COUNT > 0 and runs backfill_bands over the NULL
+    // rows, setting band AND rank_host in one statement.
+    let db = Database::open(&path).await.expect("reopen");
+    let active = page_req(PurgatoryView::Active, ts(now - 7 * 86_400), None);
+    assert_eq!(
+        page_ids(&db, &active).await,
+        vec![1],
+        "the one-time backfill filled band (and rank_host, same statement)"
     );
 }
 
@@ -1402,13 +1553,14 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     .await
     .expect("upsert protocol");
 
+    let now = xray_tui_db::models::now_epoch();
     let link = ProfileStats {
         protocol_id: ProtocolId::new(1001),
         endpoint_id: EndpointId::new(1),
         core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_used_at: None,
-        last_seen_at: ts(50),
+        last_seen_at: now,
         latency: None,
         speed_bps: None,
         error: None,
@@ -1446,12 +1598,17 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     assert_eq!(active_link.protocol_id, ProtocolId::new(1001));
     assert_eq!(proto.proto_kind, ProtocolKind::Vless);
 
-    // A threshold past the link's last_seen_at drops the endpoint.
-    assert!(
-        page_ids(&db, &page_req(PurgatoryView::Active, ts(100), Some("g1")))
-            .await
-            .is_empty(),
-        "the active window excludes a link last seen before the threshold"
+    // A fresh link in the group is inside the Active window (band = 0). This
+    // exercises the group∩active intersection on real membership, not a vacuous
+    // empty from every synthetic timestamp collapsing to band 1.
+    assert_eq!(
+        page_ids(
+            &db,
+            &page_req(PurgatoryView::Active, ts(now - 7 * 86_400), Some("g1"))
+        )
+        .await,
+        vec![1],
+        "a fresh link in the group is in the Active window"
     );
 }
 

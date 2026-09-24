@@ -481,6 +481,16 @@ impl AppState {
         let (core_tx, core_rx) = tokio::sync::mpsc::channel(65536);
         let purgatory_ttl_secs = (config.purgatory.ttl_days * 86400) as i64;
         let purgatory_retention_secs = (config.purgatory.retention_days * 86400) as i64;
+        // The stored `band` (Active membership) is materialized against
+        // `now − ttl`, so the DB layer must use the same ttl the page means.
+        db.set_band_ttl_secs(purgatory_ttl_secs);
+        // Continuity-independent catch-up: `now` advanced while the app was
+        // closed (and the configured ttl may differ from the open-time
+        // default), so reband every row against the current threshold before
+        // the first page renders.
+        if let Err(e) = db.reband_all().await {
+            tracing::warn!(target: "tui::state", "reband_all at startup: {e}");
+        }
         // Scheduler limits come from the speed-test config (T21); they stay
         // runtime-settable afterwards via `TaskScheduler::set_limits` on
         // settings save.

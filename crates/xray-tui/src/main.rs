@@ -454,6 +454,12 @@ async fn main() -> Result<()> {
                 if purge_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
+                // Demote endpoints that aged out of the Active window since the
+                // last tick (band 0 → 1) — a cheap directional index sweep, run
+                // every tick even when retention is disabled.
+                if let Err(e) = purge_db.reband_expired().await {
+                    tracing::warn!(target: "tui::main", "reband sweep failed: {e}");
+                }
                 if purge_retention_secs <= 0 {
                     continue; // 0 or negative = keep forever
                 }

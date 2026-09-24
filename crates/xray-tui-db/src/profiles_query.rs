@@ -255,7 +255,7 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
             term("k.endpoint_id".to_string(), true),
         ],
         PageSort::Address => vec![
-            term("e.host".to_string(), true),
+            term(rank_col("rank_host"), true),
             term("k.endpoint_id".to_string(), true),
         ],
         PageSort::Port => vec![
@@ -357,14 +357,12 @@ fn view_predicate(sql: &mut Sql, req: &PageRequest) {
     // so no `OR` (which would defeat the window index) is needed.
     match req.view {
         PurgatoryView::All => sql.push("1 = 1"),
-        PurgatoryView::Active => {
-            let ts = sql.bind(req.active_threshold);
-            sql.push(&format!("k.rank_newest_seen >= {ts}"));
-        }
-        PurgatoryView::Purgatory => {
-            let ts = sql.bind(req.active_threshold);
-            sql.push(&format!("k.rank_newest_seen < {ts}"));
-        }
+        // Membership is the materialized `band` — the SOLE Active predicate for
+        // every sort, so switching sort column cannot flip the set mid-drift
+        // (the reband sweep, not a per-query threshold, moves a row 0→1). A
+        // not-yet-banded row (`NULL`) is treated as not-Active by `IS NOT 0`.
+        PurgatoryView::Active => sql.push("k.band = 0"),
+        PurgatoryView::Purgatory => sql.push("k.band IS NOT 0"),
     }
 }
 
@@ -379,7 +377,7 @@ fn base_select(sql: &mut Sql, req: &PageRequest, projection: &str, join_endpoint
 /// host/port, and the Address/Port sorts order by them.
 fn needs_endpoints(req: &PageRequest) -> bool {
     req.search.as_ref().is_some_and(|s| !s.is_empty())
-        || matches!(req.sort, PageSort::Address | PageSort::Port)
+        || matches!(req.sort, PageSort::Port)
 }
 
 // ── Value decoding ──────────────────────────────────────────────────────
@@ -475,7 +473,13 @@ impl Database {
     ) -> Result<u64> {
         let mut sql = Sql::new();
         sql.push("SELECT COUNT(*)");
-        base_from_where(&mut sql, req, needs_endpoints(req));
+        // COUNT never orders, so it needs the `endpoints` join ONLY when the
+        // search predicate reads host/port — not for a Port-sorted page.
+        base_from_where(
+            &mut sql,
+            req,
+            req.search.as_ref().is_some_and(|s| !s.is_empty()),
+        );
         let rows = sql.exec(conn).await?;
         rows.first().map_or(Ok(0), decode_count)
     }

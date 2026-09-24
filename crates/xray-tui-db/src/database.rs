@@ -1230,17 +1230,36 @@ impl Database {
         let mut conn = self.conn().await?;
         let mut tx = conn.transaction().await?;
 
-        let expired: Vec<Endpoint> = Endpoint::filter(
-            Endpoint::fields()
-                .links()
-                .all(ProfileStats::fields().last_seen_at().lt(cutoff)),
-        )
+        // All-links staleness: an endpoint whose EVERY link is older than the
+        // cutoff (De-Morgan of the old `.all(last_seen < cutoff)`; vacuously
+        // true for a linkless endpoint, so orphans are reclaimed too). This is
+        // deliberately NOT the page's live-only `band`: a fresh-but-purged link
+        // (a subscription re-listed it) must keep its endpoint alive, which a
+        // live-only `rank_newest_seen` would not (ADR 0006 / view-band spec
+        // §3.5). Raw because toasty's `.all()` quantifier compiled to a
+        // whole-table projection (145 ms, dump-3.log); this is an indexed
+        // NOT EXISTS on `profile_stats.last_seen_at`.
+        let rows = toasty::sql::query(format!(
+            "SELECT e.id FROM endpoints e WHERE NOT EXISTS \
+             (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id \
+             AND p.last_seen_at >= {cutoff})"
+        ))
         .exec(&mut tx)
         .await?;
-        let count = expired.len();
+        let ids: Vec<EndpointId> = rows
+            .iter()
+            .filter_map(|row| match row {
+                toasty_core::stmt::Value::Record(r) => r.fields.first().cloned(),
+                _ => None,
+            })
+            .filter_map(|v| match v {
+                toasty_core::stmt::Value::I64(id) => Some(EndpointId::new(id)),
+                _ => None,
+            })
+            .collect();
+        let count = ids.len();
 
         if count > 0 {
-            let ids: Vec<EndpointId> = expired.iter().map(|e| e.id).collect();
             EndpointGroup::filter(toasty::stmt::in_list(
                 EndpointGroup::fields().endpoint_id(),
                 ids.clone(),
@@ -1727,7 +1746,10 @@ mod tests {
     async fn active_and_stale_windows() {
         let db = Database::in_memory().await.expect("in-memory db");
         let mut conn = db.connection().await.expect("connection");
-        let now = 5_000i64;
+        // Band membership is materialized against `now − ttl` (default 7d) at
+        // refresh time, so the fixture uses real-clock-relative timestamps: one
+        // fresh endpoint and one older than the ttl.
+        let now = crate::models_toasty::now_epoch();
         seed_endpoint(&mut conn, 1, 1001, "5.6.7.8", HostType::Ipv4, 443, now).await;
         seed_endpoint(
             &mut conn,
@@ -1736,19 +1758,20 @@ mod tests {
             "9.10.11.12",
             HostType::Ipv4,
             80,
-            now - 7_200,
+            now - 8 * 86_400,
         )
         .await;
 
         // The fixture seeded with raw writes: make the stored keys follow.
         db.repair_endpoint_ranks().await.expect("ranks");
 
-        // Active: only the recent endpoint.
-        let active = req(PurgatoryView::Active, ts(now - 3_600));
+        // Active: only the fresh endpoint (the `active` arg is now advisory —
+        // membership is the stored `band`).
+        let active = req(PurgatoryView::Active, now - 7 * 86_400);
         assert_eq!(ids(&db, &active).await, vec![1]);
 
-        // Stale: only the old endpoint.
-        let stale = req(PurgatoryView::Purgatory, ts(now - 3_600));
+        // Stale: only the older-than-ttl endpoint.
+        let stale = req(PurgatoryView::Purgatory, now - 7 * 86_400);
         assert_eq!(ids(&db, &stale).await, vec![2]);
 
         // Count matches the stale view.

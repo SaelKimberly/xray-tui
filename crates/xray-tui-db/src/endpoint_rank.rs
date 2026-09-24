@@ -32,6 +32,18 @@ pub const NO_SPEED: i64 = -1;
 /// Sentinel for "unknown config type", matching the retired `COALESCE(…, 2)`.
 pub const CONFIG_OTHER: i64 = 2;
 
+/// Process-wide Active-view TTL (seconds). `band` is materialized against
+/// `now − this` at write and sweep time, so the DB layer needs the same ttl
+/// the page uses. Set once at startup (and on settings save) from the config;
+/// defaults to 7 days so a write before the setter runs is still sensible.
+static ACTIVE_TTL_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(7 * 86400);
+
+/// Set the Active-view TTL used to materialize `band` (startup + settings save).
+pub fn set_active_ttl_secs(secs: i64) {
+    ACTIVE_TTL_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The link facts the ordering law reads. Built from a typed `ProfileStats`
 /// when one is in hand, or straight from the stored columns when the refresh
 /// path would otherwise pay ~0.8 ms per bound id.
@@ -267,6 +279,16 @@ const RANK_COLUMNS: &str = "endpoint_id, rank_dns, rank_tier, rank_latency, rank
 const WINDOW_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS endpoint_rank_window ON endpoint_rank(rank_newest_seen)";
 
+/// The Active-view Address page: `WHERE band = 0 ORDER BY rank_host` is an
+/// index seek + ordered scan, no temp b-tree (the range-vs-order filesort the
+/// `(rank_newest_seen, host)` shape could not avoid — host lives on `endpoints`).
+const BAND_HOST_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_band_host \
+     ON endpoint_rank(band, rank_host, endpoint_id)";
+
+/// The directional reband sweep seeks `band = 0 AND rank_newest_seen < ?`.
+const BAND_WINDOW_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_band_window \
+     ON endpoint_rank(band, rank_newest_seen)";
+
 /// Create the rank table and, on a database that has none yet, fill it from
 /// the current link state. Runs once per database: an upgraded one pays the
 /// backfill here, at open, instead of on its first page.
@@ -286,7 +308,18 @@ pub(crate) async fn ensure(conn: &mut toasty::Connection) -> crate::Result<()> {
 }
 
 async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
-    for ddl in [COVERING_INDEX, WINDOW_INDEX] {
+    // `band` + `rank_host` are RAW columns on this derived table (NOT toasty
+    // model fields), so the page's Active membership is a stored `band = 0` and
+    // the Address order is an index seek on `rank_host` — no schema-tag bump,
+    // no file wipe. ADD COLUMN is attempted every open; the duplicate-column
+    // error on an already-migrated database is expected and ignored.
+    for alter in [
+        "ALTER TABLE endpoint_rank ADD COLUMN band INTEGER",
+        "ALTER TABLE endpoint_rank ADD COLUMN rank_host TEXT",
+    ] {
+        let _ = toasty::sql::query(alter).exec(conn).await;
+    }
+    for ddl in [COVERING_INDEX, WINDOW_INDEX, BAND_HOST_INDEX, BAND_WINDOW_INDEX] {
         toasty::sql::query(ddl).exec(conn).await?;
     }
     if scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank").await? > 0 {
@@ -294,10 +327,34 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         // path existed, or by a path that bypassed one) heals here rather than
         // hiding rows from the page.
         repair_missing(conn).await?;
+        // One-time band/rank_host backfill for rows that predate the columns:
+        // `repair_missing` fills only ABSENT rows, so an existing rank row
+        // carries a NULL band until it is next refreshed. Fill them once here.
+        backfill_bands(conn).await?;
         return Ok(());
     }
     let written = backfill_all(conn).await?;
     tracing::info!(target: "xray_tui_db", "endpoint_rank: backfilled {written} rows");
+    Ok(())
+}
+
+/// Fill `band`/`rank_host` for rows that predate the columns (`band IS NULL`) —
+/// the non-destructive upgrade's one-time cost. Same derivation as `write`'s
+/// follow-up: band from the ttl membership, rank_host from the endpoint host.
+async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
+    if scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank WHERE band IS NULL").await? == 0 {
+        return Ok(());
+    }
+    let threshold = crate::models_toasty::now_epoch()
+        - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    toasty::sql::query(format!(
+        "UPDATE endpoint_rank SET \
+         band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END, \
+         rank_host = (SELECT host FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
+         WHERE band IS NULL"
+    ))
+    .exec(conn)
+    .await?;
     Ok(())
 }
 
@@ -330,6 +387,8 @@ pub(crate) async fn write(
     conn: &mut impl toasty::Executor,
     ranks: &[EndpointRank],
 ) -> crate::Result<usize> {
+    let threshold = crate::models_toasty::now_epoch()
+        - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
     for chunk in ranks.chunks(RANK_CHUNK) {
         let values = chunk
             .iter()
@@ -353,6 +412,24 @@ pub(crate) async fn write(
             .join(",");
         toasty::sql::query(format!(
             "INSERT OR REPLACE INTO endpoint_rank ({RANK_COLUMNS}) VALUES {values}"
+        ))
+        .exec(conn)
+        .await?;
+        // `band`/`rank_host` are RAW columns (not in the toasty model): INSERT
+        // OR REPLACE re-inserts the row and nulls them, so re-set them for this
+        // chunk. band is the ttl membership from the just-written
+        // rank_newest_seen; rank_host mirrors the endpoint host so the
+        // Active-Address page is an index seek, not a cross-table sort.
+        let ids = chunk
+            .iter()
+            .map(|r| r.endpoint_id.get().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        toasty::sql::query(format!(
+            "UPDATE endpoint_rank SET \
+             band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END, \
+             rank_host = (SELECT host FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
+             WHERE endpoint_id IN ({ids})"
         ))
         .exec(conn)
         .await?;
@@ -391,6 +468,52 @@ impl crate::Database {
     ) -> crate::Result<usize> {
         let mut conn = self.connection().await?;
         refresh(&mut conn, endpoint_ids).await
+    }
+
+    /// Set the Active-view TTL used to materialize `band` (startup + settings
+    /// save). Band is stored against `now − ttl`, so this must match the ttl
+    /// the page's view means by "Active".
+    pub fn set_band_ttl_secs(&self, secs: i64) {
+        set_active_ttl_secs(secs);
+    }
+
+    /// Directional reband sweep: demote endpoints whose newest LIVE link has
+    /// aged past the Active threshold (`band` 0 → 1). Monotonic and
+    /// continuity-independent — it seeks exactly the drifted rows through the
+    /// `(band, rank_newest_seen)` index, so an arbitrary downtime gap is
+    /// corrected in one range scan (not a fixed window that a long gap could
+    /// skip). Run at startup after the ttl is set (before the first page) and
+    /// on the retention tick.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+    pub async fn reband_expired(&self) -> crate::Result<()> {
+        let threshold = crate::models_toasty::now_epoch()
+            - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut conn = self.connection().await?;
+        toasty::sql::query(format!(
+            "UPDATE endpoint_rank SET band = 1 WHERE band = 0 AND rank_newest_seen < {threshold}"
+        ))
+        .exec(&mut conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Full reband: recompute `band` for EVERY row against the current
+    /// threshold, in BOTH directions. Used at startup, where the configured
+    /// ttl may differ from the open-time default either way (a larger ttl must
+    /// PROMOTE rows the default demoted), so the directional sweep alone is not
+    /// enough. One indexed pass, once.
+    #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+    pub async fn reband_all(&self) -> crate::Result<()> {
+        let threshold = crate::models_toasty::now_epoch()
+            - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut conn = self.connection().await?;
+        toasty::sql::query(format!(
+            "UPDATE endpoint_rank SET \
+             band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END"
+        ))
+        .exec(&mut conn)
+        .await?;
+        Ok(())
     }
 }
 
