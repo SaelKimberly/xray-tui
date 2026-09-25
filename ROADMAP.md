@@ -101,7 +101,7 @@
 - ✅ Log source validation toggle — V key on Logs tab toggles validation/subscription source logs visibility
 - ✅ Graveyard orphan promotion — subscription_upsert_profiles promotes re-imported profiles from graveyard
 - ✅ Keybinding harmonization — Ctrl+D disconnect, Ctrl+Shift+S copy share URL, TUI_MANUAL.md updated
-:- ✅ Heed-backed log storage — `logs` LMDB database with postcard-encoded LogMessage entries, `HeedLogStorage` in xray-tui-core::log_heed, non-blocking TuiLogLayer via std::sync::mpsc channel, background batched heed writer (spawn_blocking, batch up to 100), MapFull→auto-resize (1 GB default, doubles up to 8 GB, atomic fail counter) with backoff retry — batches retried after successful resize, never dropped, async heed read wrappers (spawn_blocking), lazy log loading on first Logs tab access
+- ✅ Heed-backed log storage — `logs` LMDB database with postcard-encoded LogMessage entries, `HeedLogStorage` in xray-tui-core::log_heed, non-blocking TuiLogLayer via std::sync::mpsc channel, background batched heed writer (spawn_blocking, batch up to 100), MapFull→auto-resize (1 GB default, doubles up to 8 GB, atomic fail counter) with backoff retry — batches retried after successful resize, never dropped, async heed read wrappers (spawn_blocking), lazy log loading on first Logs tab access, and non-TLS LMDB read transactions so reader slots release with each transaction.
 - ✅ Geo file auto-update — periodic download of geoip.dat/geosite.dat for both backends
 - ✅ Log to file toggle — core log persistence with configurable path
 - ✅ Certificate pinning UI — SHA-256 fingerprint or PEM upload per profile

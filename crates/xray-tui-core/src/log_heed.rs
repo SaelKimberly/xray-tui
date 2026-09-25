@@ -1,6 +1,6 @@
 use heed::byteorder::BE;
 use heed::types::{Bytes, Str, Unit};
-use heed::{Database, Env, EnvOpenOptions};
+use heed::{Database, Env, EnvOpenOptions, WithoutTls};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ pub struct LogMessage {
 /// All reads/writes are synchronous (heed uses mmap). Callers should wrap
 /// this in `Arc` for shared access across async tasks.
 pub struct HeedLogStorage {
-    env: Env,
+    env: Env<WithoutTls>,
     /// Key = u64 timestamp_ns (big-endian), Value = postcard(LogMessage)
     logs: Database<U64BE, Bytes>,
     /// Key = target string, Value = () — a set of seen targets
@@ -76,7 +76,7 @@ impl HeedLogStorage {
     pub fn new(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path).map_err(|e| HeedError::Io(e.to_string()))?;
 
-        let mut options = EnvOpenOptions::new();
+        let mut options = EnvOpenOptions::new().read_txn_without_tls();
         options.map_size(DEFAULT_MAP_SIZE);
         options.max_dbs(2);
 
@@ -455,6 +455,23 @@ mod tests {
             timestamp_nanos: ts,
         }
     }
+    #[test]
+    fn many_worker_thread_reads_release_reader_slots() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(HeedLogStorage::new(dir.path()).unwrap());
+        storage.write_log(1000, "info", "target", "message").unwrap();
+
+        for _ in 0..160 {
+            let worker_storage = Arc::clone(&storage);
+            let worker = std::thread::spawn(move || {
+                let recent = worker_storage.read_recent(1).unwrap();
+                assert_eq!(recent.len(), 1);
+                assert_eq!(recent[0].message, "message");
+            });
+            worker.join().unwrap();
+        }
+    }
+
 
     #[test]
     fn resize_retries_until_success_or_exhaustion() {
