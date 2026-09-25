@@ -114,7 +114,7 @@ impl std::str::FromStr for CoreType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "xray" | "xray-core" => Ok(Self::Xray),
-            "sing-box" | "singbox" => Ok(Self::SingBox),
+            "sing-box" | "singbox" | "sing_box" => Ok(Self::SingBox),
             _ => Err(()),
         }
     }
@@ -558,6 +558,71 @@ impl InjectToCoreConf for ProtocolConfig {
     }
 }
 
+impl ProtocolConfig {
+    /// Mutable security view for export-time defaulting. The exhaustive match
+    /// makes a new protocol variant fail to compile until its security owner is
+    /// classified.
+    pub const fn security_mut(&mut self) -> Option<&mut SecurityConfig> {
+        match self {
+            Self::Vless(config) => Some(&mut config.security),
+            Self::Vmess(config) => Some(&mut config.security),
+            Self::Trojan(config) => Some(&mut config.security),
+            Self::Hysteria2(config) => Some(&mut config.security),
+            Self::Ss(config) => Some(&mut config.security),
+            Self::Ssr(config) => Some(&mut config.security),
+            Self::Tuic(config) => Some(&mut config.security),
+            Self::Wireguard(config) => Some(&mut config.security),
+            Self::Socks(config) => Some(&mut config.security),
+            Self::Http(config) => Some(&mut config.security),
+            Self::Naive(config) => Some(&mut config.security),
+            Self::AnyTls(config) => Some(&mut config.security),
+            Self::ShadowTls(config) => Some(&mut config.security),
+            Self::Tor(config) => Some(&mut config.security),
+            Self::Ssh(config) => Some(&mut config.security),
+            Self::Tailscale(config) => Some(&mut config.security),
+            Self::Hysteria1(config) => Some(&mut config.security),
+            Self::Redirect(_) | Self::TProxy(_) | Self::Mixed(_) => None,
+        }
+    }
+
+    /// Mutable transport view for export-time defaulting. Only protocols with
+    /// a transport own one; all other variants are explicitly classified.
+    pub const fn transport_mut(&mut self) -> Option<&mut common::TransportConfig> {
+        match self {
+            Self::Vless(config) => Some(&mut config.transport),
+            Self::Vmess(config) => Some(&mut config.transport),
+            Self::Trojan(config) => Some(&mut config.transport),
+            Self::Hysteria2(_)
+            | Self::Ss(_)
+            | Self::Ssr(_)
+            | Self::Tuic(_)
+            | Self::Wireguard(_)
+            | Self::Socks(_)
+            | Self::Http(_)
+            | Self::Naive(_)
+            | Self::AnyTls(_)
+            | Self::ShadowTls(_)
+            | Self::Tor(_)
+            | Self::Ssh(_)
+            | Self::Tailscale(_)
+            | Self::Hysteria1(_)
+            | Self::Redirect(_)
+            | Self::TProxy(_)
+            | Self::Mixed(_) => None,
+        }
+    }
+
+    /// Apply Resolved-export defaults to a cloned config. Explicit SNI and
+    /// transport authority remain untouched.
+    pub fn set_export_defaults(&mut self, dns: &str) {
+        if let Some(security) = self.security_mut() {
+            security.set_default_sni(dns);
+        }
+        if let Some(transport) = self.transport_mut() {
+            transport.set_default_authority(dns);
+        }
+    }
+}
 // ── Placeholder config type ─────────────────────────────────────────────
 
 /// Stub config for protocols not yet implemented.
@@ -875,6 +940,7 @@ mod tests {
         // Accepted aliases.
         assert_eq!("xray-core".parse::<CoreType>(), Ok(CoreType::Xray));
         assert_eq!("singbox".parse::<CoreType>(), Ok(CoreType::SingBox));
+        assert_eq!("sing_box".parse::<CoreType>(), Ok(CoreType::SingBox));
         assert_eq!("SING-BOX".parse::<CoreType>(), Ok(CoreType::SingBox));
         // Unknown strings must error.
         assert!("auto".parse::<CoreType>().is_err());
@@ -1198,5 +1264,92 @@ mod tests {
             12,
             "the 12 sing-box-only variants must report distinct kind strings"
         );
+    }
+    #[test]
+    fn export_defaults_preserve_explicit_values() {
+        let mut config = ProtocolConfig::Vless(VlessConfig {
+            uuid: "00000000-0000-0000-0000-000000000001".into(),
+            uuid_origin: None,
+            security: SecurityConfig {
+                tls: Some(TlsConfig::Tls(TlsOpts {
+                    sni: Some("explicit.example".into()),
+                    ..TlsOpts::default()
+                })),
+                enc: None,
+            },
+            transport: common::TransportConfig::Ws(common::WebSocketConfig {
+                host: Some("explicit.example".into()),
+                ..common::WebSocketConfig::default()
+            }),
+            encryption: None,
+            flow: None,
+            path: None,
+            splice: None,
+            remarks: None,
+        });
+        config.set_export_defaults("fallback.example");
+        let ProtocolConfig::Vless(vless) = config else {
+            panic!("vless")
+        };
+        assert_eq!(vless.security.sni(), Some("explicit.example"));
+        let common::TransportConfig::Ws(ws) = vless.transport else {
+            panic!("ws")
+        };
+        assert_eq!(ws.host.as_deref(), Some("explicit.example"));
+    }
+
+    #[test]
+    fn export_defaults_fill_absent_vless_values() {
+        let mut config = ProtocolConfig::Vless(VlessConfig {
+            uuid: "00000000-0000-0000-0000-000000000001".into(),
+            uuid_origin: None,
+            security: SecurityConfig {
+                tls: Some(TlsConfig::Tls(TlsOpts::default())),
+                enc: None,
+            },
+            transport: common::TransportConfig::Ws(common::WebSocketConfig::default()),
+            encryption: None,
+            flow: None,
+            path: None,
+            splice: None,
+            remarks: None,
+        });
+        config.set_export_defaults("fallback.example");
+        let ProtocolConfig::Vless(vless) = config else {
+            panic!("vless")
+        };
+        assert_eq!(vless.security.sni(), Some("fallback.example"));
+        let common::TransportConfig::Ws(ws) = vless.transport else {
+            panic!("ws")
+        };
+        assert_eq!(ws.host.as_deref(), Some("fallback.example"));
+    }
+    #[test]
+    fn resolved_vless_reconstruct_uses_ip_authority_and_dns_sni() {
+        let mut config = ProtocolConfig::Vless(VlessConfig {
+            uuid: "00000000-0000-0000-0000-000000000001".into(),
+            uuid_origin: None,
+            security: SecurityConfig {
+                tls: Some(TlsConfig::Tls(TlsOpts::default())),
+                enc: None,
+            },
+            transport: common::TransportConfig::Ws(common::WebSocketConfig::default()),
+            encryption: Some("none".into()),
+            flow: None,
+            path: None,
+            splice: None,
+            remarks: None,
+        });
+        config.set_export_defaults("origin.example");
+        let endpoint = EndpointEssentials {
+            host: "1.1.1.1".into(),
+            host_type: HostKind::Ipv4,
+            port: 443,
+            ports: Vec::new(),
+        };
+        let url = config.reconstruct_proto(&endpoint).expect("url");
+        assert!(url.contains("@1.1.1.1:443"));
+        assert!(url.contains("sni=origin.example"));
+        assert!(url.contains("host=origin.example"));
     }
 }

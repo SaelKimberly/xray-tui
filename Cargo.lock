@@ -8078,6 +8078,7 @@ dependencies = [
  "toasty-driver-turso",
  "tokio",
  "tracing",
+ "turso",
  "uuid",
  "xray-tui-hakari",
  "xray-tui-proto",

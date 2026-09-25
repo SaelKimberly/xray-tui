@@ -10,7 +10,7 @@ xray-tui (bin)
   │     ├── xray-tui-tls   (ring TLS 1.3 + TLS 1.2-fallback client, browser fingerprints, REALITY client)
   │     ├── xray-tui-route (first-match routing engine for the local inbounds — TLS/HTTP/QUIC sniffing)
   │     └── xray-tui-proto (typed ProtocolConfig/EndpointEssentials — config source of truth)
-  ├── xray-tui-db       (toasty ORM, Database query methods, Model definitions)
+  ├── xray-tui-db       (toasty ORM + direct Turso streaming export reader)
   ├── xray-tui-config   (AppConfig load/save, import_export, forms, permissive_json)
   │     └── xray-tui-proto  (ProtocolConfig types + EndpointEssentials for import/export round-trip)
   ├── xray-tui-dns      (DNSCrypt-stamp DNS resolution — enrichment pipeline)
@@ -40,6 +40,9 @@ generated core config and no share link ever names it. Design brief:
 ### xray-tui (binary crate)
 
 Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, initializes all subsystems, enters the ratatui event loop.
+### Whole-database export
+
+`xray-tui-db/src/export.rs` owns the file-backed direct Turso read path. Toasty 0.10 public/raw APIs buffer values, so export opens a fresh dedicated Turso connection, applies the existing WAL/MVCC journal-mode authority, begins the matching read transaction, and drains ordered rows before commit/rollback. `xray-tui/src/ops/export.rs` owns scope policy, Resolved host transformation, and bounded clipboard/file sinks; `ui/export.rs` owns popup interaction. Export never uses a second fallback serializer.
 
 **Shared state** (`crates/xray-tui/src/state.rs`):
 

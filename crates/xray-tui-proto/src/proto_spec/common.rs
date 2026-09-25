@@ -196,6 +196,19 @@ impl TransportConfig {
             other => other,
         }
     }
+    /// Set an HTTP/WS/gRPC authority fallback without replacing an explicit
+    /// stored value.
+    pub fn set_default_authority(&mut self, value: &str) {
+        let value = || Some(TinyText::from(value));
+        match self {
+            Self::Ws(config) => config.host = config.host.clone().or_else(value),
+            Self::Grpc(config) => config.authority = config.authority.clone().or_else(value),
+            Self::Http(config) => config.host = config.host.clone().or_else(value),
+            Self::HttpUpgrade(config) => config.host = config.host.clone().or_else(value),
+            Self::XHttp(config) => config.host = config.host.clone().or_else(value),
+            Self::Tcp | Self::Quic | Self::Kcp(_) => {}
+        }
+    }
 }
 
 /// Returns `true` when `value` equals the endpoint host's DNS name
@@ -408,6 +421,18 @@ impl SecurityConfig {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.tls.is_none() && self.enc.is_none()
+    }
+    /// Set an SNI fallback without replacing an explicitly stored value.
+    pub fn set_default_sni(&mut self, value: &str) {
+        match &mut self.tls {
+            Some(TlsConfig::Tls(opts)) => {
+                opts.sni.get_or_insert_with(|| TinyText::from(value));
+            }
+            Some(TlsConfig::Reality(opts)) => {
+                opts.sni.get_or_insert_with(|| TinyText::from(value));
+            }
+            None => {}
+        }
     }
 }
 

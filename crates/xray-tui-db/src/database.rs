@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use toasty::Executor;
 use toasty::stmt::IntoStatement;
@@ -18,6 +20,8 @@ use crate::retry_on_busy;
 pub struct Database {
     db: toasty::Db,
     concurrent_writes: bool,
+    path: Option<PathBuf>,
+    export_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Which mutable column groups a [`LinkPatch`] writes.
@@ -334,6 +338,8 @@ impl Database {
         Ok(Self {
             db,
             concurrent_writes,
+            path: Some(PathBuf::from(path_str)),
+            export_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -385,6 +391,22 @@ impl Database {
     #[must_use]
     pub const fn uses_concurrent_writes(&self) -> bool {
         self.concurrent_writes
+    }
+
+    /// Acquire the process-local export gate for a complete streaming export.
+    pub async fn export_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.export_lock.clone().lock_owned().await
+    }
+    pub(crate) fn export_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_for_export_test(
+        path: impl AsRef<Path>,
+        concurrent_writes: bool,
+    ) -> Result<Self> {
+        Self::open_with_concurrent_writes(path, concurrent_writes).await
     }
 
     pub async fn in_memory() -> Result<Self> {
@@ -442,6 +464,8 @@ impl Database {
         Ok(Self {
             db,
             concurrent_writes: false,
+            path: None,
+            export_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 

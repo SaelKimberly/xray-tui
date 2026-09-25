@@ -19,7 +19,7 @@ jiff.workspace = true
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true
-tokio.features = ["rt-multi-thread", "macros", "signal", "sync"]
+tokio.features = ["fs", "io-util", "rt-multi-thread", "macros", "signal", "sync"]
 futures-util.workspace = true
 dashmap = "6"
 

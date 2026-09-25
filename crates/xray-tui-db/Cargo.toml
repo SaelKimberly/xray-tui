@@ -9,6 +9,7 @@ license.workspace = true
 toasty = { workspace = true, features = ["turso", "serde", "jiff"] }
 toasty-driver-turso = "0.10"
 toasty-core = "0.10"
+turso = "0.7.2"
 
 # ============ Time ============
 jiff = { workspace = true }

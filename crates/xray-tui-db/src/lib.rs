@@ -16,5 +16,6 @@ pub use retry::{is_busy_error, retry_on_busy};
 mod database;
 pub mod endpoint_ip;
 pub mod endpoint_rank;
+pub mod export;
 pub mod profiles_query;
 mod retry;

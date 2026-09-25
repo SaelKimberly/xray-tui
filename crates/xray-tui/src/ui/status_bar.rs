@@ -134,6 +134,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         crate::AppMode::AddServer { .. } => " Add Server",
         crate::AppMode::EditServer { .. } => " Edit Server",
         crate::AppMode::SpeedTestMenu { .. } => " Server Tools",
+        crate::AppMode::ExportScope { .. } => " Export",
+        crate::AppMode::ExportDestination { .. } => " Export",
+        crate::AppMode::ExportPath { .. } => " Export File",
         crate::AppMode::BatchImport { .. } => " Batch Import",
         crate::AppMode::Help => " Help",
         _ => "",
@@ -183,6 +186,13 @@ const fn build_hints(state: &AppState) -> &'static str {
     }
     match &state.mode {
         crate::AppMode::SpeedTestMenu { .. } => " [↑↓] Navigate  [Enter] Select  [Esc] Close ",
+        crate::AppMode::ExportScope { .. } | crate::AppMode::ExportDestination { .. } => {
+            " [↑↓] Navigate  [Enter] Select  [Esc] Close "
+        }
+        crate::AppMode::ExportPath {
+            overwrite: true, ..
+        } => " [Y] Overwrite  [N] Cancel ",
+        crate::AppMode::ExportPath { .. } => " [Enter] Write  [Esc] Cancel ",
         crate::AppMode::Settings { mode } => match mode {
             crate::SettingsMode::Split { focus, right, .. } => match focus {
                 crate::SplitFocus::Tree => {

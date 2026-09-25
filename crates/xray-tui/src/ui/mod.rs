@@ -1,5 +1,6 @@
 pub mod actions_log;
 pub mod add_server;
+pub mod export;
 pub mod logs;
 pub mod native_activity;
 pub mod palette_bridge;
@@ -377,9 +378,15 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
     // Form mode: route all keys to add_server handler (except Ctrl+C quit, SpeedTestMenu, BatchImport, TargetPicker)
     if !matches!(state.mode, crate::AppMode::List)
         && !matches!(&state.mode, crate::AppMode::Help)
-        && !matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. })
-        && !matches!(&state.mode, crate::AppMode::BatchImport { .. })
-        && !matches!(&state.mode, crate::AppMode::TargetPicker { .. })
+        && !matches!(
+            &state.mode,
+            crate::AppMode::SpeedTestMenu { .. }
+                | crate::AppMode::ExportScope { .. }
+                | crate::AppMode::ExportDestination { .. }
+                | crate::AppMode::ExportPath { .. }
+                | crate::AppMode::BatchImport { .. }
+                | crate::AppMode::TargetPicker { .. }
+        )
     {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -413,6 +420,17 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             }
             _ => {}
         }
+        return;
+    }
+
+    // Export popup mode
+    if matches!(
+        &state.mode,
+        crate::AppMode::ExportScope { .. }
+            | crate::AppMode::ExportDestination { .. }
+            | crate::AppMode::ExportPath { .. }
+    ) {
+        export::handle_key(key, state).await;
         return;
     }
 
@@ -746,6 +764,12 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             state.filter_cache_valid.set(false);
             let _ = execute!(std::io::stdout(), SetCursorStyle::BlinkingBlock);
         }
+        KeyCode::Char('e')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
+            state.mode = crate::AppMode::ExportScope { selected: 0 };
+        }
         // Speed test menu
         KeyCode::Char('t' | 'T') if state.current_tab == Tab::Profiles => {
             state.mode = crate::AppMode::SpeedTestMenu { selected: 0 };
@@ -776,14 +800,16 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 .unwrap_or(0);
             let next_idx = (current_idx + 1) % all.len();
             let _ = selected_id;
-            // The query owns the order, so the page restarts at the top.
             state.set_sort(all[next_idx]);
         }
         // CRUD shortcuts (profiles tab)
         KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {
             state.start_add_server();
         }
-        KeyCode::Char('e' | 'E') if state.current_tab == Tab::Profiles => {
+        KeyCode::Char('e' | 'E')
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && state.current_tab == Tab::Profiles =>
+        {
             if let Some(id) = state.selected_profile_id() {
                 state.start_edit_profile(&id.to_string()).await;
             }
@@ -979,9 +1005,25 @@ fn render(frame: &mut Frame, state: &AppState) {
             | crate::AppMode::EditServer { .. }
             | crate::AppMode::ImportUrl { .. }
             | crate::AppMode::BatchImport { .. }
+            | crate::AppMode::ExportScope { .. }
+            | crate::AppMode::ExportDestination { .. }
+            | crate::AppMode::ExportPath { .. }
     );
     if !is_form_mode {
         render_tabs(frame, chunks[0], state);
+    }
+    if !matches!(state.mode, crate::AppMode::List) {
+        if matches!(
+            &state.mode,
+            crate::AppMode::ExportScope { .. }
+                | crate::AppMode::ExportDestination { .. }
+                | crate::AppMode::ExportPath { .. }
+        ) {
+            profiles::render(frame, chunks[1], state);
+            export::render(frame, chunks[1], state);
+            status_bar::render(frame, chunks[3], state);
+            return;
+        }
     }
     if !matches!(state.mode, crate::AppMode::List) {
         if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {

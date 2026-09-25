@@ -280,6 +280,30 @@ Opened with `t` from the Profiles tab. Overlay menu centered on screen:
 - `s` — stop running tests (works when progress shown in status bar)
 
 Progress is shown in the status bar during batch tests (`Testing: {completed}/{total}` or `Testing...`).
+### Export Menu
+
+Open with `Ctrl+E` from Profiles. First choose scope, then destination:
+
+- `Only Alive` — links with current real/fast success (canonical rank tiers 0/1)
+- `Only Resolved` — dialable endpoints; DNS endpoints emit one line per stored IP
+- `Only Active` — exact current Active view
+- `All Valid` — all non-purged links, including aged/stale Purgatory rows
+- `Clipboard` — copies raw subscription text through `arboard`
+- `File` — writes raw subscription text through `tokio::fs`
+
+`↑↓` navigates, `Enter` selects, `Esc` closes. File paths are editable; existing destinations require `y` confirmation. Output has four metadata comment lines followed by one share URL per line. `Количество` counts matching stored links before Resolved IP expansion or serializer skips; Actions reports emitted and skipped counts separately.
+Output header:
+
+```text
+# profile-title: xray-tui export • <Scope>
+# profile-update-interval: 1
+# Date/Time: YYYY-MM-DD / HH:MM (Moscow)
+# Количество: <matching-links>
+
+<one share URL per line>
+```
+
+File export writes directly to the confirmed destination. A write failure can leave a partial destination; the UI reports the error and does not claim success.
 
 **Batch behavior (Fast Ping / Real Ping / Fast+Real on All Profiles):** the
 "All Profiles" entry points test the whole DATABASE — every (protocol,

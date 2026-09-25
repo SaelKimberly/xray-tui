@@ -414,6 +414,19 @@ pub enum AppMode {
     SpeedTestMenu {
         selected: usize,
     },
+    ExportScope {
+        selected: usize,
+    },
+    ExportDestination {
+        scope: xray_tui_db::export::ExportScope,
+        selected: usize,
+    },
+    ExportPath {
+        scope: xray_tui_db::export::ExportScope,
+        input: String,
+        overwrite: bool,
+        error: Option<String>,
+    },
     /// Batch import multiple share URLs
     BatchImport {
         /// Parsed/split profiles for each URL
@@ -546,6 +559,10 @@ pub enum CoreEvent {
     /// (a feed-wide batch sent ~34k of them, and the shared `Arc<BatchMeters>`
     /// already publishes everything they carried).
     BatchEnded,
+    ExportFinished {
+        report: Option<crate::ops::export::ExportReport>,
+        error: Option<String>,
+    },
     /// Background whitelist files loaded; carries the ready checker.
     HostFeaturesLoaded(Arc<xray_tui_host_features::HostFeaturesChecker>),
     /// Background enrichment (DNS resolve / geo lookup / whitelist / outbound)

@@ -413,6 +413,24 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     state.log_cache.pop_front();
                 }
             }
+            CoreEvent::ExportFinished { report, error } => {
+                state.mode = crate::AppMode::List;
+                if let Some(report) = report {
+                    state.log_activity(
+                        "info",
+                        "tui::ops::export",
+                        &format!(
+                            "Exported {}: candidates={} emitted={} skipped={}",
+                            report.scope.title(),
+                            report.candidate_count,
+                            report.emitted_count,
+                            report.skipped_count
+                        ),
+                    );
+                } else if let Some(error) = error {
+                    state.log_activity("error", "tui::ops::export", &error);
+                }
+            }
             CoreEvent::SubscriptionsUpdated {
                 group_id,
                 count,
