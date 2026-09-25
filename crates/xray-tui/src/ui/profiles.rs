@@ -1008,11 +1008,15 @@ fn render_data_grid(
         .map(|r| r.height(area.width.saturating_sub(2)))
         .collect();
     let data_offset = compute_scroll_offset(&heights, selected_display_idx, area.height);
+    let scrollbar_total = usize::try_from(state.page_total).unwrap_or(usize::MAX);
+    let scrollbar_offset = state.page_offset.saturating_add(data_offset);
     let data_table = DataTable::new(columns, display_rows)
         .highlight_style(ThemeStyles::table_row_selected(palette))
         .column_spacing(0)
         .block(block)
         .sort_column(sort_column, sort_direction)
+        .total_rows(Some(scrollbar_total))
+        .scrollbar_offset(Some(scrollbar_offset))
         .scrollbar(
             ThemeStyles::scrollbar_thumb(palette),
             ThemeStyles::scrollbar_track(palette),
@@ -1038,41 +1042,71 @@ fn panel_window(total: usize, selected: Option<usize>, max_visible: usize) -> us
     sel.saturating_sub(max_visible / 2).min(total - max_visible)
 }
 
-/// First visible row index that keeps the selected row roughly centered, in
-/// line units. `heights[i]` is row i's height (expanded rows are taller than
-/// 1). Clamped so the last rows still fit the viewport (same math as
-/// `DataTable`'s own offset clamp).
+/// First visible row index that keeps the selected row roughly centered.
+/// `heights[i]` is row i's height (expanded rows are taller than 1). The
+/// return value is a row index because [`DataTableState::offset`] indexes
+/// `DataTable::rows`, even though vertical positioning uses line heights.
 fn compute_scroll_offset(heights: &[u16], selected: usize, viewport_height: u16) -> usize {
     let inner_height = viewport_height.saturating_sub(3) as usize;
-    if heights.is_empty() {
+    let Some(selected_height) = heights.get(selected).copied() else {
         return 0;
+    };
+    if selected_height as usize >= inner_height {
+        return selected.min(heights.len().saturating_sub(1));
     }
-    let sel_h = heights.get(selected).copied().unwrap_or(1) as usize;
-    // Rows above the selection, in lines.
-    let above: usize = heights[..selected].iter().map(|h| *h as usize).sum();
-    // Centering offset: put the selected row's start at mid-viewport.
-    let target_sel_start = (inner_height.saturating_sub(sel_h)) / 2;
-    let ideal = above.saturating_sub(target_sel_start);
-    // Height-aware clamp: earliest offset whose rows still fill the viewport.
-    let mut rows_from_end = 0usize;
-    let mut h_sum = 0u16;
-    for h in heights.iter().rev() {
-        if h_sum + h > inner_height as u16 {
+
+    let selected_start: usize = heights[..selected].iter().map(|h| *h as usize).sum();
+    let ideal_line =
+        selected_start.saturating_sub(inner_height.saturating_sub(selected_height as usize) / 2);
+
+    // Earliest row that still shows the selected row's last line. For a
+    // selected row taller than the viewport, this is the selected row itself.
+    let minimum_line = selected_start
+        .saturating_add(selected_height as usize)
+        .saturating_sub(inner_height);
+    let mut line = 0usize;
+    let mut minimum_offset = selected;
+    for (index, height) in heights.iter().enumerate() {
+        if line >= minimum_line {
+            minimum_offset = index;
             break;
         }
-        h_sum += h;
+        line += *height as usize;
+    }
+
+    // Latest row offset that still fills the viewport from the end. A row
+    // taller than the viewport remains partially visible at the last index.
+    let mut rows_from_end = 0usize;
+    let mut height_from_end = 0usize;
+    for height in heights.iter().rev() {
+        let height = *height as usize;
+        if height_from_end + height > inner_height {
+            break;
+        }
+        height_from_end += height;
         rows_from_end += 1;
     }
-    let mut max_offset = heights.len().saturating_sub(rows_from_end);
-    // A row taller than the viewport leaves nothing to fill it, so
-    // `rows_from_end` is 0 and the raw max_offset would equal `len` — the
-    // table would render nothing. Clamp so the last row is at least
-    // partially (clipped) visible.
-    max_offset = max_offset.min(heights.len().saturating_sub(1));
-    // Minimum offset that still shows the selection's last line: when content
-    // below the selection is taller than the viewport, jump toward the end.
-    let o_min = above.saturating_add(sel_h).saturating_sub(inner_height);
-    ideal.max(o_min.min(max_offset)).min(max_offset)
+    let maximum_offset = heights
+        .len()
+        .saturating_sub(rows_from_end)
+        .min(heights.len().saturating_sub(1));
+    let minimum_offset = minimum_offset.min(maximum_offset);
+
+    // Convert the ideal LINE position to the closest actual ROW start.
+    let mut best = minimum_offset;
+    let mut best_distance = usize::MAX;
+    line = 0;
+    for (index, height) in heights.iter().enumerate().take(maximum_offset + 1) {
+        if index >= minimum_offset {
+            let distance = line.abs_diff(ideal_line);
+            if distance < best_distance {
+                best = index;
+                best_distance = distance;
+            }
+        }
+        line += *height as usize;
+    }
+    best
 }
 
 fn format_traffic(bytes: u64) -> String {
@@ -1265,6 +1299,50 @@ fn render_confirmation_overlays(
 mod page_window_tests {
     use std::sync::Arc;
 
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn scrollbar_thumb_row(state: &AppState, rows: &[DisplayRowData]) -> usize {
+        let area = Rect::new(0, 0, 125, 10);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_data_grid(
+                    frame,
+                    area,
+                    rows,
+                    state.selected_index,
+                    state,
+                    &state.current_palette(),
+                );
+            })
+            .unwrap();
+        let symbols: String = (1..area.height)
+            .map(|y| terminal.backend().buffer()[(area.width - 2, y)].symbol())
+            .collect();
+        symbols
+            .char_indices()
+            .find(|(_, symbol)| matches!(*symbol, '█' | '▄' | '▀'))
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| panic!("scrollbar glyphs: {symbols:?}"))
+    }
+
+    #[tokio::test]
+    async fn rendered_scrollbar_moves_across_full_feed() {
+        let mut state = two_page_state().await;
+        let first_page = display(&state);
+        let first_thumb = scrollbar_thumb_row(&state, &first_page);
+
+        state.selected_index = PROFILES_PAGE_SIZE - 1;
+        move_selection(&mut state, 1).await;
+        let second_page = display(&state);
+        let second_thumb = scrollbar_thumb_row(&state, &second_page);
+
+        assert!(
+            second_thumb > first_thumb,
+            "page 2 thumb ({second_thumb}) must follow page 1 ({first_thumb})"
+        );
+    }
     use super::*;
     use crate::ops::profiles::{PROFILES_PAGE_SIZE, move_selection, reload_profiles, test_support};
 
@@ -1335,6 +1413,7 @@ mod page_window_tests {
 
         state.selected_index = 0;
         move_selection(&mut state, -1).await; // back to page 1
+        assert_ne!(first_address, second_address);
         assert_eq!(state.page_offset, 0);
         assert_eq!(
             display(&state)[0].address_port_str.trim(),
@@ -1880,7 +1959,19 @@ mod tests {
         // escape the row list even though the row is taller than the viewport.
         let heights = vec![1u16, 1, 10, 1, 1];
         let offset = compute_scroll_offset(&heights, 2, 8);
-        assert!(offset < heights.len());
+        assert_eq!(offset, 2, "offset must select the tall row, not exceed it");
+    }
+
+    #[test]
+    fn scroll_offset_returns_row_index_for_mixed_heights() {
+        let heights = [3, 10, 8, 8, 8];
+        assert_eq!(compute_scroll_offset(&heights, 1, 14), 1);
+    }
+
+    #[test]
+    fn scroll_offset_converts_line_position_after_expanded_prefix() {
+        let heights = [8, 8, 8, 1, 1, 1, 1, 1];
+        assert_eq!(compute_scroll_offset(&heights, 5, 8), 3);
     }
 
     /// A selection move patches only the two affected rows: the rest of the

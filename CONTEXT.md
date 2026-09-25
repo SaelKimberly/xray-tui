@@ -158,7 +158,7 @@ AGENTS.md
 | Aspect | v2rayN | xray-tui |
 |--------|--------|----------|
 | Display | Desktop GUI (WinForms), multi-window | Terminal TUI (ratatui), single-window tabbed |
-| Profile view | Flat list with sortable columns | 16-column endpoint rows (country flag, Address, Feat flags, Protocol Info `protocol/transport/security`, Test delay, Outbound) with expandable rounded panel containing the per-protocol sub-table (Protocol Type, config type, last seen/used, sorted by test priority — fastest successful protocol on top; Enter on a sub-row pins that protocol as the endpoint default; panels cap at 8 sub-rows and window-scroll) |
+| Profile view | Flat list with sortable columns | 16-column endpoint rows (country flag, Address, Feat flags, Protocol Info `protocol/transport/security`, Test delay, Outbound) with expandable rounded panel containing the per-protocol sub-table (Protocol Type, config type, last seen/used, sorted by test priority — fastest successful protocol on top; Enter on a sub-row pins that protocol as the endpoint default; panels cap at 8 sub-rows and window-scroll). Scrollbar spans the full filtered feed without loading it: `page_total` sizes the thumb, `page_offset + first_visible_row` positions it; expanded panels still use a row-index local offset. |
 | Group view | Dropdown filter | Modal overlay (g key) + Settings section |
 | Settings | Menu-driven dialog boxes | Split-pane: collapsible tree + inline form/routing list |
 | Search | Search box | `/` key focus to inline filter with cursor |

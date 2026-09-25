@@ -58,6 +58,11 @@ Acceptance criteria (observable):
 6. Test All, select-all, remove-failed, and enrichment seeding operate on the
    whole filtered view (not just the loaded window) and behave as today.
 7. No schema change: reopening an existing `data.db` does not delete it.
+8. The Profiles scrollbar represents the full SQL-filtered result set, not
+   only the loaded page: thumb length uses `PageMeta.total`, and its position
+   uses the global index of the first visible endpoint (`page_offset` plus the
+   page-local viewport offset). No additional feed-sized query or in-memory
+   load is required.
 
 ## 3. Non-goals
 
@@ -86,6 +91,7 @@ Acceptance criteria (observable):
 | `SortColumn::Core` | Removed from the sort cycle (the `SortColumn::Core` variant and its comparator arm are deleted; the Core column stays display-only) — runtime `protocol_core_overrides` cannot be expressed in SQL |
 | Database wipe | Not required by this design (no schema change) |
 | Page size | Fixed, defined as a constant in the TUI layer (initial value 200 endpoint rows) |
+| Scrollbar position | Standard viewport semantics: content length is the filtered total; offset is the global index of the first visible endpoint |
 
 ## 5. Architecture: the raw-SQL owner
 
