@@ -314,11 +314,7 @@ impl DnsResolver {
         if let Ok(ip) = hostname.parse::<IpAddr>() {
             return Ok(vec![ip].into_boxed_slice());
         }
-        if self.resolver.get().is_none() {
-            let resolver = self.init().await?;
-            let _ = self.resolver.set(resolver);
-        }
-        let resolver = self.resolver.get().expect("resolver set above");
+        let resolver = self.resolver.get_or_try_init(|| self.init()).await?;
         let ips: Vec<IpAddr> = resolver
             .lookup_ip(hostname)
             .await?

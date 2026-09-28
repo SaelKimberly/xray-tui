@@ -847,6 +847,11 @@ pub(crate) struct BatchShared {
     real_ended_ms: AtomicU32,
     // ── real-level endpoint dedup: endpoints whose real ping succeeded ─
     completed_endpoints: Mutex<HashSet<i64>>,
+    /// DNS resolution requests already emitted by this batch. The plan walk
+    /// dispatches pages sequentially, but the set belongs to the batch: a DNS
+    /// endpoint can span page boundaries while its first request is still
+    /// queued or in flight.
+    resolve_requested: Mutex<HashSet<i64>>,
 }
 
 /// Per-batch counters, folded into ONE summary line at the end (per-result
@@ -981,6 +986,7 @@ impl BatchShared {
             real_started_ms: AtomicU32::new(0),
             real_ended_ms: AtomicU32::new(0),
             completed_endpoints: Mutex::new(HashSet::new()),
+            resolve_requested: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1605,11 +1611,9 @@ impl BatchShared {
     /// link's own halves find their config and endpoint without a second pass
     /// over the whole plan.
     async fn dispatch_page(self: &Arc<Self>, links: Vec<PlanLink>) {
-        // One resolution request per DNS endpoint in this page. The handler's
-        // TTL gate makes a repeat cheap, but a fresh entry is invisible to that
-        // gate until its resolution completes, so per-link requests would all
-        // spawn their own lookup.
-        let mut resolve_requested: HashSet<i64> = HashSet::new();
+        // One resolution request per DNS endpoint for the whole batch. The
+        // handler's TTL gate makes a completed repeat cheap, but a request
+        // waiting on the resolver semaphore is invisible to that gate.
         for plan in links {
             let key = (plan.link.protocol_id, plan.link.endpoint_id);
             self.fast_config
@@ -1626,16 +1630,23 @@ impl BatchShared {
             // persisted their exit IPs. Best-effort like every other batch
             // event: a full channel drops the request, and the next batch (or a
             // connect) asks again.
-            if plan.endpoint.host_type == HostType::Dns
-                && resolve_requested.insert(plan.endpoint.id.get())
-                && !self.dns_resolution_is_fresh(&plan.endpoint)
+            let endpoint_id = plan.endpoint.id.get();
             {
-                let _ = self.tx.try_send(CoreEvent::DnsResolveRequest {
-                    endpoint_id: plan.endpoint.id.get(),
-                    host: plan.endpoint.host.clone(),
-                    host_type: plan.endpoint.host_type,
-                    sni: crate::ops::enrich::extract_sni(&plan.protocol),
-                });
+                let mut requested = self.resolve_requested.lock();
+                if plan.endpoint.host_type == HostType::Dns
+                    && !self.dns_resolution_is_fresh(&plan.endpoint)
+                    && !requested.contains(&endpoint_id)
+                {
+                    let request = CoreEvent::DnsResolveRequest {
+                        endpoint_id,
+                        host: plan.endpoint.host.clone(),
+                        host_type: plan.endpoint.host_type,
+                        sni: crate::ops::enrich::extract_sni(&plan.protocol),
+                    };
+                    if self.tx.try_send(request).is_ok() {
+                        requested.insert(endpoint_id);
+                    }
+                }
             }
             // The kind-level testability gate: it needs only the in-memory
             // `proto_kind`, so it is decided here — the one place every batch
@@ -2807,7 +2818,27 @@ mod tests {
             "one load for the one protocol row the two links share"
         );
     }
+    #[tokio::test]
+    async fn dns_resolution_request_is_claimed_once_per_batch() {
+        let mut row = fake_row(1, "example.test", 1);
+        row.endpoint.host_type = HostType::Dns;
+        let rows = vec![row];
+        let mut h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        let shared = Arc::new(BatchShared::new(build_params(&h, Vec::new(), false, false)));
 
+        shared.dispatch_page(vec![plan[0].clone()]).await;
+        shared.dispatch_page(vec![plan[0].clone()]).await;
+
+        let receiver = h.state.core_event_rx.as_mut().expect("event receiver");
+        let mut requests = 0;
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(event, CoreEvent::DnsResolveRequest { .. }) {
+                requests += 1;
+            }
+        }
+        assert_eq!(requests, 1, "one DNS request per batch endpoint");
+    }
     #[tokio::test]
     async fn batch_three_links_schedules_fast_then_real() {
         let rows = vec![
