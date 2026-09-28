@@ -64,6 +64,12 @@
 - ✅ Sort by results, remove invalid servers
 - ✅ Test result caching in SQLite
 - ✅ Test cell reports the endpoint's representative link (delay band or failure marker), never a failed link's stale delay
+- ✅ **Windows reliability (from a 796-link Fast + Real Ping run on a non-English Windows host)** — four defects the run's own log proved, each fixed with a regression test:
+  - ✅ Fast-probe failure classification is TYPED, not text-matched (`IoFailure { kind, raw_code, text }` + pure `classify_io_failure`). Localized OS messages had put 332 unreachable endpoints in the soft class and sent them to the real level
+  - ✅ Persisted failure text is bounded (`cap_error_text`) without losing the `(os error N)` code or truncating an `UNTESTABLE_PREFIX` marker
+  - ✅ DNS lookups dedup by host with answer fan-out, in-flight lookups defer the gate, and the deferral window outlasts the resolver deadline (`deferred=0` against 196 failures before)
+  - ✅ Logs tab reconciles its two producers through one event-time watermark and its poll no longer discards the window between reads
+- ⏳ **QUIC on Windows (`WSAEMSGSIZE` / os error 10040)** — NOT fixed, needs a repro. quinn 0.11 exposes no public socket-buffer or GSO API, and a 1420-byte payload is far below any plausible send buffer, so the cause is unestablished. `socket2` is already in the lock if a repro justifies a direct dep
 
 ## Phase 6 — Settings Panel ✅
 -

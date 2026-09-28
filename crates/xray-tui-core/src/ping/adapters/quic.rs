@@ -1,4 +1,4 @@
-use super::{FastPingAdapter, PingCapability, PingError};
+use super::{FastPingAdapter, IoFailure, PingCapability, PingError};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +30,9 @@ impl FastPingAdapter for QuicPingAdapter {
         // DNS resolve (quinn requires SocketAddr)
         let addr = tokio::net::lookup_host(format!("{host}:{port}"))
             .await
-            .map_err(|e| PingError::Io(format!("DNS: {e}")))?
+            .map_err(|e| PingError::Io(IoFailure::from(e).prefixed("DNS")))?
             .next()
-            .ok_or_else(|| PingError::Io("DNS returned no addresses".into()))?;
+            .ok_or_else(|| PingError::Io(IoFailure::msg("DNS returned no addresses")))?;
 
         // TLS config skipping cert verification (proxy self-signed certs)
         let crypto = rustls::ClientConfig::builder()
@@ -46,7 +46,7 @@ impl FastPingAdapter for QuicPingAdapter {
         ));
 
         let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| PingError::Io(format!("endpoint: {e}")))?;
+            .map_err(|e| PingError::Io(IoFailure::from(e).prefixed("endpoint")))?;
 
         let start = std::time::Instant::now();
         let connecting = endpoint

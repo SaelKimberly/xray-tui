@@ -7,6 +7,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -30,6 +31,17 @@ pub(crate) fn extract_sni(protocol: &Protocol) -> Option<String> {
     }
     protocol.security.sni.clone()
 }
+
+/// Overall deadline for one resolution: resolver init (the `DNSCrypt` list
+/// download) plus lookups across many name servers, which can otherwise stall
+/// indefinitely.
+///
+/// Public because it is the other half of a relationship the settings have to
+/// respect: the batch's DNS-failure deferral window must outlast this, or a
+/// deferral expires before the lookup it defers can report. The two were
+/// independent constants — 8s here against a 5s `default_dns_failure_defer_secs`
+/// — and the window was the shorter of the pair.
+pub const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// True when a resolution must run: no entry, no address and no attempt, or a
 /// DNS entry older than the TTL, or `force`.
@@ -191,12 +203,39 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
 static RESOLVE_SEM: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
 
+/// Endpoint ids waiting on the lookup currently running for each host.
+///
+/// Keyed by the HOST, not the endpoint: a feed routinely carries one hostname
+/// on many rows (different ports, different protocols), and the old
+/// per-endpoint dedup — [`should_resolve`] against each endpoint's own
+/// `endpoint_info` entry, which a failed lookup cannot write — asked the
+/// resolver the same question once per row. The 2026-09-27 run logged 19
+/// lookups for a single dead hostname inside one TTL window, and the network
+/// work is the expensive part: each costs an 8s deadline and a `RESOLVE_SEM`
+/// permit.
+///
+/// A waiter still gets its OWN `EndpointInfoUpdated`: the answer is fanned out
+/// to every id registered here, because the result is per-endpoint state (an
+/// `endpoint_info` entry, a `profile_stats` refresh) even though the query is
+/// per-host. Sharing the query without fanning the answer would leave the
+/// siblings `[name]` forever — the regression this replaces.
+static LOOKUP_WAITERS: std::sync::LazyLock<dashmap::DashMap<String, Vec<i64>>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// The key a host is deduplicated under: case-insensitive, trailing dot
+/// dropped, so `Example.COM` and `example.com.` share one lookup.
+fn lookup_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Resolve one endpoint's inbound host from facts the caller already holds.
 ///
-/// The TTL gate
-/// ([`should_resolve`]) is evaluated here, against the session's
+/// The TTL gate ([`should_resolve`]) is evaluated here, against the session's
 /// `endpoint_info`, so repeated requests for the same endpoint collapse to one
-/// lookup and a fresh resolution is never repeated.
+/// lookup and a fresh resolution is never repeated. Requests for DIFFERENT
+/// endpoints sharing a host collapse too, one level up: the first caller runs
+/// the query and later callers register as waiters on [`LOOKUP_WAITERS`], and
+/// the answer is fanned out to all of them.
 pub fn spawn_dns_resolve_host(
     state: &mut AppState,
     endpoint_id: i64,
@@ -205,21 +244,51 @@ pub fn spawn_dns_resolve_host(
     sni: Option<String>,
     force: bool,
 ) {
+    let scheduler = state.scheduler.clone();
     if !should_resolve(
         state.endpoint_info.get(&endpoint_id),
         force,
         state.dns_cache_ttl_secs,
         unix_now(),
     ) {
+        // The SESSION says this host was resolved recently, so no lookup runs.
+        // The batch may still have marked the endpoint in flight — it gates on
+        // the PERSISTED attempt, which is a different fact and can be stale
+        // while the session entry is fresh. The two gates disagree exactly
+        // there, and the marker is cleared by the only code that runs on this
+        // path; without this the endpoint's links defer forever and the batch's
+        // self-looping retry never ends.
+        scheduler.end_dns_lookup(EndpointId::new(endpoint_id));
         return;
     }
 
     let dns = state.dns_resolver.clone();
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
-    let scheduler = state.scheduler.clone();
     let db = state.db.clone();
     let tx = state.core_event_tx.clone();
+
+    // The endpoint is now waiting on an answer that does not exist yet, so the
+    // batch's gate must not schedule it: a link dispatched in the same
+    // iteration as the request would otherwise be probed before the resolver
+    // has been asked, and could only measure the wrong thing.
+    scheduler.begin_dns_lookup(EndpointId::new(endpoint_id));
+
+    // An IP host is parsed, not queried, and a forced lookup is a user action
+    // on one specific endpoint — neither shares a per-host query.
+    let key = (host_type == HostType::Dns && !force).then(|| lookup_key(&host));
+    if let Some(key) = &key
+        && let Some(mut waiters) = LOOKUP_WAITERS.get_mut(key)
+    {
+        if !waiters.contains(&endpoint_id) {
+            waiters.push(endpoint_id);
+        }
+        return;
+    }
+    if let Some(key) = &key {
+        LOOKUP_WAITERS.insert(key.clone(), vec![endpoint_id]);
+    }
+    let waiters_key = key;
 
     tokio::spawn(async move {
         // One permit per in-flight lookup — see [`RESOLVE_SEM`]. A FORCED
@@ -230,10 +299,13 @@ pub fn spawn_dns_resolve_host(
         let _permit = if force {
             None
         } else {
-            match Arc::clone(&RESOLVE_SEM).acquire_owned().await {
-                Ok(permit) => Some(permit),
-                Err(_) => return,
-            }
+            let Ok(permit) = Arc::clone(&RESOLVE_SEM).acquire_owned().await else {
+                // The runtime is gone; release the waiters this lookup was
+                // registered for, or their endpoints defer forever.
+                release_waiters(waiters_key.as_ref(), endpoint_id, &scheduler);
+                return;
+            };
+            Some(permit)
         };
         let now = unix_now();
         // Whether the resolution produced a usable answer; `false` feeds the
@@ -260,7 +332,7 @@ pub fn spawn_dns_resolve_host(
                             // download) plus lookups over many name servers
                             // can otherwise stall indefinitely.
                             match tokio::time::timeout(
-                                Duration::from_secs(8),
+                                DNS_LOOKUP_TIMEOUT,
                                 r.lookup_ip(&host, false),
                             )
                             .await
@@ -319,14 +391,19 @@ pub fn spawn_dns_resolve_host(
             }
         };
 
-        // Feed the scheduler's DNS-failure gate: a failed resolution marks
-        // the endpoint so the batch scheduler skips it for the deferral
-        // window; a successful one clears the marker (resolvable again).
-        let scheduler_endpoint = EndpointId::new(endpoint_id);
-        if resolved_ok {
-            scheduler.clear_dns_failure(scheduler_endpoint);
-        } else {
-            scheduler.mark_dns_failure(scheduler_endpoint);
+        // Every endpoint waiting on this host shares the answer, so the whole
+        // set is settled here: the per-host registry is released (a later
+        // request must be able to start a fresh lookup), the batch's gate is
+        // told the answer is in, and each id gets its own event.
+        let waiters = take_waiters(waiters_key.as_ref(), endpoint_id);
+        for id in &waiters {
+            let endpoint = EndpointId::new(*id);
+            scheduler.end_dns_lookup(endpoint);
+            if resolved_ok {
+                scheduler.clear_dns_failure(endpoint);
+            } else {
+                scheduler.mark_dns_failure(endpoint);
+            }
         }
 
         let mut info = EndpointInfo {
@@ -341,10 +418,12 @@ pub fn spawn_dns_resolve_host(
         // Phase 1: deliver the resolution immediately — the UI must never
         // wait on geo/whitelist work (the mmdb can download on first use).
         if let Some(t) = tx.as_ref() {
-            let _ = t.try_send(CoreEvent::EndpointInfoUpdated {
-                endpoint_id,
-                info: info.clone(),
-            });
+            for id in &waiters {
+                let _ = t.try_send(CoreEvent::EndpointInfoUpdated {
+                    endpoint_id: *id,
+                    info: info.clone(),
+                });
+            }
         }
         // Phase 2: country + whitelist features. Bounded by the geo crate's
         // own download deadline; a timeout here still degrades to `🏴`.
@@ -353,16 +432,50 @@ pub fn spawn_dns_resolve_host(
         // re-resolutions), so the next launch renders it without a lookup.
         if let Some((ip, iso)) =
             fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await
-            && let Err(e) = db
-                .set_endpoint_ip_country(EndpointId::new(endpoint_id), ip, &iso)
-                .await
         {
-            tracing::warn!(target: "tui::ops::enrich", "country persist failed: {e}");
+            for id in &waiters {
+                if let Err(e) = db
+                    .set_endpoint_ip_country(EndpointId::new(*id), ip, &iso)
+                    .await
+                {
+                    tracing::warn!(target: "tui::ops::enrich", "country persist failed: {e}");
+                    break;
+                }
+            }
         }
         if let Some(t) = tx {
-            let _ = t.try_send(CoreEvent::EndpointInfoUpdated { endpoint_id, info });
+            for id in &waiters {
+                let _ = t.try_send(CoreEvent::EndpointInfoUpdated {
+                    endpoint_id: *id,
+                    info: info.clone(),
+                });
+            }
         }
     });
+}
+
+/// Take the waiters registered for `key`. A non-DNS or forced lookup never
+/// registers — an IP host is parsed and a forced lookup is one user action on
+/// one endpoint — so it serves only `fallback`, its own id. Without that
+/// fallback those lookups would emit no event at all and would leave a
+/// permanent in-flight marker, deferring their links forever.
+fn take_waiters(key: Option<&String>, fallback: i64) -> Vec<i64> {
+    key.and_then(|k| LOOKUP_WAITERS.remove(k).map(|(_, ids)| ids))
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_else(|| vec![fallback])
+}
+
+/// Release the waiters a lookup will never answer (the runtime shut down
+/// between registering them and acquiring a permit). Their in-flight markers
+/// go with them, for the same reason as the fallback above.
+fn release_waiters(
+    key: Option<&String>,
+    fallback: i64,
+    scheduler: &crate::ops::scheduler::TaskScheduler,
+) {
+    for id in take_waiters(key, fallback) {
+        scheduler.end_dns_lookup(EndpointId::new(id));
+    }
 }
 
 /// One enrichment target: endpoint id, the endpoint, its persisted

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_tui_core::CoreType;
 use xray_tui_core::speed_test::TestType;
@@ -80,6 +79,55 @@ const fn err_kind_for(test_type: TestType) -> ProfileErr {
     }
 }
 
+/// Longest failure text a profile row will carry.
+///
+/// The debug per-result line prints the probe's full text — for a fast failure
+/// that is the OS's own sentence, 238 characters of Russian on the 2026-09-27
+/// Windows run — and `error_ttl_hours` defaults to never sweeping it, so a
+/// column the UI renders as a three-character marker would hold a few hundred
+/// bytes of prose per dead endpoint. The full text stays in the log; this is
+/// the storage bound.
+const MAX_ERROR_TEXT_CHARS: usize = 200;
+
+/// Clamp a failure text to [`MAX_ERROR_TEXT_CHARS`] without losing the two
+/// things a reader needs: the OS code, and the untestable marker's prefix.
+fn cap_error_text(text: &str) -> String {
+    // `is_untestable_marker` / `is_removable_failure` match on the PREFIX, and
+    // a truncated marker would silently turn "never attempted by the native
+    // engine" into an ordinary failure — one `remove_failed_servers` away from
+    // deleting a row that was never tested. Never truncate one.
+    if text.starts_with(crate::ops::ping::UNTESTABLE_PREFIX) {
+        return text.to_owned();
+    }
+    if text.chars().count() <= MAX_ERROR_TEXT_CHARS {
+        return text.to_owned();
+    }
+    // `(os error 10060)` is the only locale-independent token in a localized
+    // OS sentence, and it sits at the END of it — so a plain prefix truncation
+    // would keep 200 characters of Russian and drop the one part worth
+    // searching for. Keep the head for context and re-attach the code, with the
+    // head shortened so the TOTAL still fits the bound.
+    // The suffix is built WITHOUT the ellipsis and pushed separately: slicing
+    // it off the front by byte offset would split `…` (U+2026, three bytes)
+    // and panic, on every long localized failure.
+    let suffix = os_error_code(text).map_or_else(String::new, |code| format!("(os error {code})"));
+    // One char of the budget is the ellipsis itself.
+    let head_budget = MAX_ERROR_TEXT_CHARS
+        .saturating_sub(suffix.chars().count())
+        .saturating_sub(1);
+    let mut kept: String = text.chars().take(head_budget).collect();
+    kept.push('…');
+    kept.push_str(&suffix);
+    kept
+}
+
+/// The trailing `(os error N)` of an OS message, if it has one.
+fn os_error_code(text: &str) -> Option<&str> {
+    let start = text.rfind("(os error ")?;
+    let rest = &text[start..];
+    rest.strip_prefix("(os error ")?.strip_suffix(')')
+}
+
 /// Overlay one probe result onto `row`'s RESULT columns
 /// (`latency*` / `speed_bps` / `error*`) and, when the probe decides it, the
 /// PURGE column.
@@ -117,7 +165,7 @@ pub(crate) fn apply_test_result(
         // stays, so a dead host does not erase a previously measured delay.
         row.error = Some(ErrorInfo {
             kind: err_kind_for(test_type),
-            text: err.to_string(),
+            text: cap_error_text(err),
         });
         // Only a real probe carries evidence; a fast result can never set a
         // verdict (a TCP handshake proves nothing about the config).
@@ -397,17 +445,31 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 target,
                 level,
                 message,
+                timestamp_nanos,
+                persisted,
             } => {
-                let level = level.to_lowercase();
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as i64;
+                // The line is displayed here and is ALSO on its way to the heed
+                // store, which the Logs tab polls. One watermark covers both
+                // deliveries: advancing it here means the poll only reads what
+                // this path never carried (a channel drop), instead of
+                // re-delivering every info+ line a second time — which is what
+                // the 2026-09-27 Windows dump shows, the same target and level
+                // rendered twice for some lines and once for others.
+                //
+                // `persisted` is the guard that keeps this from losing instead
+                // of duplicating: a session-only `log_activity` line has no
+                // heed copy, so moving the watermark past it would step over
+                // every unread info+ line behind it and the poll would never
+                // deliver them. `max`, so a late arrival cannot pull it back.
+                if persisted {
+                    state.last_seen_log_ns =
+                        state.last_seen_log_ns.max(timestamp_nanos.max(0) as u64);
+                }
                 state.log_cache.push_back(crate::LogLine {
-                    level,
+                    level: level.to_lowercase(),
                     target,
                     message,
-                    timestamp_nanos: now,
+                    timestamp_nanos,
                 });
                 if state.log_cache.len() > 10_000 {
                     state.log_cache.pop_front();
@@ -1179,6 +1241,70 @@ mod tests {
     use crate::types::EndpointInfo;
 
     use super::*;
+
+    /// A stored failure text is bounded, and the bound is on CHARACTERS — the
+    /// sentence that needed it in the first place was Russian, and a byte
+    /// bound on multi-byte text cuts mid-codepoint.
+    #[test]
+    fn stored_failure_text_is_bounded_on_a_char_boundary() {
+        let short = "IO: timed out (os error 10060)";
+        assert_eq!(cap_error_text(short), short, "a short text is untouched");
+
+        // The exact shape that motivated the cap: an OS sentence far past the
+        // bound, in a non-ASCII locale.
+        let long: String = "Попытка установить соединение была безуспешной. ".repeat(20);
+        let capped = cap_error_text(&long);
+        assert_eq!(capped.chars().count(), MAX_ERROR_TEXT_CHARS);
+        assert!(capped.ends_with('…'), "truncation is marked");
+        // Round-trips: no replacement char, no panic on a char boundary.
+        assert!(!capped.contains('\u{fffd}'));
+    }
+
+    /// The OS code is the one locale-independent token in a localized sentence,
+    /// and it sits at the END — a plain prefix truncation would keep 200
+    /// characters of Russian and drop the only part worth searching for.
+    #[test]
+    fn a_capped_failure_text_keeps_its_os_code() {
+        let long: String =
+            "Попытка установить соединение была безуспешной. ".repeat(20) + " (os error 10060)";
+        let capped = cap_error_text(&long);
+        assert!(
+            capped.ends_with("(os error 10060)"),
+            "code survives truncation: {capped:?}"
+        );
+        assert!(capped.contains('…'), "truncation is still marked");
+        assert_eq!(
+            capped.chars().count(),
+            MAX_ERROR_TEXT_CHARS,
+            "the code is re-attached INSIDE the bound, not on top of it"
+        );
+    }
+
+    /// `is_untestable_marker` and `is_removable_failure` match on the PREFIX.
+    /// A truncated marker would silently reclassify "never attempted by the
+    /// native engine" as an ordinary failure — one `remove_failed_servers`
+    /// away from deleting a row that was never tested.
+    #[test]
+    fn an_untestable_marker_is_never_truncated() {
+        let marker = crate::ops::ping::untestable_marker_text(
+            "a deliberately long reason that would otherwise be cut off by the cap, \
+             padded out to well past the two hundred character storage bound \
+             with more words appended to it here",
+        );
+        assert!(
+            marker.chars().count() > MAX_ERROR_TEXT_CHARS,
+            "the fixture must exceed the bound for this to test anything"
+        );
+        let capped = cap_error_text(&marker);
+        assert_eq!(capped, marker, "an untestable marker is stored verbatim");
+        assert!(capped.starts_with(crate::ops::ping::UNTESTABLE_PREFIX));
+        assert!(crate::ops::ping::is_untestable_marker(
+            &xray_tui_db::models::ErrorInfo {
+                kind: xray_tui_db::models::ProfileErr::Real,
+                text: capped,
+            }
+        ));
+    }
 
     /// The verdict rule, which is the whole point of the PURGE group: only a
     /// REAL probe can move it, and only a data-carrying success can clear it.

@@ -94,6 +94,20 @@ pub struct TaskScheduler {
     dns_defer_secs: AtomicI64,
     /// Endpoints whose DNS failed recently, by last failure time.
     dns_failures: DashMap<EndpointId, Timestamp>,
+    /// Endpoints with a resolution lookup IN FLIGHT, by start time.
+    ///
+    /// Separate from `dns_failures` because the two windows are different
+    /// questions. A failure is answered for `dns_defer_secs`; a lookup is
+    /// answered by the lookup itself, so it needs no window at all — only a
+    /// record that it has not answered yet.
+    ///
+    /// This is what makes the deferral able to help the run that asked for the
+    /// resolution. `dispatch_page` issues the request and schedules the link in
+    /// the same loop iteration, and the resolver's own deadline is 8s, so a
+    /// link dispatched at `t` could not consult a failure report that arrives
+    /// at `t+8s` — the gate reported `deferred=0` against 196 DNS failures for
+    /// exactly this reason.
+    dns_pending: DashMap<EndpointId, Timestamp>,
     /// Serializes every gate transition ([`Self::schedule`], [`Self::complete`],
     /// [`Self::cancel_queued`]).
     ///
@@ -105,6 +119,21 @@ pub struct TaskScheduler {
     gate: tokio::sync::Mutex<()>,
 }
 
+/// Smallest DNS-failure deferral window that can outlast one resolution.
+///
+/// A window shorter than [`crate::ops::enrich::DNS_LOOKUP_TIMEOUT`] is
+/// self-defeating: the stamp is written when the lookup REPORTS, so a window
+/// that has already elapsed by then never defers anything. The two were
+/// unrelated constants and the window was the shorter — the shipped 5s against
+/// an 8s deadline — which is one reason the 2026-09-27 run reported
+/// `deferred=0` against 196 DNS failures.
+///
+/// The rule belongs to the CONFIG, not to this type: [`TaskScheduler`] holds
+/// whatever window it is given, because the batch tests construct one directly
+/// with a short window on purpose and there is no resolver deadline to outlive
+/// in a test. `AppState::new` applies the floor to the user's setting.
+pub const MIN_DNS_DEFER_SECS: i64 = 15;
+
 impl TaskScheduler {
     /// Create a scheduler with the given queue limit and DNS deferral window.
     #[must_use]
@@ -114,8 +143,14 @@ impl TaskScheduler {
             states: DashMap::new(),
             next_id: AtomicU16::new(0),
             queue_limit: AtomicU16::new(queue_limit),
+            // The raw value: this type holds whatever window it is given, and
+            // the "must outlast a resolution" rule is a property of the CONFIG,
+            // enforced where the setting enters (see `state.rs`). Tests and
+            // single-ping paths construct one directly with a short window on
+            // purpose, and there is no lookup deadline to outlive in a test.
             dns_defer_secs: AtomicI64::new(dns_defer_secs),
             dns_failures: DashMap::new(),
+            dns_pending: DashMap::new(),
             gate: tokio::sync::Mutex::new(()),
         }
     }
@@ -142,10 +177,10 @@ impl TaskScheduler {
     /// mutex, so a stale snapshot cannot produce two `Started` outcomes on the
     /// same link.
     pub async fn schedule(&self, link: &ProfileStats, kind: TaskKind) -> ScheduleOutcome {
-        // DNS deferral FIRST — nothing is touched. No gate needed: the
-        // failure map is a DashMap and the check mutates nothing but expired
+        // DNS resolution state FIRST — nothing is touched. No gate needed:
+        // both maps are DashMaps and the check mutates nothing but expired
         // entries.
-        if self.is_dns_deferred(link.endpoint_id, Timestamp::now()) {
+        if self.is_dns_unresolved(link.endpoint_id, Timestamp::now()) {
             return ScheduleOutcome::DnsDeferred;
         }
 
@@ -326,10 +361,30 @@ impl TaskScheduler {
         }
     }
 
-    /// Whether `endpoint` is inside its DNS-deferral window at `now`. Expired
-    /// entries are dropped lazily. `dns_defer_secs <= 0` never defers (the
-    /// window is read per call so `set_limits` takes effect at once).
-    fn is_dns_deferred(&self, endpoint: EndpointId, now: Timestamp) -> bool {
+    /// Record that a resolution lookup for `endpoint` has started, so a link
+    /// dispatched alongside it waits for the answer instead of racing it.
+    ///
+    /// The counterpart is [`Self::end_dns_lookup`], called when the lookup
+    /// finishes — which is also when [`Self::mark_dns_failure`] or
+    /// [`Self::clear_dns_failure`] decides the endpoint's DNS state.
+    pub fn begin_dns_lookup(&self, endpoint: EndpointId) {
+        self.dns_pending.insert(endpoint, Timestamp::now());
+    }
+
+    /// Clear the in-flight marker: the lookup has answered.
+    pub fn end_dns_lookup(&self, endpoint: EndpointId) {
+        self.dns_pending.remove(&endpoint);
+    }
+
+    /// Whether `endpoint` cannot be probed yet: a lookup for it is in flight,
+    /// or it failed inside the deferral window. Expired failure entries are
+    /// dropped lazily. `dns_defer_secs <= 0` disables the FAILURE window only —
+    /// an in-flight lookup still defers, because the answer is coming and
+    /// probing before it lands can only measure the wrong thing.
+    fn is_dns_unresolved(&self, endpoint: EndpointId, now: Timestamp) -> bool {
+        if self.dns_pending.contains_key(&endpoint) {
+            return true;
+        }
         let defer_secs = self.dns_defer_secs.load(Ordering::Relaxed);
         if defer_secs <= 0 {
             return false;
@@ -366,6 +421,8 @@ mod tests {
         ConfigType, EndpointId, ProfileStats, ProtocolId, TaskKind, TrafficStats,
     };
     use xray_tui_proto::proto_spec::CoreType;
+
+    use super::MIN_DNS_DEFER_SECS;
 
     use super::{ScheduleOutcome, TaskScheduler};
 
@@ -618,6 +675,95 @@ mod tests {
             s.schedule(&l, TaskKind::FastPing).await,
             ScheduleOutcome::Started(_)
         ));
+    }
+
+    /// A link dispatched in the same breath as its resolution request must
+    /// wait for the answer. This is the arm the 2026-09-27 run never reached:
+    /// the request travelled a bounded channel to the UI task, so every link
+    /// was scheduled first and the failure that would justify a deferral
+    /// arrived 8s later — `deferred=0` against 196 DNS failures.
+    #[tokio::test]
+    async fn an_in_flight_lookup_defers_before_any_failure_is_known() {
+        let s = TaskScheduler::new(3, 0);
+        let l = link(1, 10);
+        // No failure recorded: the resolver has not answered yet.
+        s.begin_dns_lookup(l.endpoint_id);
+        assert_eq!(
+            s.schedule(&l, TaskKind::FastPing).await,
+            ScheduleOutcome::DnsDeferred
+        );
+        // The lookup answers; the link runs.
+        s.end_dns_lookup(l.endpoint_id);
+        assert!(matches!(
+            s.schedule(&l, TaskKind::FastPing).await,
+            ScheduleOutcome::Started(_)
+        ));
+    }
+
+    /// An in-flight lookup defers even with the failure window switched off:
+    /// `dns_failure_defer_secs = 0` is a policy about REPEATED failures, not
+    /// permission to probe a host whose answer is still outstanding.
+    #[tokio::test]
+    async fn an_in_flight_lookup_defers_with_deferral_disabled() {
+        let s = TaskScheduler::new(3, 0);
+        let l = link(1, 10);
+        s.begin_dns_lookup(l.endpoint_id);
+        assert_eq!(
+            s.schedule(&l, TaskKind::FastPing).await,
+            ScheduleOutcome::DnsDeferred
+        );
+    }
+
+    /// A marker belongs to one endpoint and cannot leak onto a sibling.
+    #[tokio::test]
+    async fn a_lookup_marker_is_scoped_to_its_endpoint() {
+        let s = TaskScheduler::new(3, 0);
+        let marked = link(1, 10);
+        let other = link(2, 11);
+        s.begin_dns_lookup(marked.endpoint_id);
+        assert_eq!(
+            s.schedule(&marked, TaskKind::FastPing).await,
+            ScheduleOutcome::DnsDeferred
+        );
+        assert!(matches!(
+            s.schedule(&other, TaskKind::FastPing).await,
+            ScheduleOutcome::Started(_)
+        ));
+    }
+
+    /// The scheduler holds whatever window it is given — the "must outlast a
+    /// resolution" rule is enforced on the user's setting, where it belongs.
+    /// This is what lets the batch tests below run a 2s window in a second
+    /// instead of the configured floor.
+    #[test]
+    fn the_scheduler_takes_the_window_it_is_given() {
+        assert_eq!(TaskScheduler::new(3, 2).dns_defer_secs(), 2);
+        assert_eq!(TaskScheduler::new(3, 0).dns_defer_secs(), 0);
+    }
+
+    /// The floor the config boundary applies has to outlast the deadline it
+    /// exists to protect — this is the invariant that was inverted (5s against
+    /// 8s) when the 2026-09-27 run reported `deferred=0` against 196 failures.
+    #[test]
+    fn the_configured_floor_outlasts_one_resolution() {
+        assert!(
+            MIN_DNS_DEFER_SECS > crate::ops::enrich::DNS_LOOKUP_TIMEOUT.as_secs() as i64,
+            "deferral floor {MIN_DNS_DEFER_SECS} must exceed the resolver deadline"
+        );
+    }
+
+    /// The shipped default and the floor the config boundary enforces are two
+    /// literals in two crates, and drift between them is silent — a default
+    /// under the floor would mean every fresh install re-clamps and re-warns on
+    /// first run.
+    #[test]
+    fn the_shipped_default_clears_the_floor() {
+        let default =
+            xray_tui_config::app_config::SpeedTestConfig::default().dns_failure_defer_secs;
+        assert!(
+            default >= MIN_DNS_DEFER_SECS,
+            "default {default} sits below the enforced floor {MIN_DNS_DEFER_SECS}"
+        );
     }
 
     #[tokio::test]

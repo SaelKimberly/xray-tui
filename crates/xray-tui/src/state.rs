@@ -475,6 +475,38 @@ pub async fn load_protocol_with_config(
         .await?;
     Ok(protocol)
 }
+
+/// Raise a configured DNS-failure deferral window to the floor that can
+/// actually defer anything.
+///
+/// The window is measured from the moment a resolution REPORTS, so a window
+/// shorter than [`crate::ops::enrich::DNS_LOOKUP_TIMEOUT`] has already expired
+/// by the time there is a failure to defer. The shipped 5s against an 8s
+/// deadline is exactly that inversion, and it is why the 2026-09-27 Windows run
+/// reported `deferred=0` against 196 DNS failures.
+///
+/// Applied here, where the user's setting enters the runtime, rather than
+/// inside `TaskScheduler`: the scheduler is also constructed directly by the
+/// batch tests with a deliberately short window, and there is no resolver
+/// deadline to outlive in a test. `0` is the explicit "deferral off" choice and
+/// passes through.
+pub(crate) fn clamp_dns_defer_secs(configured: i64) -> i64 {
+    use crate::ops::scheduler::MIN_DNS_DEFER_SECS;
+    if configured > 0 && configured < MIN_DNS_DEFER_SECS {
+        tracing::warn!(
+            target: "tui::state",
+            configured,
+            MIN_DNS_DEFER_SECS,
+            lookup_timeout_secs = crate::ops::enrich::DNS_LOOKUP_TIMEOUT.as_secs(),
+            "DNS-failure deferral window is shorter than one resolution; a \
+             window that expires before the lookup reports defers nothing, \
+             so it was raised",
+        );
+        return MIN_DNS_DEFER_SECS;
+    }
+    configured
+}
+
 impl AppState {
     pub async fn new(db: Arc<Database>, config: AppConfig) -> Self {
         let theme_name = config.theme_name;
@@ -495,7 +527,7 @@ impl AppState {
         // runtime-settable afterwards via `TaskScheduler::set_limits` on
         // settings save.
         let queue_limit = config.speed_test.task_queue_limit;
-        let dns_defer_secs = config.speed_test.dns_failure_defer_secs;
+        let dns_defer_secs = clamp_dns_defer_secs(config.speed_test.dns_failure_defer_secs);
         let link_writer = crate::ops::link_writer::LinkWriter::with_defaults(Arc::clone(&db));
         let mut state = Self {
             db,
@@ -738,12 +770,18 @@ impl AppState {
             let _ = sender.try_send(log_msg);
         }
 
-        // Send to actions panel
+        // Send to actions panel, stamped with the SAME event time the heed copy
+        // carries: the two deliveries are reconciled by one watermark, so a
+        // drain-time stamp here would run ahead of it and make the poll skip
+        // in-flight lines.
         if let Some(tx) = &self.core_event_tx {
             let _ = tx.try_send(crate::CoreEvent::TuiLog {
                 target: target.to_string(),
                 level: level.to_string(),
                 message: message.to_string(),
+                timestamp_nanos: i64::try_from(timestamp_nanos).unwrap_or(i64::MAX),
+                // Sent to the heed channel just above.
+                persisted: true,
             });
         }
     }
@@ -763,6 +801,14 @@ impl AppState {
                 target: target.to_string(),
                 level: level.to_string(),
                 message: message.to_string(),
+                // Event time, for the same reason as `log_trace`.
+                timestamp_nanos: std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64,
+                // Session-only by design: the heed store does NOT keep this
+                // line, so it must never move the heed watermark.
+                persisted: false,
             });
         }
     }

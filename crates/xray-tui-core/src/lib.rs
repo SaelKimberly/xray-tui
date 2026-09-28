@@ -24,7 +24,8 @@ pub use log_heed::HeedLogStorage;
 #[cfg(feature = "quic-ping")]
 pub use ping::QuicPingAdapter;
 pub use ping::{
-    FastPingAdapter, FastPingManager, PingCapability, PingError, TcpPingAdapter, UdpPingAdapter,
+    FastPingAdapter, FastPingManager, IoFailure, PingCapability, PingError, TcpPingAdapter,
+    UdpPingAdapter,
 };
 pub use process::{CoreManager, MockCoreManager, ProcessError, RealCoreManager};
 pub use speed_test::{SpeedTestError, TestType, speed_test, tcp_ping, udp_ping, udp_test};

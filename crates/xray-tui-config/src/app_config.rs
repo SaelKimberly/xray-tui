@@ -354,14 +354,17 @@ mod tests {
 
     #[test]
     fn speed_test_queue_and_dns_defer_defaults_and_round_trip() {
-        // Defaults: queue limit 3, deferral 5s.
+        // Defaults: queue limit 3, deferral 15s. The deferral has to outlast
+        // one resolution (8s) — the failure stamp is written when the lookup
+        // reports, so the old 5s default expired before there was anything to
+        // defer.
         let original = AppConfig::default();
         assert_eq!(original.speed_test.task_queue_limit, 3);
-        assert_eq!(original.speed_test.dns_failure_defer_secs, 5);
+        assert_eq!(original.speed_test.dns_failure_defer_secs, 15);
         let json = serde_json::to_string(&original).unwrap();
         let restored: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.speed_test.task_queue_limit, 3);
-        assert_eq!(restored.speed_test.dns_failure_defer_secs, 5);
+        assert_eq!(restored.speed_test.dns_failure_defer_secs, 15);
 
         // Explicit values round-trip through the speed-test section; absent
         // fields fall back to the defaults.
@@ -582,7 +585,12 @@ const fn default_task_queue_limit() -> u16 {
 }
 
 const fn default_dns_failure_defer_secs() -> i64 {
-    5
+    // Must outlast one resolution (`enrich::DNS_LOOKUP_TIMEOUT`, 8s): the
+    // failure stamp is written when the lookup reports, so a shorter window
+    // has already expired by the time there is anything to defer. The
+    // scheduler clamps to the same floor, so a hand-edited config.json cannot
+    // reinstall the inverted pair.
+    15
 }
 
 impl Default for SpeedTestConfig {

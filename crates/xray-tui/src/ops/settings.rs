@@ -578,11 +578,20 @@ pub fn save_settings_form(
 ) {
     apply_settings_fields(state, section, fields);
     // The scheduler limits are runtime-settable: apply the persisted values
-    // so the next batch honors them without a restart.
-    state.scheduler.set_limits(
-        state.config.speed_test.task_queue_limit,
-        state.config.speed_test.dns_failure_defer_secs,
-    );
+    // so the next batch honors them without a restart. The DNS window goes
+    // through the same clamp as config load — it is the same user setting, and
+    // a value below one resolution's deadline defers nothing.
+    //
+    // The RAISED value is written back, not just passed to `set_limits`:
+    // otherwise the form keeps showing the user's 5, the file persists 5, the
+    // runtime uses 15, and every save re-clamps and re-warns. One number,
+    // everywhere the setting is read.
+    let dns_defer_secs =
+        crate::state::clamp_dns_defer_secs(state.config.speed_test.dns_failure_defer_secs);
+    state.config.speed_test.dns_failure_defer_secs = dns_defer_secs;
+    state
+        .scheduler
+        .set_limits(state.config.speed_test.task_queue_limit, dns_defer_secs);
     if let Err(e) = state.config.save() {
         state.log_trace(
             "error",

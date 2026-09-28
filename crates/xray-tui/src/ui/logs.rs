@@ -435,6 +435,14 @@ pub(super) async fn try_load_older(state: &mut AppState) {
     }
 }
 
+/// Entries read per `read_newer_than` call.
+const POLL_PAGE: usize = 500;
+
+/// Ceiling on entries drained in one poll, so a burst cannot monopolize the UI
+/// task. Reading stops here with the watermark where it got to, and the next
+/// tick continues — the backlog is never skipped, only deferred.
+const POLL_MAX_PER_TICK: usize = 5_000;
+
 /// Poll heed for new log entries newer than `last_seen_log_ns` (async).
 pub(super) async fn poll_new_logs(state: &mut AppState) {
     let heed = match &state.heed_storage {
@@ -442,29 +450,47 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
         None => return,
     };
 
-    let entries = match heed
-        .read_newer_than_async(state.last_seen_log_ns, 100)
-        .await
-    {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(target: "tui::ui::logs::poll", "Failed to poll new logs: {e}");
-            return;
+    // Drained page by page, and the watermark advanced by the OLDEST entry of
+    // each page rather than the newest. A single capped read that then set the
+    // watermark to the newest entry SILENTLY DROPPED everything between the
+    // previous watermark and that window: a batch emits hundreds of warn-level
+    // lines per tick, and the 2026-09-27 Windows dump shows the effect — the
+    // same target at the same level rendered twice for some lines and once for
+    // others, because one of the two delivery paths had lost its copy.
+    let mut drained: Vec<xray_tui_core::log_heed::LogMessage> = Vec::new();
+    let mut watermark = state.last_seen_log_ns;
+    loop {
+        let page = match heed.read_newer_than_async(watermark, POLL_PAGE).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(target: "tui::ui::logs::poll", "Failed to poll new logs: {e}");
+                break;
+            }
+        };
+        if page.is_empty() {
+            break;
         }
-    };
+        // `page` is newest-first, so the last element is the oldest of the
+        // window — that is the point the next read must resume from.
+        let Some(oldest) = page.last() else {
+            break;
+        };
+        watermark = oldest.timestamp_nanos;
+        let full = page.len() == POLL_PAGE;
+        drained.extend(page);
+        if !full || drained.len() >= POLL_MAX_PER_TICK {
+            break;
+        }
+    }
 
-    if entries.is_empty() {
+    if drained.is_empty() {
         return;
     }
+    state.last_seen_log_ns = watermark;
 
-    // Update last_seen_log_ns from the newest entry
-    if let Some(newest) = entries.first() {
-        state.last_seen_log_ns = newest.timestamp_nanos;
-    }
-
-    // Append new entries (entries are newest-first, reverse to append in order)
-    let new_count = entries.len();
-    for entry in entries.into_iter().rev() {
+    // Newest-first from heed, so reverse to append in chronological order.
+    let new_count = drained.len();
+    for entry in drained.into_iter().rev() {
         state.log_cache.push_back(crate::LogLine {
             level: entry.level,
             target: entry.target,

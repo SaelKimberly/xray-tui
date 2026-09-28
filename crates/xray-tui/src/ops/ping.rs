@@ -607,42 +607,103 @@ impl ProbeOutcome {
     }
 }
 
+/// Windows' `WSAHOST_NOT_FOUND` — `GetAddrInfoW` could not resolve the name.
+/// `std` leaves it `Uncategorized` (it is absent from its WSA table), and no
+/// Unix `errno` reaches 11001, so the bare code identifies it unambiguously.
+const WSA_HOST_NOT_FOUND: i32 = 11001;
+
 /// Classify a fast probe's failure: the batch's class bucket plus whether the
 /// proxy is unreachable at the transport level — the classes the real phase
 /// cannot pass either, so phase 2 skips the link.
 ///
-/// Connect-class `PingError`s are hard: a timeout, or an IO error naming a
-/// refused connection, a missing route, an unreachable network, or an
+/// Connect-class `PingError`s are hard: a timeout, or an IO error that reports
+/// a refused connection, a missing route, an unreachable network, or an
 /// unresolvable host. Everything else stays probed — fd exhaustion, a
 /// TLS-level IO error or a protocol-level failure is local or ambiguous, and
 /// the fast adapter's `NotSupported`/`Other` classes say nothing about
-/// reachability. The adapter renders OS failures into `PingError::Io` text, so
-/// this is the ONE site that reads that text; the class travels as a value
-/// from here on.
+/// reachability.
+///
+/// Classification reads [`xray_tui_core::ping::IoFailure::kind`] first and the raw OS
+/// code second,
+/// because `io::Error`'s message is localized and matching it was correct in
+/// exactly one locale: a Russian Windows reports a connect timeout as
+/// `Попытка установить соединение была безуспешной… (os error 10060)`, which
+/// matched no needle, fell through to `Io`, and marked 314 dead endpoints
+/// SOFT — so the real level spent 51% of its slots probing hosts the fast
+/// level had already proven unreachable. `std` folds the WSA codes onto
+/// portable kinds (`WSAETIMEDOUT` → `TimedOut`, `WSAECONNREFUSED` →
+/// `ConnectionRefused`, `WSAEHOSTUNREACH` → `HostUnreachable`,
+/// `WSAENETUNREACH` → `NetworkUnreachable`), so the same decision now holds in
+/// every locale. The text match survives only as a last resort, for an
+/// adapter that hands over a message with no `io::Error` behind it.
 fn classify_fast_failure(err: &xray_tui_core::ping::PingError) -> (ProbeClass, bool) {
     use xray_tui_core::ping::PingError;
     match err {
         PingError::Timeout(_) => (ProbeClass::Timeout, true),
-        PingError::Io(message) => {
-            let class = if message.contains("failed to lookup address information")
-                || message.contains("Name or service not known")
-            {
-                ProbeClass::Dns
-            } else if message.contains("Connection refused") {
-                ProbeClass::Refused
-            } else if message.contains("No route to host") {
-                ProbeClass::NoRoute
-            } else if message.contains("Network is unreachable") {
-                ProbeClass::Unreachable
-            } else {
-                // Local resource failures (fd exhaustion) and ambiguous IO:
-                // classified, but not proof the endpoint is unreachable.
-                return (ProbeClass::Io, false);
-            };
-            (class, true)
-        }
+        PingError::Io(io) => classify_io_failure(io.kind, io.raw_code, &io.text),
         PingError::NotSupported => (ProbeClass::Config, false),
         PingError::Other(_) => (ProbeClass::Other, false),
+    }
+}
+
+/// The reachable/unreachable decision over the typed facts of an IO failure.
+///
+/// Split out from [`classify_fast_failure`] so it is a pure function of its
+/// arguments: the regression it fixes was invisible to the test suite *because*
+/// it depended on the host's OS message, and a pure function over `ErrorKind` +
+/// code is testable on any platform, including the CI box that has never seen a
+/// WSA error.
+fn classify_io_failure(
+    kind: Option<std::io::ErrorKind>,
+    raw_code: Option<i32>,
+    text: &str,
+) -> (ProbeClass, bool) {
+    use std::io::ErrorKind;
+    // A name that does not resolve is decided before the kind match: Windows
+    // reports `WSAHOST_NOT_FOUND` uncategorized, and an unresolvable host is a
+    // DNS verdict whatever else the platform called it.
+    if raw_code == Some(WSA_HOST_NOT_FOUND) {
+        return (ProbeClass::Dns, true);
+    }
+    match kind {
+        Some(ErrorKind::TimedOut) => (ProbeClass::Timeout, true),
+        Some(ErrorKind::ConnectionRefused) => (ProbeClass::Refused, true),
+        Some(ErrorKind::HostUnreachable) => (ProbeClass::NoRoute, true),
+        Some(ErrorKind::NetworkUnreachable | ErrorKind::NetworkDown) => {
+            (ProbeClass::Unreachable, true)
+        }
+        // `NotFound` is what a resolver reports when std does map it; the
+        // Windows code above covers the platforms that leave it uncategorized.
+        Some(ErrorKind::NotFound) => (ProbeClass::Dns, true),
+        // Nothing typed to classify on AND no OS code: the message never came
+        // from `std::io`, it is an adapter's own text, so the historical
+        // English match is the only signal left. An error that DOES carry a
+        // code has already been decided above and is never re-read as text.
+        None if raw_code.is_none() => classify_io_failure_text(text),
+        // A code or kind this function has no verdict for: local resource
+        // failures (fd exhaustion), a reset mid-exchange, a blocked datagram.
+        // Classified, but not proof the endpoint is unreachable.
+        _ => (ProbeClass::Io, false),
+    }
+}
+
+/// Last-resort text classification, for adapter messages with no `io::Error`
+/// behind them. English-only by construction: the whole reason
+/// [`classify_io_failure`] exists is that this cannot be trusted as a primary
+/// signal.
+fn classify_io_failure_text(text: &str) -> (ProbeClass, bool) {
+    if text.contains("failed to lookup address information")
+        || text.contains("Name or service not known")
+    {
+        (ProbeClass::Dns, true)
+    } else if text.contains("Connection refused") {
+        (ProbeClass::Refused, true)
+    } else if text.contains("No route to host") {
+        (ProbeClass::NoRoute, true)
+    } else if text.contains("Network is unreachable") {
+        (ProbeClass::Unreachable, true)
+    } else {
+        (ProbeClass::Io, false)
     }
 }
 
@@ -699,6 +760,14 @@ impl BatchProbeRunner for EngineProbeRunner {
                     ProbeOutcome::Failed {
                         class,
                         hard,
+                        // The FULL `Display` of the error, not a compact
+                        // summary: this string is both what the debug
+                        // per-result line prints — the only place an
+                        // unclassified failure is diagnosable — and what gets
+                        // persisted. Storage is bounded and compacted at the
+                        // boundary instead (`cap_error_text`), so the OS code
+                        // survives while the row stays short. Compacting here
+                        // would have removed the sentence from the log.
                         text: e.to_string(),
                         evidence: None,
                     }
@@ -1631,7 +1700,12 @@ impl BatchShared {
             // event: a full channel drops the request, and the next batch (or a
             // connect) asks again.
             let endpoint_id = plan.endpoint.id.get();
-            {
+            // Claim the endpoint for this batch and hand the request to the
+            // channel, both under one lock so two pages cannot ask twice. The
+            // marker is written after the guard is released — it is a
+            // synchronous map insert, and holding a std mutex across it is what
+            // the early-drop lint is about.
+            let sent = {
                 let mut requested = self.resolve_requested.lock();
                 if plan.endpoint.host_type == HostType::Dns
                     && !self.dns_resolution_is_fresh(&plan.endpoint)
@@ -1643,10 +1717,30 @@ impl BatchShared {
                         host_type: plan.endpoint.host_type,
                         sni: crate::ops::enrich::extract_sni(&plan.protocol),
                     };
+                    // A full channel drops it; the next batch (or a connect)
+                    // asks again, so only a SENT one is recorded.
                     if self.tx.try_send(request).is_ok() {
                         requested.insert(endpoint_id);
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
+            };
+            if sent {
+                // Mark the lookup in flight HERE, not in the handler: the
+                // request travels a bounded channel to the UI task and is
+                // handled on a later tick, so a link scheduled in this same
+                // iteration would otherwise start before the resolver was even
+                // asked — and the gate could never defer it, because the
+                // failure report that would justify the deferral arrives 8s
+                // later still. That is why the 2026-09-27 run reported
+                // `deferred=0` against 196 DNS failures. The handler re-marks
+                // on the non-batch paths; an insert is idempotent.
+                self.sched
+                    .begin_dns_lookup(xray_tui_db::models::EndpointId::new(endpoint_id));
             }
             // The kind-level testability gate: it needs only the in-memory
             // `proto_kind`, so it is decided here — the one place every batch
@@ -1831,8 +1925,26 @@ impl BatchShared {
     /// the whole chain and the real half's re-entry is reachable only from a
     /// settled fast half.
     async fn defer_retry(self: &Arc<Self>, link: ProfileStats, half: Half) {
+        // How long one half may sit deferred before the batch stops waiting.
+        //
+        // The loop is meant to outlast a DNS window, not to be the thing that
+        // keeps a batch alive: a link is deferred only while its endpoint's
+        // lookup is in flight or inside its failure window, and the lookup
+        // clears both when it completes. A marker that outlives its lookup is
+        // a bug, and unbounded it becomes a HANG — the batch waits for every
+        // retry before emitting its terminal event, so this is the last thing
+        // between such a leak and a batch that never finishes.
+        //
+        // Bounded by WAITED TIME, not by attempt count: the poll interval and
+        // the window are independent (the tests poll every 50ms against a 2s
+        // window), so any fixed attempt count is either too small to outlast a
+        // real window or too large to catch a leak promptly.
+        let budget =
+            Duration::from_secs(self.sched.dns_defer_secs().max(1) as u64).saturating_mul(2);
+        let mut waited = Duration::ZERO;
         loop {
             tokio::time::sleep(self.defer_delay).await;
+            waited = waited.saturating_add(self.defer_delay);
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1841,6 +1953,33 @@ impl BatchShared {
                 Half::Real => self.dispatch_real_probe(link.clone(), false).await,
             };
             if reached_gate {
+                break;
+            }
+            if waited >= budget {
+                // The link was counted in its level's `total` when the page
+                // dispatched it, so dropping it here silently would leave the
+                // summary's denominator one above its numerators — the exact
+                // mismatch the per-level meters exist to prevent. Book it as
+                // settled-but-unprobed, under `deferred` (which already means
+                // "the gate refused this link"), and name the endpoint so the
+                // stuck resolution is traceable to a row.
+                match half {
+                    Half::Fast => {
+                        self.meters.fast.done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Half::Real => {
+                        self.meters.real.done.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                tracing::warn!(
+                    target: "tui::ops::ping",
+                    endpoint_id = link.endpoint_id.get(),
+                    half = half.as_str(),
+                    waited_ms = waited.as_millis() as u64,
+                    "batch: a half stayed DNS-deferred for {:?} and was booked \
+                     unprobed — this endpoint's resolution state is stuck",
+                    budget,
+                );
                 break;
             }
             // Still deferred: the window is whole seconds, so wait it out again
@@ -2383,6 +2522,168 @@ mod tests {
     use crate::ops::scheduler::TaskScheduler;
 
     use super::*;
+
+    /// The exact failures the 2026-09-27 Windows run produced, and the verdict
+    /// each one must get.
+    ///
+    /// The strings are the ones the log carried and the kinds are what `std`
+    /// folds those WSA codes onto, so the decision is pinned on a machine that
+    /// has never produced a WSA error — exactly the gap that let the
+    /// English-text version pass CI and fail on a Russian Windows (`os error
+    /// 10060` × 314 and `os error 11001` × 18 both landed in the soft `Io`
+    /// class, sending 332 unreachable endpoints to the real level).
+    ///
+    /// `None` for the kind is how a code `std` does not classify arrives here:
+    /// `ErrorKind::Uncategorized` cannot be named on stable, so the classifier
+    /// takes the absence instead, and the two Windows codes that matter
+    /// (`11001`, `10040`) reach it exactly that way.
+    #[test]
+    fn connect_failures_are_hard_in_every_locale() {
+        use std::io::ErrorKind;
+        // (kind, raw code, message the OS actually rendered, expected class)
+        let cases = [
+            (
+                Some(ErrorKind::TimedOut),
+                Some(10060),
+                "Попытка установить соединение была безуспешной, т.к. от другого \
+                 компьютера за требуемое время не получен нужный отклик, или было разорвано \
+                 уже установленное соединение из-за неверного отклика уже подключенного \
+                 компьютера. (os error 10060)",
+                ProbeClass::Timeout,
+            ),
+            (
+                None,
+                Some(11001),
+                "Этот хост неизвестен. (os error 11001)",
+                ProbeClass::Dns,
+            ),
+            (
+                Some(ErrorKind::ConnectionRefused),
+                Some(10061),
+                "Отказано в соединении. (os error 10061)",
+                ProbeClass::Refused,
+            ),
+            (
+                Some(ErrorKind::HostUnreachable),
+                Some(10065),
+                "No route to host (os error 10065)",
+                ProbeClass::NoRoute,
+            ),
+            (
+                Some(ErrorKind::NetworkUnreachable),
+                Some(10051),
+                "Сеть недоступна (os error 10051)",
+                ProbeClass::Unreachable,
+            ),
+        ];
+        for (kind, code, text, want) in cases {
+            let (class, hard) = classify_io_failure(kind, code, text);
+            assert_eq!(class, want, "class for code {code:?}");
+            assert!(
+                hard,
+                "code {code:?} must be hard: the real probe cannot pass it"
+            );
+        }
+    }
+
+    /// A localized message must not change the verdict: the class comes from
+    /// the typed facts, and the text is read only when nothing typed stands
+    /// behind the failure.
+    #[test]
+    fn localized_text_cannot_soften_a_typed_failure() {
+        use std::io::ErrorKind;
+        // Same kind and code, English vs Russian rendering: identical verdict.
+        let en = classify_io_failure(
+            Some(ErrorKind::TimedOut),
+            Some(10060),
+            "Connection timed out (os error 10060)",
+        );
+        let ru = classify_io_failure(
+            Some(ErrorKind::TimedOut),
+            Some(10060),
+            "Попытка установить соединение была безуспешной (os error 10060)",
+        );
+        assert_eq!(en, ru);
+        assert_eq!(en, (ProbeClass::Timeout, true));
+    }
+
+    /// Failures that prove nothing about the endpoint stay soft, so the real
+    /// level still answers the different question it was dispatched to ask.
+    #[test]
+    fn local_and_ambiguous_io_failures_stay_soft() {
+        use std::io::ErrorKind;
+        for (kind, code) in [
+            // A firewall or AV block: something answered, it just said no.
+            (Some(ErrorKind::PermissionDenied), Some(10013)),
+            // A reset mid-exchange says something WAS there.
+            (Some(ErrorKind::ConnectionReset), Some(10054)),
+            // The QUIC send-path code from the same run (WSAEMSGSIZE).
+            (None, Some(10040)),
+            // fd exhaustion is a local resource problem.
+            (None, Some(10024)),
+        ] {
+            let (class, hard) = classify_io_failure(kind, code, "whatever the OS said");
+            assert_eq!(class, ProbeClass::Io, "code {code:?}");
+            assert!(!hard, "code {code:?} must stay soft");
+        }
+    }
+
+    /// An adapter message with no `io::Error` behind it still reaches the text
+    /// match, so the quic adapter's `DNS: …` wrapper keeps its class.
+    #[test]
+    fn adapter_message_without_a_code_falls_back_to_text() {
+        let (class, hard) = classify_io_failure(
+            None,
+            None,
+            "DNS: failed to lookup address information: Name or service not known",
+        );
+        assert_eq!((class, hard), (ProbeClass::Dns, true));
+    }
+
+    /// An error that DOES carry a code is never re-read as text: a message that
+    /// happens to contain an English-looking phrase must not reclassify a
+    /// failure the typed facts already decided. This is the arm the old code
+    /// took unconditionally.
+    #[test]
+    fn a_coded_failure_is_never_reclassified_by_its_text() {
+        let (class, hard) =
+            classify_io_failure(None, Some(10040), "Connection refused (os error 10040)");
+        assert_eq!((class, hard), (ProbeClass::Io, false));
+    }
+
+    /// `std`'s WSA → `ErrorKind` folding is the assumption the whole typed path
+    /// rests on, and it is only observable where those codes exist.
+    #[cfg(windows)]
+    #[test]
+    fn std_maps_the_wsa_codes_the_classifier_depends_on() {
+        use std::io::ErrorKind;
+        for (code, want) in [
+            (10060, ErrorKind::TimedOut),
+            (10061, ErrorKind::ConnectionRefused),
+            (10065, ErrorKind::HostUnreachable),
+            (10051, ErrorKind::NetworkUnreachable),
+        ] {
+            assert_eq!(
+                std::io::Error::from_raw_os_error(code).kind(),
+                want,
+                "os error {code}"
+            );
+        }
+        // The two the classifier handles by code because std does not fold
+        // them: a name that does not resolve, and a datagram that did not fit.
+        for code in [11001, 10040] {
+            let kind = std::io::Error::from_raw_os_error(code).kind();
+            assert_eq!(
+                classify_io_failure(None, Some(code), "x"),
+                if code == 11001 {
+                    (ProbeClass::Dns, true)
+                } else {
+                    (ProbeClass::Io, false)
+                },
+                "os error {code} classified off its kind {kind:?}"
+            );
+        }
+    }
 
     #[test]
     fn mvcc_skips_wal_checkpoint() {

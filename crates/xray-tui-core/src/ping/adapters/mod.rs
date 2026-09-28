@@ -6,7 +6,7 @@ mod quic;
 mod tcp;
 mod udp;
 
-use super::{PingCapability, PingError};
+use super::{IoFailure, PingCapability, PingError};
 use std::time::Duration;
 use xray_tui_proto::ProtocolKind;
 

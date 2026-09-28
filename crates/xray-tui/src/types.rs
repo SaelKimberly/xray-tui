@@ -476,10 +476,27 @@ pub enum CoreEvent {
         timestamp_nanos: i64,
     },
     /// A log line from the TUI internals via tracing.
+    ///
+    /// `timestamp_nanos` is the EVENT time, not the time the UI task drained
+    /// the channel. It has to be: this event and the heed poll are two
+    /// deliveries of the same lines, reconciled by one watermark
+    /// (`AppState::last_seen_log_ns`). A drain-time stamp runs AHEAD of the
+    /// event times, so the poll would skip everything still in flight — the
+    /// 2026-09-27 Windows dump shows that as lines out of order by up to 55
+    /// seconds.
+    ///
+    /// `persisted` says whether this line's copy in the heed store is accounted
+    /// for — true from the tracing layer and `log_trace`, which both write to
+    /// it; false from `log_activity`, which is session-only by design. Only a
+    /// `true` may advance the watermark: the poll reads the heed stream, so a
+    /// session-only line moving it forward would step over every unread info+
+    /// line behind it and lose them for good.
     TuiLog {
         target: String,
         level: String,
         message: String,
+        timestamp_nanos: i64,
+        persisted: bool,
     },
     SubscriptionsUpdated {
         group_id: String,

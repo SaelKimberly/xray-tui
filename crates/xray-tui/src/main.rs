@@ -130,11 +130,19 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Send lightweight notification to TUI for the actions panel
+        // Send lightweight notification to TUI for the actions panel. The
+        // timestamp is the one this event was created with — the same value the
+        // heed copy is keyed by, because the Logs tab reconciles the two
+        // deliveries through a single watermark (`last_seen_log_ns`).
         let _ = self.core_event_tx.try_send(xray_tui::CoreEvent::TuiLog {
             target: target.to_owned(),
             level: level.to_owned(),
             message,
+            // `i64` nanos, saturating: a clock past 2262 would otherwise wrap
+            // to a negative stamp and sort ahead of every real line.
+            timestamp_nanos: i64::try_from(timestamp_nanos).unwrap_or(i64::MAX),
+            // The heed copy is written above; the watermark may pass it.
+            persisted: true,
         });
     }
 }
