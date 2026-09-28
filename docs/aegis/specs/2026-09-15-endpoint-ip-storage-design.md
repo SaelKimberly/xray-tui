@@ -274,9 +274,10 @@ established. The storage decision (`endpoint_ip` owns the address set,
    endpoint through the LOADED PAGE. A feed-wide batch persists `latency_ip` for
    every planned link but holds only 200 rows, so every off-page DNS host kept
    `[name]` while its exit IP and country were persisted and rendered. The batch
-   now carries the endpoint facts with its request
+   carries the endpoint facts with its request
    (`CoreEvent::DnsResolveRequest { endpoint_id, host, host_type, sni }`),
-   deduped per page, so the trigger no longer depends on what is loaded.
+   deduped per batch by `BatchShared::resolve_requested`, so the trigger no
+   longer depends on what is loaded.
 
 Consequence for the columns: the Outbound/Country pair is gated on the endpoint
 being resolved. The exit IP is evidence that a tunnel to this endpoint worked,
