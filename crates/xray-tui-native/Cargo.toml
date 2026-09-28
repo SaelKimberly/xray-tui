@@ -26,29 +26,29 @@ tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
 rustls = { workspace = true, features = ["ring"] }
 # Root store for the QUIC TLS client config (same trust source as the
 # engine's `WebPkiVerifier::webpki_roots`).
-webpki-roots = "1"
+webpki-roots.workspace = true
 
 # VMess wire crypto (mandatory for any VMess client — not feature-gated).
 # `zeroize` is NOT in any of these crates' default features: without it the
 # expanded AES round keys, the ChaCha state, and the HMAC/hasher blocks
 # (which hold the VMess cmd key and every KDF subkey) are dropped unwiped.
 aes = { workspace = true, features = ["zeroize"] }
-aes-gcm = { version = "0.11", features = ["zeroize"] }
-chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
-ctr = { version = "0.10", features = ["zeroize"] }
-hmac = { version = "0.13", features = ["zeroize"] }
-sha2 = { version = "0.11", features = ["zeroize"] }
-crc32fast = "1"
-md-5 = { version = "0.11", features = ["zeroize"] }
-blake2 = { version = "0.11", features = ["zeroize"] }
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+ctr = { version = "0.10.1", features = ["zeroize"] }
+hmac = { version = "0.13.0", features = ["zeroize"] }
+sha2 = { workspace = true, features = ["zeroize"] }
+crc32fast = "1.5.2"
+md-5 = { workspace = true, features = ["zeroize"] }
+blake2 = { version = "0.11.0", features = ["zeroize"] }
 # Classic-AEAD subkey KDF: HKDF-SHA1(psk, salt, b"ss-subkey").
-sha1 = { version = "0.11", features = ["zeroize"] }
-hkdf = "0.13"
+sha1 = { version = "0.11.0", features = ["zeroize"] }
+hkdf = "0.13.0"
 # 2022-blake3 session subkey: blake3::derive_key("shadowsocks 2022 session subkey",
 # psk || salt). Promoted from dev-dependency (b3.rs cross-validation uses it too).
-blake3 = { version = "1", features = ["zeroize"] }
-wide = "1.7.0"
-inout = "0.2"
+blake3 = { version = "1.8.7", features = ["zeroize"] }
+wide = "1.7.1"
+inout = "0.2.2"
 
 # Secret wiping for the key material we own ourselves: VMess cmd/session
 # keys, VLESS UUIDs, Shadowsocks subkeys, the mlkem768x25519plus state.
@@ -58,23 +58,23 @@ zeroize.workspace = true
 ring.workspace = true
 
 # WebSocket transport framing (RFC 6455) over the engine stream — no TLS
-tokio-tungstenite = "0.30"
-futures-core = "0.3"
-futures-sink = "0.3"
-bytes = "1"
+tokio-tungstenite = "0.30.0"
+futures-core = "0.3.34"
+futures-sink = "0.3.34"
+bytes.workspace = true
 
 # gRPC transport framing (HTTP/2, RFC 7540) over the engine stream
-h2 = "0.4.15"
-http = "1"
+h2 = "0.4.19"
+http = "1.5.0"
 
 # HTTP/1.1 + HTTP/2 client framing (hyper) — minimal features, latest minor.
 # We own the stream + timeouts; hyper owns request/response/chunked/101 framing.
-hyper = { version = "1.11", default-features = false, features = ["client", "http1", "http2"] }
+hyper = { version = "1.11.1", default-features = false, features = ["client", "http1", "http2"] }
 # tokio↔hyper IO bridge: hyper's own rt::Read/Write traits take a different
 # buffer type than tokio's, so BoxStream goes through TokioIo (hyper-util's
 # standard adapter). TokioExecutor spawns hyper's h2 driver tasks.
-hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
-http-body = "1"
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body = "1.1.0"
 # Channel (live request-body pipe) is feature-gated in http-body-util.
 http-body-util = { version = "0.1.5", features = ["channel"] }
 
@@ -91,33 +91,33 @@ h3-quinn.workspace = true
 # needs the raw private key — x25519-dalek derives the public half from
 # arbitrary 32-byte seeds. The runtime tunnel never needs keygen: the client
 # only ECDHs with the server's `pbk`.
-x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"], optional = true }
+x25519-dalek = { workspace = true, optional = true }
 
 # errors
 thiserror.workspace = true
 
 # infallible sync locks (project rule rs-parking-lot; workspace already uses 0.12)
-parking_lot = "0.12"
+parking_lot.workspace = true
 
 # observability (debug diagnostics in transports)
 tracing.workspace = true
 
 # pinSHA256 (base64) decode for the fingerprint connector's SPKI pin
-base64 = { version = "0.23" }
+base64.workspace = true
 
 # misc
 uuid.workspace = true
 
 # e2e pipeline (crate-side module -> real deps, optional behind the feature)
 serde_json = { workspace = true, optional = true }
-tempfile = { version = "3", optional = true }
-rcgen = { version = "0.14", optional = true }
-tiny_http = { version = "0.12", optional = true }
+tempfile = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+tiny_http = { version = "0.12.0", optional = true }
 # inner-TLS echo target for the vision e2e rows (spec §7.4): a tokio TLS
 # server completing a real TLS 1.3 session through the tunnel. Ring backend
 # only (workspace TLS standard — tokio-rustls 0.26 defaults to aws_lc_rs;
 # see the workspace rustls pin / xray-tui-core's transitive override).
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+tokio-rustls = { workspace = true, optional = true }
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
@@ -163,11 +163,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 # to lib unit tests regardless of feature selection (normal optional deps stay
 # for the feature-gated e2e module).
 serde_json.workspace = true
-rcgen = "0.14"
+rcgen.workspace = true
 rstest.workspace = true
 # (rustls is a normal dependency now — the h3 arm's QUIC TLS config; the
 # server double reuses the same dep.)
 # Throughput benches (`benches/throughput.rs`, Task 2): criterion harness +
 # tempdir for the spawned core's on-disk config.
 criterion = { workspace = true, features = ["async_tokio"] }
-tempfile = "3"
+tempfile.workspace = true

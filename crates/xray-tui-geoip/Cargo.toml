@@ -7,7 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 # ============ Geo ============
-maxminddb = { version = "0.30", features = ["simdutf8"] }
+# 0.32 REMOVED the `simdutf8` feature outright (upstream measured no win on
+# production GeoIP2 databases), so the whole feature list is deleted rather
+# than renamed. Every read API this crate uses is source-identical.
+maxminddb = "0.32"
 
 # ============ Async Runtime & I/O ============
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "rt"] }
@@ -25,13 +28,12 @@ tracing.workspace = true
 
 # ============ Bounded caches ============
 # Memory-diet Task 6 (B-slice gate): per-IP location micro-cache LRU bound.
-# `lru 0.18` matches the workspace pick and is already in Cargo.lock.
-lru = "0.18"
+lru.workspace = true
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

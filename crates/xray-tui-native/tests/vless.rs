@@ -2,10 +2,12 @@
 //! variant × core {xray, sing-box}, plus xray-only xhttp (splithttp) rows.
 //! One generated test per (case, core).
 //!
-//! `clippy::future_not_send` is allowed file-wide: rstest 0.26.1 clears the
+//! `clippy::future_not_send` is allowed file-wide: rstest 0.27.0 clears the
 //! source fn's attributes when embedding it beside the generated tests, so no
 //! fn-/statement-level `#[allow]` reaches the nested async fn that holds the
 //! non-`Send` `CaseSpec` across the runner await. No narrower scope works.
+//! Re-verified on rstest 0.27.0 (2026-09-28 bump): the lint still fires, so the
+//! allow is still required under the gate's `-D warnings`.
 #![allow(
     clippy::future_not_send,
     reason = "rstest-generated futures lose their Send bound; they run on one local tokio runtime"

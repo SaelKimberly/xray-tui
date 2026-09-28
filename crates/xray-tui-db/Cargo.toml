@@ -7,8 +7,8 @@ license.workspace = true
 [dependencies]
 # ============ ORM ============
 toasty = { workspace = true, features = ["turso", "serde", "jiff"] }
-toasty-driver-turso = "0.10"
-toasty-core = "0.10"
+toasty-driver-turso = "0.11"
+toasty-core = "0.11"
 turso = "0.7.2"
 
 # ============ Time ============
@@ -41,4 +41,4 @@ tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
 toasty = { workspace = true, features = ["turso", "serde", "jiff"] }
 jiff = { workspace = true }
 xray-tui-proto = { path = "../xray-tui-proto", version = "0.1.0" }
-tempfile = "3"
+tempfile.workspace = true

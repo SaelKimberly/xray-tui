@@ -19,14 +19,14 @@ dirs.workspace = true
 humantime.workspace = true
 
 # ============ Encoding ============
-base64-simd = "0.8"
+base64-simd.workspace = true
 escape8259.workspace = true
 urlencoding.workspace = true
-simdutf8 = "0.1"
+simdutf8 = "0.1.5"
 url.workspace = true
 
 # ============ Enum Utilities ============
-strum = { version = "0.28", default-features = false, features = ["derive"] }
+strum = { version = "0.28.0", default-features = false, features = ["derive"] }
 
 # ============ Text / Search / Hash ============
 	aho-corasick.workspace = true

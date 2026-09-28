@@ -23,17 +23,17 @@ too_many_lines = "allow"
 
 [workspace.dependencies]
 # ============ Async Runtime & I/O ============
-tokio = { version = "1.53" }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1" }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 # ============ Serialization ============
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151" }
 
 # ============ Error Handling ============
-thiserror = { version = "2.0.19" }
-yaml-rust2 = "0.11.0"
-anyhow = "1.0"
+thiserror = { version = "2.0.21" }
+yaml-rust2 = "0.13.0"
+anyhow = "1.0.104"
 
 # ============ Networking ============
 # QUIC (RFC 9000/9001/9002) + HTTP/3 — the xhttp h3 mode (SP5). quinn
@@ -42,7 +42,7 @@ anyhow = "1.0"
 # native client supplies its own root stores). h3-quinn 0.0.10 (hyperium,
 # quinn 0.11.x) is the maintained quinn transport for the h3 crate — the
 # h3-quinn↔quinn version pairing is the lockstep constraint here.
-quinn = { version = "0.11.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
@@ -55,29 +55,32 @@ h3-quinn = "0.0.10"
 # panics ("No rustls crypto provider is configured", verified live). rustls
 # itself stays single-backend ring, so ClientConfig::builder() auto-selects
 # (quic ping adapter, hickory DoH).
-reqwest = { version = "^0.13.4", default-features = false, features = ["rustls-no-provider"] }
+reqwest = { version = "^0.13.5", default-features = false, features = ["rustls-no-provider"] }
 
 # ============ Config & Filesystem ============
-dirs = { version = "^6.0.0" }
+# dirs 7's only breaking change is `preference_dir` on Windows
+# (LocalAppData -> RoamingAppData); this workspace only ever calls
+# `config_dir()`, whose three-platform semantics are identical in 6 and 7.
+dirs = { version = "^7.0.0" }
 
 # ============ Text / Search / Hash ============
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 
 # ============ Encoding ============
-escape8259 = "0.5"
-urlencoding = "2.1"
-aho-corasick = "1.1"
-memchr = "2"
-smallvec = { version = "1", default-features = false, features = ["const_new"] }
+escape8259 = "0.5.3"
+urlencoding = "2.1.3"
+aho-corasick = "1.1.5"
+memchr = "2.8.3"
+smallvec = { version = "1.16.2", default-features = false, features = ["const_new"] }
 
 # ============ Hashing ============
-rapidhash = { version = "4.5", features = ["std", "unsafe"] }
+rapidhash = { version = "4.5.1", features = ["std", "unsafe"] }
 
 # ============ Test ============
-rstest = "0.26.1"
+rstest = "0.27.0"
 # Benchmark harness (`harness = false` targets in native/tls/route; run via
 # `cargo criterion`, results in ./.benchmarks — see criterion.toml).
-criterion = { version = "0.8" }
+criterion = { version = "0.8.2" }
 
 # ============ TLS ============
 # Workspace TLS standard is RING ONLY — aws-lc-rs is denied. Every rustls
@@ -86,24 +89,24 @@ criterion = { version = "0.8" }
 # aws_lc_rs (xray-tui-core pins it default-features = false + ring/tls12 —
 # that pin is the reason aws-lc-rs stays out of the lockfile; check with
 # `cargo tree -i aws-lc-rs` after any dependency change).
-rustls = { version = "0.23", default-features = false }
+rustls = { version = "0.23.45", default-features = false }
 
 # ============ Crypto ============
 # Shared by xray-tui-tls / xray-tui-native / xray-tui-route (ring) and
 # xray-tui-native / xray-tui-route (aes). Single-crate crypto deps stay in
 # the crate manifest; these crossed the 2-crate threshold.
-ring = "0.17"
-aes = "0.9"
+ring = "0.17.14"
+aes = "0.9.3"
 
 # Secret wiping (`Zeroizing<T>` / `#[derive(ZeroizeOnDrop)]`). Already in the
 # lockfile transitively (curve25519-dalek, the RustCrypto ciphers), so a
 # direct dep adds no tree entry. `derive` brings the `ZeroizeOnDrop` macro.
 # Shared by xray-tui-tls (key schedule, ML-KEM, REALITY auth) and
 # xray-tui-native (protocol key material).
-zeroize = { version = "1.9", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 # ============ TUI ============
-ratatui-themes = "0.2"
+ratatui-themes = "0.3"
 
 # ============ Proto crate ============
 xray-tui-proto = { path = "crates/xray-tui-proto", version = "0.1.0" }
@@ -111,15 +114,45 @@ xray-tui-proto = { path = "crates/xray-tui-proto", version = "0.1.0" }
 xray-tui-tls = { path = "crates/xray-tui-tls", version = "0.1.0" }
 
 # ============ Logging ============
-tracing = { version = "0.1" }
+tracing = { version = "0.1.44" }
 
 # ============ Time / Duration Parsing ============
 humantime = "2.4.0"
-url = "2"
-jiff = "0.2"
+url = "2.5.8"
+jiff = "0.2.37"
 
 # ============ ORM (Turso backend only — no other drivers enabled) ============
-toasty = { version = "0.10", default-features = false }
+toasty = { version = "0.11", default-features = false }
+
+# ============ Shared archive/encoding/crypto edges (2+ crates) ============
+# base64: xray-tui-proto (URL credentials) + xray-tui-native (pinSHA256).
+base64 = "0.23.1"
+# base64-simd: xray-tui-config (fast decode) + xray-tui (dev).
+base64-simd = "0.8.0"
+# bytes: payload buffers shared by the route engine, the native datapath and the TUI.
+bytes = "1.12.1"
+# flate2: RFC 8879 cert decompression (xray-tui-tls) + core binary archives.
+flate2 = "1.1.10"
+# lru: bounded caches in the TUI, geoip and the routing engine.
+lru = "0.18.5"
+# md-5 / sha2: JA3/JA4 fingerprints (tls) + VMess/VLESS wire crypto (native).
+md-5 = "0.11.0"
+sha2 = "0.11.0"
+# parking_lot: infallible sync locks across the TUI, route, native and tls.
+parking_lot = "0.12.5"
+# rcgen: rustls server doubles in the tls test suites + the native e2e harness.
+rcgen = "0.14.10"
+# tempfile: every crate's test scratch dirs.
+tempfile = "3.27.0"
+# tokio-rustls: the ring-only pin (see the rustls note above) lives here now.
+# The entry carries ONLY the two features every consumer wants; xray-tui-core
+# adds `logging` on its own edge, so the hoisted entry does not widen the
+# native e2e build.
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+# webpki-roots: QUIC root store (native) + the tls engine's WebPkiVerifier.
+webpki-roots = "1.0.9"
+# x25519-dalek: REALITY's dual-agreement keypair (tls) + native e2e configs.
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 [workspace.metadata.cargo-machete]
 # The hakari (feature-unification) crate's dependencies are never referenced
 # from code by design; its own manifest carries the full per-crate ignore list.

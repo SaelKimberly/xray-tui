@@ -459,7 +459,9 @@ mod tests {
     fn many_worker_thread_reads_release_reader_slots() {
         let dir = tempdir().unwrap();
         let storage = Arc::new(HeedLogStorage::new(dir.path()).unwrap());
-        storage.write_log(1000, "info", "target", "message").unwrap();
+        storage
+            .write_log(1000, "info", "target", "message")
+            .unwrap();
 
         for _ in 0..160 {
             let worker_storage = Arc::clone(&storage);
@@ -471,7 +473,6 @@ mod tests {
             worker.join().unwrap();
         }
     }
-
 
     #[test]
     fn resize_retries_until_success_or_exhaustion() {

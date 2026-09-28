@@ -15,12 +15,12 @@ experimental = []
 # ============ Serialization ============
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_with = { version = "^3.21.0", default-features = false, features = ["macros"] }
+serde_with = { version = "^3.24.0", default-features = false, features = ["macros"] }
 
 # ============ URL & Encoding ============
 url = { workspace = true }
 urlencoding.workspace = true
-base64 = { version = "^0.23.1" }
+base64.workspace = true
 
 # ============ Error Handling ============
 thiserror = { workspace = true }
@@ -40,13 +40,16 @@ toasty.workspace = true
 
 # ============ Performance & Memory ============
 smallvec.workspace = true
-bstr = { version = "^1.12.1", default-features = false, features = ["std"] }
+bstr = { version = "^1.13.1", default-features = false, features = ["std"] }
 aho-corasick.workspace = true
 # Small inline string for URL/credential text. `compact_str` replaces the
-# unmaintained `smartstring` (RUSTSEC-2026-0249) and is already in the graph
-# via ratatui-core, so this pins the version already resolved (0.9.x) instead
-# of adding a second major.
-compact_str = { version = "^0.9.1", features = ["serde"] }
+# unmaintained `smartstring` (RUSTSEC-2026-0249). 0.10 carries upstream's
+# UB/unsoundness fixes, so the pin moves up; ratatui-core has not shipped its
+# own 0.10 bump yet, so the graph now carries a deliberate 0.9/0.10 dual-major
+# pair (the two `CompactString` types never meet — ratatui keeps its copy
+# private). The serde impl is byte-identical, so the on-the-wire shape and
+# the identity-hash inputs are unchanged.
+compact_str = { version = "^0.10", features = ["serde"] }
 
 # ============ IDNA for hostname parsing ============
 idna = { version = "^1.1.0", default-features = false, features = ["std", "compiled_data"] }

@@ -36,7 +36,7 @@ cargo run
 - `crates/xray-tui-db/src/endpoint_ip.rs` — the resolved-address table's support module (ADR 0005): the codec (`key_of`/`ip_of`/`key_of_str`/`key_from_hex` — a family byte `4`/`6` then big-endian octets, so byte order IS address order with IPv4 first; the codec's own tests pin round-trip, order and rejections), the covering index DDL at open, and the typed accessors `replace` (delete-then-insert the whole set for one endpoint, dedup by key, carrying the surviving addresses' countries), `set_country` (the geo step's write; creates the row when the lookup won the race against the address write), `load`/`load_resolved` (id-inlined, key-ordered; the latter carries `(IpAddr, Option<String /* ISO-3166 alpha-2 */>)`), `delete_for` (the cascade the deletion owners call in their own transaction — toasty emits no `REFERENCES`)
 - `crates/xray-tui-db/src/retry.rs` — `retry_on_busy`/`is_busy_error`: retry-with-backoff (20ms doubling, 1.28s cap) for SQLite write contention (`is_serialization_failure` or "database is locked"); wired into `update_endpoint_resolution` (the enrichment herd) so concurrent DNS writes never drop. `Database::conn()` (database.rs) additionally sets `PRAGMA busy_timeout=5000` on EVERY pooled connection acquisition — the pragma in `open()` is per-connection and never reaches pool-created conns (the real cause of the lock-failure dumps); all write paths go through `conn()`
 - `crates/xray-tui-db/src/retry.rs` — busy/conflict retry is now applied across public DB mutators and rank maintenance; MVCC conflicts can surface on the second write statement, so retries wrap whole transaction bodies.
-- `crates/xray-tui/src/ops/db_monitor.rs` — in-process DB query monitor (Phase 28). `Registry` folds per-`Database`-method stats (bounded circular sample window `SAMPLE_CAP=4096`, p50/p99, fail/retry rollup, slowest-statement sample); two-source `DbMonitorLayer` (a second `tracing::Layer`) folds toasty 0.10's built-in per-statement `toasty::query` events (`duration_ms`/`rows`/`error`/`db.statement`; DEBUG, WARN past `slow_statement_threshold` default 1s — statement text is FREE, no driver fork) in `on_event` via the enclosing `db_method` span, and the method's final `retry_on_busy` retry count in `on_close`. Every public `Database` method across `database.rs`, `profiles_query.rs`, `endpoint_rank.rs` carries `#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]` — the literal target MUST equal the Layer's `METHOD_TARGET` gate or the span is rejected and events fall to `UNATTRIBUTED`; the runtime page path is `profiles_page`/`load_page_projection`, not `load_page_rows`. Always-on, ~1.3 MiB; ranked dump on the `d` key on the Logs tab; `main.rs` `LogVisitor` captures the same `toasty::query` fields so a slow-query line reads `slow query [312.4ms]: <sql>`. Spec/plan/ADR-less: `docs/aegis/{specs,plans}/2026-09-24-db-query-monitoring*`
+- `crates/xray-tui/src/ops/db_monitor.rs` — in-process DB query monitor (Phase 28). `Registry` folds per-`Database`-method stats (bounded circular sample window `SAMPLE_CAP=4096`, p50/p99, fail/retry rollup, slowest-statement sample); two-source `DbMonitorLayer` (a second `tracing::Layer`) folds toasty 0.11's built-in per-statement `toasty::query` events (`duration_ms`/`rows`/`error`/`db.statement`; DEBUG, WARN past `slow_statement_threshold` default 1s — statement text is FREE, no driver fork) in `on_event` via the enclosing `db_method` span, and the method's final `retry_on_busy` retry count in `on_close`. Every public `Database` method across `database.rs`, `profiles_query.rs`, `endpoint_rank.rs` carries `#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]` — the literal target MUST equal the Layer's `METHOD_TARGET` gate or the span is rejected and events fall to `UNATTRIBUTED`; the runtime page path is `profiles_page`/`load_page_projection`, not `load_page_rows`. Always-on, ~1.3 MiB; ranked dump on the `d` key on the Logs tab; `main.rs` `LogVisitor` captures the same `toasty::query` fields so a slow-query line reads `slow query [312.4ms]: <sql>`. The event shape is upstream-identical across 0.10→0.11 (verified in `toasty-core/src/driver/log.rs`: same `target: "toasty::query"`, same field set at DEBUG and WARN), so the bump was manifest-only. Spec/plan/ADR-less: `docs/aegis/{specs,plans}/2026-09-24-db-query-monitoring*`
 - `crates/xray-tui-core/src/config_builder/mod.rs` — BackendConfig enum, BuildParams, BuildError, ConfigBuilder struct; `protocol_config` (borrows the typed `Deferred<Json<ProtocolConfig>>`, refusing unloaded rows), `shadowsocks_method`, `endpoint_essentials` (db Endpoint → proto EndpointEssentials). Outbound blocks are produced by `protocol.config.inject_to(...)` — per-config xray/sing-box shapes, ss cipher whitelists, reality/cipher build-time validation → `SupportError` → `BuildError::Support`
 - `crates/xray-tui-config/src/lib.rs` — config management, module registration
 - `crates/xray-tui-core/src/grpc_client.rs` — StatsProvider trait + GrpcStatsClient + MockStatsProvider (test double) + factory (unified from former XrayGrpcClient/SingBoxGrpcClient)
@@ -44,7 +44,7 @@ cargo run
 - `crates/xray-tui-config/src/import_export.rs` — share URL parse/format (`parse_share_url` → `ParsedProfile { parsed: ParsedProto, validation }`, `format_share_url(parsed, endpoint)`) with per-profile required-field validation and `validate_host`. Parsing itself lives in the proto crate (`ProtocolConfig::try_parse_proto` — scheme dispatch + fallback chain); this module owns the URL-shape gate, validation settings, and host checks. `validate_host` hard-rejects unspecified IPs (`0.0.0.0`/`::`, also bracketed `[::]`) regardless of `allow_private_ips`; policy-gated checks (private/loopback/link-local) stay behind the gate
 - `crates/xray-tui-config/src/base64_util.rs` — robust base64 decode with percent-decoding and annotation stripping
 - `crates/xray-tui-dns/src/lib.rs` — DnsResolver: DNSCrypt stamp parsing (dns-stamp-parser) → hickory-resolver 0.26 config, cached resolver list, panic-free async OnceCell init
-- `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup (maxminddb 0.30)
+- `crates/xray-tui-geoip/src/lib.rs` — GeoIp: GeoLite2-City mmdb download + country/city lookup (maxminddb 0.32; its `simdutf8` feature was REMOVED upstream in 0.32, so the manifest carries no feature list)
 - `crates/xray-tui-host-features/src/lib.rs` — HostFeaturesChecker: SNI/exact-IP/CIDR whitelist membership checks (fastbloom fast-negative guard + exact HashSet/interval verification, IPv4-only), download-if-missing from hxehex/russia-mobile-internet-whitelist, `get_host_features(&ServerName)` main API
 - `crates/xray-tui-config/src/permissive_json.rs` — lenient JSON parser for vmess:// subscriptions
 - `crates/xray-tui-config/src/fast_perc.rs` — hand-rolled UTF-8 + percent-decoding character source
@@ -112,7 +112,7 @@ cargo run
 1. **Dual-backend architecture**: `CoreManager` abstracts over xray-core and sing-box subprocesses. TUI writes JSON configs and manages binary lifetime.
 2. **Protocol-core auto-resolution**: TUIC, Hysteria v1, Naïve, AnyTLS, ShadowTLS, Tor, SSH, Tailscale, ShadowsocksR, Redirect → sing-box. All others (VMess, VLESS, etc.) → xray-core by default. Shadowsocks/Shadowsocks-2022 is cipher-aware: AEAD + 2022-blake3 methods → xray-core, legacy methods (`aes-*-cfb`, `aes-*-ctr`, `rc4-md5`, `chacha20-ietf`, `xchacha20`, `none`) → sing-box (xray-core's `CipherType` enum has no legacy entries — `XRAY_SS_METHODS`/`SINGBOX_SS_METHODS` in `proto_spec/core_mapping.rs` are the whitelists). Both config builders reject ciphers neither core supports. User overrides per-profile; a forced core that can't build the cipher fails at build time with a clear error, never an invalid config. **Config validity is enforced at build**: the reality/cipher checks now live in `inject_to` (`xray-tui-proto`, `SupportError` → `BuildError::Support`) — the xray injector rejects `security: "reality"` configs whose reality settings lack `publicKey`/`serverName` (`validate_xray_reality`; xray-core dies at startup with `REALITY: Empty "realitySettings"` or `empty "password"` otherwise) and ciphers xray-core's `CipherType` enum has no entry for, and the sing-box reality block emits only `enabled`/`public_key`/`short_id` (sing-box has no `spider_x` outbound field — the URL's `spx` is dropped, never written into `short_id`).
 3. **One core at a time**: Only one backend process runs per connection session. Switching profiles between backends stops current core and starts other. Matches v2rayN.
-4. **SQLite via toasty ORM (async)** — Single DB file for all persistent data, 10 typed tables (`models_toasty.rs`: endpoints, endpoint_ip, protocols, profile_stats, endpoint_groups, groups, routing_rules, dns_settings, route_probes, endpoint_rank). Schema pushed once by toasty's `db.push_schema()` under a `PRAGMA user_version=13` tag (8 = `endpoint_rank` (ADR 0003), 9 = the durable-facts pass, 10 = `endpoint_ip` (ADR 0005), 11 = `endpoint_ip.country`, 12 = `profile_stats.purge_reason` (ADR 0006), 13 = no column change — a ws-identity re-key only; the project is pre-alpha, so a schema change arrives by wiping, not by migration) — `push_schema` is not idempotent (CREATE TABLE without IF NOT EXISTS), so the tag skips re-push on reopen; it is a tag, not migration machinery (on a mismatch `Database::open` deletes the db file and recreates it, so bumping the tag WIPES user data — a bump is never a migration). All DB methods are `async fn` on `Database` struct backed by `toasty::Db`; `Database::open()` accepts impl AsRef<Path>. Raw SQL is not banned outright — it requires a recorded cause: the typed path is the default, and `docs/database-manual-sql.md` is the authority for every hand-written statement (its cause, its measurement, the Toasty blockers behind it, and the rejected alternatives). No system groups (All/Graveyard are view filters — `PurgatoryView` — not rows; `Group` has no `is_system`). Toasty v0.10 with `turso` driver for async SQLite.
+4. **SQLite via toasty ORM (async)** — Single DB file for all persistent data, 10 typed tables (`models_toasty.rs`: endpoints, endpoint_ip, protocols, profile_stats, endpoint_groups, groups, routing_rules, dns_settings, route_probes, endpoint_rank). Schema pushed once by toasty's `db.push_schema()` under a `PRAGMA user_version=13` tag (8 = `endpoint_rank` (ADR 0003), 9 = the durable-facts pass, 10 = `endpoint_ip` (ADR 0005), 11 = `endpoint_ip.country`, 12 = `profile_stats.purge_reason` (ADR 0006), 13 = no column change — a ws-identity re-key only; the project is pre-alpha, so a schema change arrives by wiping, not by migration) — `push_schema` is not idempotent (CREATE TABLE without IF NOT EXISTS), so the tag skips re-push on reopen; it is a tag, not migration machinery (on a mismatch `Database::open` deletes the db file and recreates it, so bumping the tag WIPES user data — a bump is never a migration). All DB methods are `async fn` on `Database` struct backed by `toasty::Db`; `Database::open()` accepts impl AsRef<Path>. Raw SQL is not banned outright — it requires a recorded cause: the typed path is the default, and `docs/database-manual-sql.md` is the authority for every hand-written statement (its cause, its measurement, the Toasty blockers behind it, and the rejected alternatives). No system groups (All/Graveyard are view filters — `PurgatoryView` — not rows; `Group` has no `is_system`). Toasty v0.11 with `turso` driver for async SQLite.
 5. **Config generation** — Two builders: xray.rs (ports v2rayN's CoreConfigContextBuilder) and singbox.rs (ports sing-box JSON format).
 6. **gRPC stats abstraction**: `StatsProvider` trait with unified `GrpcStatsClient` (both backends share the same V2Ray Stats gRPC API).
 7. **Sing-box config differs structurally** from xray-core: `type` vs `protocol`, `route` vs `routing`, `experimental.v2ray_api` vs `stats`+`api`+`policy`, different TLS/transport key names.
@@ -281,7 +281,7 @@ Identity is a frozen wire format — `scripts`-less, order-sensitive, and re-key
 - Use `tokio` for async runtime
 - gRPC via `tonic` crate
 - `reqwest` for HTTP client (subscription fetch)
-- `toasty` ORM v0.10 with `toasty-driver-turso` for async SQLite
+- `toasty` ORM v0.11 with `toasty-driver-turso` for async SQLite
 - `tracing` for diagnostic event system (subscriber in bin crate, macros in lib crates)
 - `tracing-subscriber` for event filtering, formatting, and TuiLogLayer routing
 - `escape8259` for JSON string unescaping
@@ -302,16 +302,72 @@ Identity is a frozen wire format — `scripts`-less, order-sensitive, and re-key
 	- Hakari (`hakari-check` recipe) runs the documented trio: `cargo hakari generate --diff` (workspace-hack
 	  Cargo.toml up-to-date) + `cargo hakari manage-deps --dry-run` (every member depends on it) + `cargo hakari verify`
 	  (one feature set per crate). `verify` alone does NOT catch a stale hack or a member missing the dependency.
+	- **The two advisory gates disagree, and the cause DIFFERS per advisory — read both.**
+	  `cargo audit` (config `.cargo/audit.toml`) scans **Cargo.lock**, so it sees
+	  unactivated optional resolutions; it sets
+	  `informational_warnings = ["unmaintained", "unsound", "notice"]`, which
+	  DOWNGRADES those classes to allowed warnings (exit 0).
+	  `cargo deny check advisories` (config `deny.toml`, which has **no**
+	  `[advisories]` section) walks the **resolved feature graph**, so an
+	  unactivated optional dep is invisible to it entirely, and an advisory in
+	  that class is a hard error. That asymmetry is why `bincode` via heed's
+	  `serde-bincode` default feature was green in `audit` and RED in `deny`,
+	  and it is fixed at the source (`heed` `default-features = false`, since
+	  the LMDB store uses heed's native `U64BE`/`Bytes`/`Str`/`Unit` types and
+	  encodes by hand with postcard) rather than by muting either tool.
+	  **CONSEQUENCE — `cargo deny check advisories` currently under-covers this
+	  tree, and its green is NOT evidence of safety. Treat `cargo audit` as the
+	  advisory gate of record.** Observed 2026-09-28 on cargo-deny 0.20.2:
+	  `audit` reports 2 allowed warnings, `deny` reports ZERO. What is
+	  PROVEN, and what is not:
+	  - `RUSTSEC-2025-0134` (`rustls-pemfile`, unmaintained) — EXPLAINED. It is
+	    a lock-only entry: `cargo tree -i rustls-pemfile` resolves nothing
+	    (toasty's optional postgresql driver is never activated), so `deny`,
+	    which walks the resolved graph, cannot see it. `audit` scans
+	    `Cargo.lock` and does. This half of the divergence is real and expected.
+	  - `RUSTSEC-2026-0253` (`lru` 0.16.4, unsound) — **UNEXPLAINED.** The
+	    advisory IS in deny's own DB (`~/.cargo/advisory-dbs/advisory-db-*`,
+	    1252 entries, HEAD current) with TOML structurally identical to the
+	    `bincode` advisory deny demonstrably DID report; `lru` 0.16.4 IS in
+	    deny's graph (`cargo deny check bans` names both 0.16.4 and 0.18.5);
+	    and `--deny unsound --deny unmaintained` (values validated — a bogus one
+	    errors) still returns `advisories ok`. Every alternative is ruled out
+	    and the mechanism is still not pinned — do not restate a guess as fact.
+	    Re-verify before relying on any explanation.
+	  - Blast radius: `lru` is `patched = [">= 0.18.2"]`, so the DIRECT
+	    `lru = "0.18.5"` is already on the fixed side. Only the transitive
+	    0.16.4 under turso→tantivy is exposed, and `LruCache::pop` is never
+	    called on that path. Do not downgrade the direct dep over this.
+	  Re-check with `cargo deny check advisories` vs `cargo audit`; if they
+	  disagree, believe `audit`.
 	- Unused deps: `cargo machete --with-metadata --skip-target-dir`; ignores live in
 	  `[package/workspace.metadata.cargo-machete]` (Cargo.toml). The hakari crate's
 	  deps are ignored by design — regenerate its list after `cargo hakari generate`:
 	  `awk '/^\[/ {in_deps = ($0 ~ /dependencies\]/)} in_deps && /^[a-zA-Z0-9_-]+ = \{/ {print $1}' Cargo.toml | sort -u`
 	  (`--exit-code 0`); direct deps are kept at latest — semver-major tracks
-	  (toasty 0.10, base64 0.23, brotli 8, sha2 0.11) are applied with their
-	  breaking-change fixes. Residual entries are graph-inherent dual-major pins
-	  in the generated `xray-tui-hakari` (base64 0.22 via dns-stamp-parser,
-	  compact_str 0.9 via ratatui, hashbrown 0.16 via yaml-rust2, syn 2,
-	  windows-sys platform pins), so the gate never hard-fails on them
+	  (toasty 0.11, maxminddb 0.32, compact_str 0.10, brotli 9, zstd 0.14,
+	  yaml-rust2 0.13, rstest 0.27, ratatui-themes 0.3, dirs 7, base64 0.23,
+	  sha2 0.11) are applied with their breaking-change fixes; every one of
+	  them landed as a manifest-only edit (no source *behaviour* change — the
+	  only source touches were a `cargo fmt` whitespace cleanup in
+	  `log_heed.rs` and a comment-only version correction in the three native
+	  e2e test files that cite rstest 0.26.1 in their
+	  `#![allow(clippy::future_not_send)]` justification). The residual
+	  `cargo outdated` rows are all
+	  transitive-only, graph-inherent dual-major pins in the generated
+	  `xray-tui-hakari`; each is named with its REAL parent, resolved via
+	  `cargo tree -i <crate>@<ver> -e normal` after this upgrade (note: the
+	  older "hashbrown 0.16 via yaml-rust2" attribution was wrong — yaml-rust2
+	  0.13 moved to hashlink 0.12.2): base64 0.22 via dns-stamp-parser /
+	  tantivy / tonic; compact_str 0.9 via ratatui-core 0.1.2 (upstream has not
+	  shipped its own 0.10 bump); hashbrown 0.14 via dashmap, 0.16 via lru 0.16
+	  (turso→tantivy) + kasuari, against 0.17 via hashlink/indexmap/lru 0.18;
+	  nom 7 via tantivy-query-grammar; unicode-truncate 2 via ratatui-core;
+	  constant_time_eq 0.4 via blake3 + zip; itertools 0.14 via prost-derive +
+	  ratatui; quinn-udp 0.5 via quinn 0.11; rand_core 0.6 via crypto-common;
+	  tower-http 0.6 via reqwest; syn 1/2 vs 3 (build); getrandom 0.2/0.3/0.4 and
+	  windows-sys 0.52/0.59/0.60/0.61 platform pins — only upstream bumps
+	  remove them, so the gate never hard-fails on them
 - Benchmarks: `just bench` (`micro` = record + decide + dispatch + ss_codec + relay + identity, no core
   binaries needed; `all` adds the `throughput` matrix and refuses to start without the pinned cores). Seven
   criterion targets: `xray-tui-tls/record` (record layer), `xray-tui-route/decide` (routing),

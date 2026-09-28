@@ -16,7 +16,7 @@ zeroize.workspace = true
 # Constant-time comparison for the REALITY certificate HMAC
 # (`reality::verify`). `subtle` is the audited primitive; the previous
 # hand-rolled XOR fold is gone.
-subtle = { version = "2", default-features = false }
+subtle = { version = "2.6.1", default-features = false }
 # REALITY's ephemeral keypair must agree TWICE (auth with the static pbk,
 # TLS with the server's ephemeral keyshare) — ring 0.17's
 # EphemeralPrivateKey is single-use and cannot be serialized, so the
@@ -24,17 +24,17 @@ subtle = { version = "2", default-features = false }
 # `zeroize` is in dalek's DEFAULT feature set — `default-features = false`
 # turns it off, so without listing it here the REALITY scalar and every
 # `SharedSecret` would be dropped unwiped.
-x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
+x25519-dalek.workspace = true
 # async I/O seam
 tokio = { workspace = true, features = ["io-util", "time", "rt", "sync"] }
 # cert verification
-rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
-rustls-pki-types = "1"
-webpki-roots = "1"
+rustls-webpki = { version = "0.103.15", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15.1"
+webpki-roots.workspace = true
 # JA3 hash
-md-5 = "0.11"
+md-5.workspace = true
 # JA4 hash segments (sha256 truncated)
-sha2 = "0.11"
+sha2.workspace = true
 # JSON parsing for the tls.peet.ws grader (example + ignored network test)
 serde_json.workspace = true
 # Fingerprint selection persistence (TUI settings)
@@ -51,15 +51,15 @@ ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize"] }
 # RNG trait for the adapter in `crypto::mlkem`: `RingRng` bridges ring's CSPRNG
 # into `encapsulate_with_rng`, so ML-KEM key material keeps the workspace's one
 # RNG provider instead of a second OS-RNG path.
-rand_core = { version = "0.10", default-features = false }
+rand_core = { version = "0.10.1", default-features = false }
 # Certificate decompression (RFC 8879) — the engine advertises
 # `compress_certificate` in its fingerprints (Chrome offers brotli+zstd), so
 # a real server (e.g. Cloudflare) may return a compressed Certificate
 # message; the client must decompress the offered algorithms. flate2/zstd
 # are already in the workspace lockfile; brotli is new.
-flate2 = "1.1"
-brotli = "8"
-zstd = "0.13"
+flate2.workspace = true
+brotli = "9.0.0"
+zstd = "0.14.0"
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 [lints]
 workspace = true
@@ -67,8 +67,8 @@ workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
 # Inf. locks for the recording http2 test server (workspace already uses 0.12).
-parking_lot = "0.12"
-rcgen = "0.14"
+parking_lot.workspace = true
+rcgen.workspace = true
 rstest.workspace = true
 # Interop proof: our client handshakes against a real rustls server. The
 # workspace dep pins default-features = false (ring is the workspace's

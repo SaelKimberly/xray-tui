@@ -4,7 +4,7 @@
 //! server config is the same for the standard and fingerprint rows (only the
 //! client hello differs — `with_tls`).
 //!
-//! `clippy::future_not_send` is allowed file-wide: rstest 0.26.1 clears the
+//! `clippy::future_not_send` is allowed file-wide: rstest 0.27.0 clears the
 //! source fn's attributes when embedding it beside the generated tests (see
 //! `vmess.rs`).
 #![allow(clippy::future_not_send)]

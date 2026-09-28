@@ -14,8 +14,8 @@ thiserror.workspace = true
 
 # ============ Text / Search / Hash ============
 aho-corasick.workspace = true
-regex = "1.11"
-parking_lot = "0.12"
+regex = "1.13.1"
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 # ============ Sniffing (QUIC Initial packet decryption) ============
@@ -26,15 +26,14 @@ ring.workspace = true
 jiff.workspace = true
 
 # ============ Bounded caches ============
-# Memory-diet Task 6 (B-slice gate): `ResolvedCache` LRU bound. `lru 0.18`
-# matches the workspace pick (xray-tui) and is already in Cargo.lock.
-lru = "0.18"
+# Memory-diet Task 6 (B-slice gate): `ResolvedCache` LRU bound.
+lru.workspace = true
 
 # ============ Payload Buffers ============
 # Task 2 relay convention: the datapath carries payload bytes as `Bytes`
 # (zero-copy slices); `ConnMeta.payload_prefix` shares that buffer instead
 # of owning a `Vec` copy.
-bytes = "1"
+bytes.workspace = true
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [features]
@@ -61,7 +60,7 @@ harness = false
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
-xray-tui-tls = { version = "0.1", path = "../xray-tui-tls" }
+xray-tui-tls.workspace = true
 # Routing decision benches (`benches/decide.rs`): criterion harness only —
 # the engine's decide path is synchronous, so no async feature is needed.
 criterion = { workspace = true }

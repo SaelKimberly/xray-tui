@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 # ============ DNS ============
-hickory-resolver = { version = "0.26", features = ["tls-ring", "https-ring", "quic-ring", "webpki-roots"] }
+hickory-resolver = { version = "0.26.3", features = ["tls-ring", "https-ring", "quic-ring", "webpki-roots"] }
 dns-stamp-parser = "3.0.1"
 
 # ============ Async Runtime & I/O ============
@@ -30,5 +30,5 @@ xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

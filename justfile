@@ -50,12 +50,18 @@ machete mode='report':
     @cargo machete --with-metadata --skip-target-dir
 
 # Outdated direct dependencies. Informational by design (`--exit-code 0`):
-# direct deps are kept at latest (semver-major tracks toasty 0.10, base64 0.23,
-# brotli 8, sha2 0.11 are applied with breakage fixes). The residual entries are
-# graph-inherent dual-major pins in the generated xray-tui-hakari (e.g.
-# base64 0.22 via dns-stamp-parser, hashbrown 0.16 via yaml-rust2,
-# compact_str 0.9 via ratatui, syn 2, windows-sys platform pins) that only
-# upstream bumps can remove, so a hard fail would keep the gate red indefinitely.
+# direct deps are kept at latest (semver-major tracks toasty 0.11, maxminddb
+# 0.32, compact_str 0.10, brotli 9, zstd 0.14, yaml-rust2 0.13, rstest 0.27,
+# ratatui-themes 0.3, dirs 7, base64 0.23, sha2 0.11 are applied with breakage
+# fixes — all landed as manifest-only edits). The residual entries are
+# transitive-only, graph-inherent dual-major pins in the generated
+# xray-tui-hakari, e.g. base64 0.22 via dns-stamp-parser/tantivy/tonic,
+# compact_str 0.9 via ratatui-core 0.1.2, hashbrown 0.16 via lru 0.16 (NOT
+# yaml-rust2, which moved to hashlink 0.12.2), nom 7 via tantivy-query-grammar,
+# unicode-truncate 2 via ratatui-core, constant_time_eq 0.4 via blake3 + zip,
+# quinn-udp 0.5 via quinn, tower-http 0.6 via reqwest, syn 2 vs 3, and the
+# getrandom/windows-sys platform pins — only upstream bumps remove them, so a
+# hard fail would keep the gate red indefinitely.
 outdated mode='report':
     @cargo outdated --workspace --root-deps-only --exit-code 0 {{ if mode == "ci" { "--quiet" } else { "" } }}
 
