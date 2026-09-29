@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod connect;
 pub mod core;
 pub mod db_monitor;

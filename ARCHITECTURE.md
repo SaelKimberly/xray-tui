@@ -44,6 +44,8 @@ Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, i
 
 `xray-tui-db/src/export.rs` owns the file-backed direct Turso read path. Toasty 0.10 public/raw APIs buffer values, so export opens a fresh dedicated Turso connection, applies the existing WAL/MVCC journal-mode authority, begins the matching read transaction, and drains ordered rows before commit/rollback. `xray-tui/src/ops/export.rs` owns scope policy, Resolved host transformation, and bounded clipboard/file sinks; `ui/export.rs` owns popup interaction. Export never uses a second fallback serializer.
 
+The clipboard sink is not a direct `arboard` call. `arboard::Clipboard` on Linux *is* the X11 selection owner, so `ops/clipboard.rs` keeps one process-lifetime handle (`LazyLock<Mutex<Option<Clipboard>>>`) and every copy/paste site goes through it — export, the three logs-copy paths, and the paste/copy-URL keys. A per-call handle destroys the serving window in `Drop`, leaving the payload readable only if a clipboard manager wins a 100 ms handover race; without one (headless, SSH, bare X) the app logs a successful export and the clipboard never changes.
+
 **Shared state** (`crates/xray-tui/src/state.rs`):
 
 ```rust

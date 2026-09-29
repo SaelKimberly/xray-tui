@@ -879,10 +879,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && state.current_tab == Tab::Profiles =>
         {
-            let clipboard_text = arboard::Clipboard::new()
-                .ok()
-                .and_then(|mut cb| cb.get_text().ok())
-                .unwrap_or_default();
+            let clipboard_text = crate::ops::clipboard::get_text().unwrap_or_default();
 
             let urls = subscription_url_split(&clipboard_text);
             match urls.len() {
@@ -930,16 +927,11 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 _ => None,
             };
             match url {
-                Some(url) => match arboard::Clipboard::new() {
-                    Ok(mut cb) => {
-                        if let Err(e) = cb.set_text(url) {
-                            state.log_trace("error", "tui::ui", &format!("Copy failed: {e}"));
-                        }
+                Some(url) => {
+                    if let Err(error) = crate::ops::clipboard::set_text(url) {
+                        state.log_trace("error", "tui::ui", &format!("Copy failed: {error}"));
                     }
-                    Err(e) => {
-                        state.log_trace("error", "tui::ui", &format!("Clipboard unavailable: {e}"));
-                    }
-                },
+                }
                 None => state.log_trace(
                     "error",
                     "tui::ui",

@@ -657,7 +657,7 @@ fn clipboard_line(log: &crate::LogLine) -> String {
 }
 
 /// Copy the selected log range to the system clipboard.
-fn copy_selection(state: &AppState) {
+fn copy_selection(state: &mut AppState) {
     let Some(anchor) = state.log_select_anchor else {
         return copy_cursor_line(state);
     };
@@ -698,13 +698,11 @@ fn copy_selection(state: &AppState) {
         return;
     }
     let text = lines.join("\n");
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text);
-    }
+    copy_to_clipboard(state, text);
 }
 
 /// Copy the log line under the cursor to the system clipboard.
-fn copy_cursor_line(state: &AppState) {
+fn copy_cursor_line(state: &mut AppState) {
     if state.log_cache.is_empty() {
         return;
     }
@@ -732,13 +730,11 @@ fn copy_cursor_line(state: &AppState) {
         return;
     };
     let text = clipboard_line(log);
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text);
-    }
+    copy_to_clipboard(state, text);
 }
 
 /// Copy ALL filtered log entries to the system clipboard.
-fn copy_all_filtered(state: &AppState) {
+fn copy_all_filtered(state: &mut AppState) {
     if state.log_cache.is_empty() {
         return;
     }
@@ -752,12 +748,19 @@ fn copy_all_filtered(state: &AppState) {
         return;
     }
     let text = lines.join("\n");
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text);
-    }
+    copy_to_clipboard(state, text);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Write to the shared clipboard handle and surface a failure. Copy failures
+/// used to be dropped here, so a broken clipboard looked identical to a
+/// successful copy.
+fn copy_to_clipboard(state: &mut AppState, text: String) {
+    if let Err(error) = crate::ops::clipboard::set_text(text) {
+        state.log_trace("error", "tui::ui::logs", &format!("Copy failed: {error}"));
+    }
+}
 
 fn fmt_ts(ts_nanos: i64) -> String {
     let secs = if ts_nanos >= 0 {

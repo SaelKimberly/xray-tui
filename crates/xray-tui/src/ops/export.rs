@@ -214,12 +214,12 @@ impl ClipboardBuffer {
         started: std::time::Instant,
         _emitted_count: u64,
     ) -> Result<(), ExportError> {
-        let mut clipboard =
-            arboard::Clipboard::new().map_err(|error| ExportError::Clipboard(error.to_string()))?;
-        clipboard
-            .set_text(std::mem::take(&mut self.text))
-            .map_err(|error| ExportError::Clipboard(error.to_string()))?;
-        tracing::debug!(target: "tui::ops::export", scope = scope.title(), elapsed_ms = started.elapsed().as_millis(), "clipboard export complete");
+        let text = std::mem::take(&mut self.text);
+        let bytes = text.len();
+        // The shared handle owns the X11 selection; a local create-set-drop
+        // would lose the payload the moment it drops (see ops::clipboard).
+        crate::ops::clipboard::set_text(text).map_err(ExportError::Clipboard)?;
+        tracing::debug!(target: "tui::ops::export", scope = scope.title(), bytes, elapsed_ms = started.elapsed().as_millis(), "clipboard export complete");
         Ok(())
     }
 }
