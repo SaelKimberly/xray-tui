@@ -11,6 +11,12 @@
     clippy::used_underscore_binding,
     reason = "toasty-macros synthesizes `_0`-named parameters in the Update builder setters for unnamed tuple fields (`EndpointId`, `ProtocolId`) and uses them; the generated impls carry the field's span so no narrower scope reaches them, and no handwritten code here uses underscore-prefixed bindings"
 )]
+// Same root cause, different lint: `#[shared(..)]` emits one accessor per
+// variant that reads the shared column, and the expansion takes `&self` without
+// using it. The lint's span is the VARIANT, so an allow on the variant or the
+// enum does not reach it — only this module scope does, and no handwritten code
+// in this file defines a method that ignores `self`.
+#![allow(clippy::unused_self)]
 
 use std::collections::HashMap;
 
@@ -983,6 +989,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         })
     }
 

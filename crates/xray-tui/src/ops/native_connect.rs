@@ -81,6 +81,7 @@ pub async fn run_native_session(
 
     let proxy = ProxyOutbound {
         protocol: config,
+        kind: protocol.proto_kind,
         server: endpoint_essentials(endpoint),
         resolved_ip: None,
     };

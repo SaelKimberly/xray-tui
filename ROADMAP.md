@@ -372,3 +372,41 @@
 - ✅ Clipboard writes stop silently no-opping — `Ctrl+E` export (every scope) and the three Logs copy paths reported success while the clipboard never changed on any desktop without a clipboard manager. `arboard::Clipboard` on Linux IS the X11 selection owner, so the create-set-drop in `ClipboardBuffer::finish` destroyed the serving window in `Drop`; the payload survived only if a manager won a hard 100 ms handover race, and `set_text` had already returned `Ok`. A single process-lifetime handle in `ops/clipboard.rs` now backs export, logs copy, paste and copy-URL; copy errors surface instead of being swallowed.
 - ✅ Verified on a bare X server (`Xvfb`, no clipboard manager), the only environment where the defect is visible — 985,439 bytes delivered where the old code returned 0. A dev box WITH a manager reproduces the bug as a false success, so clipboard work must be checked there, not on the desktop. A display-less session returns `Err` per call and retries (infallible `LazyLock<Mutex<Option<..>>>` init: a panicking initializer would poison the cell for the rest of the process).
 - ☐ `Database::open`'s recovery branch (`database.rs:250-264`) deletes the DB file on ANY `try_open_db` error, so a lock/contention failure — a second app instance against a live file — silently wipes a healthy database. It must distinguish real corruption from a transient open failure. (Observed 2026-09-29: a live 4.8 MB / 4,669-stat file reduced to 132 KB / 0 rows, schema and `user_version` intact, so the error branch and not a tag mismatch.)
+
+## Phase 30 — Shadowsocks SIP003 plugins + VLESS TCP mux ✅ (except `mode=quic`)
+
+- ✅ Typed, lossless SIP003 model (`proto_spec/ss_plugin.rs`) — `PluginSpec` replaces the old
+  `plugin` + `plugin_opts` map pair; every wire key lands in a typed field or `extra`, and an
+  unsupported spelling is PRESERVED (`Invalid(value)`) rather than rewritten to a default that
+  would dial a server neither spelling describes. `SsConfig::plugin_opts` is **removed**, no shim.
+- ✅ simple-obfs + v2ray-plugin framing, served natively (`transport/v2ray/`) — `obfs=http`,
+  `obfs=tls` (a synthetic-TLS record writer, layouts pinned against real `sizeof`/`offsetof`), and
+  `mode=websocket` (+`tls`, early data OFF). TLS stays outermost, so no chain phase is skipped.
+- ✅ Plugin mux as the protocol phase (`transport/mux.rs` extracted from `protocol/vless/mux.rs` so
+  both families share ONE codec; `protocol/ss/mux.rs` takes a per-session SS codec;
+  `mux_session.rs` owns session/tunnel lifetime so a session id can never be duplicated).
+- ✅ VLESS `mux` end to end — field, five parse forms, value-bearing identity, form fields
+  (defaulted ABSENT so a form row and an imported row agree), Clash round trip. Usable spellings
+  (`smux`/`yamux`/`h2mux`, unparseable values) are STORED and refused **by name** at `capability`,
+  never at parse, so the row stays importable/exportable/`[untestable]`/purge-safe. Vision × mux
+  is refused by name (Xray accepts vision only with its XUDP port-666 multiplexer).
+- ✅ Batch pipeline fix (spec §8.1) — a datagram-mode row is no longer retired by a TCP fast
+  failure it could never measure, in **either** batch kind, and that marker is retracted. The
+  retraction re-stages the plan-time snapshot rather than blanking it, so a valid earlier marker
+  survives. The single-ping fast path declines such a row outright.
+- ✅ `outbound::dial` re-checks `capability` before opening a socket — it is the in-process surface
+  the SOCKS5/HTTP inbound calls, and nothing on that path consulted the gate.
+- ✅ Verification: tier-3b real-oracle rows against a live `v2ray-plugin`/`obfs-server`, plus a
+  **structural** tier-3a differential against sing-box's in-process plugin client (raw-byte
+  equality is not the claim — the WS key and the target session id must differ). Opt-in via
+  `just plugin-bins`; a skip is not green.
+- ✅ Schema tag 13 → 14 and `IDENTITY_VERSION` 1 → 2 — no column change, but every Shadowsocks and
+  VLESS-mux uid re-keys, so the stored database is recreated on first launch. Stated in the release
+  notes (`docs/aegis/2026-10-01-ss-plugin-release-notes.md`).
+- ☐ **`mode=quic` — stopped at its own evidence gate, by design.** The client wire could not be
+  pinned: the reference server (v2ray-plugin v1.3.2) embeds V2Ray 4.38.3, whose source is not in
+  this repository, and three mutually incompatible QUIC wires are in-tree — so a guess would fail as
+  an opaque handshake timeout. It is refused by name (`capability::QUIC_WIRE_UNPINNED`) BEFORE any
+  dial, which also fixes the live defect it exposed: such a row used to open a TCP connection to a
+  server answering on UDP/443. Unblocking needs the plugin's source or an upstream statement of its
+  QUIC client's key/header/ALPN. Evidence: `docs/aegis/plans/2026-09-30-ss-plugin.md` (T22).

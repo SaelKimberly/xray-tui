@@ -1323,8 +1323,10 @@ mod page_window_tests {
         symbols
             .char_indices()
             .find(|(_, symbol)| matches!(*symbol, '█' | '▄' | '▀'))
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| panic!("scrollbar glyphs: {symbols:?}"))
+            .map_or_else(
+                || panic!("scrollbar glyphs: {symbols:?}"),
+                |(index, _)| index,
+            )
     }
 
     #[tokio::test]

@@ -346,19 +346,100 @@ pub async fn connect_udp(
     }
 }
 
-/// Run the mux protocol phase: VLESS command 0x03 + v1.mux.cool framing
-/// over the given stream — the last link of a `connect_mux` chain.
+/// What a mux tunnel hands back, per family.
 ///
-/// Only VLESS has a native mux path; every other protocol stays
-/// `NotImplemented` here.
-pub async fn connect_mux(
-    ctx: &LinkContext,
-    stream: BoxStream,
-) -> Result<crate::protocol::vless::MuxClient<BoxStream>, NativeError> {
+/// They are NOT the same type, and that is the point (spec §5.2).
+///
+/// VLESS's codec sits *under* the multiplexer, so its sessions are already framed by
+/// the time they leave it. A Shadowsocks plugin row's codec must sit *above* each
+/// session — one salt/subkey/counter stream is one SS connection — so it is
+/// [`ss::mux::SsMux`], which opens a session and runs that session's own handshake.
+/// The multiplexer is boxed so the two variants differ in size by a pointer, not by
+/// the multiplexer itself.
+// Deliberately NOT `Clone`: a derived clone would hand out duplicate session ids
+// against the same tunnel (the allocator is an `AtomicU16` plus `Arc`ed maps).
+// A caller that needs a handle keeps an `Arc` explicitly, as `probe_mux` does.
+pub enum MuxTunnel {
+    /// VLESS: sessions are ready to read. `Arc` because a tunnel is shared by
+    /// every session opened on it (and because it is not `Clone` itself).
+    Vless(std::sync::Arc<crate::protocol::vless::MuxClient<BoxStream>>),
+    /// Shadowsocks with a plugin: sessions still need their codec.
+    Ss(std::sync::Arc<ss::mux::SsMux>),
+}
+
+impl MuxTunnel {
+    /// Open one session, whatever the family, and return a ready byte stream.
+    ///
+    /// The application destination goes in: for VLESS it is the mux frame's target
+    /// (the server routes it), and for a plugin row it is the SS handshake's address,
+    /// because the New frame's address is a dummy the server overrides.
+    pub async fn open_session(
+        &self,
+        target: &crate::addr::TargetAddr,
+    ) -> Result<BoxStream, NativeError> {
+        match self {
+            Self::Vless(client) => {
+                let frame_target = mux_target(target);
+                let session = client
+                    .open_session(frame_target)
+                    .await
+                    .map_err(|e| NativeError::Transport(format!("mux session: {e}")))?;
+                Ok(Box::new(session))
+            }
+            Self::Ss(mux) => mux.open_session(target).await,
+        }
+    }
+}
+
+/// The `New`-frame target for an application destination.
+///
+/// A real destination, NOT the plugin dummy: this is the VLESS path, whose server
+/// routes the frame's target. The plugin path never uses it — there the frame carries
+/// the dummy and the SS handshake carries the real address.
+fn mux_target(target: &crate::addr::TargetAddr) -> crate::transport::mux::MuxTarget {
+    use std::net::SocketAddr;
+
+    use crate::addr::Host;
+    use crate::transport::mux::MuxTarget;
+    match &target.host {
+        Host::Ip(ip) => MuxTarget::Tcp(SocketAddr::new(*ip, target.port)),
+        Host::Domain(domain) => MuxTarget::TcpDomain(domain.clone(), target.port),
+    }
+}
+
+/// Run the mux protocol phase over the given stream.
+///
+/// The last link of a `connect_mux` chain. VLESS writes its `command = 0x03`
+/// header first; a Shadowsocks plugin row has no header to write, and its codec
+/// moves per session.
+pub async fn connect_mux(ctx: &LinkContext, stream: BoxStream) -> Result<MuxTunnel, NativeError> {
     match &ctx.params.protocol {
-        ProtocolConfig::Vless(cfg) => vless::connect_mux(ctx, stream, cfg).await,
+        ProtocolConfig::Vless(cfg) => Ok(MuxTunnel::Vless(std::sync::Arc::new(
+            vless::connect_mux(ctx, stream, cfg).await?,
+        ))),
+        ProtocolConfig::Ss(cfg) => {
+            let spec = ctx.plugin_spec().ok_or_else(|| {
+                NativeError::Config(
+                    "shadowsocks mux requested for a row with no plugin — the plain SS path \
+                     does not multiplex"
+                        .into(),
+                )
+            })?;
+            if !spec.mux_active() {
+                return Err(NativeError::Config(format!(
+                    "shadowsocks plugin `{}` resolves mux off (stored {:?}); the mux path does \
+                     not apply to it",
+                    spec.name, spec.mux
+                )));
+            }
+            Ok(MuxTunnel::Ss(std::sync::Arc::new(ss::mux::SsMux::new(
+                stream,
+                cfg.clone(),
+            )?)))
+        }
         _ => Err(NativeError::NotImplemented {
-            feature: "mux protocol connect (native mux path is vless-only)".into(),
+            feature: "mux protocol connect (native mux paths are vless and shadowsocks+plugin)"
+                .into(),
         }),
     }
 }

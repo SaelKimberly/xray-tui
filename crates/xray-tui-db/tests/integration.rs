@@ -116,6 +116,7 @@ fn vless_config() -> ProtocolConfig {
         path: None,
         splice: None,
         remarks: None,
+        mux: None,
     })
 }
 
@@ -1630,7 +1631,7 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     });
     assert_eq!(journal_mode, Some("wal"));
 
-    // Fresh open writes the typed schema AND tags it `user_version=13` so a
+    // Fresh open writes the typed schema AND tags it `user_version=14` so a
     // reopen can skip push_schema.
     let rows = toasty::sql::query("PRAGMA user_version")
         .exec(&mut conn)
@@ -1638,8 +1639,8 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .expect("read version");
     assert_eq!(
         first_i64(&rows),
-        Some(13),
-        "fresh open must tag the schema user_version=13"
+        Some(xray_tui_db::SCHEMA_VERSION),
+        "fresh open must tag the schema with the crate's SCHEMA_VERSION"
     );
     let rows = toasty::sql::query(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
@@ -1677,7 +1678,11 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         .exec(&mut conn)
         .await
         .expect("read version");
-    assert_eq!(first_i64(&rows), Some(13), "reopen keeps the schema tag");
+    assert_eq!(
+        first_i64(&rows),
+        Some(xray_tui_db::SCHEMA_VERSION),
+        "reopen keeps the schema tag"
+    );
     assert!(
         Endpoint::filter_by_id(EndpointId::new(9))
             .first()
@@ -1727,7 +1732,7 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         .expect("version");
     assert_eq!(
         first_i64(&rows),
-        Some(13),
+        Some(xray_tui_db::SCHEMA_VERSION),
         "the file is rebuilt at the new tag"
     );
     let rows = toasty::sql::query(

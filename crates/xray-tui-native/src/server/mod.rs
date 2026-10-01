@@ -316,6 +316,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         });
         let (name, transport, security) = trace_meta_of_protocol(&cfg);
         assert_eq!(&name[..], "vless");
@@ -364,6 +365,7 @@ mod tests {
             socks,
             http,
             ProxyOutbound {
+                kind: xray_tui_proto::proto_spec::ProtocolKind::Vless,
                 protocol: ProtocolConfig::Vless(VlessConfig {
                     uuid: "00000000-0000-0000-0000-000000000000".into(),
                     uuid_origin: None,
@@ -374,6 +376,7 @@ mod tests {
                     path: None,
                     splice: None,
                     remarks: None,
+                    mux: None,
                 }),
                 server: EndpointEssentials::new("example.com", 443),
                 resolved_ip: None,

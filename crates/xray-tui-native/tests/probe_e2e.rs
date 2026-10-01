@@ -173,6 +173,7 @@ async fn probe_through_real_xray_vless_server() {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         }),
         EndpointEssentials {
             host: "127.0.0.1".to_string(),

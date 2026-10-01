@@ -1406,9 +1406,106 @@ pub(crate) mod xray_tui_db_helper {
                 path: None,
                 splice: None,
                 remarks: None,
+                mux: None,
             }))),
             created_at: ts(0),
             links: Deferred::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod uid_fixed_point_tests {
+    use super::test_support::test_state;
+    use toasty::{Deferred, Json};
+    use xray_tui_db::models::{Protocol, ProtocolId, Security, Transport};
+    use xray_tui_proto::proto_spec::common::{SecurityConfig, TransportConfig};
+    use xray_tui_proto::proto_spec::{
+        EndpointEssentials, ProtocolConfig, ProtocolKind, SecurityType, TransportType,
+    };
+
+    /// Row 20 at the level it actually claims: `uid(parse(export(row))) ==
+    /// uid(row)` **for a stored row**. The proto-crate test proves re-parse
+    /// equivalence, which cannot fail if the DATABASE hands back a different uid
+    /// than the config computes — and the database is the thing rows are keyed
+    /// by. So this persists a plugin row, reads the uid back OUT of the table,
+    /// and requires the export→re-import cycle to land on that same number.
+    #[tokio::test]
+    async fn a_stored_plugin_row_keeps_its_db_uid_through_export() {
+        for (label, opts) in [
+            ("host-stating, tls", "mode=websocket;host=cdn.example;tls"),
+            ("host-less", "mode=websocket;tls"),
+            ("mux on", "mode=websocket;host=cdn.example;mux=1"),
+        ] {
+            // The stored config comes from the PARSE below, not from a
+            // hand-built twin: the point is the uid the importer would compute,
+            // so a fixture assembled here would test the fixture.
+            let parsed = ProtocolConfig::try_parse_proto(&xray_tui_proto::urlx::RawUrlX::from(
+                format!(
+                    "ss://YWVzLTI1Ni1nY206cHc@1.2.3.4:8388?plugin={}",
+                    opts.replace(';', "%3B")
+                )
+                .as_str(),
+            ))
+            .expect("the fixture URL parses");
+            let expected_uid = parsed.identity_once().2;
+            // Use the parsed config (not the hand-built one) so the number is the
+            // one the importer would store.
+            let stored_config = parsed.protocol.config.clone();
+
+            let state = test_state(Vec::new()).await;
+            let protocol = Protocol {
+                id: ProtocolId::new(expected_uid),
+                sig: parsed.identity_once().0,
+                proto_kind: ProtocolKind::Shadowsocks,
+                transport: Transport {
+                    r#type: TransportType::Tcp,
+                    data: Deferred::from(Json(TransportConfig::Tcp)),
+                },
+                security: Security {
+                    r#type: SecurityType::None,
+                    sni: None,
+                    fp: None,
+                    insecure: None,
+                    data: Deferred::from(Json(SecurityConfig::default())),
+                },
+                config: Deferred::from(Json(stored_config.clone())),
+                created_at: 0,
+                links: Deferred::default(),
+            };
+            state.db.upsert_protocol(&protocol).await.expect("persist");
+
+            // Read the row back OUT of the table, through the loader the app
+            // itself uses (the plain filter does not hydrate the deferred
+            // config, and reading it that way would test nothing).
+            let stored =
+                crate::state::load_protocol_with_config(&state.db, ProtocolId::new(expected_uid))
+                    .await
+                    .expect("read")
+                    .expect("the row is there");
+            assert_eq!(
+                stored.id.get(),
+                expected_uid,
+                "{label}: the table kept the uid"
+            );
+
+            // …and require the export→re-import cycle to land on that number.
+            let ProtocolConfig::Ss(ss) = stored.config.get().0.clone() else {
+                panic!("expected ss");
+            };
+            let ss = &ss;
+            let exported = ss
+                .reconstruct_proto(&EndpointEssentials::new("1.2.3.4", 8388))
+                .expect("export");
+            let round = ProtocolConfig::try_parse_proto(&xray_tui_proto::urlx::RawUrlX::from(
+                exported.as_str(),
+            ))
+            .expect("re-import");
+            assert_eq!(
+                round.identity_once().2,
+                stored.id.get(),
+                "{label}: the exported row re-imports as the SAME stored row ({exported})"
+            );
         }
     }
 }

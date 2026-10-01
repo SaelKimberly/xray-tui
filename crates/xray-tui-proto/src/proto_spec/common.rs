@@ -1654,6 +1654,7 @@ mod tests {
             flow: None,
             splice: None,
             remarks: None,
+            mux: None,
         });
         config.normalize_transport();
         let ProtocolConfig::Vless(c) = &config else {
@@ -1690,6 +1691,7 @@ mod tests {
                 flow: None,
                 splice: None,
                 remarks: None,
+                mux: None,
             })
         };
 

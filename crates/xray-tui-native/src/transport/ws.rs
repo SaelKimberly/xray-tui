@@ -58,31 +58,48 @@ pub async fn connect(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, 
     let cfg = ctx.transport_ws().ok_or_else(|| {
         NativeError::Config("ws transport requested but config has no ws settings".into())
     })?;
-    let server_host = ctx.params.server.host.as_str();
-    let req = ws_request(cfg, server_host)?;
+    let req = ws_request(cfg, ctx.params.server.host.as_str())?;
+    let ws = upgrade_with(req, stream, "ws").await?;
+    Ok(Box::new(WsStream::new(ws)))
+}
+
+/// Run the WS upgrade for a caller-built request, and wrap the negotiated
+/// connection as a byte stream.
+///
+/// **One owner for the exchange**: `step` names the caller's phase in the
+/// timeout and transport errors, so a SIP003 plugin row reports "v2ray-plugin
+/// ws upgrade" while a `TransportConfig` row reports "ws upgrade" — but the
+/// handshake, the 101 requirement, and the binary-message wrapper are shared,
+/// because a plugin row and a transport row are the same wire (spec §2.5, and
+/// the only difference is where the request line and headers come from).
+pub async fn upgrade_with(
+    req: Request<()>,
+    stream: BoxStream,
+    step: &'static str,
+) -> Result<WebSocketStream<BoxStream>, NativeError> {
     let handshake = tokio_tungstenite::client_async(req, stream);
     let (ws, resp) = tokio::time::timeout(timeouts::TRANSPORT, handshake)
         .await
         .map_err(|_| NativeError::Timeout {
-            step: "ws upgrade",
+            step,
             limit: timeouts::TRANSPORT,
         })?
         .map_err(|e| match e {
             // The server's own answer to the upgrade carries an HTTP status —
             // the typed signal the purge policy reads (`evidence`).
             tokio_tungstenite::tungstenite::Error::Http(resp) => NativeError::TransportRejected {
-                detail: format!("ws handshake: HTTP error: {}", resp.status()),
+                detail: format!("{step}: HTTP error: {}", resp.status()),
                 status: resp.status().as_u16(),
             },
-            other => NativeError::Transport(format!("ws handshake: {other}")),
+            other => NativeError::Transport(format!("{step}: {other}")),
         })?;
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         return Err(NativeError::TransportRejected {
-            detail: format!("ws upgrade rejected: {}", resp.status()),
+            detail: format!("{step} rejected: {}", resp.status()),
             status: resp.status().as_u16(),
         });
     }
-    Ok(Box::new(WsStream::new(ws)))
+    Ok(ws)
 }
 
 /// Binary-message byte stream: writes buffer into Binary frames (flushed on

@@ -478,6 +478,7 @@ mod tests {
                 path: None,
                 splice: None,
                 remarks: None,
+                mux: None,
             }))),
             created_at: 0,
             links: Deferred::default(),
@@ -653,7 +654,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         });
         let protocol = Protocol {
             id: ProtocolId::new(2022),

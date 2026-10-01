@@ -158,3 +158,158 @@ bench target='all':
     if [ "{{target}}" = all ]; then
         cargo criterion -p xray-tui-native --features native-e2e --bench throughput
     fi
+
+# ─── Tier-3b test oracle: pinned SIP003 plugin binaries ────────────
+#
+# The Shadowsocks plugin rows (spec §9 tier 3b) need a real plugin, and
+# neither core can host one: xray-core has no SIP003 support at all, and
+# sing-box's SS *inbound* has no plugin field (only its outbound does, and
+# in-process). So the server side is a real plugin binary.
+#
+#   $XRAY_TUI_PLUGIN_BIN_DIR   install target (default /tmp/plugin-bin)
+#
+# Two pins, both deliberate:
+#   * v2ray-plugin — a PREBUILT release asset, sha256-verified. Its own
+#     `-host` default is `cloudfront.com`, the fact spec §5.1 diverges from on
+#     purpose (we follow sing-box, which uses the host only when the option is
+#     present).
+#   * obfs-local / obfs-server — simple-obfs v0.0.5, which is C (not the Go
+#     port) and needs libev + autotools. Its published v0.0.5 asset is
+#     Windows-only, so there is nothing to download. The binary speaks the env
+#     contract shadowsocks-rust drives it with (SS_REMOTE_HOST /
+#     SS_REMOTE_PORT / SS_LOCAL_HOST / SS_LOCAL_PORT / SS_PLUGIN_OPTIONS —
+#     simple-obfs src/local.c:889-893). Name the **server** half:
+#     `obfs-server` binds SS_REMOTE_PORT (src/server.c:1437-1438) and is what
+#     `ssserver` must spawn; `obfs-local` is the client half and binds
+#     SS_LOCAL_PORT (src/local.c:913) — the port ssserver already holds, so it
+#     fails with EADDRINUSE on every fresh port.
+#
+# Never a CI requirement: tier 3b is opt-in, exactly like the core binaries.
+PLUGIN_V2RAY_TAG := 'v1.3.2'
+PLUGIN_V2RAY_SHA256 := 'b578514235b98b230f881aa2a01a7277205f85135bc09fc3832e5f3993ee541a'
+PLUGIN_OBFS_TAG := 'v0.0.5'
+PLUGIN_LIBEV_VERSION := '4.33'
+
+# Install the pinned SIP003 plugin binaries the Shadowsocks plugin e2e rows need.
+plugin-bins:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="${XRAY_TUI_PLUGIN_BIN_DIR:-/tmp/plugin-bin}"
+    mkdir -p "$dir"
+
+    # ── v2ray-plugin: prebuilt, checksum-verified ──
+    # The release ASSET is named with hyphens, the binary INSIDE the tarball
+    # with underscores — both are mapped here so neither guess reaches install.
+    case "$(uname -m)" in
+        x86_64|amd64) asset="linux-amd64"; inner="v2ray-plugin_linux_amd64" ;;
+        aarch64|arm64) asset="linux-arm64"; inner="v2ray-plugin_linux_arm64" ;;
+        *) echo "unsupported arch $(uname -m) for the pinned plugin assets" >&2; exit 2 ;;
+    esac
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    url="https://github.com/shadowsocks/v2ray-plugin/releases/download/{{PLUGIN_V2RAY_TAG}}/v2ray-plugin-$asset-{{PLUGIN_V2RAY_TAG}}.tar.gz"
+    echo "fetching $url"
+    curl -fsSL -o "$tmp/vp.tar.gz" "$url"
+    echo "{{PLUGIN_V2RAY_SHA256}}  $tmp/vp.tar.gz" | sha256sum -c -
+    tar xzf "$tmp/vp.tar.gz" -C "$tmp"
+    install -m 0755 "$tmp/$inner" "$dir/v2ray-plugin"
+
+    # ── obfs: built from source. Two facts make this self-contained:
+    #   * the published v0.0.5 asset is Windows-only, so there is nothing to
+    #     download; and
+    #   * libev (its only dependency) builds to a user prefix with no root, so
+    #     the recipe needs neither sudo nor libev-dev. It goes into a TEMP
+    #     prefix, and the binaries get an rpath, so nothing lands in $HOME and
+    #     they run without LD_LIBRARY_PATH.
+    prefix="$tmp/prefix"
+    loader_path=""
+    if [ ! -e /usr/include/ev.h ] && [ ! -e "$HOME/.local/include/ev.h" ] && ! pkg-config --exists libev 2>/dev/null; then
+        echo "building libev into $prefix (no root needed)" >&2
+        curl -fsSL -o "$tmp/libev.tar.gz" "https://dist.schmorp.de/libev/Attic/libev-{{PLUGIN_LIBEV_VERSION}}.tar.gz"
+        tar xf "$tmp/libev.tar.gz" -C "$tmp"
+        (
+            cd "$tmp/libev-{{PLUGIN_LIBEV_VERSION}}"
+            # static-only: see the LDFLAGS note below
+            ./configure --prefix="$prefix" --disable-shared --enable-static >/dev/null
+            make -j"$(nproc)" >/dev/null
+            make install >/dev/null
+        )
+    elif [ -e "$HOME/.local/include/ev.h" ]; then
+        prefix="$HOME/.local"
+        loader_path="$prefix/lib"
+        echo "using the user-local libev at $prefix" >&2
+    else
+        prefix=""
+        echo "using the system libev" >&2
+    fi
+    shim="$tmp/shim"; mkdir -p "$shim"
+    # configure hard-requires asciidoc + xmlto for the man pages; the binaries
+    # do not use them, so stub rather than install two doc toolchains.
+    for tool in asciidoc xmlto; do
+        printf '#!/bin/sh\nexit 0\n' > "$shim/$tool"
+        chmod +x "$shim/$tool"
+    done
+    git clone -q --depth 1 --recurse-submodules --branch {{PLUGIN_OBFS_TAG}} \
+        https://github.com/shadowsocks/simple-obfs.git "$tmp/simple-obfs"
+    (
+        cd "$tmp/simple-obfs"
+        # simple-obfs probes `-lev` and `ev.h` directly, so no pkg-config is
+        # needed — only the include and library paths.
+        if [ -n "$prefix" ]; then
+            export CPPFLAGS="-I$prefix/include ${CPPFLAGS:-}"
+            export LDFLAGS="-L$prefix/lib ${LDFLAGS:-}"
+            # The obfs binaries link libev dynamically, and `$ORIGIN` does not
+            # survive shell -> make -> ld intact (it arrives as the literal
+            # `RIGIN`), so the loader path is reported below and the caller
+            # passes it to the server that spawns `obfs-local`.
+            loader_path="$prefix/lib"
+        fi
+        PATH="$shim:$PATH" ./autogen.sh >/dev/null 2>&1
+        PATH="$shim:$PATH" ./configure >/dev/null
+        PATH="$shim:$PATH" make -j"$(nproc)" >/dev/null
+    )
+    for bin in obfs-local obfs-server; do
+        if [ ! -x "$tmp/simple-obfs/src/$bin" ]; then
+            echo "build produced no $bin" >&2
+            exit 2
+        fi
+        install -m 0755 "$tmp/simple-obfs/src/$bin" "$dir/$bin"
+    done
+
+    # ── verify both, loudly ──
+    echo
+    echo "installed in $dir:"
+    if ! "$dir/v2ray-plugin" --help 2>&1 | grep -m1 -- '-host'; then
+        echo "v2ray-plugin failed to run" >&2
+        exit 2
+    fi
+    echo "  v2ray-plugin  {{PLUGIN_V2RAY_TAG}}  sha $(sha256sum "$dir/v2ray-plugin" | cut -c1-16)…"
+    for bin in obfs-local obfs-server; do
+        if ! "$dir/$bin" -v >/dev/null 2>&1 && ! "$dir/$bin" -h >/dev/null 2>&1; then
+            echo "$bin failed to run" >&2
+            exit 2
+        fi
+        echo "  $bin  simple-obfs {{PLUGIN_OBFS_TAG}}"
+    done
+    # The plugin's CHILD environment, written next to the binaries: a plugin-capable
+    # ssserver spawns the plugin itself, so the plugin dir must be on PATH and libev
+    # must be loadable by the child. `tests/plugin_sip003.rs` reads this file, so the
+    # recipe is the single place that knows the loader path.
+    {
+        echo "export PATH=\"$dir\":\$PATH"
+        [ -n "$loader_path" ] && echo "export LD_LIBRARY_PATH=\"$loader_path\":\$LD_LIBRARY_PATH"
+    } > "$dir/plugin-env.sh"
+    echo
+    if [ -n "$loader_path" ]; then
+        echo "wrote $dir/plugin-env.sh (PATH + the libev loader path); the obfs binaries"
+        echo "need libev at runtime and the recipe has no say over a server that spawns them."
+    else
+        echo "wrote $dir/plugin-env.sh (system libev; no loader path needed)"
+    fi
+    echo
+    echo "run the plugin rows with:"
+    echo "  XRAY_TUI_PLUGIN_BIN_DIR=$dir \\"
+    echo "    cargo test -p xray-tui-native --features native-e2e --test plugin_sip003 -- --ignored"
+    echo
+    echo "(--ignored matters: the plugin rows live in an #[ignore]d test. Set"
+    echo "XRAY_TUI_SSSERVER_BIN if the vendored thirdparty build is not present."

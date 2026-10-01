@@ -801,7 +801,7 @@ where
 /// the echo (status 200 + [`super::config::BODY`]); the e2e runner asserts
 /// both equal [`MUX_SESSION_COUNT`]. Returns `(0, 0)` on a failed connect.
 pub async fn probe_mux(params: &crate::NativeConnectParams, target: SocketAddr) -> (usize, usize) {
-    use crate::protocol::vless::MuxTarget;
+    use crate::addr::{Host, TargetAddr};
     let deadline = tokio::time::Instant::now() + MUX_PROBE_TIMEOUT;
     let client = match tokio::time::timeout_at(deadline, crate::connect_mux(params)).await {
         Ok(Ok(c)) => c,
@@ -814,17 +814,19 @@ pub async fn probe_mux(params: &crate::NativeConnectParams, target: SocketAddr) 
             return (0, 0);
         }
     };
-    // The sessions share one MuxClient; `open_session` takes `&self`, so
-    // the client is shared across the per-session tasks. Dropping the
-    // JoinSet (on deadline expiry) aborts the in-flight sessions.
+    // The sessions share one tunnel; `open_session` takes `&self`, so it is
+    // shared across the per-session tasks. Dropping the JoinSet (on deadline
+    // expiry) aborts the in-flight sessions.
     let client = Arc::new(client);
     let mut set = tokio::task::JoinSet::new();
     for i in 0..MUX_SESSION_COUNT {
         let client = Arc::clone(&client);
         set.spawn(async move {
+            // A VLESS mux session's frame target IS the destination; the
+            // per-family tunnel resolves that, so this call is family-agnostic.
             let mut session = match tokio::time::timeout_at(
                 deadline,
-                client.open_session(MuxTarget::Tcp(target)),
+                client.open_session(&TargetAddr::new(Host::Ip(target.ip()), target.port())),
             )
             .await
             {

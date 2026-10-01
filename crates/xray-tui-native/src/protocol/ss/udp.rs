@@ -1125,6 +1125,34 @@ pub async fn connect_udp(
                 .into(),
         ));
     }
+    // SIP003 has no datagram path (the plugin is a stream transformer and the
+    // SS server's UDP relay is a separate endpoint), so a plugin row's UDP leg
+    // cannot be carried at all.
+    //
+    // This refusal is RUNTIME-scoped and cannot announce itself: RFC 1928 gives
+    // a SOCKS5 client no channel to report a failure after the ASSOCIATE
+    // reply, and the inbound drops per-datagram failures without ending the
+    // association — so the row would look perfectly healthy (its TCP probes
+    // are green) while every datagram vanished. The `warn!` is the only
+    // diagnosability this has, which is why it names the row and the reason
+    // and why it is emitted ONCE per association: a per-datagram warn on a
+    // busy association is itself a log flood.
+    if let Some(plugin) = &cfg.plugin {
+        tracing::warn!(
+            target: "xray_tui_native::protocol::ss::udp",
+            protocol = ?method.kind(),
+            server = %ctx.params.server.host,
+            port = ctx.params.server.port,
+            plugin = %plugin.name,
+            mode = plugin.mode.as_str(),
+            "dropping UDP for a shadowsocks plugin row: SIP003 has no datagram path, \
+             and the SOCKS5 UDP association cannot report the failure",
+        );
+        return Err(NativeError::Config(format!(
+            "shadowsocks plugin `{}` cannot carry UDP (SIP003 has no datagram path)",
+            plugin.name
+        )));
+    }
     let key = Arc::new(password_key(method, &cfg.password)?);
     let server = ctx.server_socket().await?;
     let bind: SocketAddr = if server.is_ipv4() {
@@ -1167,12 +1195,15 @@ mod tests {
 
     use base64::Engine as _;
     use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
-    use xray_tui_proto::proto_spec::{ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts};
+    use xray_tui_proto::proto_spec::{
+        PluginSpec, ProtocolConfig, ProtocolKind, SecurityConfig, TlsConfig, TlsOpts,
+    };
     use xray_tui_proto::urlx::TinyText;
 
     use super::*;
     use crate::addr::encode_addr_port_last;
     use crate::context::NativeConnectParams;
+    use crate::protocol::ss::resolve_method;
     use crate::protocol::vless::encryption::derive_key_bytes;
 
     /// Seal one datagram through the writer state with a scratch buffer.
@@ -1193,7 +1224,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         }
     }
 
@@ -1211,6 +1241,150 @@ mod tests {
         );
         params.resolved_ip = Some(server);
         LinkContext::new(params, target)
+    }
+
+    /// A plugin row cannot carry UDP, and the refusal is the ONLY diagnosability
+    /// the user gets: RFC 1928 gives a SOCKS5 client no channel to report a
+    /// failure after ASSOCIATE, and the inbound drops per-datagram failures
+    /// without ending the association. So the error must name the plugin, and
+    /// the row's TCP path must be untouched.
+    #[tokio::test]
+    async fn a_plugin_row_refuses_udp_by_name() {
+        let cfg = SsConfig {
+            plugin: Some(PluginSpec::from_parts(
+                Some("obfs-local"),
+                "obfs=http;obfs-host=example.com",
+            )),
+            ..ss_cfg("aes-128-gcm", "pw")
+        };
+        let server: SocketAddr = "127.0.0.1:1".parse().expect("literal");
+        let ctx = ctx_for(&cfg, server, TargetAddr::new(Host::new("example.org"), 53));
+        let method = resolve_method(&cfg).expect("aead method");
+        // `SsUdpTunnel` is not `Debug`, so the error is bound with `let-else`
+        // rather than `expect_err`.
+        let Err(err) = connect_udp(&ctx, method, &cfg).await else {
+            panic!("SIP003 has no datagram path, so this must be refused");
+        };
+        let text = err.to_string();
+        assert!(text.contains("obfs-local"), "{text} must name the plugin");
+        assert!(text.contains("no datagram path"), "{text} must say why");
+
+        // The same row's TCP leg is unaffected: it must not be gated here, or
+        // the refusal would disable the feature's main benefit.
+        assert!(
+            crate::capability::supported(ProtocolKind::Shadowsocks, &ProtocolConfig::Ss(cfg)),
+            "a plugin row's TCP path is still native-servable"
+        );
+    }
+
+    /// A dependency-free `Subscriber` that counts events on one target. The
+    /// crate deliberately has no `tracing-subscriber` dependency, and asserting
+    /// "exactly one warn" needs a real subscriber — the previous test only
+    /// called `connect_udp` twice and asserted the same error both times, which
+    /// passes whether the code logs once or a hundred times.
+    struct WarnCounter {
+        target: &'static str,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.target() == self.target
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Row 22's unasserted fact: the warn fires **exactly once per association**.
+    ///
+    /// The seam matters and is easy to get wrong: `connect_udp` IS the
+    /// association-level dial (`inbound/mod.rs` calls it once per SOCKS5 UDP
+    /// ASSOCIATE, before the datagram loop), so "once per association" means
+    /// once per CALL to this function — not once per datagram, which never
+    /// reaches here at all. A test that called it N times and expected one warn
+    /// would be asserting that N associations produce one warning, which is the
+    /// opposite of the contract.
+    #[test]
+    fn a_plugin_association_warns_exactly_once() {
+        let cfg = SsConfig {
+            plugin: Some(PluginSpec::from_parts(
+                Some("v2ray-plugin"),
+                "host=cdn.example",
+            )),
+            ..ss_cfg("aes-128-gcm", "pw")
+        };
+        let server: SocketAddr = "127.0.0.1:1".parse().expect("literal");
+        let ctx = ctx_for(&cfg, server, TargetAddr::new(Host::new("example.org"), 53));
+        let method = resolve_method(&cfg).expect("aead method");
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = WarnCounter {
+            target: "xray_tui_native::protocol::ss::udp",
+            count: std::sync::Arc::clone(&count),
+        };
+
+        let mut refusal = String::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                let Err(err) = connect_udp(&ctx, method, &cfg).await else {
+                    panic!("a plugin row's UDP leg must be refused");
+                };
+                refusal = err.to_string();
+            });
+        });
+
+        assert!(
+            refusal.contains("v2ray-plugin"),
+            "the refusal names the row's own plugin: {refusal}"
+        );
+        assert!(
+            refusal.contains("no datagram path"),
+            "and says why: {refusal}"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one association dial warns exactly once, even though the refusal is \
+             what the association is built from"
+        );
+    }
+
+    /// A refusal that fires on EVERY datagram would flood the log; the guard
+    /// runs once per association dial, so the warn is emitted once.
+    #[tokio::test]
+    async fn the_plugin_udp_refusal_is_a_dial_time_decision() {
+        let cfg = SsConfig {
+            plugin: Some(PluginSpec::from_parts(
+                Some("v2ray-plugin"),
+                "host=cdn.example",
+            )),
+            ..ss_cfg("aes-256-gcm", "pw")
+        };
+        let server: SocketAddr = "127.0.0.1:1".parse().expect("literal");
+        let ctx = ctx_for(&cfg, server, TargetAddr::new(Host::new("example.org"), 53));
+        let method = resolve_method(&cfg).expect("aead method");
+        // The refusal happens before any socket is bound, so it costs no I/O
+        // and repeats identically for a second datagram on the same link.
+        for _ in 0..2 {
+            let Err(err) = connect_udp(&ctx, method, &cfg).await else {
+                panic!("a plugin row's UDP leg must be refused");
+            };
+            assert!(err.to_string().contains("v2ray-plugin"));
+        }
     }
 
     /// The independent 2022 subkey the tests pin against: the hand-rolled

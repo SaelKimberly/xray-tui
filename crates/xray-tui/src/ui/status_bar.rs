@@ -134,8 +134,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         crate::AppMode::AddServer { .. } => " Add Server",
         crate::AppMode::EditServer { .. } => " Edit Server",
         crate::AppMode::SpeedTestMenu { .. } => " Server Tools",
-        crate::AppMode::ExportScope { .. } => " Export",
-        crate::AppMode::ExportDestination { .. } => " Export",
+        crate::AppMode::ExportScope { .. } | crate::AppMode::ExportDestination { .. } => " Export",
         crate::AppMode::ExportPath { .. } => " Export File",
         crate::AppMode::BatchImport { .. } => " Batch Import",
         crate::AppMode::Help => " Help",
@@ -185,8 +184,11 @@ const fn build_hints(state: &AppState) -> &'static str {
         return " [Esc] Close help ";
     }
     match &state.mode {
-        crate::AppMode::SpeedTestMenu { .. } => " [↑↓] Navigate  [Enter] Select  [Esc] Close ",
-        crate::AppMode::ExportScope { .. } | crate::AppMode::ExportDestination { .. } => {
+        // One string for every list-shaped overlay: the keys are the same, so
+        // splitting them into arms only invites the two copies to drift.
+        crate::AppMode::SpeedTestMenu { .. }
+        | crate::AppMode::ExportScope { .. }
+        | crate::AppMode::ExportDestination { .. } => {
             " [↑↓] Navigate  [Enter] Select  [Esc] Close "
         }
         crate::AppMode::ExportPath {

@@ -88,7 +88,18 @@ pub async fn fetch(
     // TLS handshake and the hyper request together, and every caller awaits it
     // inside its own function — one box per attempt keeps those futures small.
     let attempt = async move {
-        let tunnel = crate::connect(params).await?;
+        // The SAME predicate the inbound dial uses: a link that resolved mux goes
+        // through the mux protocol phase and one session, so the probe cannot
+        // report a plugin row as "server unreachable" when the real cause is a
+        // missing mux frame (v2ray-plugin's server mandates mux).
+        let tunnel = if params.mux {
+            // The session owns its tunnel here too, for the same keepalive
+            // reason as the inbound dial.
+            let mux = crate::connect_mux(&params).await?;
+            crate::mux_session::open_session(mux, &params.target).await?
+        } else {
+            Box::new(crate::connect(params).await?)
+        };
         fetch_over(tunnel, req).await
     };
     let response = Box::pin(tokio::time::timeout(req.timeout, attempt))

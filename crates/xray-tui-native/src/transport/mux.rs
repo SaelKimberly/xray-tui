@@ -138,7 +138,11 @@ pub struct Frame {
     pub payload: Bytes,
 }
 
-/// Reads one frame. `Ok(None)` on a clean EOF at a frame boundary; a
+/// Frame and session plumbing for the v1.mux.cool multiplexer.
+///
+/// The format itself is protocol-independent (spec §7): the same bytes
+/// serve a VLESS command-0x03 link and a SIP003 plugin row, which is why this
+/// lives under `transport` rather than under a protocol.
 /// truncated length/metadata/payload at EOF is `UnexpectedEof`, a
 /// `meta_len` over [`MAX_META`] or an unparseable/unsupported New target
 /// is `InvalidData`.
@@ -308,7 +312,11 @@ fn parse_meta(meta: &[u8]) -> io::Result<Frame> {
     })
 }
 
-/// Writes one frame in a single `write_all`: `[2B meta_len][metadata]`
+/// A client-side multiplexer: sessions over one underlying stream.
+///
+/// Each session gets a stream id and a `New` frame carrying its target;
+/// data rides `Keep` frames, and a `KeepAlive` tick keeps the tunnel warm
+/// (spec §7).
 /// plus `[2B data_len][payload]` when the Data option is set. The
 /// metadata (sid, status, option, frame target) is what `meta_len`
 /// covers; `writeMetaWithFrame` appends the data after it.

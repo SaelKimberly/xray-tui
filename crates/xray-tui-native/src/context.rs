@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
 
+use xray_tui_proto::proto_spec::VlessMux;
 use xray_tui_proto::proto_spec::common::{
     GrpcConfig, HttpConfig, HttpUpgradeConfig, KcpConfig, TransportConfig, WebSocketConfig,
     XHttpConfig,
 };
 use xray_tui_proto::proto_spec::endpoint::EndpointEssentials;
+use xray_tui_proto::proto_spec::ss_plugin::{PluginSpec, link_sni};
 use xray_tui_proto::proto_spec::{
     ProtoSpec, ProtocolConfig, SecurityConfig, TlsConfig, TlsOpts, parse_curve_names,
 };
@@ -34,21 +36,33 @@ pub struct NativeConnectParams {
     /// command 0x02) with `Raw` (header-dest) or `PacketAddr` (per-packet
     /// magic-address destinations) framing.
     pub udp: Option<PacketMode>,
-    /// Mux tunnel for UDP: `true` routes [`crate::connect_udp`] through
-    /// the VLESS mux tunnel (XUDP — `connect_mux` → `open_udp_session` →
-    /// [`PacketMode::XUdp`]) instead of the raw `command=0x02` tunnel.
-    /// The `xtls-rprx-vision-udp443` flow forces the mux path regardless
-    /// (spec §4.3). Ignored by the TCP path ([`crate::connect`]).
+    /// Mux tunnel request for this link, for BOTH phases:
+    ///
+    /// - **UDP**: `true` routes [`crate::connect_udp`] through the VLESS mux
+    ///   tunnel (XUDP — `connect_mux` → `open_udp_session` → [`PacketMode::XUdp`])
+    ///   instead of the raw `command=0x02` tunnel, and
+    ///   `xtls-rprx-vision-udp443` forces it (spec §4.3);
+    /// - **TCP**: `true` routes the dial through the mux protocol phase
+    ///   ([`crate::connect_mux`]) and opens one session on the tunnel.
+    ///
+    /// The TCP half is what the SIP003 plugin rows need: a v2ray-plugin server
+    /// *mandates* mux (it dispatches every stream to `v1.mux.cool` and parses
+    /// frames unconditionally), so a row that stored `mux=1` and resolved it
+    /// off would be dialled without frames and rejected (spec §2.3). The value
+    /// is the row's **resolved** mux — `PluginSpec::mux_active()` for a plugin
+    /// row — never the stored key, and never for a QUIC mode, which replaces the
+    /// dial entirely.
     pub mux: bool,
 }
 
 impl NativeConnectParams {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         protocol: ProtocolConfig,
         server: EndpointEssentials,
         target: crate::addr::TargetAddr,
     ) -> Self {
+        let mux = Self::resolved_mux(&protocol);
         Self {
             protocol,
             server,
@@ -56,7 +70,27 @@ impl NativeConnectParams {
             resolved_ip: None,
             reality_provisioner: HelloProvisionerChoice::FixedChrome133,
             udp: None,
-            mux: false,
+            // **Derived here, once.** The mux decision is the row's RESOLVED
+            // plugin mux (`PluginSpec::mux_active`: the resolved value, never the
+            // stored key, and never a QUIC mode), so the app's `proxy_params`, the
+            // real probe and any future caller cannot disagree — a hand-written
+            // assignment per site is exactly the drift the §5.2 predicate exists
+            // to prevent. VLESS now has a `mux` field, so this predicate covers
+            // both families — still a change to THIS function alone.
+            mux,
+        }
+    }
+
+    /// The link's mux request, from the row itself.
+    #[must_use]
+    pub fn resolved_mux(protocol: &ProtocolConfig) -> bool {
+        match protocol {
+            ProtocolConfig::Ss(cfg) => cfg.plugin.as_ref().is_some_and(PluginSpec::mux_active),
+            // VLESS: the row's own request. `is_active` rather than a magnitude
+            // test, so `mux=-1` (unlimited) is mux ON — a `u32`/`> 0` reading would
+            // silently dial an unlimited row without frames.
+            ProtocolConfig::Vless(cfg) => cfg.mux.as_ref().is_some_and(VlessMux::is_active),
+            _ => false,
         }
     }
 }
@@ -111,7 +145,13 @@ impl LinkContext {
     /// this single decision surface.
     #[must_use]
     pub fn is_tls(&self) -> bool {
+        // A plugin row's TLS is the plugin's `tls` key, not the row's
+        // `security` — which is exactly why this edit is necessary: without it
+        // `security::wrap` returns at its own `is_tls()` guard and a
+        // `mode=websocket;tls` row performs a **plaintext** upgrade against a
+        // TLS port (the corpus's most common plugin shape, 20:8014).
         self.security().is_some_and(|s| s.tls.is_some())
+            || self.plugin_spec().is_some_and(PluginSpec::needs_tls)
     }
 
     /// The TLS server name (SNI): explicit `sni` option — plain TLS or the
@@ -122,11 +162,15 @@ impl LinkContext {
     /// often-IP server host; `sec.sni()` read the steal target) into one
     /// decision. `SecurityConfig::sni()` reads `RealityOpts.sni`, so a
     /// REALITY link never leaks the endpoint host as its steal target.
+    ///
+    /// [`super::link_sni`] — the one SNI owner — with the endpoint host as the
+    /// final fallback. For a plugin row the middle term is the plugin's `host`
+    /// (only when the row states one); for every other row this is the
+    /// historical `security.sni()` → endpoint-host behaviour, unchanged.
     #[must_use]
     pub fn server_name(&self) -> String {
-        self.security()
-            .and_then(SecurityConfig::sni)
-            .map_or_else(|| self.params.server.host.clone(), str::to_string)
+        link_sni(&self.params.protocol, &self.params.server.host)
+            .unwrap_or_else(|| self.params.server.host.clone())
     }
 
     /// Canonical split of the explicit `alpn` option — the ONE place the
@@ -162,6 +206,15 @@ impl LinkContext {
         match self.transport_type() {
             Some("grpc" | "xhttp" | "http") => vec![b"h2".to_vec()],
             Some("ws" | "httpupgrade") => vec![b"http/1.1".to_vec()],
+            // A plugin row has no `TransportConfig`, so the transport-implied
+            // arm above cannot see it. Both references send `http/1.1` for the
+            // v2ray websocket transport (v2ray-core's ws dialer passes
+            // `OptionWithALPN{ALPNs: ["http/1.1"]}`; sing-box sets
+            // `NextProtos` to `["http/1.1"]` when the caller left it empty), so
+            // the plugin's TLS session advertises the same.
+            _ if self.plugin_spec().is_some_and(PluginSpec::needs_tls) => {
+                vec![b"http/1.1".to_vec()]
+            }
             _ => vec![],
         }
     }
@@ -215,6 +268,22 @@ impl LinkContext {
             PC::Vless(c) => Some(&c.transport),
             PC::Vmess(c) => Some(&c.transport),
             PC::Trojan(c) => Some(&c.transport),
+            _ => None,
+        }
+    }
+
+    /// The SIP003 plugin spec, when the link is a Shadowsocks row carrying one.
+    ///
+    /// The SS arm of the typed-accessor family (`transport_ws`, `transport_grpc`,
+    /// …): an `SsConfig` carries **no transport field**, so this is the only
+    /// input the transport phase has for selecting the plugin framing — and the
+    /// reason `transport::upgrade` dispatches on it before any
+    /// `TransportConfig` match (§5 items 1–2).
+    #[must_use]
+    pub const fn plugin_spec(&self) -> Option<&xray_tui_proto::proto_spec::PluginSpec> {
+        use xray_tui_proto::proto_spec::ProtocolConfig as PC;
+        match &self.params.protocol {
+            PC::Ss(config) => config.plugin.as_ref(),
             _ => None,
         }
     }

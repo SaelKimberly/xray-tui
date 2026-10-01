@@ -11,6 +11,7 @@
 
 pub mod consts;
 pub mod method;
+pub mod mux;
 pub mod stream;
 pub mod stream2022;
 pub mod udp;
@@ -66,7 +67,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         }
     }
 
@@ -98,7 +98,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         };
         let err = resolve_method(&cfg).unwrap_err();
         assert!(matches!(err, NativeError::Config(_)));

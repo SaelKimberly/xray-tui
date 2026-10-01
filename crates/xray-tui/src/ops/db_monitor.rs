@@ -392,7 +392,7 @@ mod tests {
         let s = &r.methods["upsert_link"];
         assert_eq!(s.query_count, 3);
         assert_eq!(s.fail_count, 1);
-        assert_eq!(s.slowest.as_ref().unwrap().0, 200.0);
+        assert!((s.slowest.as_ref().unwrap().0 - 200.0).abs() < f64::EPSILON);
         assert_eq!(s.slowest.as_ref().unwrap().1, "INSERT slow");
     }
 

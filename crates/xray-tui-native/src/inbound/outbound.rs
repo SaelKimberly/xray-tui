@@ -43,6 +43,11 @@ pub enum OutboundKind {
 #[derive(Debug, Clone)]
 pub struct ProxyOutbound {
     pub protocol: ProtocolConfig,
+    /// The row's protocol kind, carried alongside the config because the
+    /// refusal gate is keyed on it (`capability::support_reason(kind, config)`)
+    /// and the kind lives on the `Protocol` ROW, not on the typed config — the
+    /// two agree by construction, and the app has the row in hand.
+    pub kind: xray_tui_proto::proto_spec::ProtocolKind,
     pub server: EndpointEssentials,
     /// Pre-resolved proxy server address; `None` = resolve/DNS in
     /// [`crate::connect`].
@@ -57,6 +62,12 @@ pub fn proxy_params(proxy: &ProxyOutbound, target: &TargetAddr) -> NativeConnect
     let mut params =
         NativeConnectParams::new(proxy.protocol.clone(), proxy.server.clone(), target.clone());
     params.resolved_ip = proxy.resolved_ip;
+    // `mux` is NOT set here: `NativeConnectParams::new` derives it from the row
+    // (`resolved_mux`), so the app and the real probe — which builds its params
+    // with `new` alone — cannot disagree about a `mux=1` plugin row. A second
+    // copy of the match would be exactly the app/probe divergence the single
+    // derivation exists to prevent, and Slice 4's VLESS term is a change to
+    // `resolved_mux` alone.
     params
 }
 
@@ -69,7 +80,34 @@ pub(crate) async fn dial(
         OutboundKind::Direct => Ok(Box::new(dial_direct(target).await?)),
         OutboundKind::Block => Err(NativeError::Config("block outbound cannot dial".into())),
         OutboundKind::Proxy(proxy) => {
-            Ok(Box::new(crate::connect(proxy_params(proxy, target)).await?))
+            let params = proxy_params(proxy, target);
+            // The refusal gate, re-checked HERE so no caller can reach a socket
+            // with a config the engine has already declared it will not serve.
+            // `resolve_runtime_core` is the production decision point, but this
+            // is the in-process surface: the SOCKS5/HTTP inbound builds its
+            // outbound from operator config, and without the check a refused row
+            // (e.g. `mode=quic`, whose client wire is unpinned) opened a TCP
+            // connection to a server answering on UDP and failed later with a
+            // message about the framing layer instead of the row's own refusal.
+            //
+            // One pure call over a config that is already in hand — no load, no
+            // allocation, no second source of truth: it asks the SAME
+            // `capability` the app asked.
+            if let Some(reason) = crate::capability::support_reason(proxy.kind, &proxy.protocol) {
+                return Err(NativeError::Config(reason.into_owned()));
+            }
+            // ONE predicate for both families, so VLESS and a plugin row cannot
+            // drift: mux requested → the mux protocol phase, then one session
+            // on the tunnel; otherwise today's plain chain.
+            if params.mux {
+                let tunnel = crate::connect_mux(&params).await?;
+                // The session OWNS the tunnel: `MuxClient::new` spawns the
+                // demux/writer/keepalive tasks and does not hold the tunnel
+                // itself, so returning the bare session would stop the keepalive
+                // at return and let an idle session be reaped server-side.
+                return crate::mux_session::open_session(tunnel, target).await;
+            }
+            Ok(Box::new(crate::connect(params).await?))
         }
     }
 }
@@ -233,11 +271,347 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{HostKind, SecurityConfig, Socks5Config};
+
+    /// Rows 24/25: the dispatch predicate the app's `dial` reads, pinned
+    /// exactly — plus the *observable* difference a mux row makes on the wire.
+    ///
+    /// Success/failure could not be the discriminator: a plugin row runs the
+    /// **WebSocket upgrade either way**, so against a non-WebSocket listener both
+    /// shapes fail in the upgrade and the test would prove nothing. What does
+    /// differ is the first byte run after the upgrade — a mux `New` frame for a
+    /// mux row, an SS salt for a non-mux one — so that is what is asserted.
+    #[tokio::test]
+    async fn dial_dispatches_on_the_resolved_mux() {
+        use xray_tui_proto::proto_spec::{PluginSpec, SsConfig, VlessConfig, VlessMux};
+
+        let ss = |opts: Option<&str>| {
+            ProtocolConfig::Ss(SsConfig {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin: opts.map(|o| PluginSpec::from_parts(Some("obfs-local"), o)),
+            })
+        };
+        let vless = |mux: Option<VlessMux>| {
+            ProtocolConfig::Vless(VlessConfig {
+                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                uuid_origin: None,
+                security: SecurityConfig::default(),
+                transport: TransportConfig::Tcp,
+                encryption: None,
+                flow: None,
+                mux,
+                path: None,
+                splice: None,
+                remarks: None,
+            })
+        };
+
+        // The predicate, exactly as `dial` and the probe read it.
+        assert!(
+            !NativeConnectParams::resolved_mux(&ss(Some("mode=websocket;mux=0;host=cdn.example"))),
+            "row 3's client shape does not multiplex"
+        );
+        assert!(
+            NativeConnectParams::resolved_mux(&ss(Some("mode=websocket;host=cdn.example"))),
+            "a plugin row with mux on multiplexes"
+        );
+        assert!(
+            NativeConnectParams::resolved_mux(&vless(Some(VlessMux::Limited(8)))),
+            "a VLESS row that asks for mux multiplexes"
+        );
+        assert!(
+            !NativeConnectParams::resolved_mux(&vless(None)),
+            "a VLESS row that never mentions mux does not"
+        );
+        // Anti-overreach: a socks row never takes the mux path.
+        assert!(!NativeConnectParams::resolved_mux(&ProtocolConfig::Socks(
+            Socks5Config {
+                username: None,
+                password: None,
+                security: SecurityConfig::default(),
+                remarks: None,
+            }
+        )));
+    }
+
+    async fn command_byte(cfg: &ProtocolConfig) -> u8 {
+        use xray_tui_proto::proto_spec::EndpointEssentials;
+
+        let (client, _server) = tokio::io::duplex(4096);
+        let _ = client;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut head = [0u8; 64];
+            let n = sock.read(&mut head).await.unwrap_or(0);
+            assert!(n >= 19, "VLESS request is at least 19 bytes, got {n}");
+            head[18]
+        });
+        let kind = super::OutboundKind::Proxy(Box::new(super::ProxyOutbound {
+            protocol: cfg.clone(),
+            kind: xray_tui_proto::proto_spec::ProtocolKind::Vless,
+            server: EndpointEssentials::new("127.0.0.1", addr.port()),
+            resolved_ip: None,
+        }));
+        let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
+        let _ = super::dial(&kind, &target).await;
+        seen.await.expect("join")
+    }
+
+    /// The safety property `ProxyOutbound::kind` exists for, tested through the
+    /// path that actually consumes it.
+    ///
+    /// `ss_reason` branches on the kind (`method.kind() != kind` → "family does
+    /// not match", `capability.rs:415`), so a gate handed the WRONG kind refuses
+    /// a perfectly valid classic row. `capability.rs:1392` already pins the
+    /// DIVERGENCE at `supported()`; what nothing pinned is the WIRING — that the
+    /// kind carried on `ProxyOutbound` is the one the gate reads. Calling
+    /// `support_reason` directly, as an earlier version of this test did, tests
+    /// neither: it re-ran the existing test at a second address.
+    ///
+    /// So this drives `dial` itself, against accept-and-record listeners: the
+    /// mismatched kind must be refused by the family's own rule and open no
+    /// socket; the matching kind must get all the way to connecting.
+    #[tokio::test]
+    async fn the_outbound_kind_is_what_the_gate_actually_reads() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use xray_tui_proto::proto_spec::SsConfig;
+
+        let cfg = ProtocolConfig::Ss(SsConfig {
+            method: "aes-128-gcm".into(),
+            password: "pw".into(),
+            security: SecurityConfig::default(),
+            remarks: None,
+            plugin: None,
+        });
+        let accepted = StdArc::new(AtomicUsize::new(0));
+
+        for (kind, expect_refused) in [
+            (xray_tui_proto::proto_spec::ProtocolKind::Shadowsocks, false),
+            (
+                xray_tui_proto::proto_spec::ProtocolKind::Shadowsocks2022,
+                true,
+            ),
+        ] {
+            // Per iteration, not cumulative: the matching case deliberately
+            // connects, and a shared counter would make the refused case's
+            // assertion read that earlier connection as its own.
+            accepted.store(0, AtomicOrdering::Relaxed);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let seen = StdArc::clone(&accepted);
+            tokio::spawn(async move {
+                if listener.accept().await.is_ok() {
+                    seen.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            });
+            let (_client, _server) = tokio::io::duplex(4096);
+            let outbound = super::OutboundKind::Proxy(Box::new(super::ProxyOutbound {
+                protocol: cfg.clone(),
+                kind,
+                server: EndpointEssentials::new("127.0.0.1", addr.port()),
+                resolved_ip: None,
+            }));
+            let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
+            let result = super::dial(&outbound, &target).await;
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+            if expect_refused {
+                // `BoxStream` is not `Debug`, so the error is bound with let-else
+                // rather than `expect_err`.
+                let Err(error) = result else {
+                    panic!("a 2022 kind on a classic method is refused");
+                };
+                let text = error.to_string();
+                assert!(
+                    text.contains("family does not match"),
+                    "refused by the FAMILY rule, not by something else: {text}"
+                );
+                assert_eq!(
+                    accepted.load(AtomicOrdering::Relaxed),
+                    0,
+                    "…and it refused BEFORE opening a socket"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "the matching kind must not be refused by its own family rule"
+                );
+                assert_eq!(
+                    accepted.load(AtomicOrdering::Relaxed),
+                    1,
+                    "and it must actually connect — otherwise the mismatch case \
+                     above proves nothing"
+                );
+            }
+        }
+    }
+
+    /// Row 8's second clause, which the audit found unasserted: a refused row
+    /// must write **no byte first**. "Returns its own named reason" is about the
+    /// message; this is about the wire — a refusal that still dialled, and only
+    /// then reported itself, would leak a connection attempt (and a SNI) to a
+    /// server the client has already decided it cannot serve.
+    #[tokio::test]
+    async fn a_refused_row_never_reaches_the_socket() {
+        use crate::capability;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use xray_tui_proto::proto_spec::common::SecurityConfig;
+        use xray_tui_proto::proto_spec::{PluginSpec, SsConfig, VlessConfig, VlessMux};
+
+        let accepted = StdArc::new(AtomicUsize::new(0));
+        // Each pair is (config, expected_servable).
+        let ss = |plugin: Option<PluginSpec>| {
+            ProtocolConfig::Ss(SsConfig {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin,
+            })
+        };
+        let vless_mux_invalid = ProtocolConfig::Vless(VlessConfig {
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            uuid_origin: None,
+            security: SecurityConfig::default(),
+            transport: TransportConfig::Tcp,
+            encryption: None,
+            flow: None,
+            mux: Some(VlessMux::Invalid {
+                key: "muxtype".into(),
+                value: "yamux".into(),
+            }),
+            path: None,
+            splice: None,
+            remarks: None,
+        });
+        let configs: Vec<(
+            ProtocolConfig,
+            bool,
+            xray_tui_proto::proto_spec::ProtocolKind,
+        )> = vec![
+            (
+                ss(Some(PluginSpec::from_parts(Some("kcptun"), "key=abc"))),
+                false,
+                xray_tui_proto::proto_spec::ProtocolKind::Shadowsocks,
+            ),
+            (
+                ss(Some(PluginSpec::from_parts(
+                    Some("v2ray-plugin"),
+                    "mode=quic;host=cdn.example",
+                ))),
+                false,
+                xray_tui_proto::proto_spec::ProtocolKind::Shadowsocks,
+            ),
+            (
+                vless_mux_invalid,
+                false,
+                xray_tui_proto::proto_spec::ProtocolKind::Vless,
+            ),
+            // The anti-overreach: a SERVABLE plugin row really does connect, so
+            // "nothing connected" is a property of the refusal and not of the test.
+            (
+                ss(Some(PluginSpec::from_parts(
+                    Some("v2ray-plugin"),
+                    "mode=websocket;host=cdn.example",
+                ))),
+                true,
+                xray_tui_proto::proto_spec::ProtocolKind::Shadowsocks,
+            ),
+        ];
+
+        for (config, servable, kind_ref) in configs {
+            assert_eq!(
+                capability::supported(kind_ref, &config),
+                servable,
+                "fixture classification for {config:?}"
+            );
+
+            // EVERY fixture is dialled, including the refused ones — row 8's
+            // claim is about the WIRE ("no row writes a byte first"), so the
+            // refused rows have to actually reach `dial`. Skipping them here
+            // (an earlier version did) left the test asserting `supported()` a
+            // second time and never touching a socket for the refusals at all.
+            // The servable row must still connect, or the count proves nothing.
+            // Per iteration, not cumulative: the matching case deliberately
+            // connects, and a shared counter would make the refused case's
+            // assertion read that earlier connection as its own.
+            accepted.store(0, AtomicOrdering::Relaxed);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let seen = StdArc::clone(&accepted);
+            tokio::spawn(async move {
+                if listener.accept().await.is_ok() {
+                    seen.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            });
+            let (_client, _server) = tokio::io::duplex(4096);
+            let kind = super::OutboundKind::Proxy(Box::new(super::ProxyOutbound {
+                protocol: config,
+                kind: kind_ref,
+                server: EndpointEssentials::new("127.0.0.1", addr.port()),
+                resolved_ip: None,
+            }));
+            let target = TargetAddr::new(Host::Domain("example.com".into()), 80);
+            let _ = super::dial(&kind, &target).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            accepted.load(AtomicOrdering::Relaxed),
+            1,
+            "exactly the servable row reached the socket; no refused row did"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vless_mux_row_dials_the_mux_branch() {
+        use crate::protocol::vless::header::{CMD_MUX, CMD_TCP};
+        use xray_tui_proto::proto_spec::{VlessConfig, VlessMux};
+
+        let vless = |mux: Option<VlessMux>| {
+            ProtocolConfig::Vless(VlessConfig {
+                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                uuid_origin: None,
+                security: SecurityConfig::default(),
+                transport: TransportConfig::Tcp,
+                encryption: None,
+                flow: None,
+                mux,
+                path: None,
+                splice: None,
+                remarks: None,
+            })
+        };
+
+        assert_eq!(
+            command_byte(&vless(None)).await,
+            CMD_TCP,
+            "a non-mux VLESS row dials the plain branch"
+        );
+        assert_eq!(
+            command_byte(&vless(Some(VlessMux::Limited(8)))).await,
+            CMD_MUX,
+            "a mux VLESS row dials the mux branch"
+        );
+    }
 
     #[test]
     fn proxy_params_carries_protocol_server_target_and_resolved_ip() {
         let proxy = Box::new(ProxyOutbound {
+            kind: xray_tui_proto::proto_spec::ProtocolKind::Vless,
             protocol: ProtocolConfig::Socks(Socks5Config {
                 username: Some("u".into()),
                 password: Some("p".into()),

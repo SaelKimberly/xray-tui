@@ -1004,18 +1004,18 @@ fn render(frame: &mut Frame, state: &AppState) {
     if !is_form_mode {
         render_tabs(frame, chunks[0], state);
     }
-    if !matches!(state.mode, crate::AppMode::List) {
-        if matches!(
+    if !matches!(state.mode, crate::AppMode::List)
+        && matches!(
             &state.mode,
             crate::AppMode::ExportScope { .. }
                 | crate::AppMode::ExportDestination { .. }
                 | crate::AppMode::ExportPath { .. }
-        ) {
-            profiles::render(frame, chunks[1], state);
-            export::render(frame, chunks[1], state);
-            status_bar::render(frame, chunks[3], state);
-            return;
-        }
+        )
+    {
+        profiles::render(frame, chunks[1], state);
+        export::render(frame, chunks[1], state);
+        status_bar::render(frame, chunks[3], state);
+        return;
     }
     if !matches!(state.mode, crate::AppMode::List) {
         if matches!(&state.mode, crate::AppMode::SpeedTestMenu { .. }) {

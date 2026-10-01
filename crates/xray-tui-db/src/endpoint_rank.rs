@@ -349,7 +349,7 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
 
 /// Fill `band`/`rank_host` for rows that predate the columns (`band IS NULL`) —
 /// the non-destructive upgrade's one-time cost. Same derivation as `write`'s
-/// follow-up: band from the ttl membership, rank_host from the endpoint host.
+/// follow-up: `band` from the ttl membership, `rank_host` from the endpoint host.
 async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     if scalar_i64(
         conn,

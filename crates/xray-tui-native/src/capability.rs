@@ -26,9 +26,16 @@
 //! (`security::fingerprint::resolve_fingerprint`, read by `security::wrap`
 //! where the substitution happens), so this gate does not consult one.
 
+use std::borrow::Cow;
+
 use xray_tui_proto::proto_spec::common::{KcpConfig, TransportConfig};
 use xray_tui_proto::proto_spec::{
-    Hysteria2Config, ProtocolConfig, ProtocolKind, SsConfig, TrojanConfig, VlessConfig, VmessConfig,
+    Hysteria2Config, MuxSetting, PluginFamily, PluginMode, PluginSpec, ProtocolConfig,
+    ProtocolKind, SsConfig, TlsSetting, TrojanConfig, VlessConfig, VlessMux, VmessConfig,
+};
+use xray_tui_proto::proto_spec::{
+    SecurityConfig, TlsConfig,
+    ss_plugin::{OBFS_KEYS, V2RAY_KEYS},
 };
 
 use crate::protocol::ss::method::password_key;
@@ -102,19 +109,30 @@ pub const KIND_UNSUPPORTED_REASON: &str = "no native implementation for this pro
 /// non-empty `security` inside `ss::udp::connect_udp`, and refuses a chain in
 /// `chain.rs::ss_udp_guard`, which is where both refusals belong.
 #[must_use]
-pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<&'static str> {
+pub fn support_reason(kind: ProtocolKind, config: &ProtocolConfig) -> Option<Cow<'static, str>> {
     if !kind_supported(kind) {
-        return Some(KIND_UNSUPPORTED_REASON);
+        return Some(Cow::Borrowed(KIND_UNSUPPORTED_REASON));
+    }
+    // The Shadowsocks arm is dispatched first, and apart from ordering it is
+    // also the one that can name a VALUE from the row (a plugin option), which
+    // needs an owned string rather than a `&'static` reason.
+    if let (ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022, ProtocolConfig::Ss(cfg)) =
+        (kind, config)
+    {
+        return ss_reason(kind, cfg);
     }
     match (kind, config) {
+        // VLESS first: its mux refusals are value-bearing (an unusable option
+        // names the option), so it already returns `Cow`.
         (ProtocolKind::Vless, ProtocolConfig::Vless(cfg)) => vless_reason(cfg),
-        (ProtocolKind::Vmess, ProtocolConfig::Vmess(cfg)) => vmess_reason(cfg),
-        (ProtocolKind::Trojan, ProtocolConfig::Trojan(cfg)) => trojan_reason(cfg),
-        (ProtocolKind::Hysteria2, ProtocolConfig::Hysteria2(cfg)) => hysteria2_reason(cfg),
-        (ProtocolKind::Shadowsocks | ProtocolKind::Shadowsocks2022, ProtocolConfig::Ss(cfg)) => {
-            ss_reason(kind, cfg)
+        (ProtocolKind::Vmess, ProtocolConfig::Vmess(cfg)) => vmess_reason(cfg).map(Cow::Borrowed),
+        (ProtocolKind::Trojan, ProtocolConfig::Trojan(cfg)) => {
+            trojan_reason(cfg).map(Cow::Borrowed)
         }
-        _ => Some("protocol kind and config type do not match"),
+        (ProtocolKind::Hysteria2, ProtocolConfig::Hysteria2(cfg)) => {
+            hysteria2_reason(cfg).map(Cow::Borrowed)
+        }
+        _ => Some(Cow::Borrowed("protocol kind and config type do not match")),
     }
 }
 
@@ -215,20 +233,59 @@ fn kcp_reason(cfg: &KcpConfig, path: Option<&str>) -> Option<&'static str> {
 /// the most common native shape and its TCP path is fully implemented, so
 /// deferring it would trade a live fast path for a UDP leg that is dead on
 /// both sides of the decision.
-fn vless_reason(cfg: &VlessConfig) -> Option<&'static str> {
+fn vless_reason(cfg: &VlessConfig) -> Option<Cow<'static, str>> {
     if let Some(enc) = cfg.encryption.as_deref()
         && !enc.is_empty()
         && enc != "none"
         && !mlkem_encryption_supported(enc)
     {
-        return Some("vless account encryption is not implemented");
+        return Some(Cow::Borrowed("vless account encryption is not implemented"));
     }
     if let Some(flow) = cfg.flow.as_deref()
         && !(flow.is_empty() || flow == "xtls-rprx-vision" || flow == "xtls-rprx-vision-udp443")
     {
-        return Some("vless flow is not implemented");
+        return Some(Cow::Borrowed("vless flow is not implemented"));
     }
-    transport_reason(&cfg.transport, cfg.path.as_deref())
+    // A mux spelling we cannot serve, refused HERE rather than at parse so the
+    // row stays importable, exportable and correctly marked untestable — the same
+    // two-layer rule the plugin family follows with `MuxSetting::Invalid`.
+    if let Some(VlessMux::Invalid { key, value }) = &cfg.mux {
+        return Some(match key.as_str() {
+            // Named WITH its value: §8 requires every refusal to name the row's
+            // own key/value, and the plugin family already interpolates the same
+            // way (`ss_reason`).
+            "muxtype" => Cow::Owned(format!(
+                "vless multiplexer `{key}={value}` is not implemented — only the default \
+                 v1.mux.cool codec"
+            )),
+            // An unusable value: named, because "the row asked for mux and we
+            // cannot honour it" is the diagnosis, and silently treating it as "no
+            // mux" would dial without frames while looking as if it had asked.
+            // The value is named, not just the key: "the row asked for mux and
+            // we cannot honour it" needs the spelling to be actionable.
+            _ => {
+                return Some(Cow::Owned(format!(
+                    "vless mux option `{key}={value}` is not a supported cap"
+                )));
+            }
+        });
+    }
+    // Vision × mux: the row is refused rather than dialed, because a vision
+    // account may only carry XUDP mux (Xray's `command=Mux` with port 666), and
+    // we send the plain `v1.mux.cool` form, which Xray's inbound rejects
+    // (`isMuxAndNotXUDP`, `thirdparty/Xray-core/proxy/vless/inbound/inbound.go:180-184`).
+    if cfg.mux.as_ref().is_some_and(VlessMux::is_active)
+        && let Some(flow) = cfg.flow.as_deref()
+        && flow.starts_with("xtls-rprx-vision")
+    {
+        // Named with its value, like every other refusal here (§8): "your
+        // `flow` was X" is what a row needs to say to be actionable.
+        return Some(Cow::Owned(format!(
+            "vless flow `{flow}` with plain mux is not implemented — a vision account may only \
+             carry XUDP mux (port 666)"
+        )));
+    }
+    transport_reason(&cfg.transport, cfg.path.as_deref()).map(Cow::Borrowed)
 }
 
 /// Whether a non-`none` VLESS `encryption` value is one native can serve.
@@ -340,31 +397,158 @@ const fn hysteria2_reason(_cfg: &Hysteria2Config) -> Option<&'static str> {
 /// - Method family vs `kind`: the two kinds share `SsConfig`, and
 ///   `2022-blake3-*` selects the BLAKE3 schedule while everything else uses
 ///   HKDF-SHA1, so a mismatch means the wrong KDF, not a fallback.
-/// - `plugin`/`plugin_opts`: SIP003 is unimplemented — neither `ss::connect`
-///   nor the UDP carrier ever reads either field, so a plugin row would dial
-///   the bare server without its obfuscation wrapper. These are the only
-///   plugin fields on the typed config; the share-link and clash parsers both
-///   land here.
+/// - The SIP003 **plugin spec**, one verdict per shape, each naming the key or
+///   value that caused it. This is the single validation owner for plugin rows
+///   (spec §8): the parse/store layer never refuses, so every verdict lives here
+///   and reaches the row as the `[untestable]` marker — which is also what keeps
+///   `remove_failed_servers` from deleting a row we merely cannot serve.
 /// - `password_key`: a malformed 2022 PSK (not base64, or the wrong length
 ///   for the method) is a fatal `NativeError::Config` in the connect path, so
 ///   refusing at gate time keeps Auto resolution on the subprocess.
 ///
 /// A fingerprint id is no longer a refusal here: `security::wrap` resolves
 /// every id, approximating one with no roster row rather than failing.
-fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<&'static str> {
+fn ss_reason(kind: ProtocolKind, cfg: &SsConfig) -> Option<Cow<'static, str>> {
     let Ok(method) = resolve_method(cfg) else {
-        return Some("shadowsocks method is not implemented");
+        return Some(Cow::Borrowed("shadowsocks method is not implemented"));
     };
     if method.kind() != kind {
-        return Some("shadowsocks method family does not match the protocol kind");
+        return Some(Cow::Borrowed(
+            "shadowsocks method family does not match the protocol kind",
+        ));
     }
-    if cfg.plugin.is_some() || cfg.plugin_opts.is_some() {
-        return Some("shadowsocks SIP003 plugin is not implemented");
+    if let Some(plugin) = &cfg.plugin
+        && let Some(reason) = plugin_reason(plugin, &cfg.security)
+    {
+        return Some(reason);
     }
     if password_key(method, &cfg.password).is_err() {
-        return Some("shadowsocks 2022 password key is malformed");
+        return Some(Cow::Borrowed("shadowsocks 2022 password key is malformed"));
     }
     None
+}
+
+/// The plugin verdicts — one per shape, each naming the key or value that
+/// caused it (spec §8).
+///
+/// This is the only place a plugin row is judged: the parse layer never refuses
+/// (it preserves what it cannot interpret in `extra`), so a row we cannot serve
+/// still imports, exports and round-trips — it just carries this reason as its
+/// `[untestable]` marker, which is also what keeps `remove_failed_servers` from
+/// deleting it.
+/// `mode=quic`: named, deliberately not served, and not because it is hard.
+/// The full evidence is in the comment at the refusal site; the short form is
+/// what a row's marker has to say.
+const QUIC_WIRE_UNPINNED: &str = "shadowsocks plugin mode `quic` is not implemented — its client wire could not be pinned \
+     from evidence (v2ray-plugin embeds V2Ray 4.38.3, whose source is not in-tree)";
+
+fn plugin_reason(spec: &PluginSpec, security: &SecurityConfig) -> Option<Cow<'static, str>> {
+    // A row that speaks both vocabularies is not decidable: the two describe
+    // different wire framings, and guessing would dial a server neither spells.
+    if spec.family == PluginFamily::Unknown
+        && !spec.extra.is_empty()
+        && (spec.extra.keys().any(|k| OBFS_KEYS.contains(&k.as_str()))
+            || spec.extra.keys().any(|k| V2RAY_KEYS.contains(&k.as_str())))
+    {
+        return Some(Cow::Borrowed(
+            "shadowsocks plugin carries both option vocabularies (obfs/obfs-host and mode/mux/tls/path/host); which one is on the wire is not decidable",
+        ));
+    }
+    if spec.name.is_empty() {
+        return Some(Cow::Borrowed(
+            "shadowsocks plugin options arrived with no plugin name",
+        ));
+    }
+    let family = spec.effective_family();
+    if family == PluginFamily::Unknown {
+        return Some(Cow::Owned(format!(
+            "shadowsocks plugin `{}` is not implemented",
+            spec.name
+        )));
+    }
+    // A mode the row states that we do not implement — named, never rewritten
+    // to a default (that would dial a server neither spelling describes).
+    if let PluginMode::Invalid(value) = &spec.mode {
+        if family == PluginFamily::Obfs && value.eq_ignore_ascii_case("websocket") {
+            return Some(Cow::Borrowed(
+                "shadowsocks plugin `obfs=websocket` is the legacy smux dialect, not the v2ray-plugin websocket framing",
+            ));
+        }
+        return Some(Cow::Owned(format!(
+            "shadowsocks plugin mode `{value}` is not implemented for `{name}`",
+            name = spec.name
+        )));
+    }
+    // `mode=quic` is a mode we name but do NOT serve, and the reason is a
+    // recorded evidence gap rather than a missing snippet: v2ray-plugin v1.3.2
+    // embeds V2Ray **4.38.3**, and that tree's source is not in the repo. Three
+    // divergent QUIC wires ARE in it — v2ray-core v5.53.0 (`KeepAlivePeriod`
+    // 15 s), v2ray-core v4.31.0 legacy (`HandshakeTimeout`, quic-go 0.18.1) and
+    // sing-box's own `v2rayquic` (which sing-box's own docs state is *not*
+    // v2ray-core-compatible here) — so picking any of them would be a guess
+    // about the peer's wire, and a wrong QUIC wire fails as an opaque handshake
+    // timeout. Xray-core is no help: it removed its QUIC transport outright and
+    // has no SIP003 surface at all. So the row is refused BY NAME here and the
+    // dial never happens: without this it would open a TCP connection to a
+    // server that answers on UDP/443 and fail in the framing layer with a
+    // message that describes neither the mode nor the reason.
+    if spec.resolved_mode() == xray_tui_proto::proto_spec::PluginMode::Quic {
+        return Some(Cow::Borrowed(QUIC_WIRE_UNPINNED));
+    }
+    if let MuxSetting::Invalid(value) = &spec.mux {
+        return Some(Cow::Owned(format!(
+            "shadowsocks plugin option `mux={value}` is not a number we can use"
+        )));
+    }
+    if let TlsSetting::Invalid(value) = &spec.tls {
+        return Some(Cow::Owned(format!(
+            "shadowsocks plugin option `tls={value}` is not a boolean we can use"
+        )));
+    }
+    // A client CA pin is never silently ignored: ignoring a pin is the one
+    // failure mode this change refuses to ship. Matched lowercased, because the
+    // parser lowercases option keys (feeds spell these both ways).
+    for key in ["cert", "certraw"] {
+        if spec.extra.contains_key(key) {
+            let spelled = if key == "certraw" { "certRaw" } else { "cert" };
+            return Some(Cow::Owned(format!(
+                "shadowsocks plugin option `{spelled}` pins a client CA, which the native engine does not implement"
+            )));
+        }
+    }
+    // The `security` layer: on a TLS-bearing plugin mode it is the *supported*
+    // case (it supplies the SNI/fingerprint/insecure the plugin's own `tls` key
+    // turns on). REALITY never is — a steal target around an obfs stream is a
+    // construct no server has — and the obfs modes cannot carry one at all,
+    // because their server expects the plugin's first bytes on a plain socket.
+    if let Some(layer) = security_layer(security) {
+        if layer == SecurityLayer::Reality {
+            return Some(Cow::Borrowed(
+                "shadowsocks plugin row carries a REALITY layer; a steal target cannot wrap an obfuscated stream",
+            ));
+        }
+        if family == PluginFamily::Obfs {
+            return Some(Cow::Borrowed(
+                "shadowsocks obfs plugin row also requests a TLS layer; the plugin's framing is what its server parses first",
+            ));
+        }
+    }
+    None
+}
+
+/// The `security` layer a row states, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityLayer {
+    Tls,
+    Reality,
+}
+
+const fn security_layer(security: &SecurityConfig) -> Option<SecurityLayer> {
+    match &security.tls {
+        Some(TlsConfig::Reality(_)) => Some(SecurityLayer::Reality),
+        Some(TlsConfig::Tls(_)) => Some(SecurityLayer::Tls),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +573,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         }
     }
 
@@ -461,7 +646,49 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
+        }
+    }
+
+    /// A plugin spec built through the ONE constructor the parse path uses.
+    fn plugin(name: &str, opts: &str) -> PluginSpec {
+        PluginSpec::from_parts(if name.is_empty() { None } else { Some(name) }, opts)
+    }
+
+    fn ss_with_plugin(method: &str, name: &str, opts: &str) -> SsConfig {
+        SsConfig {
+            plugin: Some(plugin(name, opts)),
+            ..ss_cfg(method, "pw")
+        }
+    }
+
+    /// The verdict text for a plugin row, or `""` when it is accepted.
+    fn ss_reason_text(method: &str, name: &str, opts: &str) -> String {
+        support_reason(
+            ProtocolKind::Shadowsocks,
+            &ProtocolConfig::Ss(ss_with_plugin(method, name, opts)),
+        )
+        .map_or_else(String::new, std::borrow::Cow::into_owned)
+    }
+
+    /// A plain-TLS security config with an optional SNI.
+    fn tls_security(sni: Option<&str>) -> SecurityConfig {
+        SecurityConfig {
+            tls: Some(TlsConfig::Tls(TlsOpts {
+                sni: sni.map(TinyText::from),
+                ..TlsOpts::default()
+            })),
+            enc: None,
+        }
+    }
+
+    fn reality_security() -> SecurityConfig {
+        SecurityConfig {
+            tls: Some(TlsConfig::Reality(RealityOpts {
+                sni: Some(TinyText::from("example.com")),
+                pbk: Some("cHVibGljLWtleS0zMi1ieXRlcy1iYXNlNjR1cmw".to_owned()),
+                ..RealityOpts::default()
+            })),
+            enc: None,
         }
     }
 
@@ -606,6 +833,125 @@ mod tests {
         }
     }
 
+    /// The refusal the parse-time check used to be: vision + plain mux is Xray's
+    /// `isMuxAndNotXUDP` rejection (its inbound refuses it; its XRV outbound
+    /// turns vision UDP into `command=Mux` with port 666 — an XUDP path this
+    /// change explicitly leaves out of scope). It lives HERE, not at parse, so
+    /// the row imports, exports, carries `[untestable]` and is purge-safe.
+    #[test]
+    fn vision_with_mux_is_refused_by_name() {
+        for flow in ["xtls-rprx-vision", "xtls-rprx-vision-udp443"] {
+            let mut cfg = vless_cfg();
+            cfg.flow = Some(TinyText::from(flow));
+            cfg.mux = Some(VlessMux::Limited(8));
+            assert!(
+                !supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)),
+                "{flow} + plain mux must not be served"
+            );
+            let mut cfg = vless_cfg();
+            cfg.flow = Some(TinyText::from(flow));
+            cfg.mux = Some(VlessMux::Limited(8));
+            let reason = support_reason(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg))
+                .unwrap_or_else(|| panic!("{flow} + mux must be refused"));
+            assert!(
+                reason.contains("mux") && reason.contains(flow),
+                "the refusal names the row's own combination, got {reason}"
+            );
+            // And the row itself is NOT refused — only the combination is.
+            let mut cfg = vless_cfg();
+            cfg.flow = Some(TinyText::from(flow));
+            cfg.mux = None;
+            assert!(
+                supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)),
+                "vision alone still works"
+            );
+        }
+    }
+
+    /// §8: every refusal names the row's OWN key/value, so the row reads as
+    /// "this spelling", not as a generic "mux is unsupported".
+    #[test]
+    fn an_unusable_mux_spelling_is_named_in_its_refusal() {
+        // Row 29 names smux/yamux/h2mux, so ALL THREE are driven: a refusal
+        // covering only `smux` would pass while a `yamux` row was handed
+        // mux.cool frames — which is a different wire format, not a different
+        // cap. (An earlier version of this test covered `smux` alone while the
+        // plan claimed three; the claim was wrong, not the code.)
+        for multiplexer in ["smux", "yamux", "h2mux"] {
+            let mut cfg = vless_cfg();
+            cfg.mux = Some(VlessMux::Invalid {
+                key: "muxtype".into(),
+                value: multiplexer.into(),
+            });
+            assert!(
+                !supported(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg.clone())),
+                "muxtype={multiplexer} must not be served"
+            );
+            let reason =
+                support_reason(ProtocolKind::Vless, &ProtocolConfig::Vless(cfg)).expect("refused");
+            assert!(
+                reason.contains(&format!("muxtype={multiplexer}")),
+                "the refusal names the offending spelling, got {reason}"
+            );
+            // An `Invalid` row must NOT be refused for something else, and must
+            // not be "supported" either — it is stored, importable and marked
+            // untestable, which is what keeps it purge-safe.
+            assert!(!reason.contains("vision"), "no unrelated reason leaks in");
+        }
+    }
+
+    /// T22's disposition, made executable: `mode=quic` is STORED (parse never
+    /// refuses it) and refused HERE, by name, so the row stays importable,
+    /// exportable and `[untestable]` — and, the point of the refusal, is never
+    /// dialled. Without it the row opened a TCP connection to a server that
+    /// answers on UDP and failed downstream with a message describing neither the
+    /// mode nor the reason.
+    ///
+    /// It is NOT `PluginMode::Invalid`: the mode is well-formed and sing-box
+    /// serves it. The reason is recorded in the message.
+    #[test]
+    fn a_quic_plugin_row_is_refused_by_name_and_never_dialled() {
+        let mut cfg = ss_cfg("aes-256-gcm", "pw");
+        cfg.plugin = Some(PluginSpec::from_parts(
+            Some("v2ray-plugin"),
+            "mode=quic;host=cdn.example",
+        ));
+        assert!(
+            !supported(ProtocolKind::Shadowsocks, &ProtocolConfig::Ss(cfg.clone())),
+            "a quic plugin row is not served by the native engine"
+        );
+        let reason =
+            support_reason(ProtocolKind::Shadowsocks, &ProtocolConfig::Ss(cfg)).expect("refused");
+        assert!(
+            reason.contains("quic"),
+            "the refusal names the mode, got {reason}"
+        );
+        assert!(
+            reason.contains("4.38.3"),
+            "and says WHY it is not implemented rather than implying it is hard, got {reason}"
+        );
+        // The mode is well-formed, so it must NOT read as an invalid spelling —
+        // that would tell a user their URL is malformed when it is not.
+        assert!(
+            !reason.contains("is not implemented for"),
+            "a valid mode is refused as unpinned, not as malformed, got {reason}"
+        );
+        // Anti-overreach: the modes we DO serve are untouched by this.
+        for (opts, served) in [
+            ("mode=websocket;host=cdn.example", true),
+            ("obfs=http;obfs-host=cdn.example", true),
+            ("mode=gun;host=cdn.example", false), // gun is a framing we do not own
+        ] {
+            let mut cfg = ss_cfg("aes-256-gcm", "pw");
+            cfg.plugin = Some(PluginSpec::from_parts(Some("v2ray-plugin"), opts));
+            assert_eq!(
+                supported(ProtocolKind::Shadowsocks, &ProtocolConfig::Ss(cfg)),
+                served,
+                "{opts}"
+            );
+        }
+    }
+
     #[test]
     fn legacy_vmess_ciphers_deferred() {
         for enc in ["none", "zero", "aes-128-cfb", "chacha20"] {
@@ -678,7 +1024,7 @@ mod tests {
         let mut ss_family = ss_cfg("2022-blake3-aes-128-gcm", "secret");
         ss_family.method = "2022-blake3-aes-128-gcm".into();
         let mut ss_plugin = ss_cfg("aes-256-gcm", "secret");
-        ss_plugin.plugin = Some("v2ray-plugin".into());
+        ss_plugin.plugin = Some(plugin("v2ray-plugin", "host=cdn.example;tls"));
 
         let rows: Vec<(ProtocolKind, ProtocolConfig)> = vec![
             // Refusals.
@@ -693,6 +1039,18 @@ mod tests {
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_legacy)),
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_family)),
             (ProtocolKind::Shadowsocks, ProtocolConfig::Ss(ss_plugin)),
+            (
+                ProtocolKind::Shadowsocks,
+                ProtocolConfig::Ss(ss_with_plugin(
+                    "aes-256-gcm",
+                    "obfs-local",
+                    "obfs=websocket",
+                )),
+            ),
+            (
+                ProtocolKind::Shadowsocks,
+                ProtocolConfig::Ss(ss_with_plugin("aes-256-gcm", "kcptun", "key=x")),
+            ),
             // Accepted rows.
             (ProtocolKind::Vless, ProtocolConfig::Vless(vless_cfg())),
             (ProtocolKind::Vmess, ProtocolConfig::Vmess(vmess_cfg())),
@@ -1044,20 +1402,88 @@ mod tests {
         ));
     }
 
+    /// Every plugin shape gets its OWN named verdict (spec §8), and the shapes
+    /// we do implement are accepted.
     #[test]
-    fn ss_plugin_rows_defer() {
-        // SIP003: neither `ss::connect` nor the UDP carrier reads the plugin
-        // fields, so a plugin row must never reach the native dial.
-        let mut cfg = ss_cfg("aes-128-gcm", "pw");
-        cfg.plugin = Some(TinyText::from("obfs-local"));
-        assert!(!ss_row(ProtocolKind::Shadowsocks, cfg));
+    fn ss_plugin_rows_are_judged_one_verdict_per_shape() {
+        for (name, opts) in [
+            ("obfs-local", "obfs=http"),
+            ("obfs-local", "obfs=tls;obfs-host=example.com"),
+            ("simple-obfs", "obfs=http;obfs-host=example.com:8080"),
+            ("v2ray-plugin", "host=cdn.example"),
+            ("v2ray-plugin", "mode=websocket;host=cdn.example;mux=0"),
+            ("v2ray-plugin", "host=cdn.example;tls"),
+        ] {
+            assert!(
+                ss_row(
+                    ProtocolKind::Shadowsocks,
+                    ss_with_plugin("aes-128-gcm", name, opts)
+                ),
+                "{name};{opts} must be servable natively"
+            );
+        }
 
-        let mut cfg = ss_cfg("aes-128-gcm", "pw");
-        cfg.plugin_opts = Some(std::collections::HashMap::from([(
-            "obfs".to_owned(),
-            "http".to_owned(),
-        )]));
-        assert!(!ss_row(ProtocolKind::Shadowsocks, cfg));
+        let cases: &[(&str, &str, &str)] = &[
+            // Row 14's wording is "refused at connect **naming the name**", so
+            // the expectation is the plugin's own name, not a generic phrase —
+            // a refusal that said only "is not implemented" would leave the user
+            // with nothing to act on.
+            ("kcptun", "key=abc", "kcptun"),
+            ("obfs", "", "obfs"),
+            (
+                "obfs-local",
+                "obfs=websocket;obfs-host=h",
+                "legacy smux dialect",
+            ),
+            ("v2ray-plugin", "host=h;mux=many", "mux=many"),
+            ("v2ray-plugin", "host=h;tls=maybe", "tls=maybe"),
+            (
+                "v2ray-plugin",
+                "host=h;cert=/tmp/ca.pem",
+                "pins a client CA",
+            ),
+            ("v2ray-plugin", "host=h;certRaw=PEM", "pins a client CA"),
+            (
+                "obfs-local",
+                "obfs=http;obfs-host=h;mode=websocket",
+                "both option vocabularies",
+            ),
+            ("", "obfs=http;obfs-host=h", "no plugin name"),
+        ];
+        for (name, opts, expect) in cases {
+            let reason = ss_reason_text("aes-128-gcm", name, opts);
+            assert!(
+                reason.contains(expect),
+                "{name};{opts} → {reason:?} must mention {expect:?}"
+            );
+        }
+    }
+
+    /// A `wss` row that also states a `security` layer is the SUPPORTED case
+    /// (it supplies the SNI/fingerprint/insecure for the plugin's `tls`), REALITY
+    /// never is, and the obfs modes cannot carry one at all.
+    #[test]
+    fn ss_plugin_security_is_refused_only_where_it_is_meaningless() {
+        let mut cfg = ss_with_plugin("aes-128-gcm", "v2ray-plugin", "host=cdn.example;tls");
+        cfg.security = tls_security(Some("cdn.example"));
+        assert!(
+            ss_row(ProtocolKind::Shadowsocks, cfg),
+            "wss + security is supported"
+        );
+
+        let mut reality = ss_with_plugin("aes-128-gcm", "v2ray-plugin", "host=cdn.example;tls");
+        reality.security = reality_security();
+        assert!(
+            !ss_row(ProtocolKind::Shadowsocks, reality),
+            "REALITY wraps no obfs stream"
+        );
+
+        let mut obfs = ss_with_plugin("aes-128-gcm", "obfs-local", "obfs=http");
+        obfs.security = tls_security(None);
+        assert!(
+            !ss_row(ProtocolKind::Shadowsocks, obfs),
+            "the obfs server parses the head first"
+        );
     }
 
     #[test]

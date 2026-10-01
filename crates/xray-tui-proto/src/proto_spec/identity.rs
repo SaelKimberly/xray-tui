@@ -43,7 +43,13 @@ use smallvec::SmallVec;
 
 /// Identity format version, written first into both streams. A bump is a
 /// deliberate, global re-key.
-pub const IDENTITY_VERSION: u8 = 1;
+///
+/// **2** — the SIP003 plugin field became a typed, lossless `PluginSpec`: the
+/// `plugin` + `plugin_opts` pair is replaced by per-field writes, so every
+/// stored uid changes and the schema tag moves with it (`SCHEMA_VERSION` 13 →
+/// 14, which recreates the database — the accepted pre-alpha cost,
+/// `AGENTS.md` decision 4/11).
+pub const IDENTITY_VERSION: u8 = 2;
 
 /// Domain separator for the credential stream: credential bytes are hashed
 /// with a different prefix than sig bytes, so a byte slice moved between the

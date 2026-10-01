@@ -93,6 +93,11 @@ pub struct ClashVless {
     pub network: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow: Option<String>,
+    /// Clash states mux as a **bool** (`mux: true`); a true row asks for the
+    /// default cap. This is the Clash shape, not ours — `VlessMux` carries the
+    /// cap and the unlimited case that a bool cannot express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

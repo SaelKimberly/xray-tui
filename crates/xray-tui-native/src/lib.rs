@@ -57,6 +57,7 @@ pub mod e2e;
 pub mod error;
 pub mod headers;
 pub mod inbound;
+pub mod mux_session;
 /// HTTP-over-tunnel primitive (the real-ping probe's transport).
 pub mod probe;
 pub mod protocol;
@@ -73,6 +74,7 @@ pub use chain::{connect_chain, connect_chain_mux, connect_chain_udp};
 pub use context::{LinkContext, NativeConnectParams};
 pub use error::NativeError;
 pub use inbound::{Outbound, OutboundKind, ProxyOutbound, Socks5Inbound, Socks5InboundConfig};
+pub use protocol::MuxTunnel;
 pub use protocol::PacketTunnel;
 pub use protocol::vless::{
     MuxClient, MuxTarget, PacketConn, PacketMode, SessionStream, UdpSession,
@@ -116,13 +118,14 @@ pub async fn connect_udp(params: &NativeConnectParams) -> Result<PacketTunnel, N
 /// tunnel (command 0x03).
 ///
 /// The same dial → security → transport chain as [`connect`] runs
-/// unchanged; only the protocol phase differs (command 0x03 + mux framing
-/// to the fixed `v1.mux.cool` destination). The returned [`MuxClient`]
-/// opens concurrent TCP sessions via [`MuxClient::open_session`] and UDP
-/// (XUDP) sessions via [`MuxClient::open_udp_session`].
-pub async fn connect_mux(
-    params: &NativeConnectParams,
-) -> Result<MuxClient<BoxStream>, NativeError> {
+/// unchanged; only the protocol phase differs (VLESS command 0x03 + mux
+/// framing to the fixed `v1.mux.cool` destination; a Shadowsocks plugin row
+/// opens a session whose codec runs per session). The returned
+/// [`MuxTunnel`] opens a session for any family via
+/// [`MuxTunnel::open_session`]; VLESS-only callers can reach the raw
+/// multiplexer through [`MuxTunnel::as_vless`] for the XUDP path
+/// ([`MuxClient::open_udp_session`]).
+pub async fn connect_mux(params: &NativeConnectParams) -> Result<MuxTunnel, NativeError> {
     let target = params.target.clone();
     connect_chain_mux(std::slice::from_ref(params), target).await
 }

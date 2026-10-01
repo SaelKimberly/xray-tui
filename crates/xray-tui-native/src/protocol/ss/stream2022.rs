@@ -757,6 +757,17 @@ pub async fn connect(
     cfg: &SsConfig,
     method: SsMethod,
 ) -> Result<BoxStream, NativeError> {
+    connect_to(&ctx.target, stream, cfg, method).await
+}
+
+/// The same handshake against an **explicit** target — the mux path's
+/// per-session entry (see `stream::connect_to`).
+pub async fn connect_to(
+    target: &TargetAddr,
+    stream: BoxStream,
+    cfg: &SsConfig,
+    method: SsMethod,
+) -> Result<BoxStream, NativeError> {
     if method.family != SsFamily::Blake3_2022 {
         return Err(NativeError::Config(format!(
             "shadowsocks-2022 codec requires a 2022-blake3 method, got {}",
@@ -766,7 +777,7 @@ pub async fn connect(
     let key = password_key(method, &cfg.password)?;
     let mut salt = Zeroizing::new(vec![0u8; method.aead.salt_len()]);
     crate::rand::fill_nonsecret(&mut salt);
-    let mut stream = Ss2022Stream::new(stream, method, key, salt.to_vec(), ctx.target.clone());
+    let mut stream = Ss2022Stream::new(stream, method, key, salt.to_vec(), target.clone());
     let timeout = timeouts::PROTOCOL;
     tokio::time::timeout(timeout, stream.write_handshake())
         .await
@@ -1292,7 +1303,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         };
         // The link target and the profile target differ on purpose: the wire
         // must carry the LINK one.

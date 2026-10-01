@@ -273,6 +273,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         })
     }
 
@@ -367,7 +368,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         })
     }
 
@@ -390,6 +390,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         })
     }
 
@@ -603,7 +604,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         });
         let protocol = protocol(ProtocolKind::Shadowsocks, ss);
         assert_eq!(

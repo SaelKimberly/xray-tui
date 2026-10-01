@@ -15,10 +15,10 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
 use crate::addr::{Host, TargetAddr};
-use crate::protocol::vless::mux::UdpSession;
 use crate::protocol::vless::packetaddr;
 use crate::protocol::vless::stream::Peel;
 use crate::protocol::vless::udp::{FrameReader, write_packet};
+use crate::transport::mux::UdpSession;
 
 /// Maximum frame payload: the 2-byte length field is u16.
 const MAX_FRAME: usize = 65_535;
@@ -415,10 +415,10 @@ fn reject_oversized(total: usize) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::protocol::vless::MuxTarget;
-    use crate::protocol::vless::mux::{
+    use crate::protocol::vless::udp::read_packet;
+    use crate::transport::mux::{
         Frame, MuxClient, OPT_DATA, STATUS_END, STATUS_KEEP, STATUS_NEW, read_frame, write_frame,
     };
-    use crate::protocol::vless::udp::read_packet;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -45,8 +45,6 @@
 //! - subconverter: `subparser.cpp` `explodeSS()`
 //! - go-shadowsocks2: `parseURL()` (plain format)
 
-use std::collections::HashMap;
-
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,6 +52,8 @@ use serde_json::{Value, json};
 use crate::urlx::{HostSpec, RawUrlX, SchemeX, TinyText};
 
 use super::ProtoIdentity;
+use super::ss_plugin::{MuxSetting, PluginFamily, PluginMode, PluginSpec, TlsSetting};
+
 use super::common::{
     SecurityConfig, TransportConfig, security_force_insecure, to_xray_stream_settings,
 };
@@ -84,9 +84,12 @@ pub struct SsConfig {
     #[serde(default, skip_serializing_if = "SecurityConfig::is_empty")]
     pub security: SecurityConfig,
     pub remarks: Option<TinyText>,
-    pub plugin: Option<TinyText>,
+    /// The SIP003 plugin row, in the total lossless form (spec §3). `None` when
+    /// the URL carried no plugin at all; `Some` — even with an empty `name` —
+    /// whenever options were present, so a spelling can never fall through to a
+    /// plugin-less row that dials the bare server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_opts: Option<HashMap<String, String>>,
+    pub plugin: Option<PluginSpec>,
 }
 
 impl SsConfig {
@@ -151,15 +154,11 @@ impl SsConfig {
         let remarks = utils::decode_fragment(raw)?;
 
         let query = utils::parse_query(raw.query);
-        let plugin = utils::query_get(&query, "plugin").map(TinyText::from);
-        let plugin_opts = utils::query_get(&query, "plugin_opts").map(|s| {
-            s.split(';')
-                .filter_map(|pair| {
-                    pair.split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                })
-                .collect::<HashMap<String, String>>()
-        });
+        // The single constructor: glued name+options, a separate `plugin_opts`,
+        // and the base64-JSON spelling all resolve here (spec §3.2), and it
+        // never refuses — a row we cannot serve still stores, so it can be
+        // exported, re-imported, and reported by `capability` at connect.
+        let plugin = PluginSpec::from_query(&query);
 
         // Cipher-aware kind + core: the one config where resolve_core's
         // ss_method argument matters.
@@ -170,7 +169,6 @@ impl SsConfig {
             security: SecurityConfig::default(),
             remarks,
             plugin,
-            plugin_opts,
         };
         Ok(ParsedProto {
             endpoints: vec![endpoint],
@@ -196,18 +194,16 @@ impl SsConfig {
         };
         let mut query_parts: Vec<String> = Vec::new();
         if let Some(plugin) = &self.plugin {
-            query_parts.push(format!("plugin={}", urlencoding::encode(plugin)));
-        }
-        if let Some(opts) = &self.plugin_opts {
-            let encoded_opts = opts
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(";");
-            query_parts.push(format!(
-                "plugin_opts={}",
-                urlencoding::encode(&encoded_opts)
-            ));
+            // Canonical form: the bare name, then every non-default typed field
+            // and every preserved extra key, sorted. The typed fields are
+            // re-derived into the option string here — echoing only the name
+            // would silently drop `mode`/`host`/`tls`/`mux` and re-import as a
+            // different row (spec §3.1 rule 2).
+            query_parts.push(format!("plugin={}", urlencoding::encode(&plugin.name)));
+            let opts = plugin.render_opts();
+            if !opts.is_empty() {
+                query_parts.push(format!("plugin_opts={}", urlencoding::encode(&opts)));
+            }
         }
         let query_string = if query_parts.is_empty() {
             String::new()
@@ -239,13 +235,12 @@ impl SsConfig {
             password: self.password.clone(),
             udp: None,
             udp_over_tcp: None,
-            plugin: self.plugin.as_ref().map(std::string::ToString::to_string),
-            plugin_opts: self.plugin_opts.as_ref().map(|opts| {
-                opts.iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(";")
-            }),
+            plugin: self.plugin.as_ref().map(|spec| spec.name.to_string()),
+            plugin_opts: self
+                .plugin
+                .as_ref()
+                .map(super::ss_plugin::PluginSpec::render_opts)
+                .filter(|opts| !opts.is_empty()),
         }))
     }
 
@@ -265,16 +260,18 @@ impl SsConfig {
                         "" => None,
                         s => Some(TinyText::from(s)),
                     },
-                    plugin: c.plugin.clone().map(TinyText::from),
-                    plugin_opts: c.plugin_opts.as_ref().map(|opts_str| {
-                        opts_str
-                            .split(';')
-                            .filter_map(|pair| {
-                                pair.split_once('=')
-                                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                            })
-                            .collect::<HashMap<String, String>>()
-                    }),
+                    // The same constructor the URL path uses, so a Clash YAML
+                    // with only `plugin-opts` (no `plugin`) stores an empty name
+                    // rather than losing the options.
+                    plugin: match (&c.plugin, &c.plugin_opts) {
+                        (name, opts) if name.is_some() || opts.is_some() => {
+                            Some(PluginSpec::from_parts(
+                                name.as_deref(),
+                                opts.as_deref().unwrap_or_default(),
+                            ))
+                        }
+                        _ => None,
+                    },
                 };
                 Ok(ParsedProto {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
@@ -394,16 +391,32 @@ impl ProtoSpec for SsConfig {
 }
 
 /// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
-const ID_PLUGIN: u8 = 0x50;
-const ID_PLUGIN_OPTS: u8 = 0x51;
+///
+/// The SIP003 plugin tags replace the old `ID_PLUGIN` / `ID_PLUGIN_OPTS` pair
+/// (spec §4), so the spec is written field by field, in this frozen order.
+const ID_PLUGIN_NAME: u8 = 0x50;
+const ID_PLUGIN_FAMILY: u8 = 0x51;
+const ID_PLUGIN_MODE: u8 = 0x52;
+const ID_PLUGIN_HOST: u8 = 0x53;
+const ID_PLUGIN_PORT: u8 = 0x54;
+const ID_PLUGIN_PATH: u8 = 0x55;
+const ID_PLUGIN_TLS: u8 = 0x56;
+const ID_PLUGIN_MUX: u8 = 0x57;
+const ID_PLUGIN_EXTRA: u8 = 0x58;
 
 impl ProtoIdentity for SsConfig {
     /// Identity fields: everything that reaches a builder.
     ///
-    /// The SIP003 `plugin`/`plugin_opts` reach both cores and are identity;
-    /// `plugin_opts` goes through [`IdentityWriter::map_str`] because raw
-    /// `HashMap` iteration order is per-instance randomized (iterating the map
-    /// into the hasher was a live nondeterminism bug).
+    /// The SIP003 plugin spec reaches both cores and is identity, written
+    /// field by field. Defaults are **elided** (identity rule (c)) so an absent
+    /// key and an explicit default are one row — with one deliberate exception:
+    /// `host` is written whenever present, *including* when its value is the
+    /// `cloudfront.com` default, because sing-box's SNI rule is gated on the
+    /// key's **presence** (spec §4, §5.1). Collapsing those two forms would
+    /// silently change which name a server is dialed with.
+    ///
+    /// `Invalid(_)` values and `extra` entries are always written: neither is
+    /// ever a default, and dropping them would merge two rows that differ.
     ///
     /// Excluded on purpose: `remarks` (display). Credentials: `method` and
     /// `password` (the 2022-blake3 PSK).
@@ -412,12 +425,67 @@ impl ProtoIdentity for SsConfig {
         super::common::write_security(w, &self.security);
         // Endpoint (host/port) intentionally absent from the identity — it
         // lives on the ParsedProto boundary, never in the config payload (T5).
-        w.present_str(ID_PLUGIN, self.plugin.as_deref());
-        if let Some(opts) = &self.plugin_opts {
-            w.map_str(ID_PLUGIN_OPTS, opts);
+        if let Some(plugin) = &self.plugin {
+            // The EFFECTIVE family, not the stored field: vocabulary presence
+            // is not recoverable from the wire form. `?plugin=v2ray-plugin`
+            // (name only) stores `Unknown` but resolves to V2Ray, and the
+            // canonical export renders it as the bare name — so hashing the
+            // stored field would give those two spellings different uids and
+            // row 20's fixed point could never pass. Rule (c) says they are
+            // one row: both put the same bytes on the wire.
+            let family = plugin.effective_family();
+            w.present_str(ID_PLUGIN_NAME, Some(plugin.name.as_str()));
+            w.present_str(ID_PLUGIN_FAMILY, Some(family_tag(family)));
+            // The mode, elided against the SAME effective family's default so
+            // an absent key and an explicit default are one row. An `Invalid`
+            // value is never a default, so it always writes — dropping it
+            // would merge two rows that refuse for different reasons.
+            match &plugin.mode {
+                PluginMode::Unset => {}
+                PluginMode::Invalid(value) => w.str(ID_PLUGIN_MODE, value),
+                mode => {
+                    // The elision is conditioned on `name_agrees` for the same
+                    // reason the renderer conditions it there: a name that
+                    // disagrees with its keys must keep the key, or the name
+                    // alone re-derives the other family on the next import.
+                    if *mode != PluginMode::default_for(family) || !plugin.name_agrees() {
+                        w.str(ID_PLUGIN_MODE, mode.as_str());
+                    }
+                }
+            }
+            // Presence-gated, so NEVER elided against a default.
+            w.present_str(ID_PLUGIN_HOST, plugin.host.as_deref());
+            w.present_u64(ID_PLUGIN_PORT, plugin.port.map(u64::from));
+            w.opt_str(ID_PLUGIN_PATH, plugin.path.as_deref(), "/");
+            match &plugin.tls {
+                TlsSetting::Unset | TlsSetting::Off => {}
+                TlsSetting::On => w.str(ID_PLUGIN_TLS, "1"),
+                TlsSetting::Invalid(value) => w.str(ID_PLUGIN_TLS, value),
+            }
+            match &plugin.mux {
+                MuxSetting::Unset | MuxSetting::On(1) => {}
+                MuxSetting::Off => w.str(ID_PLUGIN_MUX, "0"),
+                MuxSetting::On(n) => w.str(ID_PLUGIN_MUX, &n.to_string()),
+                MuxSetting::Invalid(value) => w.str(ID_PLUGIN_MUX, value),
+            }
+            // Sorted by key: `extra` is a `BTreeMap`, so the write order is
+            // deterministic (a raw `HashMap` here was a live nondeterminism bug).
+            for (key, value) in &plugin.extra {
+                w.str(ID_PLUGIN_EXTRA, key);
+                w.str(ID_PLUGIN_EXTRA, value);
+            }
         }
         w.cred("method", self.method.as_str());
         w.cred("password", &self.password);
+    }
+}
+
+/// The family tag written to identity — stable text, not a `Debug` rendering.
+const fn family_tag(family: PluginFamily) -> &'static str {
+    match family {
+        PluginFamily::Obfs => "obfs",
+        PluginFamily::V2Ray => "v2ray",
+        PluginFamily::Unknown => "unknown",
     }
 }
 
@@ -457,6 +525,18 @@ impl SsConfig {
                  supported: aes-128-gcm, aes-256-gcm, chacha20-poly1305, \
                  xchacha20-poly1305, 2022-blake3-*",
                 self.method.as_str()
+            )));
+        }
+        // xray-core has NO SIP003 support at all (no `plugin` field anywhere
+        // under `thirdparty/Xray-core/proxy/shadowsocks/`), so a plugin row
+        // used to be emitted WITHOUT its obfuscation wrapper — a config that
+        // dials the bare server and reports a dead endpoint, i.e. a client
+        // defect that reads as a server verdict. Refuse it instead (decision
+        // 2's rule, the same one the cipher check above uses).
+        if let Some(plugin) = &self.plugin {
+            return Err(SupportError::Config(format!(
+                "Shadowsocks plugin `{}` cannot be built for xray-core: it has no SIP003 support",
+                plugin.name
             )));
         }
         let security = security_force_insecure(&self.security, opts.skip_cert_verify);
@@ -512,19 +592,16 @@ impl SsConfig {
             "password": self.password,
         });
         if let Some(plugin) = &self.plugin {
-            out["plugin"] = json!(plugin);
-        }
-        if let Some(opts) = &self.plugin_opts {
-            // Sorted: a HashMap's iteration order is per-instance random, so
-            // joining it raw made the emitted core config differ between runs
-            // (identity already sorts via `map_str`).
-            let mut entries: Vec<(&String, &String)> = opts.iter().collect();
-            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            let joined: Vec<String> = entries
-                .into_iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            out["plugin_opts"] = json!(joined.join(";"));
+            // sing-box looks the plugin up by name in a registry
+            // (`transport/sip003/plugin.go:28-37` — `v2ray-plugin` and
+            // `obfs-local` are built in), so the name and a canonical option
+            // string are the whole contract. `render_opts` is sorted, which is
+            // what kept the emitted config from differing between runs.
+            out["plugin"] = json!(plugin.name.as_str());
+            let opts = plugin.render_opts();
+            if !opts.is_empty() {
+                out["plugin_opts"] = json!(opts);
+            }
         }
         *core_conf = out;
         Ok(())
@@ -540,6 +617,7 @@ mod tests {
         SecurityConfig, TlsConfig, TlsOpts,
     };
     use super::SsConfig;
+    use crate::proto_spec::ss_plugin::{PluginFamily, PluginMode};
     use crate::urlx::{RawUrlX, SchemeX};
 
     fn parse(url: &str) -> ParsedProto {
@@ -763,19 +841,34 @@ mod tests {
             other => panic!("expected SsConfig, got {other:?}"),
         };
         assert_eq!(cfg.method, "aes-256-gcm");
-        assert_eq!(cfg.plugin.as_deref(), Some("obfs-local"));
+        let plugin = cfg.plugin.as_ref().expect("the plugin row is stored");
+        assert_eq!(plugin.name.as_str(), "obfs-local");
         assert_eq!(
-            cfg.plugin_opts
-                .as_ref()
-                .and_then(|m| m.get("obfs"))
-                .map(String::as_str),
-            Some("http")
+            plugin.mode,
+            PluginMode::Http,
+            "an absent key normalizes to the default"
+        );
+        assert!(
+            plugin.host.is_none(),
+            "this entry states no host — one must not be invented"
         );
         assert_no_top_level_host_port(cfg);
+        // The canonical export elides a default, so the emitted TEXT differs
+        // from the input (`obfs=http` becomes absent). What must hold is that
+        // re-parsing it yields the same row: the Clash round trip is a parse
+        // fixed point, not a text round trip.
         let out = cfg.to_clash_proto(&parsed.endpoints[0]).expect("to clash");
-        match (out, proxy) {
-            (ClashProxy::Shadowsocks(out), ClashProxy::Shadowsocks(orig)) => assert_eq!(out, orig),
-            _ => panic!("expected shadowsocks clash proxy"),
+        let round_tripped = SsConfig::try_from_clash_proto(&out).expect("clash re-parse");
+        match (round_tripped.protocol.config, parsed.protocol.config) {
+            (ProtocolConfig::Ss(first), ProtocolConfig::Ss(second)) => {
+                assert_eq!(
+                    first.plugin, second.plugin,
+                    "the plugin row survives the round trip"
+                );
+                assert_eq!(first.method, second.method);
+                assert_eq!(first.password, second.password);
+            }
+            _ => panic!("expected shadowsocks on both sides"),
         }
     }
 
@@ -931,7 +1024,6 @@ mod tests {
             security: super::super::common::SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         };
         let mut conf = serde_json::json!({});
         let err = cfg
@@ -948,6 +1040,115 @@ mod tests {
         );
     }
 
+    // ── Plugin identity (spec §4) ────────────────────────────────────────
+
+    /// The uid of a row carrying `?plugin=<opts>`. The option string is
+    /// inserted **raw**: `parse_query` percent-decodes, so encoding here would
+    /// store the escape instead of the value.
+    fn uid_of(opts: &str) -> i64 {
+        let url = format!("ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388?plugin={opts}");
+        parse(&url).identity_once().2
+    }
+
+    /// An absent key and an explicit default are ONE row: the canonical export
+    /// elides defaults, so if the two hashed differently the export fixed point
+    /// (`uid(parse(u)) == uid(parse(export(parse(u))))`) could not hold.
+    #[test]
+    fn plugin_defaults_elide_to_one_protocol_row() {
+        for (absent, explicit) in [
+            ("v2ray-plugin", "v2ray-plugin;mode=websocket"),
+            ("v2ray-plugin;host=h", "v2ray-plugin;mode=websocket;host=h"),
+            ("obfs-local;obfs-host=h", "obfs-local;obfs=http;obfs-host=h"),
+            ("v2ray-plugin", "v2ray-plugin;path=%2F"),
+            ("v2ray-plugin", "v2ray-plugin;tls=0"),
+            // Row 13's `mux` pair: `write_identity` elides `MuxSetting::Unset`
+            // against `On(1)`, because a v2ray-plugin row's default IS mux-on for
+            // the websocket and unset modes (`active_for`), so the two spellings
+            // are the same configured behaviour and therefore one row.
+            (
+                "v2ray-plugin;mode=websocket",
+                "v2ray-plugin;mode=websocket;mux=1",
+            ),
+            ("v2ray-plugin", "v2ray-plugin;mux=1"),
+        ] {
+            assert_eq!(
+                uid_of(absent),
+                uid_of(explicit),
+                "{absent} and {explicit} must be one row"
+            );
+        }
+
+        // The anti-overreach: `mux=0` really does turn mux OFF for a websocket
+        // row (`active_for`: `Off` → false), so it is a DIFFERENT stored config
+        // and must be a different row. Eliding it the way `mux=1` is elided
+        // would merge a multiplexed row with a plain one — and whichever
+        // imported first would supply the config for both.
+        assert_ne!(
+            uid_of("v2ray-plugin;mode=websocket"),
+            uid_of("v2ray-plugin;mode=websocket;mux=0"),
+            "`mux=0` disables the websocket default and is its own row"
+        );
+    }
+
+    /// The one deliberate exception: the plugin `host` is **never** elided,
+    /// because sing-box's SNI rule is gated on the key's presence. A row that
+    /// spells `host=cloudfront.com` and one that spells nothing dial different
+    /// names, so merging them would change which name a server is reached by.
+    #[test]
+    fn plugin_host_is_never_elided_because_its_presence_gates_the_sni() {
+        assert_ne!(
+            uid_of("v2ray-plugin;tls"),
+            uid_of("v2ray-plugin;host=cloudfront.com;tls"),
+            "a stated host and an absent one are different rows"
+        );
+        assert_ne!(uid_of("v2ray-plugin;host=a"), uid_of("v2ray-plugin;host=b"));
+    }
+
+    /// Everything that is not a default IS identity: an invalid value, a
+    /// preserved extra key, a mode, a port, a path, a non-default cap.
+    #[test]
+    fn plugin_non_defaults_are_all_identity() {
+        let base = uid_of("v2ray-plugin;host=h");
+        for opts in [
+            "v2ray-plugin;host=h;mode=quic",
+            "v2ray-plugin;host=h;path=%2Fp",
+            "v2ray-plugin;host=h;obfs-uri=%2F",
+            "v2ray-plugin;host=h;zz=1",
+            "v2ray-plugin;host=h;mux=8",
+            "v2ray-plugin;host=h;tls=1",
+        ] {
+            assert_ne!(uid_of(opts), base, "{opts} must differ from the bare row");
+        }
+        assert_ne!(
+            uid_of("obfs-local;obfs-host=h"),
+            uid_of("obfs-local;obfs-host=h:8080"),
+            "the obfs port reaches the Host header, so it is part of the row"
+        );
+        assert_ne!(
+            uid_of("obfs-local;obfs=http"),
+            uid_of("obfs-local;obfs=tls"),
+            "the obfs mode is a different wire"
+        );
+    }
+
+    /// A row with NO plugin and a row with one are different rows, and the
+    /// endpoint still plays no part: the same plugin row on two servers is one
+    /// `Protocol` (decision 11(f)).
+    #[test]
+    fn plugin_presence_is_identity_and_the_endpoint_is_not() {
+        assert_ne!(
+            uid_of("v2ray-plugin;host=h"),
+            parse("ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388")
+                .identity_once()
+                .2
+        );
+        let other = "ss://YWVzLTI1Ni1nY206cGFzcw@9.9.9.9:8388?plugin=v2ray-plugin%3Bhost%3Dh";
+        assert_eq!(
+            uid_of("v2ray-plugin;host=h"),
+            parse(other).identity_once().2
+        );
+    }
+
     #[test]
     fn singbox_inject_without_endpoint_is_rejected() {
         let cfg = ss_aead();
@@ -956,5 +1157,244 @@ mod tests {
             .inject_to(&mut conf, CoreType::SingBox, None, InjectOptions::default())
             .expect_err("orphan ss must be rejected");
         assert!(matches!(err, SupportError::MissingField("server", "ss")));
+    }
+
+    // ── Injectors (T5) ──────────────────────────────────────────────────
+
+    /// xray-core has no SIP003 support, so a plugin row must be a BUILD
+    /// refusal — never a config that silently dials the bare server.
+    #[test]
+    fn xray_inject_refuses_a_plugin_row_instead_of_dropping_it() {
+        let url = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp";
+        let parsed = parse(url);
+        let mut conf = serde_json::json!({});
+        let err = config(parsed.clone())
+            .inject_to(
+                &mut conf,
+                CoreType::Xray,
+                Some(&parsed.endpoints[0]),
+                InjectOptions::default(),
+            )
+            .expect_err("xray-core cannot carry a plugin");
+        let text = err.to_string();
+        assert!(text.contains("obfs-local"), "{text} must name the plugin");
+        assert!(text.contains("SIP003"), "{text} must say why");
+    }
+
+    /// sing-box DOES carry the plugin (it registers `v2ray-plugin` and
+    /// `obfs-local` in-process), so the row builds there with the canonical
+    /// option string.
+    #[test]
+    fn singbox_inject_emits_the_plugin_name_and_canonical_opts() {
+        let url = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388?plugin=v2ray-plugin%3Bhost%3Dcdn.example%3Btls";
+        let parsed = parse(url);
+        let mut conf = serde_json::json!({});
+        config(parsed.clone())
+            .inject_to(
+                &mut conf,
+                CoreType::SingBox,
+                Some(&parsed.endpoints[0]),
+                InjectOptions::default(),
+            )
+            .expect("sing-box has the plugin in-process");
+        assert_eq!(conf["plugin"], "v2ray-plugin");
+        assert_eq!(conf["plugin_opts"], "host=cdn.example;tls=1");
+    }
+
+    // ── The stored-form fixed point (T4, acceptance row 20) ──────────────
+
+    /// `uid(parse(export(row))) == uid(row)` for a STORED row — the Ctrl+E
+    /// path. A corpus URL cannot prove this on its own: SS export emits no
+    /// `security` field, so the invariant is only testable through the plugin
+    /// spec the export does re-derive.
+    #[test]
+    fn export_reimport_is_uid_stable_for_a_stored_row() {
+        for opts in [
+            // A v2ray-plugin row whose typed fields are ALL defaults: the
+            // export carries only `plugin=<name>`, and the name alone must
+            // reproduce the same stored row.
+            "v2ray-plugin",
+            // …and one that states a host, which SS export does emit.
+            "v2ray-plugin;host=cdn.example;tls",
+            "obfs-local;obfs=tls;obfs-host=example.com:8080",
+            "obfs-local",
+            "kcptun;key=abc",
+        ] {
+            let url = format!("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388?plugin={opts}");
+            let parsed = parse(&url);
+            let exported = config(parsed.clone())
+                .reconstruct_proto(&parsed.endpoints[0])
+                .expect("reconstruct");
+            let reparsed = parse(&exported);
+            assert_eq!(
+                config(reparsed.clone()).plugin,
+                config(parsed.clone()).plugin,
+                "{opts} → {exported} must re-parse to the same spec"
+            );
+            assert_eq!(
+                reparsed.identity_once(),
+                parsed.identity_once(),
+                "{opts} → {exported} must re-import as the SAME row"
+            );
+        }
+    }
+
+    // ── The captured feeds (tier 1b) ─────────────────────────────────────
+
+    /// Every plugin-bearing `ss://` line in the captured feeds
+    /// (`tests/fixtures/m1n1-5ub-*.txt`) parses, is stored losslessly, and
+    /// survives export → re-import as the SAME row.
+    ///
+    /// The corpus is the only source of the real spellings: glued name+opts,
+    /// percent-encoded, base64-JSON under a key named after the plugin, an obfs
+    /// name with v2ray vocabulary, `host:port`, a name with no options, and the
+    /// nested-`ss://` junk. No crate consumed these files before this test.
+    #[test]
+    fn corpus_plugin_rows_parse_and_round_trip() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.to_string_lossy().contains("m1n1-5ub"))
+            .collect();
+        files.sort();
+        assert!(files.len() >= 30, "the corpus is {} files", files.len());
+
+        // Markers taken from the corpus itself, in the exact spelling the files
+        // carry (most rows percent-encode the option string; a few do not).
+        // Each is a shape the spec's §2.7 table names.
+        let expected: &[(&str, PluginFamily, PluginMode)] = &[
+            // unencoded, carrying the `obfs-uri` the reference ignores
+            ("obfs-local;obfs-uri", PluginFamily::Obfs, PluginMode::Tls),
+            // percent-encoded option strings
+            (
+                "obfs-local%3Bobfs%3Dtls",
+                PluginFamily::Obfs,
+                PluginMode::Tls,
+            ),
+            (
+                "obfs-local%3Bobfs%3Dhttp%3Bobfs-host",
+                PluginFamily::Obfs,
+                PluginMode::Http,
+            ),
+            (
+                "simple-obfs%3Bobfs%3Dtls",
+                PluginFamily::Obfs,
+                PluginMode::Tls,
+            ),
+            (
+                "simple-obfs%3Bobfs-host%3D51.38.112.84",
+                PluginFamily::Obfs,
+                PluginMode::Http,
+            ),
+            // an obfs NAME with the v2ray vocabulary (the keys win)
+            (
+                "obfs-local%3Bmode%3Dwebsocket",
+                PluginFamily::V2Ray,
+                PluginMode::Websocket,
+            ),
+            // v2ray-plugin: glued, and the base64-JSON key form
+            (
+                "plugin=v2ray-plugin%3B",
+                PluginFamily::V2Ray,
+                PluginMode::Websocket,
+            ),
+            (
+                "v2ray-plugin=ey",
+                PluginFamily::V2Ray,
+                PluginMode::Websocket,
+            ),
+        ];
+        let mut seen_marker = [false; 8];
+        let mut plugin_rows = 0usize;
+        let mut nested = 0usize;
+        let mut unparsed_userinfo = 0usize;
+
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read corpus file");
+            for line in text.lines() {
+                if !line.starts_with("ss://") {
+                    continue;
+                }
+                if !line.contains("plugin") {
+                    continue;
+                }
+                let parsed = match SsConfig::try_parse_proto(&RawUrlX::from(line)) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        // Two pre-existing failure shapes reach here, both
+                        // BEFORE any plugin branch runs — the userinfo layer
+                        // either sees a nested `ss://` or a base64 payload that
+                        // a feed percent-encoded mid-string. Neither is a
+                        // plugin regression; both must be NAMED errors rather
+                        // than a panic, and neither may reach a dial.
+                        assert!(
+                            !err.to_string().is_empty(),
+                            "{}: a parse failure must carry a reason",
+                            path.display()
+                        );
+                        if line.contains("@ss://") {
+                            nested += 1;
+                        } else {
+                            unparsed_userinfo += 1;
+                        }
+                        continue;
+                    }
+                };
+                plugin_rows += 1;
+                let cfg = config(parsed.clone());
+                let plugin = cfg
+                    .plugin
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{}: {line} stored no plugin", path.display()));
+                assert!(!plugin.name.is_empty(), "{}: {line}", path.display());
+
+                for (index, (marker, family, mode)) in expected.iter().enumerate() {
+                    if line.contains(marker) {
+                        assert_eq!(plugin.family, *family, "{line}");
+                        assert_eq!(plugin.mode, *mode, "{line}");
+                        seen_marker[index] = true;
+                    }
+                }
+                // The export fixed point, on real rows.
+                let exported = cfg
+                    .reconstruct_proto(&parsed.endpoints[0])
+                    .expect("reconstruct a corpus row");
+                let reparsed = match SsConfig::try_parse_proto(&RawUrlX::from(exported.as_str())) {
+                    Ok(reparsed) => reparsed,
+                    Err(e) => panic!("{line} → {exported} failed to re-parse: {e}"),
+                };
+                assert_eq!(
+                    reparsed.identity_once(),
+                    parsed.identity_once(),
+                    "{line} → {exported} must re-import as the same row"
+                );
+            }
+        }
+
+        assert!(
+            plugin_rows >= 20,
+            "only {plugin_rows} plugin rows in the corpus"
+        );
+        assert!(
+            nested >= 1,
+            "the nested-ss:// rows are missing from the corpus"
+        );
+        // Feeds also carry rows whose base64 userinfo is percent-encoded
+        // mid-string; those fail at the userinfo layer, before any plugin
+        // branch, and are counted rather than fixed here — a userinfo-layer
+        // change is a separate concern from SIP003.
+        assert!(
+            unparsed_userinfo >= 1,
+            "the percent-encoded-userinfo rows vanished from the corpus"
+        );
+        for (index, hit) in seen_marker.iter().enumerate() {
+            assert!(
+                *hit,
+                "no corpus row matched the expected shape {}",
+                expected[index].0
+            );
+        }
     }
 }

@@ -15,14 +15,16 @@ use crate::protocol::vless::vision::{
 
 pub mod encryption;
 pub mod header;
-pub(crate) mod mux;
 pub mod packet;
 pub(crate) mod packetaddr;
 pub mod stream;
 pub(crate) mod udp;
 pub(crate) mod vision;
 
-pub use mux::{MuxClient, MuxTarget, SessionStream, UdpSession};
+// The mux codec moved to `crate::transport::mux` (spec §7): the
+// v1.mux.cool frame format plus a session multiplexer, with no VLESS
+// specifics — the SS plugin arm shares it verbatim.
+pub use crate::transport::mux::{MuxClient, MuxTarget, SessionStream, UdpSession};
 pub use packet::{PacketConn, PacketMode, PacketReader, PacketWriter, SplitHalves};
 
 /// Connect through a VLESS outbound over an already-secured stream.
@@ -461,7 +463,10 @@ async fn connect_mux_vision(
 /// [`header::encode_request`] as the mux command's target; the `CMD_MUX`
 /// arm does not encode it on the wire.
 fn mux_header_target() -> TargetAddr {
-    TargetAddr::new(Host::Domain(mux::MUX_DEST.to_string()), mux::MUX_PORT)
+    TargetAddr::new(
+        Host::Domain(crate::transport::mux::MUX_DEST.to_string()),
+        crate::transport::mux::MUX_PORT,
+    )
 }
 
 #[cfg(test)]
@@ -826,12 +831,12 @@ mod tests {
             .expect("open session");
 
         // The eager New frame arrives at the server (spec §8 deviation 1).
-        let frame = mux::read_frame(&mut peer)
+        let frame = crate::transport::mux::read_frame(&mut peer)
             .await
             .unwrap()
             .expect("eager new frame");
         assert_eq!(frame.session_id, 1);
-        assert_eq!(frame.status, mux::STATUS_NEW);
+        assert_eq!(frame.status, crate::transport::mux::STATUS_NEW);
         assert_eq!(
             frame.target,
             Some(MuxTarget::TcpDomain("example.com".into(), 80))
@@ -839,21 +844,21 @@ mod tests {
 
         // App data roundtrips as a Keep frame with the payload.
         session.write_all(b"ping").await.unwrap();
-        let frame = mux::read_frame(&mut peer)
+        let frame = crate::transport::mux::read_frame(&mut peer)
             .await
             .unwrap()
             .expect("keep frame");
         assert_eq!(frame.session_id, 1);
-        assert_eq!(frame.status, mux::STATUS_KEEP);
+        assert_eq!(frame.status, crate::transport::mux::STATUS_KEEP);
         assert_eq!(frame.payload.as_ref(), b"ping");
 
         // The server's Keep reply reaches the session stream.
-        mux::write_frame(
+        crate::transport::mux::write_frame(
             &mut peer,
-            &mux::Frame {
+            &crate::transport::mux::Frame {
                 session_id: 1,
-                status: mux::STATUS_KEEP,
-                option: mux::OPT_DATA,
+                status: crate::transport::mux::STATUS_KEEP,
+                option: crate::transport::mux::OPT_DATA,
                 target: None,
                 global_id: None,
                 payload: bytes::Bytes::from_static(b"ok"),

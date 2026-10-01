@@ -1029,6 +1029,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         })
     }
 

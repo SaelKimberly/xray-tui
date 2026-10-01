@@ -34,6 +34,7 @@ use xray_tui_proto::proto_spec::{ProtocolKind, SsConfig};
 use zeroize::Zeroizing;
 
 use crate::BoxStream;
+use crate::addr::TargetAddr;
 use crate::addr::encode_addr_port_last;
 use crate::context::LinkContext;
 use crate::crypto::aead::{NonceCounter, SsAead};
@@ -483,6 +484,20 @@ pub async fn connect(
     cfg: &SsConfig,
     method: SsMethod,
 ) -> Result<BoxStream, NativeError> {
+    connect_to(&ctx.target, stream, cfg, method).await
+}
+
+/// The same handshake against an **explicit** target.
+///
+/// The mux path needs this: a v2ray-plugin session's real destination is not
+/// `ctx.target` (the New frame carries a dummy, §7), so the per-session codec
+/// cannot read the link's target. One implementation, two callers.
+pub async fn connect_to(
+    target: &TargetAddr,
+    stream: BoxStream,
+    cfg: &SsConfig,
+    method: SsMethod,
+) -> Result<BoxStream, NativeError> {
     if method.family != SsFamily::Classic {
         return Err(NativeError::Config(format!(
             "shadowsocks classic AEAD codec requires a classic method, got {:?}",
@@ -492,7 +507,7 @@ pub async fn connect(
     let key = password_key(method, &cfg.password)?;
     let mut salt = Zeroizing::new(vec![0u8; method.aead.salt_len()]);
     crate::rand::fill_nonsecret(&mut salt);
-    let first = encode_addr_port_last(&ctx.target)?;
+    let first = encode_addr_port_last(target)?;
     let mut stream = SsStream::new(stream, method, key, &salt, Some(first));
     let timeout = timeouts::PROTOCOL;
     tokio::time::timeout(timeout, stream.flush_out())
@@ -962,7 +977,6 @@ mod tests {
             security: SecurityConfig::default(),
             remarks: None,
             plugin: None,
-            plugin_opts: None,
         }
     }
 

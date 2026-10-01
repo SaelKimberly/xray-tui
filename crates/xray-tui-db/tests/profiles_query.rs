@@ -117,6 +117,7 @@ async fn seed_link(
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         }))),
     })
     .exec(&mut *conn)

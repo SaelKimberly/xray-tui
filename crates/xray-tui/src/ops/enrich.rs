@@ -18,16 +18,22 @@ use crate::AppState;
 use crate::ops::profiles::PROFILES_PAGE_SIZE;
 use crate::types::{CoreEvent, EndpointInfo};
 
-/// SNI from a typed protocol row: the `security.sni` column, populated at
-/// write time from `config.security().sni()` (covers both `tls` and `reality`
-/// variants). The column is queryable without loading the deferred `config`
-/// JSON; when the config IS loaded, the typed accessor chain is equivalent.
-pub(crate) fn extract_sni(protocol: &Protocol) -> Option<String> {
-    use xray_tui_proto::proto_spec::ProtoSpec;
-    if !protocol.config.is_unloaded()
-        && let Some(sni) = protocol.config.get().0.security().and_then(|s| s.sni())
-    {
-        return Some(sni.to_string());
+/// The SNI a link actually presents, for the whitelist/`🏳️` verdict.
+///
+/// **One owner with the engine:** [`xray_tui_proto::proto_spec::ss_plugin::link_sni`],
+/// so the name the whitelist judges is the name the handshake sends. It matters for plugin
+/// rows, whose SNI is the plugin's `host` (or the endpoint host) rather than a stated
+/// `security.sni` — and it returns `None` for a row with no TLS session at all, so an
+/// `obfs=http`/`obfs=tls` row never gets a verdict computed from a fake name.
+///
+/// When the deferred config is not loaded, the `security.sni` **column** answers: it is
+/// written at row-build time from `config.security().sni()` and is queryable without the
+/// JSON. A plugin row has no stated SNI, so the column is `None` there — correct, because a
+/// plugin row's SNI needs the config.
+pub(crate) fn extract_sni(protocol: &Protocol, endpoint_host: &str) -> Option<String> {
+    use xray_tui_proto::proto_spec::ss_plugin::link_sni;
+    if !protocol.config.is_unloaded() {
+        return link_sni(&protocol.config.get().0, endpoint_host);
     }
     protocol.security.sni.clone()
 }
@@ -188,7 +194,9 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     };
     let host = row.endpoint.host.clone();
     let host_type = row.endpoint.host_type;
-    let sni = row.active_protocol().and_then(|(_, p)| extract_sni(p));
+    let sni = row
+        .active_protocol()
+        .and_then(|(_, p)| extract_sni(p, &row.endpoint.host));
     spawn_dns_resolve_host(state, endpoint_id, host, host_type, sni, force);
 }
 
@@ -511,7 +519,8 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
                 r.endpoint.clone(),
                 r.resolved_ips.clone(),
                 r.endpoint.resolved_at,
-                r.active_protocol().and_then(|(_, p)| extract_sni(p)),
+                r.active_protocol()
+                    .and_then(|(_, p)| extract_sni(p, &r.endpoint.host)),
             )
         })
         .collect();
@@ -667,7 +676,8 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
         .map(|r| {
             (
                 r.endpoint.id.get(),
-                r.active_protocol().and_then(|(_, p)| extract_sni(p)),
+                r.active_protocol()
+                    .and_then(|(_, p)| extract_sni(p, &r.endpoint.host)),
                 state
                     .endpoint_info
                     .get(&r.endpoint.id.get())
@@ -950,6 +960,133 @@ mod tests {
         )
         .expect("parse vless url");
         let protocol = crate::state::protocol_from_parsed(&parsed.parsed);
-        assert_eq!(extract_sni(&protocol).as_deref(), Some("chat.example.com"));
+        assert_eq!(
+            extract_sni(&protocol, "server.example").as_deref(),
+            Some("chat.example.com")
+        );
+    }
+
+    /// Row 16, the half that was missing. The test above calls `link_sni`
+    /// DIRECTLY, which cannot fail when the two CALLERS drift apart: one of them
+    /// could stop routing through the shared resolver and this would still pass,
+    /// while the engine dialled with one SNI and enrichment recorded another —
+    /// the exact split §5.1 exists to prevent.
+    ///
+    /// So this drives BOTH public callers on the same stored row and compares
+    /// their answers, on the two shapes that matter: a row that STATES a host,
+    /// and a host-less row that falls back to the endpoint.
+    #[test]
+    fn the_engine_and_enrichment_cannot_disagree_on_a_plugin_sni() {
+        use xray_tui_native::context::{LinkContext, NativeConnectParams};
+        use xray_tui_proto::proto_spec::common::SecurityConfig;
+        use xray_tui_proto::proto_spec::{
+            EndpointEssentials, PluginSpec, ProtocolConfig, SsConfig,
+        };
+
+        for (opts, expect) in [
+            ("host=cdn.example;tls", "cdn.example"),
+            ("tls", "fallback.example"),
+        ] {
+            let config = ProtocolConfig::Ss(SsConfig {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin: Some(PluginSpec::from_parts(Some("v2ray-plugin"), opts)),
+            });
+            let host = if expect == "fallback.example" {
+                "fallback.example"
+            } else {
+                "server.example"
+            };
+
+            // Caller 1: the engine, through LinkContext.
+            let params = NativeConnectParams::new(
+                config.clone(),
+                EndpointEssentials::new(host, 443),
+                xray_tui_native::addr::TargetAddr::new(
+                    xray_tui_native::addr::Host::Domain("example.com".into()),
+                    80,
+                ),
+            );
+            let engine = LinkContext::new(
+                params,
+                xray_tui_native::addr::TargetAddr::new(
+                    xray_tui_native::addr::Host::Domain("example.com".into()),
+                    80,
+                ),
+            )
+            .server_name();
+
+            // Caller 2: enrichment, through the persisted Protocol row.
+            let protocol = xray_tui_db::models::Protocol {
+                id: xray_tui_db::models::ProtocolId::new(1),
+                sig: 1,
+                proto_kind: xray_tui_proto::proto_spec::ProtocolKind::Shadowsocks,
+                transport: xray_tui_db::models::Transport {
+                    r#type: xray_tui_proto::proto_spec::TransportType::Tcp,
+                    data: toasty::Deferred::from(toasty::Json(
+                        xray_tui_proto::proto_spec::common::TransportConfig::Tcp,
+                    )),
+                },
+                security: xray_tui_db::models::Security {
+                    r#type: xray_tui_proto::proto_spec::SecurityType::None,
+                    sni: None,
+                    fp: None,
+                    insecure: None,
+                    data: toasty::Deferred::from(toasty::Json(SecurityConfig::default())),
+                },
+                config: toasty::Deferred::from(toasty::Json(config)),
+                created_at: 0,
+                links: toasty::Deferred::default(),
+            };
+            let enrich = super::extract_sni(&protocol, host);
+
+            assert_eq!(
+                engine.as_str(),
+                enrich.as_deref().unwrap_or(engine.as_str()),
+                "the engine and enrichment must answer identically for `{opts}`"
+            );
+            assert_eq!(engine, expect, "…and both must be the expected SNI");
+        }
+    }
+
+    /// The plugin path: a TLS-bearing plugin row's SNI is the plugin's `host`,
+    /// a host-less one falls back to the endpoint, and a row with no TLS
+    /// session has **no** SNI — so a whitelist verdict is never computed from
+    /// the obfs `Host` (which is a disguise, not a name any certificate
+    /// carries). Spec §5.1; the engine reads the same function.
+
+    #[test]
+    fn plugin_rows_resolve_the_sni_the_engine_sends() {
+        use xray_tui_proto::proto_spec::common::SecurityConfig;
+        use xray_tui_proto::proto_spec::ss_plugin::link_sni;
+        use xray_tui_proto::proto_spec::{PluginSpec, ProtocolConfig, SsConfig};
+
+        let row = |opts: Option<&str>| {
+            let plugin = opts.map(|o| PluginSpec::from_parts(Some("v2ray-plugin"), o));
+            ProtocolConfig::Ss(SsConfig {
+                method: "aes-128-gcm".into(),
+                password: "pw".into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin,
+            })
+        };
+        assert_eq!(
+            link_sni(&row(Some("host=cdn.example;tls")), "server.example").as_deref(),
+            Some("cdn.example"),
+            "a stated host is the SNI"
+        );
+        assert_eq!(
+            link_sni(&row(Some("tls")), "server.example").as_deref(),
+            Some("server.example"),
+            "a host-less TLS row falls back to the endpoint"
+        );
+        assert_eq!(
+            link_sni(&row(Some("host=cdn.example")), "server.example").as_deref(),
+            None,
+            "a plaintext ws row has no SNI at all"
+        );
     }
 }

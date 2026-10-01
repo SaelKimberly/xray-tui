@@ -18,7 +18,6 @@ use crate::error::NativeError;
 use crate::protocol;
 use crate::protocol::PacketTunnel;
 use crate::protocol::ss;
-use crate::protocol::vless::MuxClient;
 use crate::security;
 use crate::transport;
 use crate::{BoxStream, NativeTunnel};
@@ -184,13 +183,18 @@ pub async fn connect_chain_udp(
 /// multiplexed tunnel (command 0x03).
 ///
 /// Identical to [`connect_chain`] except the LAST link runs the mux
-/// protocol phase and the result is the [`MuxClient`] multiplexer instead
-/// of a byte tunnel. Intermediate links tunnel TCP as usual — they carry
-/// the mux tunnel as a byte stream to the next hop.
+/// protocol phase and the result is a [`protocol::MuxTunnel`] instead of a
+/// byte tunnel. Intermediate links tunnel TCP as usual — they carry the mux
+/// tunnel as a byte stream to the next hop.
+///
+/// The tunnel is per family ([`protocol::MuxTunnel`]): VLESS's sessions are
+/// already framed by the multiplexer, while a Shadowsocks plugin row's
+/// sessions still need their own codec, so the caller opens a session through
+/// one method on both.
 pub async fn connect_chain_mux(
     links: &[NativeConnectParams],
     target: TargetAddr,
-) -> Result<MuxClient<BoxStream>, NativeError> {
+) -> Result<protocol::MuxTunnel, NativeError> {
     let mut base: Option<BoxStream> = None;
     for (i, link) in links.iter().enumerate() {
         let to = next_target(links, i, &target);
@@ -278,7 +282,6 @@ mod tests {
                 security: SecurityConfig::default(),
                 remarks: None,
                 plugin: None,
-                plugin_opts: None,
             }),
             EndpointEssentials::new("127.0.0.1", port),
             TargetAddr::new(Host::Domain("ignored".into()), 1),

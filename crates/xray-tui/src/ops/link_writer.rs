@@ -328,6 +328,7 @@ mod tests {
                 path: None,
                 splice: None,
                 remarks: None,
+                mux: None,
             }))),
             created_at: 1,
             links: toasty::Deferred::default(),

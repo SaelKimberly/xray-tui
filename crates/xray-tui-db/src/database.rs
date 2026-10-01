@@ -17,6 +17,65 @@ use crate::retry_on_busy;
 
 // ── Database handle ─────────────────────────────────────────────────────
 
+// Tag for databases created by this 7-table schema. toasty 0.9's
+// push_schema emits CREATE TABLE without IF NOT EXISTS, so it can
+// only run on a database that has no tables yet; the tag lets reopen
+// skip it. Any other tag is a pre-T8 9-table database (incompatible
+// with the typed models) and is recreated from scratch.
+//
+// 7 = per-kind binary identity (`Protocol.id = uid`, see
+// `xray-tui-proto::proto_spec::identity`). v6 rows carry uids hashed
+// from canonical JSON, which are unrelated to the new values, so
+// reusing a v6 file would re-key every protocol into a duplicate row
+// and orphan its links. The bump WIPES the file by design.
+//
+// 8 = `endpoint_rank` (ADR 0003) as a first-class table. This project
+// is pre-alpha, so a new table arrives by the same wipe rather than by
+// migration machinery: a v7 file is discarded and rebuilt with the
+// table present. The stored keys are derived state — a feed is
+// re-imported, and the keys rebuild from its links.
+//
+// 9 = the durable-facts pass: `profile_stats` loses `task_id` /
+// `task_queue` (the scheduler's state is runtime-only — an id is only
+// meaningful inside the process that allocated it), the timestamps
+// become epoch seconds, `protocols.cred_hash` and `endpoints.parent_id`
+// go (both derivable: the uid is recomputed from the config, a DNS
+// endpoint's resolutions live in `resolved_as`), and the two indexes
+// the purge / failed-sweep predicates need are added. Same contract as
+// every bump: a v8 file is WIPED, never migrated.
+//
+// 10 = resolved addresses become a table: the JSON-array
+// `endpoints.resolved_as` column is replaced by `endpoint_ip`, one row
+// per address with a sortable key. A v9 file is WIPED (the addresses it
+// holds cannot be moved: the old column is gone, and the enrichment
+// pipeline re-resolves on the next pass).
+//
+// 11 = `endpoint_ip` carries the address's ISO-3166 country, written
+// once by the mmdb lookup, so a later launch renders the flag without
+// the database. A v10 file is WIPED (a column cannot be added to a
+// pushed table here; the countries are re-derived on the next pass).
+//
+// 12 = `profile_stats.purge_reason` (spec 2026-09-17-purge-reason):
+// the typed, permanent verdict a real probe's evidence writes and only
+// a data-carrying success clears. A v11 file is WIPED (a column cannot
+// be added to a pushed table here; the verdicts are re-derived by the
+// next Real run, and the reference classification is kept beside the
+// dataset copy the design spec names).
+//
+// 14 = the SIP003 plugin field became a typed, lossless `PluginSpec`.
+// No COLUMN changes — the JSON column carries the new shape — but the
+// identity format changed with it (`IDENTITY_VERSION` 1 → 2), so every
+// stored uid re-keys. A v13 file would still open and every row would
+// simply be a stale uid with no config behind it, so the file is wiped
+// for the clean re-import. The user accepted the wipe (pre-alpha,
+// 2026-09-30).
+pub const SCHEMA_VERSION: i64 = 14;
+
+/// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
+/// geo step wrote (`None` until it does). A named alias because the signature
+/// appears in three places and the tuple spelling is unreadable inline.
+pub type ResolvedAddress = (std::net::IpAddr, Option<String>);
+
 pub struct Database {
     db: toasty::Db,
     concurrent_writes: bool,
@@ -179,61 +238,6 @@ impl Database {
         path: impl AsRef<Path>,
         requested_mvcc: bool,
     ) -> Result<Self> {
-        // Tag for databases created by this 7-table schema. toasty 0.9's
-        // push_schema emits CREATE TABLE without IF NOT EXISTS, so it can
-        // only run on a database that has no tables yet; the tag lets reopen
-        // skip it. Any other tag is a pre-T8 9-table database (incompatible
-        // with the typed models) and is recreated from scratch.
-        //
-        // 7 = per-kind binary identity (`Protocol.id = uid`, see
-        // `xray-tui-proto::proto_spec::identity`). v6 rows carry uids hashed
-        // from canonical JSON, which are unrelated to the new values, so
-        // reusing a v6 file would re-key every protocol into a duplicate row
-        // and orphan its links. The bump WIPES the file by design.
-        //
-        // 8 = `endpoint_rank` (ADR 0003) as a first-class table. This project
-        // is pre-alpha, so a new table arrives by the same wipe rather than by
-        // migration machinery: a v7 file is discarded and rebuilt with the
-        // table present. The stored keys are derived state — a feed is
-        // re-imported, and the keys rebuild from its links.
-        //
-        // 9 = the durable-facts pass: `profile_stats` loses `task_id` /
-        // `task_queue` (the scheduler's state is runtime-only — an id is only
-        // meaningful inside the process that allocated it), the timestamps
-        // become epoch seconds, `protocols.cred_hash` and `endpoints.parent_id`
-        // go (both derivable: the uid is recomputed from the config, a DNS
-        // endpoint's resolutions live in `resolved_as`), and the two indexes
-        // the purge / failed-sweep predicates need are added. Same contract as
-        // every bump: a v8 file is WIPED, never migrated.
-        //
-        // 10 = resolved addresses become a table: the JSON-array
-        // `endpoints.resolved_as` column is replaced by `endpoint_ip`, one row
-        // per address with a sortable key. A v9 file is WIPED (the addresses it
-        // holds cannot be moved: the old column is gone, and the enrichment
-        // pipeline re-resolves on the next pass).
-        //
-        // 11 = `endpoint_ip` carries the address's ISO-3166 country, written
-        // once by the mmdb lookup, so a later launch renders the flag without
-        // the database. A v10 file is WIPED (a column cannot be added to a
-        // pushed table here; the countries are re-derived on the next pass).
-        //
-        // 12 = `profile_stats.purge_reason` (spec 2026-09-17-purge-reason):
-        // the typed, permanent verdict a real probe's evidence writes and only
-        // a data-carrying success clears. A v11 file is WIPED (a column cannot
-        // be added to a pushed table here; the verdicts are re-derived by the
-        // next Real run, and the reference classification is kept beside the
-        // dataset copy the design spec names).
-        //
-        // 13 = no column change at all. The ws `?ed=NNNN` path query is now
-        // hoisted into the typed `max_early_data`, which is IN the identity
-        // stream (`write_transport` → `TR_MAX_EARLY_DATA`), so every ws config
-        // carrying the query re-keys. The bump is the user's call (2026-09-23)
-        // to wipe rather than carry the transient duplicate set the re-key
-        // would otherwise age out through Purgatory — the stored shapes are
-        // unchanged, so a v12 file would open fine; it is dropped for the
-        // clean re-import.
-        const SCHEMA_VERSION: i64 = 13;
-
         let path_str = path
             .as_ref()
             .to_str()
@@ -1325,7 +1329,7 @@ impl Database {
     pub async fn endpoint_resolutions(
         &self,
         ids: &[EndpointId],
-    ) -> Result<HashMap<EndpointId, Vec<(std::net::IpAddr, Option<String>)>>> {
+    ) -> Result<HashMap<EndpointId, Vec<ResolvedAddress>>> {
         let mut conn = self.conn().await?;
         crate::endpoint_ip::load_resolved(&mut conn, ids).await
     }
@@ -1968,6 +1972,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         })
     }
 
@@ -2343,24 +2348,46 @@ mod tests {
             "open() must recreate with the 7-table schema"
         );
     }
+    /// Create a database file already in WAL mode, tagged with the CURRENT
+    /// schema version so the reopen under test takes the "existing WAL file"
+    /// path rather than the wipe path. A hardcoded older tag turns this into a
+    /// different test the moment the tag moves — which is exactly what happened
+    /// when it was pinned to 13.
+    ///
+    /// Its own function so the connection and the database are released on
+    /// return: the reopen below needs the file free, and the caller reads far
+    /// more naturally than an inline scope.
+    ///
+    /// `significant_drop_tightening` is silenced here rather than obeyed: it
+    /// reports the `driver` temporary as "dropped at the end of its contained
+    /// scope", but `driver` is MOVED into `try_open_db` and no such temporary
+    /// survives — and both handles are already dropped explicitly on the last
+    /// two lines, which is the whole of the lint's intent.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn seed_wal_file(path: &std::path::Path) {
+        let driver = toasty_driver_turso::Turso::file(path);
+        let db = Database::try_open_db(driver).await.expect("initial db");
+        db.push_schema().await.expect("initial schema");
+        let mut conn = db.connection().await.expect("initial connection");
+        toasty::sql::query("PRAGMA journal_mode='wal'")
+            .exec(&mut conn)
+            .await
+            .expect("set WAL");
+        toasty::sql::query(format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .exec(&mut conn)
+            .await
+            .expect("set schema tag");
+        // The caller reopens this path immediately, so both handles are released
+        // HERE rather than wherever the compiler happens to end the function.
+        drop(conn);
+        drop(db);
+    }
+
     #[tokio::test]
     async fn existing_wal_file_stays_wal_and_reopens() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wal.db");
-        {
-            let driver = toasty_driver_turso::Turso::file(&path);
-            let db = Database::try_open_db(driver).await.expect("initial db");
-            db.push_schema().await.expect("initial schema");
-            let mut conn = db.connection().await.expect("initial connection");
-            toasty::sql::query("PRAGMA journal_mode='wal'")
-                .exec(&mut conn)
-                .await
-                .expect("set WAL");
-            toasty::sql::query("PRAGMA user_version=13")
-                .exec(&mut conn)
-                .await
-                .expect("set schema tag");
-        }
+        seed_wal_file(&path).await;
         let db = Database::open(&path).await.expect("reopen WAL db");
         assert!(!db.uses_concurrent_writes());
         let mut conn = db.connection().await.expect("WAL connection");

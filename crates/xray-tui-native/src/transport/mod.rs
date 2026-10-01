@@ -15,8 +15,10 @@ pub mod grpc;
 pub mod http;
 pub mod httpupgrade;
 pub mod kcp;
+pub mod mux;
 pub mod quic;
 pub mod tcp;
+pub mod v2ray;
 pub mod v2rayhttp;
 pub mod ws;
 pub mod xhttp;
@@ -57,10 +59,21 @@ pub(crate) fn is_self_contained(ctx: &LinkContext) -> bool {
     ctx.transport_type() == Some("xhttp") && xhttp::http_version(ctx.security()) == "3"
 }
 
-/// Run the transport-upgrade step over an established (secured) stream:
+/// Run the transport-upgrade step over an established (secured) stream.
+///
 /// TCP/kcp = passthrough (mKCP is a dial, never framed);
-/// ws/grpc/httpupgrade/xhttp/v2rayhttp = framing handshake.
+/// ws/grpc/httpupgrade/xhttp/v2rayhttp = framing handshake;
+/// a SIP003 plugin row = that plugin's framing.
+///
+/// The plugin arm is dispatched FIRST, on `LinkContext::plugin_spec()`, because an
+/// `SsConfig` carries no transport field at all (`context::transport_type()` is
+/// `None` for it) — there is no `TransportConfig` arm that could select it. The
+/// arm is framing only: TLS is the security phase above, and the mux
+/// multiplexer is the protocol phase's return type (§5.2).
 pub async fn upgrade(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
+    if ctx.plugin_spec().is_some() {
+        return v2ray::upgrade(ctx, stream).await;
+    }
     match ctx.transport_type() {
         Some("ws") => ws::connect(ctx, stream).await,
         Some("grpc") => grpc::connect(ctx, stream).await,

@@ -57,6 +57,12 @@ impl From<std::io::Error> for ExportError {
     }
 }
 
+// `significant_drop_tightening` is silenced here rather than obeyed: it reports
+// the export reader as "dropped at the end of its contained scope", but
+// `reader.finish()` takes it BY VALUE — the snapshot is released on that line,
+// and an explicit `drop(reader)` after it is a use-after-move (the compiler
+// says so). The suggestion is not applicable to a value that is consumed.
+#[allow(clippy::significant_drop_tightening)]
 pub async fn run_export(
     db: Arc<Database>,
     scope: ExportScope,
@@ -199,6 +205,9 @@ struct ClipboardBuffer {
 }
 
 impl ClipboardBuffer {
+    // Not a `const fn`: the parameter is an owned `String`, and a const fn may
+    // not move or drop one. The lint's suggestion is not applicable here.
+    #[allow(clippy::missing_const_for_fn)]
     fn new(header: String) -> Self {
         Self { text: header }
     }
@@ -224,6 +233,7 @@ impl ClipboardBuffer {
     }
 }
 
+#[must_use]
 pub fn default_export_path(scope: ExportScope) -> PathBuf {
     PathBuf::from(format!(
         "./xray-tui-export-{}-{}",

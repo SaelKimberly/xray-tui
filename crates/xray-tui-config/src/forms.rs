@@ -3,10 +3,10 @@ use xray_tui_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketC
 use xray_tui_proto::proto_spec::core_mapping;
 use xray_tui_proto::proto_spec::{
     AnyTlsConfig, ConfigKind, EndpointEssentials, HostKind, HttpClientConfig, Hysteria1Config,
-    Hysteria2Config, NaiveConfig, ParsedProto, PlaceholderConfig, ProtocolConfig,
+    Hysteria2Config, NaiveConfig, ParsedProto, PlaceholderConfig, PluginSpec, ProtocolConfig,
     ProtocolEssentials, ProtocolKind, SecurityConfig, ShadowTlsConfig, Socks5Config, SsConfig,
     SshConfig, SsrConfig, TailscaleConfig, TlsConfig, TlsOpts, TorConfig, TrojanConfig, TuicConfig,
-    VlessConfig, VmessConfig, WireguardConfig,
+    VlessConfig, VlessMux, VmessConfig, WireguardConfig,
 };
 use xray_tui_proto::urlx::TinyText;
 
@@ -257,6 +257,30 @@ fn protocol_specific_fields(protocol: ProtocolKind) -> Vec<FormField> {
                 "Flow",
                 FormFieldType::Select(&["", "xtls-rprx-vision", "xtls-rprx-vision-udp443"]),
                 "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
+            // Default ABSENT, not "false": `fields_to_parsed` skips only EMPTY
+            // values, so a "false" default would make every untouched form row
+            // store the stated "no" (`Limited(0)`) — a different uid from the
+            // imported row for the same server, which stores `None`. The two
+            // would duplicate into two `Protocol` rows, which is the form/import
+            // disagreement this mapper exists to prevent. A Boolean renders
+            // `[ ]` when empty and toggles to "true"; un-toggling gives the
+            // stated "false", which IS a distinct stored state (spec §5.2 item 9).
+            field(
+                "mux",
+                "Mux",
+                FormFieldType::Boolean,
+                "",
+                false,
+                FieldSection::ProtocolSetting,
+            ),
+            field(
+                "mux_concurrency",
+                "Mux Concurrency",
+                FormFieldType::Text,
+                "8",
                 false,
                 FieldSection::ProtocolSetting,
             ),
@@ -1703,6 +1727,8 @@ fn vless_from_form(
             // The producer routes the form's `network` select here (I1).
             "network",
             "flow",
+            "mux",
+            "mux_concurrency",
             "pin_sha256",
             "ech.enable",
             "ech.config",
@@ -1739,6 +1765,15 @@ fn vless_from_form(
         // ("none").
         encryption: None,
         flow: opt_text(ps.get("flow")),
+        // The form states mux as a bool plus an optional cap: the same shape the
+        // share links carry, so a form row and an imported row of the same
+        // server agree (an absent cap means the ecosystem default).
+        mux: opt_bool(ps.get("mux")).map(|on| {
+            let cap = opt_string(ps.get("mux_concurrency"))
+                .and_then(|c| c.parse::<i64>().ok())
+                .unwrap_or(8);
+            VlessMux::from_i64(if on { cap } else { 0 })
+        }),
         path,
         splice: None,
         remarks: None,
@@ -1873,22 +1908,19 @@ fn ss_from_form(
     check_keys("ss", ps, &["method", "plugin", "plugin_opts"])?;
     let method = req_string("ss", "method", opt_string(ps.get("method")).as_deref())?;
     let password = req_string("ss", "password", user_id)?;
-    let plugin = opt_text(ps.get("plugin"));
-    let plugin_opts = opt_string(ps.get("plugin_opts")).map(|s| {
-        s.split(';')
-            .filter_map(|pair| {
-                pair.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect::<std::collections::HashMap<String, String>>()
-    });
+    // The SAME constructor the share-link and Clash paths use, so the form is
+    // not a second dialect — and a `plugin_opts` with no `plugin` stores an
+    // empty name instead of losing the options.
+    let plugin_name = opt_string(ps.get("plugin"));
+    let plugin_opts = opt_string(ps.get("plugin_opts")).unwrap_or_default();
+    let plugin = (plugin_name.is_some() || !plugin_opts.is_empty())
+        .then(|| PluginSpec::from_parts(plugin_name.as_deref(), &plugin_opts));
     Ok(SsConfig {
         method: TinyText::from(method),
         password,
         security: SecurityConfig::default(),
         remarks: None,
         plugin,
-        plugin_opts,
     })
 }
 
@@ -2241,8 +2273,144 @@ fn ssr_from_form(
 
 #[cfg(test)]
 mod tests {
+    use xray_tui_proto::urlx::RawUrlX;
+
     use super::*;
     use xray_tui_proto::proto_spec::CoreType;
+
+    /// Row 31's form half, and the guard for the arm that was unreachable:
+    /// `vless_from_form` read `mux`/`mux_concurrency` while NO field emitted
+    /// them and `check_keys` rejected them as unknown — so the mapper arm could
+    /// never run. This test walks the real producer path (the declared fields,
+    /// through `check_keys`, into the mapper) rather than calling the mapper
+    /// directly, which is exactly how the gap survived.
+    /// An UNTOUCHED form row must store no mux at all. With a `"false"` default
+    /// the producer would send `mux=false` for every VLESS row the user never
+    /// toggled, storing the stated "no" — a different uid from the imported row
+    /// for the same server, which stores `None`. The two then duplicate into two
+    /// `Protocol` rows, defeating the form/import agreement the mapper's own
+    /// comment claims.
+    #[test]
+    fn an_untouched_vless_form_row_stores_no_mux() {
+        let declared = form_fields_for(ProtocolKind::Vless);
+        let mux = declared
+            .iter()
+            .find(|f| f.key == "mux")
+            .expect("the VLESS form declares a mux field");
+        assert_eq!(
+            mux.default, "",
+            "the mux field's default must be absent, not a stated \"false\""
+        );
+
+        // Exactly what the producer does with untouched fields: skip empties, and
+        // route only `ProtocolSetting` fields into `protocol_settings` (the
+        // Common/StreamSetting ones go to other maps, so passing them here would
+        // be rejected by `check_keys` as unknown settings).
+        let mut ps = SettingsMap::new();
+        for f in &declared {
+            if f.default.is_empty() || f.section != FieldSection::ProtocolSetting {
+                continue;
+            }
+            let value = if f.default == "true" {
+                Value::Bool(true)
+            } else if f.default == "false" {
+                Value::Bool(false)
+            } else if let Ok(n) = f.default.parse::<i64>() {
+                Value::Number(n.into())
+            } else {
+                Value::String(f.default.to_string())
+            };
+            ps.insert(f.key.to_string(), value);
+        }
+        let cfg = vless_from_form(
+            Some("11111111-2222-3333-4444-555555555555"),
+            &ps,
+            &SettingsMap::new(),
+        )
+        .expect("defaults-only form row");
+        assert_eq!(
+            cfg.mux, None,
+            "an untouched form row stores no mux, matching an imported row"
+        );
+
+        // Non-vacuity: the SAME producer path with the old `"false"` default is
+        // the duplicate this guards against, so assert it really does store one.
+        let mut regressed = SettingsMap::new();
+        regressed.insert("mux".into(), Value::Bool(false));
+        let cfg = vless_from_form(
+            Some("11111111-2222-3333-4444-555555555555"),
+            &regressed,
+            &SettingsMap::new(),
+        )
+        .expect("accepted");
+        assert_eq!(
+            cfg.mux,
+            Some(VlessMux::Limited(0)),
+            "a stated \"false\" IS stored — which is why the default must be absent"
+        );
+    }
+
+    #[test]
+    fn the_vless_mux_fields_reach_the_mapper() {
+        let fields = form_fields_for(ProtocolKind::Vless);
+        let names: Vec<&str> = fields.iter().map(|f| f.key).collect();
+        for key in ["mux", "mux_concurrency"] {
+            assert!(
+                names.contains(&key),
+                "the VLESS form declares no `{key}` field, so the mapper can never see it"
+            );
+        }
+
+        // Exactly what the UI sends: `ops/profiles.rs:656-664` turns the field
+        // buffers into typed values — "true"/"false" become `Value::Bool` and a
+        // numeric buffer becomes `Value::Number`, NOT a string. (That conversion
+        // is inline in the TUI crate, so it is replicated here rather than
+        // called; a string here would silently read as "absent".)
+        let mut ps = SettingsMap::new();
+        ps.insert("mux".into(), Value::Bool(true));
+        ps.insert("mux_concurrency".into(), Value::Number(16.into()));
+        let cfg = vless_from_form(
+            Some("11111111-2222-3333-4444-555555555555"),
+            &ps,
+            &SettingsMap::new(),
+        )
+        .expect("the producer's own keys are accepted");
+        assert_eq!(
+            cfg.mux,
+            Some(VlessMux::Limited(16)),
+            "the form's bool+cap reaches the stored mux"
+        );
+        // And the stated "no" is a stored state, not an absent one (spec §5.2 item 9).
+        let mut off = SettingsMap::new();
+        off.insert("mux".into(), Value::Bool(false));
+        let cfg = vless_from_form(
+            Some("11111111-2222-3333-4444-555555555555"),
+            &off,
+            &SettingsMap::new(),
+        )
+        .expect("accepted");
+        assert_eq!(cfg.mux, Some(VlessMux::Limited(0)));
+
+        // The rest of row 31's claim: the form's mux survives the EXPORT, i.e.
+        // a form row and an imported row of the same server agree. Without this
+        // leg the test only proved the mapper reads its own keys.
+        let exported = cfg
+            .reconstruct_proto(&EndpointEssentials::new("example.com", 443))
+            .expect("reconstruct");
+        assert!(
+            exported.contains("mux="),
+            "the form's mux request is exported, got {exported}"
+        );
+        let reimported =
+            ProtocolConfig::try_parse_proto(&RawUrlX::from(exported.as_str())).expect("re-import");
+        let ProtocolConfig::Vless(back) = reimported.protocol.config else {
+            panic!("expected vless");
+        };
+        assert_eq!(
+            back.mux, cfg.mux,
+            "the form's mux survives form → export → import"
+        );
+    }
 
     #[test]
     fn form_fields_all_protocols() {
@@ -2698,13 +2866,28 @@ mod tests {
         };
         assert_eq!(c.method.as_str(), "aes-256-gcm");
         assert_eq!(c.password, "passw0rd");
-        assert_eq!(c.plugin.as_deref(), Some("obfs-local"));
+        let plugin = c
+            .plugin
+            .as_ref()
+            .expect("the form's plugin fields are stored");
+        assert_eq!(plugin.name.as_str(), "obfs-local");
+        assert_eq!(plugin.mode, xray_tui_proto::proto_spec::PluginMode::Http);
+        assert_eq!(plugin.host.as_deref(), Some("example.com"));
+        // The form goes through the SAME constructor as the share-link path, so
+        // this row is byte-identical to the imported form of the same options.
+        let imported = xray_tui_proto::proto_spec::SsConfig::try_parse_proto(
+            &xray_tui_proto::urlx::RawUrlX::from(
+                "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@h:1?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dexample.com",
+            ),
+        )
+        .expect("parse the equivalent URL");
+        let ProtocolConfig::Ss(imported) = imported.protocol.config else {
+            panic!("expected Ss config");
+        };
         assert_eq!(
-            c.plugin_opts
-                .as_ref()
-                .and_then(|m| m.get("obfs"))
-                .map(String::as_str),
-            Some("http")
+            imported.plugin.as_ref(),
+            c.plugin.as_ref(),
+            "form and URL rows must be one row"
         );
     }
 

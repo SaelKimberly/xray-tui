@@ -85,9 +85,126 @@ pub struct VlessConfig {
     pub transport: TransportConfig,
     pub encryption: Option<TinyText>,
     pub flow: Option<TinyText>,
+    /// The mux request, when the row states one. **Presence is the decision**, not
+    /// magnitude: a row with no `mux*` key has no mux, and one with `mux=-1` asks for
+    /// *unlimited*, which is active (§5.2's activity rule).
+    ///
+    /// Until this field landed, every `mux*` spelling a feed carries was parsed and
+    /// dropped, so the rows it describes silently lost their mux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux: Option<VlessMux>,
     pub path: Option<TinyText>,
     pub splice: Option<bool>,
     pub remarks: Option<TinyText>,
+}
+
+/// A VLESS row's mux request.
+///
+/// A **variant, not a number**: `mux=-1` (and `muxConcurrency=-1`) mean
+/// *unlimited*, which is an active mux request and must not collapse to
+/// "off". A `u32` cannot hold it, and a magnitude test (`> 0`) would put an
+/// unlimited row on the non-mux path — the silent-wrong-answer class this
+/// predicate exists to prevent (spec §5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VlessMux {
+    /// A bounded concurrency cap.
+    Limited(u32),
+    /// `mux=-1`: unlimited. **Active.**
+    Unlimited,
+    /// A mux spelling we cannot serve — an unparseable `mux` value, or a named
+    /// multiplexer (`muxtype=smux`). The **key** is kept with the value so an
+    /// export writes back the spelling the row arrived with, and so the refusal
+    /// can name it.
+    ///
+    /// Stored rather than rejected at parse, for the same reason the plugin
+    /// family stores `MuxSetting::Invalid` / `PluginMode::Invalid`: the parse
+    /// layer never refuses, so the row stays importable, exportable and
+    /// correctly marked untestable — a parse error would drop it from the feed
+    /// before `capability` could ever name the reason.
+    Invalid { key: String, value: String },
+}
+
+impl VlessMux {
+    /// Whether this request multiplexes at all.
+    ///
+    /// Stated over *activity*, never magnitude — see the type's doc.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        match self {
+            Self::Limited(n) => *n > 0,
+            Self::Unlimited => true,
+            Self::Invalid { .. } => false,
+        }
+    }
+
+    /// The wire spelling, for reconstructing a share URL.
+    #[must_use]
+    pub fn as_value(&self) -> String {
+        match self {
+            Self::Limited(n) => n.to_string(),
+            Self::Unlimited => "-1".to_string(),
+            Self::Invalid { value, .. } => value.clone(),
+        }
+    }
+
+    /// The option key this request arrived under, so an export writes back the
+    /// spelling the row used rather than a canonical one.
+    #[must_use]
+    pub fn as_key(&self) -> &str {
+        match self {
+            Self::Invalid { key, .. } => key,
+            _ => "mux",
+        }
+    }
+
+    /// The stored identity token: the cap, or the unusable spelling.
+    #[must_use]
+    pub fn identity_token(&self) -> String {
+        match self {
+            Self::Limited(n) => format!("cap:{n}"),
+            Self::Unlimited => "cap:unlimited".to_string(),
+            Self::Invalid { key, value } => format!("invalid:{key}={value}"),
+        }
+    }
+
+    /// Build a request from a signed cap (`muxConcurrency=-1` → unlimited).
+    #[must_use]
+    pub fn from_i64(cap: i64) -> Self {
+        if cap < 0 {
+            Self::Unlimited
+        } else {
+            // A cap above `u32::MAX` cannot be a real concurrency limit, so it
+            // is clamped rather than truncated: `Limited(u32::MAX)` keeps the row
+            // mux-ACTIVE, which is the part that decides the dial.
+            Self::Limited(u32::try_from(cap).unwrap_or(u32::MAX))
+        }
+    }
+
+    /// Parse a `mux`-family option value.
+    ///
+    /// `mux=8` → `Limited(8)`; `mux=true` → the ecosystem default cap of 8 (what
+    /// xray/sing-box use); `mux=false` → `Limited(0)`, i.e. *explicitly no mux*,
+    /// which is why presence alone cannot be the test and `is_active` exists;
+    /// `mux=-1` / `muxConcurrency=-1` → `Unlimited`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(Self::Limited(8)),
+            "false" | "0" | "no" | "off" => Some(Self::Limited(0)),
+            other => other.parse::<i64>().ok().map_or_else(
+                || None,
+                |n| {
+                    if n < 0 {
+                        Some(Self::Unlimited)
+                    } else {
+                        Some(Self::Limited(u32::try_from(n).unwrap_or(u32::MAX)))
+                    }
+                },
+            ),
+        }
+    }
 }
 
 impl VlessConfig {
@@ -254,6 +371,67 @@ impl VlessConfig {
             _ => path,
         };
 
+        // The mux family, in the order the feeds write it: an explicit `muxtype`
+        // first (so a smux/yamux row is named as such rather than silently treated as
+        // the default multiplexer), then `mux`/`muxConcurrency`/`muxconcurrency`.
+        // `muxConcurrency` alone does not request mux — it caps one — so it is only
+        // read together with a positive `mux`.
+        // The mux family. Looked up CASE-INSENSITIVELY, because the feeds spell
+        // these keys both ways (`muxConcurrency` and `muxconcurrency`, corpus
+        // `-18:7717`) and a case-sensitive miss is a SILENT drop: the row would
+        // store no mux and dial without frames while looking as if it had asked.
+        let mux_key = |name: &str| {
+            query
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        // A named multiplexer is a DIFFERENT wire format, not a cap we can
+        // clamp: stored as-is so the row stays importable and exportable, and
+        // refused by name at connect. Xray's own inbound rejects anything but
+        // its default (`thirdparty/Xray-core/proxy/vless/inbound/inbound.go:180-184`).
+        let named_multiplexer = mux_key("muxtype").map(|kind| VlessMux::Invalid {
+            key: "muxtype".to_string(),
+            value: kind,
+        });
+        // SIGNED, because `-1` means unlimited and a `u32` cannot hold it.
+        let cap = ["muxConcurrency", "muxconcurrency", "muxmaxc"]
+            .into_iter()
+            .find_map(mux_key)
+            .and_then(|v| v.parse::<i64>().ok());
+        // A cap with no `mux` key is NOT a request: `muxConcurrency` caps a mux
+        // the row already asked for. Strictness is SAFE here in a way it is not
+        // for a plugin row — VLESS mux is client-elected, so a row that does not
+        // multiplex still connects, whereas a v2ray-plugin server mandates frames.
+        let from_mux_key = mux_key("mux").map(|raw| {
+            VlessMux::parse(&raw).map_or_else(
+                // An unusable value is PRESERVED, not dropped: storing "absent"
+                // would dial without frames AND hash identically to a plain
+                // non-mux row, merging two rows into one `Protocol` — the
+                // collision decision 11 exists to prevent.
+                || VlessMux::Invalid {
+                    key: "mux".to_string(),
+                    value: raw,
+                },
+                |request| {
+                    // An explicit cap WINS over the boolean's default: `mux=true`
+                    // says *that* the row multiplexes and `muxConcurrency=-1`
+                    // says how many.
+                    cap.map_or(request, VlessMux::from_i64)
+                },
+            )
+        });
+        let mux = named_multiplexer.or(from_mux_key);
+
+        // Vision × mux is NOT refused here: the combination STORES (`flow` present
+        // and a mux request present) and `capability::vless_reason` refuses it by
+        // name, so the row stays importable, exportable, `[untestable]` and
+        // purge-safe — the same two-layer treatment the neighbouring unusable
+        // `muxtype`/`mux` spellings get. Xray's own inbound rejects this shape
+        // (`isMuxAndNotXUDP`,
+        // `thirdparty/Xray-core/proxy/vless/inbound/inbound.go:180-184`; its XRV
+        // outbound turns vision UDP into `command=Mux` with port 666).
+
         let config = Self {
             uuid,
             uuid_origin,
@@ -261,6 +439,7 @@ impl VlessConfig {
             transport,
             encryption,
             flow,
+            mux,
             path,
             splice,
             remarks,
@@ -338,6 +517,17 @@ impl VlessConfig {
             }
             if self.transport.type_str() != "tcp" {
                 q.append_pair("type", self.transport.type_str());
+            }
+            // The mux REQUEST, re-emitted so an exported URL re-imports to the
+            // same row. An explicit "no" is emitted too: it is a stated request
+            // about how the row dials, and dropping it would make an export of
+            // `mux=false` indistinguishable from a row that never said.
+            if let Some(mux) = &self.mux {
+                // Under the key the row ARRIVED with, not a canonical one: a
+                // `muxtype=smux` row exported as `mux=smux` would re-import as a
+                // different stored state — a different uid — and the exported
+                // row would duplicate instead of matching (§3.1 rule 2).
+                q.append_pair(mux.as_key(), &mux.as_value());
             }
             match &self.transport {
                 TransportConfig::Ws(cfg) => {
@@ -433,6 +623,11 @@ impl VlessConfig {
             tfo: None,
             network,
             flow: self.flow.as_ref().map(std::string::ToString::to_string),
+            // Clash states mux as a bool, so a cap and `Unlimited` both become
+            // `true` — the shape Clash can express. Re-importing such a row gives
+            // the default cap, which is the documented lossiness of the Clash
+            // round trip.
+            mux: self.mux.as_ref().map(VlessMux::is_active),
             encryption: self
                 .encryption
                 .as_ref()
@@ -489,6 +684,9 @@ impl VlessConfig {
                     transport,
                     encryption: c.encryption.clone().map(TinyText::from),
                     flow: c.flow.clone().map(TinyText::from),
+                    // Clash states mux as a BOOL (`mux: true`); a true row asks
+                    // for the default cap.
+                    mux: c.mux.map(|on| VlessMux::Limited(if on { 8 } else { 0 })),
                     path,
                     splice: None,
                     remarks: match c.name.as_str() {
@@ -598,6 +796,13 @@ impl ProtoSpec for VlessConfig {
 
 /// Per-kind identity tags (see [`super::identity`] for the reserved ranges).
 const ID_ENCRYPTION: u8 = 0x50;
+/// The mux-request tag. It records the mux REQUEST **with its value** (see
+/// `write_identity`): `mux=-1` (`cap:unlimited`) and `mux=8` (`cap:8`) are two
+/// rows, and `mux=false` (`cap:0`) is a third, distinct from a row that never
+/// said. Only an ABSENT mux writes nothing — see `write_identity` for why
+/// collapsing the others would merge rows and leak the refusal onto a plain one.
+const ID_MUX: u8 = 0x52;
+
 const ID_FLOW: u8 = 0x51;
 
 impl ProtoIdentity for VlessConfig {
@@ -613,6 +818,19 @@ impl ProtoIdentity for VlessConfig {
         super::common::write_transport(w, &self.transport);
         w.nonempty_str(ID_ENCRYPTION, self.encryption.as_deref());
         w.nonempty_str(ID_FLOW, self.flow.as_deref());
+        // The mux REQUEST — for ANY present state, not only an active one, and
+        // with its VALUE. The rule is "rows that export differently must not
+        // merge", not "rows that dial alike are one row": `mux=8` and `mux=-1`
+        // are two stored configs that both re-import to themselves, and an
+        // unusable spelling (`VlessMux::Invalid`) is a third. Collapsing any of
+        // them onto a plain row would merge two `Protocol` rows and leave
+        // whichever imported first to supply the config for both — and because
+        // the refusal verdict reads the STORED field, the `[untestable]` marker
+        // would then land on the plain row, which the user never asked to mux.
+        // This mirrors the plugin family, which likewise writes its mux value.
+        if let Some(mux) = &self.mux {
+            w.str(ID_MUX, &mux.identity_token());
+        }
         w.cred("uuid", &self.uuid);
     }
 }
@@ -1117,6 +1335,7 @@ mod tests {
             }),
             grpc_opts: None,
             xhttp_opts: None,
+            mux: None,
         });
         let parsed = VlessConfig::try_from_clash_proto(&proxy).expect("clash parse");
         assert_eq!(parsed.endpoints[0].host, "159.223.24.65");
@@ -1389,6 +1608,7 @@ mod tests {
             ws_opts: None,
             grpc_opts: None,
             xhttp_opts: None,
+            mux: None,
         });
         // try_from_clash delegates to try_from_clash_proto and extracts the
         // config (endpoints discarded).
@@ -1906,5 +2126,323 @@ mod tests {
         // Shorter than the 27+len(window) strip: an error, not a panic
         // (upstream Go would panic on the slice).
         assert!(parse_mlkem_encryption("mlkem768x25519plus.native.1rtt.a.b").is_err());
+    }
+}
+
+#[cfg(test)]
+mod mux_tests {
+    use super::*;
+
+    fn mux_of(url: &str) -> Option<VlessMux> {
+        let parsed = VlessConfig::try_parse_proto(&RawUrlX::from(url)).expect("vless parses");
+        let ProtocolConfig::Vless(cfg) = parsed.protocol.config else {
+            panic!("expected a vless config");
+        };
+        cfg.mux
+    }
+
+    const BASE: &str =
+        "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?type=ws&security=tls";
+
+    /// The spellings the captured feeds carry, each with the cap it must resolve
+    /// to. `m1n1-5ub-13:5855` / `-15:6208` (`mux=8`), `-14:946` / `-18:7707`
+    /// (`mux=true&muxConcurrency=8`), `-18:7717` (lowercase `muxconcurrency`), and the
+    /// `-1` case spec row 28 names.
+    #[test]
+    fn the_feed_mux_spellings_resolve_to_the_right_cap() {
+        assert_eq!(mux_of(&format!("{BASE}&mux=8")), Some(VlessMux::Limited(8)));
+        assert_eq!(
+            mux_of(&format!("{BASE}&mux=true")),
+            Some(VlessMux::Limited(8))
+        );
+        assert_eq!(
+            mux_of(&format!("{BASE}&mux=true&muxConcurrency=8")),
+            Some(VlessMux::Limited(8))
+        );
+        assert_eq!(
+            mux_of(&format!("{BASE}&mux=true&muxconcurrency=8")),
+            Some(VlessMux::Limited(8))
+        );
+        // Unlimited is ACTIVE, and a `u32` could not have held it.
+        assert_eq!(
+            mux_of(&format!("{BASE}&mux=true&muxConcurrency=-1")),
+            Some(VlessMux::Unlimited)
+        );
+        assert!(VlessMux::Unlimited.is_active());
+        // An explicit "no" is a request that is NOT active — and it is still a
+        // request, so it must not be the same row as one that never said.
+        assert_eq!(
+            mux_of(&format!("{BASE}&mux=false")),
+            Some(VlessMux::Limited(0))
+        );
+        assert!(!VlessMux::Limited(0).is_active());
+        // Absent: no mux at all.
+        assert_eq!(mux_of(BASE), None);
+        // A cap alone is not a request — `muxConcurrency` only caps one.
+        assert_eq!(mux_of(&format!("{BASE}&muxConcurrency=8")), None);
+    }
+
+    /// `muxtype=smux` (corpus `-6:277`, `-15:6680`, `-33:5087`) is a DIFFERENT
+    /// multiplexer, and an unusable `mux` value is equally unusable. Both are
+    /// **stored verbatim and refused at connect** — never dropped to "absent":
+    /// storing absent would dial without frames AND hash identically to a plain
+    /// non-mux row, merging two rows into one `Protocol`, which is the collision
+    /// decision 11 exists to prevent. The refusal itself lives in `capability`
+    /// (`vless_reason`), so the row keeps the `[untestable]` marker and stays
+    /// purge-safe — a parse error would drop it from the feed before it could
+    /// ever be named.
+    #[test]
+    fn an_unusable_mux_spelling_is_stored_not_dropped() {
+        // A named multiplexer is preserved WITH the key it arrived under, so an
+        // export writes back the spelling the row used.
+        let named = mux_of(&format!("{BASE}&muxtype=smux")).expect("stored");
+        assert_eq!(
+            named,
+            VlessMux::Invalid {
+                key: "muxtype".into(),
+                value: "smux".into()
+            }
+        );
+        assert!(!named.is_active(), "and it is never a mux request");
+        assert_eq!(named.as_key(), "muxtype");
+
+        // An unusable VALUE is equally unusable, and equally preserved.
+        let unusable = mux_of(&format!("{BASE}&mux=many")).expect("stored");
+        assert_eq!(
+            unusable,
+            VlessMux::Invalid {
+                key: "mux".into(),
+                value: "many".into()
+            }
+        );
+        assert!(!unusable.is_active());
+        assert_eq!(unusable.as_key(), "mux");
+
+        // Neither may collapse onto a row that never mentioned mux: storing
+        // "absent" would dial without frames AND hash identically, merging two
+        // rows into one `Protocol`.
+        assert_ne!(mux_of(BASE), Some(unusable));
+        assert_ne!(mux_of(BASE), Some(named));
+    }
+
+    /// Identity records the mux REQUEST's presence, not its magnitude: `mux=-1`
+    /// and `mux=8` are both "multiplexes", and neither may collapse onto a row
+    /// that never mentioned mux.
+    #[test]
+    fn identity_distinguishes_mux_presence_from_absence() {
+        let uid = |opts: &str| {
+            let url = format!("{BASE}{opts}");
+            let parsed =
+                VlessConfig::try_parse_proto(&RawUrlX::from(url.as_str())).expect("vless parses");
+            parsed.identity_once().2
+        };
+        let absent = uid("");
+        assert_ne!(
+            uid("&mux=8"),
+            absent,
+            "a mux row is not the same row as a non-mux one"
+        );
+        // The cap IS identity. It is stored configuration, it is exported, and it
+        // re-imports to itself — collapsing `unlimited` into `cap:8` would merge
+        // two rows whose stored configs differ, leaving whichever imported first
+        // to supply the config for both (decision 11(d)'s collision). "Same way
+        // configured servers" means the stored shape, not just the wire's framing.
+        assert_ne!(
+            uid("&mux=true&muxConcurrency=-1"),
+            uid("&mux=8"),
+            "an unlimited cap and a bounded one are two stored rows"
+        );
+        // An explicit "no" is a stated request about how the row dials, so it is a
+        // distinct row from one that never said — exactly as the plugin family's
+        // `MuxSetting::Off` is distinct from absent (spec §5.2 item 9).
+        assert_ne!(
+            uid("&mux=false"),
+            absent,
+            "an explicit 'no' behaves as no mux"
+        );
+    }
+
+    fn clash_vless(mux: Option<bool>) -> crate::clash::ClashProxy {
+        crate::clash::ClashProxy::Vless(crate::clash::ClashVless {
+            name: String::new(),
+            server: "1.2.3.4".into(),
+            port: 443,
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            udp: None,
+            tfo: None,
+            network: None,
+            flow: None,
+            encryption: None,
+            tls: None,
+            servername: None,
+            skip_cert_verify: None,
+            alpn: None,
+            reality_opts: None,
+            ws_opts: None,
+            grpc_opts: None,
+            xhttp_opts: None,
+            mux,
+        })
+    }
+
+    /// The export fixed point for a mux row: a re-imported URL must be the same
+    /// row, so the request survives `reconstruct_proto` — including the
+    /// *unlimited* cap, which a naive `mux=8` would flatten, and the
+    /// `muxtype=smux` spelling, which must come back under its own key.
+    #[test]
+    fn a_mux_row_survives_export_and_reimport() {
+        for opts in [
+            "&mux=8",
+            "&mux=true&muxConcurrency=-1",
+            "&mux=false",
+            "&muxtype=smux",
+        ] {
+            let url = format!("{BASE}{opts}");
+            let first = VlessConfig::try_parse_proto(&RawUrlX::from(url.as_str())).expect("parse");
+            let ProtocolConfig::Vless(cfg) = first.protocol.config.clone() else {
+                panic!("expected vless");
+            };
+            let exported = cfg
+                .reconstruct_proto(&first.endpoints[0])
+                .expect("reconstruct");
+            let second =
+                VlessConfig::try_parse_proto(&RawUrlX::from(exported.as_str())).expect("reparse");
+            assert_eq!(
+                first.identity_once(),
+                second.identity_once(),
+                "{opts} → {exported} must re-import as the SAME row"
+            );
+        }
+    }
+
+    /// row, so the request survives `reconstruct_proto` — including the
+    /// *unlimited* cap, which a naive `mux=8` would flatten, and the
+    /// `muxtype=smux` spelling, which must come back under its OWN key. That
+    /// second half is what §3.1 rule 2 is about: exporting it as `mux=smux`
+    /// would re-import as a different stored state — a different uid — so the
+    /// exported row would duplicate instead of matching.
+    ///
+    /// Row 31's CLASH leg, which had no test at all: the form leg was covered
+    /// and the Clash arm was implemented, but nothing asserted the bool → stored
+    /// cap mapping, so a swapped `Limited(0)`/`Limited(8)` would have been
+    /// invisible.
+    #[test]
+    fn a_clash_mux_bool_maps_to_the_stated_cap_in_both_directions() {
+        for (clash_mux, expected) in [
+            (Some(true), VlessMux::Limited(8)),
+            (Some(false), VlessMux::Limited(0)),
+        ] {
+            let proxy = clash_vless(clash_mux);
+            let round = VlessConfig::try_from_clash_proto(&proxy).expect("clash → config");
+            let ProtocolConfig::Vless(parsed) = round.protocol.config else {
+                panic!("expected vless");
+            };
+            assert_eq!(
+                parsed.mux,
+                Some(expected.clone()),
+                "clash `mux: {clash_mux:?}` stores `{expected:?}`"
+            );
+
+            // …and back out. `Limited(0)` is inactive, so it exports as `false`;
+            // an active cap exports as `true` (the documented lossiness: a bool
+            // cannot carry `-1` or any cap other than the default).
+            let exported = parsed
+                .to_clash_proto(&EndpointEssentials::new("1.2.3.4", 443))
+                .expect("config → clash");
+            let crate::clash::ClashProxy::Vless(back) = exported else {
+                panic!("expected a vless clash proxy");
+            };
+            assert_eq!(
+                back.mux, clash_mux,
+                "`{expected:?}` exports as `mux: {clash_mux:?}`"
+            );
+        }
+    }
+
+    /// The absent case, which must NOT become a stated "no".
+    #[test]
+    fn a_clash_row_without_mux_stores_absent() {
+        let round = VlessConfig::try_from_clash_proto(&clash_vless(None)).expect("clash → config");
+        let ProtocolConfig::Vless(parsed) = round.protocol.config else {
+            panic!("expected vless");
+        };
+        assert_eq!(
+            parsed.mux, None,
+            "a Clash row that never mentions mux stores NO mux, not a stated \"no\""
+        );
+        assert_eq!(
+            match parsed
+                .to_clash_proto(&EndpointEssentials::new("1.2.3.4", 443))
+                .expect("export")
+            {
+                crate::clash::ClashProxy::Vless(p) => p.mux,
+                _ => panic!("expected a vless clash proxy"),
+            },
+            None,
+            "and exports back as absent"
+        );
+    }
+
+    #[test]
+    fn an_unusable_mux_spelling_round_trips_under_its_own_key() {
+        let url = format!("{BASE}&muxtype=smux");
+        let first = VlessConfig::try_parse_proto(&RawUrlX::from(url.as_str())).expect("parse");
+        let ProtocolConfig::Vless(cfg) = first.protocol.config.clone() else {
+            panic!("expected vless");
+        };
+        let exported = cfg
+            .reconstruct_proto(&first.endpoints[0])
+            .expect("reconstruct");
+        assert!(
+            exported.contains("muxtype=smux"),
+            "the export kept the key the row arrived with, got {exported}"
+        );
+        let second =
+            VlessConfig::try_parse_proto(&RawUrlX::from(exported.as_str())).expect("reparse");
+        assert_eq!(
+            first.identity_once(),
+            second.identity_once(),
+            "a muxtype=smux row must re-import as the SAME row, not a duplicate"
+        );
+    }
+
+    /// Vision × mux is refused by name. Xray's vless inbound rejects a vision
+    /// account that receives a *plain* mux request (`isMuxAndNotXUDP`,
+    /// `thirdparty/Xray-core/proxy/vless/inbound/inbound.go:180-184`, used in the
+    /// flow branch at `:593`), and its XRV outbound turns vision UDP into
+    /// `command=Mux` with port **666** (`outbound.go:315-319`) — i.e. mux under
+    /// vision is XUDP-only, a shape we do not implement. Checked every corpus row
+    /// the spec cites for the mux spellings (`13:5855`, `15:6208`, `14:946`,
+    /// `18:7707`, `18:7717`, `6:277`, `15:6680`, `33:5087`): **none carries a
+    /// vision flow alongside a mux request**, so this combination is synthetic —
+    /// the test below constructs it deliberately rather than quoting a feed row.
+    ///
+    /// Vision × mux is **stored**, not parse-refused, and
+    /// `capability::vless_reason` refuses it by name. The two-layer rule (§3)
+    /// exists so an unusable combination stays importable, exportable and
+    /// `[untestable]` — a parse error would drop the row from the feed before
+    /// `capability` could ever name it, which is the fate the neighbouring
+    /// unusable `muxtype`/`mux` spellings were deliberately spared.
+    #[test]
+    fn vision_with_mux_stores_both_so_capability_can_name_it() {
+        let url = concat!(
+            "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?type=tcp&security=reality",
+            "&pbk=AAAA&sid=1111&spx=%2F&fp=chrome&flow=xtls-rprx-vision&mux=8"
+        );
+        let parsed = VlessConfig::try_parse_proto(&RawUrlX::from(url))
+            .expect("the combination imports so the verdict can name it");
+        let ProtocolConfig::Vless(cfg) = parsed.protocol.config else {
+            panic!("expected vless");
+        };
+        assert!(
+            cfg.flow
+                .as_deref()
+                .is_some_and(|f| f.contains("xtls-rprx-vision")),
+            "the vision flow is retained"
+        );
+        assert!(
+            cfg.mux.as_ref().is_some_and(VlessMux::is_active),
+            "the mux request is retained, so capability sees the pair"
+        );
     }
 }

@@ -11,6 +11,7 @@ pub mod reality;
 use std::sync::Arc;
 
 use xray_tui_proto::proto_spec::TlsConfig;
+use xray_tui_proto::proto_spec::ss_plugin::PluginSpec;
 use xray_tui_tls::SecureRandom;
 use xray_tui_tls::client::{TlsConfig as EngineTlsConfig, TlsMode, connect as client_connect};
 use xray_tui_tls::error::TlsError;
@@ -29,14 +30,18 @@ use crate::security::reality::{FixedChrome133, HelloProvisionerChoice};
 /// profile + verifier seam) and REALITY (provisioner + server material).
 /// Each handshake is bounded by [`timeouts::SECURITY`].
 pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, NativeError> {
-    let Some(sec) = ctx.security() else {
-        return Ok(stream);
-    };
-    // Single decision-surface guard: `is_tls()` collapses the old
-    // `sec.is_empty()` and the two byte-identical `has_tls()` copies.
+    // A plugin row's TLS lives in the plugin's `tls` key, and an
+    // `SsConfig::security()` is present but EMPTY for it — so the historical
+    // `let Some(sec) = ctx.security()` would return the stream untouched and a
+    // `mode=websocket;tls` row would perform a **plaintext** upgrade against a
+    // TLS port. `is_tls()` is the single decision surface and already folds
+    // the plugin key in (`context.rs`), so it gates both halves.
     if !ctx.is_tls() {
         return Ok(stream);
     }
+    let Some(sec) = ctx.security() else {
+        return Ok(stream);
+    };
     let rng: Arc<dyn SecureRandom> = Arc::new(ring::rand::SystemRandom::new());
     match &sec.tls {
         Some(TlsConfig::Tls(opts)) => {
@@ -126,6 +131,44 @@ pub async fn wrap(ctx: &LinkContext, stream: BoxStream) -> Result<BoxStream, Nat
                 .await
                 .map_err(|_| NativeError::Timeout {
                     step: "reality handshake",
+                    limit: timeouts::SECURITY,
+                })?
+                .map_err(map_tls_err)?;
+            Ok(Box::new(tls))
+        }
+        // A plugin row states its TLS in the plugin spec, not in `security` —
+        // so without an arm here the stream would be left in the clear, which is
+        // the silent dial this whole change exists to remove. The SNI comes from
+        // the one resolver (`server_name`) and ALPN from `alpn_vec` (which folds
+        // the plugin's `http/1.1` in).
+        //
+        // This arm is reachable ONLY when `security` states nothing at all, so
+        // there is no `insecure`/pin/fingerprint to honour: a plugin row that
+        // carries them is handled by the `Some(Tls)` arm above, which has always
+        // read them. Verification is therefore unconditional here, which is the
+        // correct default — a plugin server with a self-signed chain needs the
+        // row to say `insecure`, and an earlier version of this comment claimed
+        // otherwise.
+        None if ctx.plugin_spec().is_some_and(PluginSpec::needs_tls) => {
+            let verifier: Arc<dyn ServerVerifier> =
+                Arc::new(fingerprint::verifier_for(false, None));
+            let config = EngineTlsConfig {
+                mode: TlsMode::Plain {
+                    fingerprint: None,
+                    verifier,
+                },
+                server_name: ctx.server_name(),
+                alpn: (!ctx.alpn_vec().is_empty()).then(|| ctx.alpn_vec()),
+                curves: {
+                    let ids = ctx.curve_ids();
+                    (!ids.is_empty()).then_some(ids)
+                },
+                rng,
+            };
+            let tls = tokio::time::timeout(timeouts::SECURITY, client_connect(stream, &config))
+                .await
+                .map_err(|_| NativeError::Timeout {
+                    step: "plugin tls handshake",
                     limit: timeouts::SECURITY,
                 })?
                 .map_err(map_tls_err)?;

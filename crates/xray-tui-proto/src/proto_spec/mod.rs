@@ -27,6 +27,7 @@ pub mod security_rank;
 mod shadowtls;
 mod socks;
 mod ss;
+pub mod ss_plugin;
 mod ssh;
 mod ssr;
 mod tailscale;
@@ -52,12 +53,14 @@ pub use security_rank::protocol_security_rank;
 pub use shadowtls::ShadowTlsConfig;
 pub use socks::Socks5Config;
 pub use ss::SsConfig;
+pub use ss_plugin::{MuxSetting, PluginFamily, PluginMode, PluginSpec, TlsSetting};
 pub use ssh::SshConfig;
 pub use ssr::SsrConfig;
 pub use tailscale::TailscaleConfig;
 pub use tor::TorConfig;
 pub use trojan::TrojanConfig;
 pub use tuic::TuicConfig;
+pub use vless::VlessMux;
 pub use vless::{MlkemEncryption, MlkemMode, VlessConfig, parse_mlkem_encryption};
 pub use vmess::VmessConfig;
 pub use wireguard::WireguardConfig;
@@ -1286,6 +1289,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         });
         config.set_export_defaults("fallback.example");
         let ProtocolConfig::Vless(vless) = config else {
@@ -1313,6 +1317,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         });
         config.set_export_defaults("fallback.example");
         let ProtocolConfig::Vless(vless) = config else {
@@ -1339,6 +1344,7 @@ mod tests {
             path: None,
             splice: None,
             remarks: None,
+            mux: None,
         });
         config.set_export_defaults("origin.example");
         let endpoint = EndpointEssentials {

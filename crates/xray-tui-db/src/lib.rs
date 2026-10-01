@@ -3,8 +3,8 @@ pub mod hash;
 pub use hash::stable_hash;
 pub mod models_toasty;
 pub use database::{
-    Database, LinkGroups, LinkPatch, upsert_endpoint_group_links_bulk, upsert_endpoints_bulk,
-    upsert_links_bulk, upsert_protocols_bulk,
+    Database, LinkGroups, LinkPatch, SCHEMA_VERSION, upsert_endpoint_group_links_bulk,
+    upsert_endpoints_bulk, upsert_links_bulk, upsert_protocols_bulk,
 };
 pub use endpoint_rank::{compute_rank, rank_of_row};
 pub use error::{DatabaseError, Result};

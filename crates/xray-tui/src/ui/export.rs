@@ -21,7 +21,7 @@ const SCOPES: [ExportScope; 4] = [
     ExportScope::Full,
 ];
 
-fn scope_label(scope: ExportScope) -> &'static str {
+const fn scope_label(scope: ExportScope) -> &'static str {
     match scope {
         ExportScope::Alive => "Only Alive",
         ExportScope::Resolved => "Only Resolved",

@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use xray_tui_config::IpProvider;
 use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
+use xray_tui_db::LinkGroups;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{
     Endpoint, EndpointId, EndpointRow, HostType, Latency, ProfileStats, ProtocolId, PurgatoryView,
@@ -94,6 +95,20 @@ fn is_removable_failure(link: &ProfileStats) -> bool {
 }
 
 /// Start TCP ping on the given profile. Returns immediately; result arrives via `CoreEvent`.
+/// The row's plugin mode when a TCP fast probe would be meaningless — a
+/// datagram-mode SIP003 row. `None` for every other row, including one that
+/// merely mentions `mode=quic` in a spelling we resolve to something else.
+fn datagram_plugin_mode(config: &ProtocolConfig) -> Option<String> {
+    let ProtocolConfig::Ss(ss) = config else {
+        return None;
+    };
+    let plugin = ss.plugin.as_ref()?;
+    if plugin.tcp_fast_probe_is_meaningful() {
+        return None;
+    }
+    Some(plugin.resolved_mode().as_str().to_string())
+}
+
 pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) {
     if state.testing_profiles.contains(&(endpoint_id, protocol_id)) {
         state.log_trace(
@@ -132,6 +147,23 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
         );
         return;
     };
+    // §8.1 item 4: the fast level is protocol-KIND-blind — `FastPingManager`
+    // picks `TcpPingAdapter` from `ProtocolKind` alone — so a datagram-mode
+    // plugin row would be TCP-probed against a UDP port and the refusal booked
+    // as a hard connect failure about a server that is perfectly alive. The menu
+    // path and every other caller land here, so this is the ONE place the row's
+    // own resolved mode has to be consulted.
+    if let Some(mode) = datagram_plugin_mode(&proto.config.get().0) {
+        state.log_trace(
+            "warn",
+            "tui::ops::ping",
+            &format!(
+                "No TCP fast probe for this row: shadowsocks plugin mode `{mode}` is a \
+                 datagram transport, so a TCP connect proves nothing (spec 8.1 item 4)"
+            ),
+        );
+        return;
+    }
     if row.endpoint.host.is_empty() {
         state.log_trace("error", "tui::ops::ping", "Profile has no address");
         return;
@@ -299,7 +331,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
                     latency_ms: None,
                     speed_bps: None,
                     ip_info: None,
-                    error: Some(untestable_marker_text(reason)),
+                    error: Some(untestable_marker_text(&reason)),
                     purge: None,
                 },
                 "real_ping_untestable",
@@ -1408,7 +1440,7 @@ const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 /// markers older than the configured TTL are cleared before the terminal event
 /// lands. Links the batch did not touch (dedup-retired siblings, queue-full/stop
 /// skips) are exactly the ones whose stale markers this clears.
-fn wal_checkpoint_enabled(concurrent_writes: bool) -> bool {
+const fn wal_checkpoint_enabled(concurrent_writes: bool) -> bool {
     !concurrent_writes
 }
 
@@ -1715,7 +1747,7 @@ impl BatchShared {
                         endpoint_id,
                         host: plan.endpoint.host.clone(),
                         host_type: plan.endpoint.host_type,
-                        sni: crate::ops::enrich::extract_sni(&plan.protocol),
+                        sni: crate::ops::enrich::extract_sni(&plan.protocol, &plan.endpoint.host),
                     };
                     // A full channel drops it; the next batch (or a connect)
                     // asks again, so only a SENT one is recorded.
@@ -1812,15 +1844,37 @@ impl BatchShared {
             self.emit_untestable_marker(link, &reason);
             return;
         }
-        if !self.real_phase {
-            return;
-        }
         // The fast level already proved this link's proxy unreachable (refused,
         // no route, unresolvable, dial timeout): the real probe would only spend
         // its whole timeout re-learning that. The row keeps its `[fast]` marker,
         // which is the honest statement about it.
         if self.hard_fast.lock().contains(&key) {
-            self.counters.unreachable.fetch_add(1, Ordering::Relaxed);
+            // …unless the fast level CANNOT measure this row. A `mode=quic`
+            // plugin row is served over QUIC/UDP and the fast level is a TCP
+            // handshake, so its hard failure is evidence about the fast level,
+            // not about the server: retiring here left every quic row
+            // permanently `[fast]`-failed and untested no matter what the server
+            // was. The marker goes with the verdict — a TCP timeout is not a
+            // statement about a QUIC server.
+            //
+            // The check is HERE, on the rare hard-failure arm, and reads the
+            // batch's per-`ProtocolId` config cache. It is deliberately NOT the
+            // plan-time gate: that would cost a config load per planned link,
+            // including for the rows this exemption will never apply to.
+            if self.is_quic_plugin_link(link).await {
+                self.retract_fast_marker(link);
+            } else {
+                self.counters.unreachable.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Above the hard-failure block on purpose, and reachable in a fast-ONLY
+        // batch ("Fast Ping", `real_phase == false`) as well as the fast+real
+        // one: the retraction is a statement about the FAST probe's verdict, not
+        // about the real level, so it must not be gated on whether a real level
+        // exists. Returning above it left every quic row carrying the TCP-derived
+        // `[fast]` marker in a fast-only run — the §8.1 symptom, unfixed.
+        if !self.real_phase {
             return;
         }
         // A candidate is known: it enters the real level's denominator, and
@@ -2071,7 +2125,7 @@ impl BatchShared {
         // refuses reaches here. Its marker IS the probe's result — phase 2, so
         // it lands after the fast result and is not cleared by it.
         if let Some(reason) = capability::support_reason(protocol.kind, &protocol.config) {
-            return ProbeOutcome::soft_failure(untestable_marker_text(reason));
+            return ProbeOutcome::soft_failure(untestable_marker_text(&reason));
         }
         let Some(endpoint) = self
             .endpoints
@@ -2128,6 +2182,47 @@ impl BatchShared {
         });
         self.protocols.insert(id, Arc::clone(&loaded));
         Ok(loaded)
+    }
+
+    /// Whether this link's protocol is a `mode=quic` SIP003 plugin row.
+    ///
+    /// A config-load failure answers `false`, i.e. the row keeps the ordinary
+    /// retirement: the exemption exists for a row we can positively identify as
+    /// QUIC, and a row we could not read is not evidence that it is.
+    async fn is_quic_plugin_link(&self, link: &ProfileStats) -> bool {
+        let Ok(loaded) = self.protocol_config(link.protocol_id).await else {
+            return false;
+        };
+        let ProtocolConfig::Ss(ss) = &loaded.config else {
+            return false;
+        };
+        ss.plugin
+            .as_ref()
+            .is_some_and(|p| p.mode == xray_tui_proto::proto_spec::PluginMode::Quic)
+    }
+
+    /// Retract the RESULT/PURGE columns a meaningless fast probe staged.
+    ///
+    /// `stage` REPLACES the pending entry per (link, group), so this wins over
+    /// the marker written moments earlier — the retraction is a later fact, not
+    /// a merge. Both groups go: a purge verdict derived from a probe that could
+    /// not have reached the server is as wrong as its marker.
+    fn retract_fast_marker(&self, link: &ProfileStats) {
+        // Re-stage the PLAN-TIME SNAPSHOT verbatim, and do NOT blank it.
+        //
+        // `link` is the batch's snapshot: the fast half only ever wrote into a
+        // clone through `stage_result`, so `link.error` is whatever verdict the
+        // row carried BEFORE this batch — possibly a valid `[real]` marker from an
+        // earlier run, still inside `error_ttl_hours`. Setting `error = None`
+        // would destroy that, and if the real half is then retired by a stop or
+        // a queue-full the row would be left with no marker at all.
+        //
+        // `stage` REPLACES the pending entry per (link, group), so re-staging the
+        // snapshot is what withdraws the fast half's staged verdict: same shape
+        // as every other patch in this batch, which is built from the snapshot.
+        let row = link.clone();
+        self.writer
+            .stage(&row, LinkGroups::RESULT.union(LinkGroups::PURGE));
     }
 
     /// The purge verdict for one result, or `None`.
@@ -2957,6 +3052,114 @@ mod tests {
         assert_eq!(plan.len(), 2, "both links are offered for a manual test");
     }
 
+    /// An endpoint whose single link is a Shadowsocks row carrying a
+    /// `mode=<plugin mode>` plugin. T24 needs a real QUIC row and a real
+    /// WebSocket row side by side, so the two tests that share this helper
+    /// differ only in the mode — the anti-overreach pair is meaningful exactly
+    /// because everything else is identical.
+    fn plugin_row(id: i64, host: &str, opts: &str) -> EndpointRow {
+        use toasty::{Deferred, Json};
+        use xray_tui_db::models::{Protocol, Security, Transport};
+        use xray_tui_proto::proto_spec::common::{SecurityConfig, TransportConfig};
+        use xray_tui_proto::proto_spec::{
+            PluginSpec, ProtocolConfig, ProtocolKind, SecurityType, SsConfig, TransportType,
+        };
+
+        let mut row = fake_row(id, host, 1);
+        let link = row.links[0].clone();
+        let protocol = Protocol {
+            id: link.protocol_id,
+            sig: link.protocol_id.get(),
+            proto_kind: ProtocolKind::Shadowsocks,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+                data: Deferred::from(Json(TransportConfig::Tcp)),
+            },
+            security: Security {
+                r#type: SecurityType::None,
+                sni: None,
+                fp: None,
+                insecure: None,
+                data: Deferred::from(Json(SecurityConfig::default())),
+            },
+            config: Deferred::from(Json(ProtocolConfig::Ss(SsConfig {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin: Some(PluginSpec::from_parts(Some("v2ray-plugin"), opts)),
+            }))),
+            created_at: crate::ops::profiles::test_support::ts(0),
+            links: Deferred::default(),
+        };
+        row.protocols = std::collections::HashMap::from([(link.protocol_id, protocol)]);
+        row
+    }
+
+    /// Row 11 / §8.1 item 4: the single-ping fast path reports **no TCP probe**
+    /// for a datagram-mode row, and still probes every stream-mode one.
+    ///
+    /// Both directions are asserted because the dangerous failure here is
+    /// SILENT: a gate written as "skip plugin rows" would satisfy the first half
+    /// while quietly de-optimizing every `obfs=http` and `mode=websocket` row,
+    /// and nothing in the UI would say so.
+    #[test]
+    fn a_datagram_plugin_row_declines_a_tcp_probe_and_a_stream_one_still_probes() {
+        use xray_tui_proto::proto_spec::common::SecurityConfig;
+        use xray_tui_proto::proto_spec::{PluginSpec, ProtocolConfig, SsConfig};
+
+        let mode_of = |opts: &str| {
+            let config = ProtocolConfig::Ss(SsConfig {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin: Some(PluginSpec::from_parts(Some("v2ray-plugin"), opts)),
+            });
+            datagram_plugin_mode(&config)
+        };
+
+        assert_eq!(
+            mode_of("mode=quic;host=cdn.example").as_deref(),
+            Some("quic"),
+            "a datagram row declares no meaningful TCP probe, by name"
+        );
+        for stream_mode in [
+            "mode=websocket;host=cdn.example",
+            "mode=websocket;host=cdn.example;mux=1",
+            "mode=websocket;host=cdn.example;tls",
+        ] {
+            assert_eq!(
+                mode_of(stream_mode),
+                None,
+                "{stream_mode} is a STREAM mode — skipping its TCP probe would \
+                 de-optimize every ordinary plugin row"
+            );
+        }
+        // A row with no plugin at all is likewise unaffected.
+        assert_eq!(
+            datagram_plugin_mode(&ProtocolConfig::Ss(SsConfig {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                security: SecurityConfig::default(),
+                remarks: None,
+                plugin: None,
+            })),
+            None,
+            "a plain shadowsocks row still takes the TCP fast probe"
+        );
+    }
+
+    /// T24's subject: a `mode=quic` plugin row.
+    fn quic_plugin_row(id: i64, host: &str) -> EndpointRow {
+        plugin_row(id, host, "mode=quic;host=cdn.example")
+    }
+
+    /// T24's control: the same row with a mode the fast level CAN measure.
+    fn ws_plugin_row(id: i64, host: &str) -> EndpointRow {
+        plugin_row(id, host, "mode=websocket;host=cdn.example;path=/x")
+    }
+
     async fn harness(rows: Vec<EndpointRow>) -> Harness {
         let mut state = test_state(rows.clone()).await;
         // Persist the plan rows so the scheduler gate (`write_task_state`
@@ -3406,6 +3609,267 @@ mod tests {
             link.error.as_ref().map(|e| e.kind),
             Some(ProfileErr::Real),
             "and the marker still lands: {link:?}"
+        );
+    }
+
+    /// T24: a `mode=quic` plugin row reaches a REAL result.
+    ///
+    /// The fast level is a TCP handshake probe, and a QUIC server does not speak
+    /// TCP — so every quic row's fast probe fails in a connect class, the
+    /// retirement decision read that as "unreachable", and the real probe was
+    /// never dispatched. The row was permanently `[fast]`-failed and untestable
+    /// no matter what the server was. The fast probe still runs (it is cheap and
+    /// its verdict may still be informative for other rows); only its RETIREMENT
+    /// is wrong, and its marker is retracted because a TCP failure is not
+    /// evidence about a QUIC server.
+    #[tokio::test]
+    async fn a_quic_plugin_row_is_not_retired_by_its_tcp_fast_failure() {
+        let rows = vec![quic_plugin_row(1, "10.0.0.1")];
+        let mut h = harness(rows.clone()).await;
+        let params = build_params(&h, plan_from_rows(&rows), true, false);
+        h.state.batch_progress = Some(params.meters.clone());
+        let shared = Arc::new(BatchShared::new(params));
+        // Per-address, so this is the ONLY link in the batch that hard-fails.
+        *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
+            rows[0].endpoint.host.clone(),
+            ProbeOutcome::Failed {
+                text: "connection timed out".into(),
+                class: ProbeClass::Timeout,
+                hard: true,
+                evidence: None,
+            },
+        )]);
+        let link = rows[0].links[0].clone();
+        // The caches `run_batch`'s dispatch fills per page; calling the chain
+        // directly means seeding the same two entries, or `fast_probe` answers
+        // its "Endpoint not found" soft failure and the test measures nothing.
+        shared
+            .endpoints
+            .insert(link.endpoint_id, Arc::new(rows[0].endpoint.clone()));
+        // `fast_config` holds `proto_kind.to_i32()` — its own field doc says
+        // "Fast config type per link (`proto_kind`)" and `dispatch_page` writes
+        // exactly that. Seeding `config_type` (the unrelated ShareUrl/Form
+        // enum) happened to be invisible because the stub ignores the argument,
+        // which is precisely why it is worth stating here.
+        shared.fast_config.insert(
+            (link.protocol_id, link.endpoint_id),
+            rows[0].protocols[&link.protocol_id].proto_kind.to_i32(),
+        );
+        run_task_chain(Arc::clone(&shared), link.clone(), 0, TaskKind::FastPing).await;
+
+        assert_eq!(
+            shared.counters.unreachable.load(Ordering::Relaxed),
+            0,
+            "a quic row is NOT retired: its TCP probe cannot measure a QUIC server"
+        );
+        assert_eq!(
+            shared.meters.real.done.load(Ordering::Relaxed),
+            1,
+            "the real half ran and settled — it is not retired"
+        );
+        // The verdict it reaches today is the capability gate's: `mode=quic` is
+        // refused by name (T22 could not pin its wire from evidence), so the row
+        // gets an `[untestable]` marker naming that reason. When T23 lands this
+        // becomes a real probe result instead — what must NOT come back is the
+        // TCP-derived `[fast]` verdict the retirement used to leave behind.
+        assert_eq!(
+            shared.counters.untestable.load(Ordering::Relaxed),
+            1,
+            "the real level produced the row's verdict"
+        );
+        let mut rx = h.state.core_event_rx.take().expect("event receiver");
+        // Both levels emit. The fast probe still RUNS (it is cheap, and its
+        // verdict may still be informative for other rows); what must not happen
+        // is that its TCP verdict becomes this row's answer.
+        let mut fast_text = String::new();
+        let mut real_text = String::new();
+        // Each level emits a TestTypeUpdate and then its result, so read until
+        // both results are in rather than counting events.
+        for _ in 0..8 {
+            if !fast_text.is_empty() && !real_text.is_empty() {
+                break;
+            }
+            match rx.recv().await.expect("channel open") {
+                CoreEvent::SpeedTestResult {
+                    protocol_id,
+                    test_type,
+                    error: Some(text),
+                    ..
+                } if protocol_id == link.protocol_id.get() => match test_type {
+                    TestType::TcpPing => fast_text = text,
+                    TestType::RealPing => real_text = text,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        assert_eq!(
+            fast_text, "connection timed out",
+            "the fast probe still ran — only its RETIREMENT was wrong"
+        );
+        assert!(
+            crate::ops::ping::is_untestable_text(&real_text),
+            "the real level's verdict is the named untestable marker, got {real_text}"
+        );
+
+        // …and the fast probe's `[fast]` marker is NOT persisted: the fast level
+        // cannot measure a QUIC server, so its TCP verdict is not a statement
+        // about this row. Flush the writer to see what the batch actually wrote.
+        h.state.link_writer.flush().await.expect("flush");
+        let row = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            link.protocol_id,
+            link.endpoint_id,
+        )
+        .first()
+        .exec(&mut h.state.db.connection().await.expect("conn"))
+        .await
+        .expect("read the row back")
+        .expect("row exists");
+        // The persisted verdict is the real level's. It is NOT `None` — the real
+        // half's own verdict is legitimate — but it must NOT be the fast probe's
+        // TCP failure, which is what the retirement used to leave behind.
+        let error = row.error.as_ref().expect("a verdict is persisted");
+        assert!(
+            !matches!(error.kind, ProfileErr::Fast),
+            "the `[fast]` marker was retracted: {error:?}"
+        );
+        assert!(
+            crate::ops::ping::is_untestable_marker(error),
+            "and what remains is the real level's named refusal: {error:?}"
+        );
+    }
+
+    /// T24's other half, and the one that was missing: a **fast-ONLY** batch
+    /// (the plain "Fast Ping" mode, `real_phase == false`).
+    ///
+    /// The quic exemption has to sit ABOVE `if !self.real_phase { return; }`,
+    /// because the retraction is a statement about the FAST probe's verdict, not
+    /// about the real level. With it below that guard a fast-only run returned
+    /// first and every quic row kept the TCP-derived `[fast]` marker — §8.1's
+    /// exact symptom, unfixed on the mode most likely to be pressed.
+    ///
+    /// Nothing else clears the marker on this path (there is no real probe to
+    /// overwrite it), so this case is what makes the retraction load-bearing: it
+    /// fails if the block is moved back below the guard, and it passes with the
+    /// retraction removed.
+    #[tokio::test]
+    async fn a_fast_only_batch_also_retracts_the_quic_rows_fast_marker() {
+        let rows = vec![quic_plugin_row(3, "10.0.0.3")];
+        let mut h = harness(rows.clone()).await;
+        let params = build_params(&h, plan_from_rows(&rows), false, false);
+        h.state.batch_progress = Some(params.meters.clone());
+        let shared = Arc::new(BatchShared::new(params));
+        *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
+            rows[0].endpoint.host.clone(),
+            ProbeOutcome::Failed {
+                text: "connection timed out".into(),
+                class: ProbeClass::Timeout,
+                hard: true,
+                evidence: None,
+            },
+        )]);
+        let link = rows[0].links[0].clone();
+        shared
+            .endpoints
+            .insert(link.endpoint_id, Arc::new(rows[0].endpoint.clone()));
+        shared.fast_config.insert(
+            (link.protocol_id, link.endpoint_id),
+            rows[0].protocols[&link.protocol_id].proto_kind.to_i32(),
+        );
+        run_task_chain(Arc::clone(&shared), link.clone(), 0, TaskKind::FastPing).await;
+
+        assert_eq!(
+            shared.meters.real.done.load(Ordering::Relaxed),
+            0,
+            "a fast-only batch runs no real half at all"
+        );
+        shared.writer.flush().await.expect("flush");
+        let persisted = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            link.protocol_id,
+            link.endpoint_id,
+        )
+        .first()
+        .exec(&mut h.state.db.connection().await.expect("conn"))
+        .await
+        .expect("read the row back")
+        .expect("row exists");
+        assert!(
+            !persisted
+                .error
+                .as_ref()
+                .is_some_and(|e| matches!(e.kind, ProfileErr::Fast)),
+            "no TCP-derived `[fast]` marker survives a fast-only run either: {:?}",
+            persisted.error
+        );
+    }
+
+    /// The anti-overreach guard: the retirement decision is still correct for
+    /// every OTHER hard fast failure. If the quic exception were written as
+    /// "never retire", this row would stop being retired too — and the 2026-09-15
+    /// run retired 253 of 350 real probes that way for good reason.
+    #[tokio::test]
+    async fn a_non_quic_plugin_row_is_still_retired_by_a_hard_fast_failure() {
+        let rows = vec![ws_plugin_row(2, "10.0.0.2")];
+        let mut h = harness(rows.clone()).await;
+        let params = build_params(&h, plan_from_rows(&rows), true, false);
+        h.state.batch_progress = Some(params.meters.clone());
+        let shared = Arc::new(BatchShared::new(params));
+        // Per-address, so this is the ONLY link in the batch that hard-fails.
+        *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
+            rows[0].endpoint.host.clone(),
+            ProbeOutcome::Failed {
+                text: "connection timed out".into(),
+                class: ProbeClass::Timeout,
+                hard: true,
+                evidence: None,
+            },
+        )]);
+        let link = rows[0].links[0].clone();
+        // The caches `run_batch`'s dispatch fills per page; calling the chain
+        // directly means seeding the same two entries, or `fast_probe` answers
+        // its "Endpoint not found" soft failure and the test measures nothing.
+        shared
+            .endpoints
+            .insert(link.endpoint_id, Arc::new(rows[0].endpoint.clone()));
+        // `fast_config` holds `proto_kind.to_i32()` — its own field doc says
+        // "Fast config type per link (`proto_kind`)" and `dispatch_page` writes
+        // exactly that. Seeding `config_type` (the unrelated ShareUrl/Form
+        // enum) happened to be invisible because the stub ignores the argument,
+        // which is precisely why it is worth stating here.
+        shared.fast_config.insert(
+            (link.protocol_id, link.endpoint_id),
+            rows[0].protocols[&link.protocol_id].proto_kind.to_i32(),
+        );
+        run_task_chain(Arc::clone(&shared), link.clone(), 0, TaskKind::FastPing).await;
+
+        assert_eq!(
+            shared.counters.unreachable.load(Ordering::Relaxed),
+            1,
+            "a websocket plugin row IS retired: its TCP probe measures it honestly"
+        );
+        assert_eq!(
+            shared.meters.real.done.load(Ordering::Relaxed),
+            0,
+            "and no real probe is wasted re-learning it"
+        );
+        // Row 12's second half, which the audit found unasserted: the row still
+        // gets its `[fast]` marker. It is the honest statement about a row whose
+        // TCP probe measured it and found it down — and its ABSENCE here would
+        // be the silent de-optimization the row exists to prevent.
+        h.state.link_writer.flush().await.expect("flush");
+        let persisted = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            link.protocol_id,
+            link.endpoint_id,
+        )
+        .first()
+        .exec(&mut h.state.db.connection().await.expect("conn"))
+        .await
+        .expect("read the row back")
+        .expect("row exists");
+        let error = persisted.error.as_ref().expect("a verdict was persisted");
+        assert!(
+            matches!(error.kind, ProfileErr::Fast),
+            "a websocket plugin row keeps its `[fast]` marker: {error:?}"
         );
     }
 
