@@ -36,6 +36,7 @@ mod trojan;
 mod tuic;
 mod vless;
 mod vmess;
+pub mod weight;
 mod wireguard;
 pub use anytls::AnyTlsConfig;
 pub use common::{

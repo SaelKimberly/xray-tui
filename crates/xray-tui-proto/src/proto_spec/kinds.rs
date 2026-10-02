@@ -285,10 +285,40 @@ impl<'de> Deserialize<'de> for TransportType {
     }
 }
 
+impl TransportType {
+    /// Parse the label `toasty` WRITES for an embedded enum column.
+    ///
+    /// NOT the same as `FromStr`: the embed derive stores its own `snake_case`
+    /// label derived from the Rust ident, so the database holds `http_upgrade`
+    /// and `x_http` where the wire form (`as_str()`, and every share URL) says
+    /// `httpupgrade` / `xhttp`. Verified against a real feed (2026-10-01:
+    /// 145 `http_upgrade` + 169 `x_http` rows). A caller that reads the column
+    /// back as text and parses it with `FromStr` silently gets `Err` for those
+    /// two transports — which, in the ordering law, means a stored zero weight
+    /// and a page sorted differently from the in-memory comparator.
+    ///
+    /// Accepts both spellings; the wire form stays the canonical output.
+    #[must_use]
+    pub fn from_db_label(label: &str) -> Option<Self> {
+        match label.to_ascii_lowercase().as_str() {
+            "tcp" => Some(Self::Tcp),
+            "ws" => Some(Self::Ws),
+            "grpc" => Some(Self::Grpc),
+            "http" => Some(Self::Http),
+            "quic" => Some(Self::Quic),
+            "kcp" => Some(Self::Kcp),
+            "httpupgrade" | "http_upgrade" => Some(Self::HttpUpgrade),
+            "xhttp" | "x_http" => Some(Self::XHttp),
+            _ => None,
+        }
+    }
+}
+
 impl std::str::FromStr for TransportType {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // The wire spellings only — a share URL is never `x_http`.
         match s.to_ascii_lowercase().as_str() {
             "tcp" => Ok(Self::Tcp),
             "ws" => Ok(Self::Ws),

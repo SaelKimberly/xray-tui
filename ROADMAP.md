@@ -220,7 +220,7 @@
 
 ## Phase 15 — Test-Priority Sorting ✅
 
-- ✅ Tier model + shared comparator — `EndpointRow::sort_protocols_by_test_priority` / `best_test_priority_key` in the db crate; ascending key `(tier, latency, -last_seen_at, id)`; tiers 0 real-ok, 1 fast/udp-ok, 2 untested, 3 real-err, 4 fast-err, 5 DNS-unresolved; latency only within tiers 0-1, tiers 2-5 by last_seen_at desc then id; fresh failure dominates stored success; main-table representative = best protocol (min key)
+- ✅ Tier model + shared comparator — `EndpointRow::sort_protocols_by_test_priority` / `best_test_priority_key` in the db crate; ascending key `(tier, u64::MAX - weight, latency, -last_seen_at, id)`; tiers 0 real-ok, 1 fast/udp-ok, 2 untested, 3 real-err, 4 fast-err, 5 DNS-unresolved; fresh failure dominates stored success; main-table representative = best protocol (min key). **Superseded in the key by the static config weight (2026-10-01)**: tier still outranks weight, but inside a tier the weight outranks latency
 - ✅ `delay_source` provenance — `profile_extensions.delay_source` column (SCHEMA_VERSION 4, `ensure_column` migration): 0 fast, 1 real, 2 udp; written by the `SpeedTestResult` handler (from `test_type`) and `batch_upsert_buffer` (from session `ping_type`); real-ok survives restarts
 - ✅ Live sub-table re-sort — `SpeedTestResult` handler re-sorts the owning endpoint's protocols on TcpPing/RealPing results (success or failure; UDP never re-sorts); `selected_sub` remapped by protocol id (only when the result's endpoint is selected); `EndpointInfoUpdated` unresolved→resolved DNS flip re-sorts; `filter_cache_valid` invalidated
 - ✅ Error events mutate nothing — `if error.is_none()` gate wraps the whole ext mutation + upsert; a cancelled/failed test never ranks an untested protocol as real-ok and never writes a `delay = 0` row
@@ -410,3 +410,4 @@
   dial, which also fixes the live defect it exposed: such a row used to open a TCP connection to a
   server answering on UDP/443. Unblocking needs the plugin's source or an upstream statement of its
   QUIC client's key/header/ALPN. Evidence: `docs/aegis/plans/2026-09-30-ss-plugin.md` (T22).
+- ✅ Static config weight — a compiled, versioned prior over each link's transport/security discriminators (`proto_spec/weight.rs`), inserted into the decision-16 key inside the tier and materialized as `endpoint_rank.rank_weight` (raw BLOB column + `endpoint_rank_test_v2` covering index + `WEIGHT_VERSION` rebuild, no schema-tag bump); the `PlanScope::All` feed walk now orders by the law and freezes its ids before the first probe

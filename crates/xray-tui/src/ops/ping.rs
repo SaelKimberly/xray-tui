@@ -600,6 +600,16 @@ struct PlanLink {
     protocol: DbProtocol,
 }
 
+/// The order the feed walk probes in.
+///
+/// The decision-16 law, so the most reliable links go first (spec
+/// `2026-10-01-static-config-weight-design`). This REPLACES ADR 0008's
+/// `PageSort::Id`, which existed to give the walk an order no write could move.
+/// That property is what the freeze in `PlanWalk::next_page` now restores by
+/// other means: the ids are read once, up front, precisely because the order is
+/// no longer stable.
+const FEED_SORT: PageSort = PageSort::Test;
+
 /// Outcome of one dispatched probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeOutcome {
@@ -1345,25 +1355,31 @@ impl PlanWalk {
                 if *exhausted {
                     return Ok(None);
                 }
-                // A SCOPED walk freezes its endpoint set BEFORE the first probe
-                // is dispatched. The scope predicate reads the endpoint's
-                // `rank_tier`, which this very batch changes as its results land,
-                // so an offset-paged walk over a mutating set silently SKIPS
-                // every endpoint that leaves the scope: a `Failed` run moves its
-                // own endpoints to tier 0 as they succeed, the filtered set
-                // shrinks, and the next page's OFFSET lands past rows it never
-                // visited. `PlanScope::All` is immune — its membership ("has a
-                // link") and its `PageSort::Id` order (endpoint ids, which no
-                // write can move) are both independent of probe results — so it
-                // keeps streaming one page at a time.
-                if frozen.is_none() && *scope != PlanScope::All {
+                // The walk freezes its endpoint set BEFORE the first probe is
+                // dispatched, for EVERY scope including `All`. The scope
+                // predicate reads the endpoint's `rank_tier`, which this very
+                // batch changes as its results land, so an offset-paged walk
+                // over a mutating set silently SKIPS every endpoint that leaves
+                // the scope: a `Failed` run moves its own endpoints to tier 0 as
+                // they succeed, the filtered set shrinks, and the next page's
+                // OFFSET lands past rows it never visited.
+                //
+                // `All` used to be exempt because its `PageSort::Id` order was
+                // result-independent — ids never move. Ordering it by the
+                // decision-16 law (spec
+                // `2026-10-01-static-config-weight-design`) gives that up
+                // DELIBERATELY: the order is now the weight/metric ranking
+                // this batch itself rewrites, so the same skip applies. The
+                // price is one full-feed id read before the first probe instead
+                // of a page-at-a-time stream.
+                if frozen.is_none() {
                     let request = PageRequest {
                         view: PurgatoryView::All,
                         active_threshold: 0,
                         scope: *scope,
                         search: None,
                         group_id: None,
-                        sort: PageSort::Id,
+                        sort: FEED_SORT,
                         ascending: true,
                         offset: 0,
                         limit: usize::MAX,
@@ -1375,44 +1391,15 @@ impl PlanWalk {
                     *pages_total = u32::try_from(pages).unwrap_or(u32::MAX);
                     *frozen = Some(page.ids);
                 }
-                let ids: Vec<EndpointId> = if let Some(all) = frozen {
-                    if *offset >= all.len() {
-                        *exhausted = true;
-                        return Ok(None);
-                    }
-                    let end = (*offset + *page_size).min(all.len());
-                    let chunk = all[*offset..end].to_vec();
-                    *offset = end;
-                    *pages_done += 1;
-                    chunk
-                } else {
-                    // `PurgatoryView::All` and no search/group: the run is about
-                    // the whole database, not about what the tab currently
-                    // filters to. The thresholds are unused for that view.
-                    let request = PageRequest {
-                        view: PurgatoryView::All,
-                        active_threshold: 0,
-                        scope: *scope,
-                        search: None,
-                        group_id: None,
-                        sort: PageSort::Id,
-                        ascending: true,
-                        offset: *offset,
-                        limit: *page_size,
-                    };
-                    let (ids, total) = db.profiles_walk_page(&request, *offset == 0).await?;
-                    if let Some(total) = total {
-                        let pages = total.div_ceil(u64::try_from(*page_size).unwrap_or(u64::MAX));
-                        *pages_total = u32::try_from(pages).unwrap_or(u32::MAX);
-                    }
-                    if ids.is_empty() {
-                        *exhausted = true;
-                        return Ok(None);
-                    }
-                    *offset += ids.len();
-                    *pages_done += 1;
-                    ids
-                };
+                let all = frozen.as_ref().expect("frozen just above");
+                if *offset >= all.len() {
+                    *exhausted = true;
+                    return Ok(None);
+                }
+                let end = (*offset + *page_size).min(all.len());
+                let ids: Vec<EndpointId> = all[*offset..end].to_vec();
+                *offset = end;
+                *pages_done += 1;
                 // Purged links are skipped by a feed-wide sweep: the real half
                 // is the long pole, and re-proving a link the classifier has
                 // already judged is the one thing the purge exists to stop.
@@ -3033,6 +3020,48 @@ mod tests {
         };
         let live = h.state.db.profiles_page(&request).await.expect("page");
         assert_eq!(live.total, 1, "only the first endpoint still fails");
+    }
+
+    /// `PlanScope::All` used to stream by `PageSort::Id`, whose order no write
+    /// can move. It now walks the decision-16 law — an order THIS BATCH rewrites
+    /// as results land — so it must freeze too: without the freeze, every
+    /// endpoint whose tier or latency improves mid-walk is skipped as the
+    /// OFFSET slides past rows the walk never visited.
+    #[tokio::test]
+    async fn the_all_walk_freezes_before_probing_too() {
+        use xray_tui_db::models::Latency;
+
+        let rows: Vec<EndpointRow> = (1..=4)
+            .map(|i| fake_row(i, &format!("10.0.1.{i}"), 1))
+            .collect();
+        let h = harness(rows).await;
+
+        let mut walk = PlanWalk::new(PlanSource::Feed(PlanScope::All), h.state.db.clone(), 1);
+        let first = walk.next_page().await.expect("page").expect("a page");
+        let mut planned: Vec<String> = first.iter().map(|pl| pl.endpoint.host.clone()).collect();
+        assert_eq!(planned, ["10.0.1.1"], "the first page is one endpoint");
+
+        // The batch's own results: every remaining endpoint now outranks the one
+        // already dispatched, so a live-order walk would page past them.
+        for i in 2..=4 {
+            let mut fixed = fake_row(i, &format!("10.0.1.{i}"), 1);
+            fixed.links[0].latency = Some(Latency::Fast { delay: 1 });
+            h.state
+                .db
+                .upsert_link(&fixed.links[0])
+                .await
+                .expect("upsert the now-measured link");
+        }
+
+        while let Some(links) = walk.next_page().await.expect("page") {
+            planned.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+        }
+        planned.sort();
+        assert_eq!(
+            planned,
+            ["10.0.1.1", "10.0.1.2", "10.0.1.3", "10.0.1.4"],
+            "the frozen set is walked in full even as the live order re-ranks"
+        );
     }
 
     /// The selected-endpoint plan keeps purged links: it reads the loaded page,

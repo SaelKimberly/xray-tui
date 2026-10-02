@@ -12,7 +12,10 @@ use xray_tui_db::models::{
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_db::{LinkGroups, LinkPatch};
-use xray_tui_proto::proto_spec::common::TransportConfig;
+use xray_tui_proto::proto_spec::common::{
+    GrpcConfig, HttpConfig, HttpUpgradeConfig, KcpConfig, TransportConfig, WebSocketConfig,
+    XHttpConfig,
+};
 use xray_tui_proto::proto_spec::{
     CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
     VlessConfig,
@@ -82,14 +85,31 @@ async fn seed_endpoint(
     }
 }
 
+/// The carrier matching a transport's type, so a fixture row never contradicts
+/// itself (nothing on the page/rank paths reads it, but a generic helper that
+/// can lie is a trap for its next user).
+fn transport_config(transport: TransportType) -> TransportConfig {
+    match transport {
+        TransportType::Tcp => TransportConfig::Tcp,
+        TransportType::Ws => TransportConfig::Ws(WebSocketConfig::default()),
+        TransportType::Grpc => TransportConfig::Grpc(GrpcConfig::default()),
+        TransportType::Http => TransportConfig::Http(HttpConfig::default()),
+        TransportType::Quic => TransportConfig::Quic,
+        TransportType::Kcp => TransportConfig::Kcp(KcpConfig::default()),
+        TransportType::HttpUpgrade => TransportConfig::HttpUpgrade(HttpUpgradeConfig::default()),
+        TransportType::XHttp => TransportConfig::XHttp(XHttpConfig::default()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn seed_link(
+async fn seed_link_with(
     conn: &mut toasty::Connection,
     endpoint_id: i64,
     protocol_id: i64,
     delay: Option<i64>,
     error_kind: Option<&str>,
     last_seen: i64,
+    transport: TransportType,
 ) {
     toasty::create!(Protocol {
         created_at: 0,
@@ -97,8 +117,11 @@ async fn seed_link(
         sig: protocol_id,
         proto_kind: ProtocolKind::Vless,
         transport: Transport {
-            r#type: TransportType::Tcp,
-            data: Deferred::from(Json(TransportConfig::Tcp)),
+            r#type: transport,
+            // Match the type: a row claiming `x_http` while its own config says
+            // `tcp` is an inconsistency that only matters because every page and
+            // rank path reads `type` and leaves this deferred carrier unloaded.
+            data: Deferred::from(Json(transport_config(transport))),
         },
         security: Security {
             r#type: SecurityType::None,
@@ -170,6 +193,27 @@ async fn seed_link(
         .await
         .expect("set error");
     }
+}
+
+/// The TCP fixture link most rows use.
+async fn seed_link(
+    conn: &mut toasty::Connection,
+    endpoint_id: i64,
+    protocol_id: i64,
+    delay: Option<i64>,
+    error_kind: Option<&str>,
+    last_seen: i64,
+) {
+    seed_link_with(
+        conn,
+        endpoint_id,
+        protocol_id,
+        delay,
+        error_kind,
+        last_seen,
+        TransportType::Tcp,
+    )
+    .await;
 }
 
 /// A `ProfileStats` value for the value-taking write paths (`upsert_link`,
@@ -244,13 +288,25 @@ async fn seed_fixture() -> Database {
     seed_endpoint(&mut conn, 5, HostType::Ipv4, &[]).await;
     seed_link(&mut conn, 5, 107, Some(40), Some("fast"), 140).await;
     seed_link(&mut conn, 5, 108, None, None, 160).await;
-    // e6: dns host, unresolved (persisted) despite a stored measurement
+    // e6: dns host, unresolved (persisted) despite a stored measurement.
+    // Deliberately TCP while e7's representative is `x_http`: the two rows must
+    // DISAGREE on weight (5 vs 7), because that disagreement is what makes the
+    // parity golden red if a reader stops understanding toasty's `x_http` label.
+    // Give e6 the same transport and both laws would agree again — which is how
+    // a revert-proof test silently stops proving anything.
     seed_endpoint(&mut conn, 6, HostType::Dns, &[]).await;
     seed_link(&mut conn, 6, 109, Some(5), None, 170).await;
     // e7: dns host WITH a persisted resolution, plus a name-resolution failure
     seed_endpoint(&mut conn, 7, HostType::Dns, &["203.0.113.7"]).await;
     seed_link(&mut conn, 7, 110, Some(7), None, 180).await;
     seed_link(&mut conn, 7, 111, None, Some("name"), 190).await;
+    // A link whose transport's STORED label is `x_http` — toasty's embed writes
+    // the snake_case ident, not the wire spelling `xhttp`. `endpoint_rank::
+    // refresh` reads that label as text, so a reader using `FromStr` (wire
+    // spellings only) persists a ZERO weight for this link while every typed
+    // path computes a real one, and the SQL page order then disagrees with the
+    // in-memory comparator. The parity golden below is what notices.
+    seed_link_with(&mut conn, 7, 112, Some(9), None, 200, TransportType::XHttp).await;
     drop(conn);
 
     // These fixtures write links with raw statements, bypassing the write
@@ -552,7 +608,22 @@ async fn resolving_a_dns_host_moves_its_stored_key() {
         .await
         .expect("page")
         .ids;
-    assert_eq!(after.first(), Some(&unresolved), "a 5 ms real link leads");
+    // It LEAVES the sunk position — that is the point of the test. It does not
+    // take first place: e7's representative is `x_http` (mimicry band 7 against
+    // this endpoint's tcp row's 5), and inside a tier the static weight outranks
+    // latency, so e7's 9 ms leads this endpoint's 5 ms. Under the `x_http`
+    // label bug that order inverts and this assertion goes red.
+    assert_eq!(
+        after.first(),
+        Some(&EndpointId::new(7)),
+        "e7's x_http representative outranks on weight, not on its 9 ms"
+    );
+    assert_eq!(
+        after.get(1),
+        Some(&unresolved),
+        "the resolved endpoint left the DNS band and sits directly behind"
+    );
+    assert_ne!(after.last(), Some(&unresolved), "it no longer sinks");
 }
 
 /// A TASK-only patch is key-neutral for an EXISTING link, but not when it
@@ -670,8 +741,12 @@ async fn link_order_is_decision_16_order() {
     assert_eq!(ids_of(5), vec![108, 107]);
     // e6: unresolved DNS collapses the band; the only link leads.
     assert_eq!(ids_of(6), vec![109]);
-    // e7: real success, then the name-resolution failure.
-    assert_eq!(ids_of(7), vec![110, 111]);
+    // e7: two real successes, then the name-resolution failure. The x_http link
+    // (112) leads the slower 110 DESPITE its 9 ms against 7 ms: inside a tier the
+    // static weight outranks latency (spec
+    // `2026-10-01-static-config-weight-design`), and x_http scores a higher
+    // mimicry band than tcp over the same security.
+    assert_eq!(ids_of(7), vec![112, 110, 111]);
 }
 
 #[tokio::test]
@@ -732,10 +807,15 @@ async fn load_page_rows_preserves_page_and_link_order() {
 
     for row in &rows {
         let unresolved = dns_unresolved(row);
+        let weights = row.link_weights();
+        let zero = xray_tui_db::weight::ZERO_WEIGHT;
         let keys: Vec<_> = row
             .links
             .iter()
-            .map(|l| xray_tui_db::endpoint_rank::RankLink::from(l).key(unresolved))
+            .map(|l| {
+                let weight = weights.get(&l.protocol_id).copied().unwrap_or(zero);
+                xray_tui_db::endpoint_rank::RankLink::new(l, weight).key(unresolved)
+            })
             .collect();
         assert!(
             keys.windows(2).all(|w| w[0] <= w[1]),
@@ -815,24 +895,35 @@ fn min_address_key(row: &xray_tui_db::models::EndpointRow) -> Vec<u8> {
         .unwrap_or_else(|| vec![0xff])
 }
 
-fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> (i64, i64, i64, i64) {
+/// The ascending oracle key, one term per `order_terms` entry.
+///
+/// `Test` carries the weight as `u64::MAX - packed`: the law's key stores the
+/// weight NEGATED so a single `.min()` implements "higher weight first", and
+/// SQL reads the stored pack DESCENDING. Comparing the negated form here is
+/// what pins that the two directions are the same order — a flip between them
+/// fails THIS test, not the field.
+type OracleKey = (i64, u64, i32, i64, i64);
+
+fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleKey {
     match sort {
         PageSort::Test => {
-            let (tier, latency, neg_seen, pid) = row
+            let (tier, neg_weight, latency, neg_seen, pid) = row
                 .best_test_priority_key(dns_unresolved(row))
-                .unwrap_or((u8::MAX, i32::MAX, i64::MAX, i64::MAX));
+                .unwrap_or((u8::MAX, u64::MAX, i32::MAX, i64::MAX, i64::MAX));
             (
                 i64::from(tier) + i64::from(dns_unresolved(row)) * 8,
-                i64::from(latency),
+                neg_weight,
+                latency,
                 neg_seen,
                 pid,
             )
         }
-        PageSort::Address | PageSort::Ip => (0, 0, 0, 0),
-        PageSort::Id => (row.endpoint.id.get(), 0, 0, 0),
-        PageSort::Port => (i64::from(row.endpoint.port), 0, 0, 0),
+        PageSort::Address | PageSort::Ip => (0, 0, 0, 0, 0),
+        PageSort::Id => (row.endpoint.id.get(), 0, 0, 0, 0),
+        PageSort::Port => (i64::from(row.endpoint.port), 0, 0, 0, 0),
         PageSort::LastSeen => (
             display_link(row).map_or(i64::MIN, |l| l.last_seen_at),
+            0,
             0,
             0,
             0,
@@ -842,15 +933,18 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> (i64, i
             0,
             0,
             0,
+            0,
         ),
         PageSort::Traffic => (
             display_link(row).map_or(0, |l| l.traffic.total_up + l.traffic.total_down),
             0,
             0,
             0,
+            0,
         ),
         PageSort::ConfigType => (
             i64::from(display_link(row).map_or(2, config_type_rank)),
+            0,
             0,
             0,
             0,
@@ -892,7 +986,7 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
                 v.sort_unstable();
                 v.into_iter().map(|(_, id)| id).collect()
             } else {
-                let mut v: Vec<((i64, i64, i64, i64), i64)> = rows
+                let mut v: Vec<(OracleKey, i64)> = rows
                     .iter()
                     .map(|r| (oracle_key(r, sort), r.endpoint.id.get()))
                     .collect();
@@ -963,6 +1057,17 @@ async fn seed_projection_fixture() -> Database {
          security_type, security_sni, security_fp, security_insecure, security_data, config, \
          created_at) VALUES (13, 333, 'shadowsocks2022', 'tcp', 'null', 'reality', \
          'steal.example', NULL, NULL, 'null', 'null', 1788220804)",
+        // A transport whose STORED label differs from its wire spelling:
+        // toasty's embed writes the snake_case ident `x_http` where the wire
+        // form (and every share URL) says `xhttp`. A reader that parses this
+        // column with `TransportType::from_str` gets `Err` — which in the
+        // ordering law is a silently persisted ZERO weight, and a stored page
+        // order that disagrees with the in-memory panel. Found in review on a
+        // real feed (145 `http_upgrade` + 169 `x_http` rows).
+        "INSERT INTO protocols (id, sig, proto_kind, transport_type, transport_data, \
+         security_type, security_sni, security_fp, security_insecure, security_data, config, \
+         created_at) VALUES (14, 444, 'vless', 'x_http', 'null', 'reality', \
+         'steal.example', NULL, NULL, 'null', 'null', 1788220812)",
         // e1/link A: real ping with an exit IP, speed, traffic, a task slot.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
@@ -980,6 +1085,16 @@ async fn seed_projection_fixture() -> Database {
          (13, 1, 'sing_box', 'form', NULL, 1789041600, \
           'fast', 8, NULL, NULL, 1, 'fast', 'fast probe', 0, 0, 0, 0, \
           1788220806, 1789041600, 1)",
+        // e1/link C: the x_http protocol row above, measured — so the raw-column
+        // read that computes its weight is on the page path the parity golden
+        // checks, not only on a synthetic parser test.
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+         last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
+         error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
+         traffic_total_down, created_at, updated_at, version) VALUES \
+         (14, 1, 'xray', 'share_url', NULL, 1789043400, \
+          'real', 77, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
+          1788220812, 1789043400, 1)",
         // e2: name-resolution failure, no measurement.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
@@ -1094,8 +1209,9 @@ async fn page_projection_matches_the_orm_rows() {
     }
     assert_eq!(
         link_counts,
-        vec![6, 5],
-        "the purged link is loaded only when the view asks for it"
+        vec![7, 6],
+        "the purged link is loaded only when the view asks for it (the x_http \
+         protocol's link is in both counts)"
     );
 
     let typed = db.load_page_rows(&ids, true).await.expect("typed rows");
@@ -1221,9 +1337,16 @@ async fn page_projection_matches_the_orm_rows() {
     }
 
     // The DNS-unresolved collapse (decision 16, tier 5) reached the page rows:
-    // every link of such an endpoint sinks, so the NEWEST one leads even though
+    // every link of such an endpoint sinks, so the newest one leads even though
     // its sibling carries a live measurement — the retired SQL link order put
     // the measured link first here.
+    //
+    // INSIDE the tier the weight decides (spec
+    // `2026-10-01-static-config-weight-design`), so recency is only the
+    // tiebreak and the verdict FLIPS relative to the pre-weight law: protocol
+    // 13 is tcp+reality (security band 10) while 99 has no protocol row at all
+    // (the LEFT JOIN misses), which is the zero weight — "worst". The measured
+    // link leads on weight, not on being newer.
     let dns_row = projected
         .iter()
         .find(|r| r.endpoint.id.get() == 3)
@@ -1235,11 +1358,12 @@ async fn page_projection_matches_the_orm_rows() {
             .iter()
             .map(|l| l.protocol_id.get())
             .collect::<Vec<_>>(),
-        vec![99, 13]
+        vec![13, 99],
+        "inside tier 5 the static weight leads, ahead of recency"
     );
     assert!(
-        dns_row.links[0].latency.is_none(),
-        "the newer failure leads a tier-5 row"
+        dns_row.links[0].latency.is_some(),
+        "the leading link is the measured one, chosen by weight rather than by recency"
     );
 }
 
@@ -1354,4 +1478,223 @@ async fn link_patch_inserts_a_missing_row_and_refreshes_its_key() {
         inserted.latency,
         Some(xray_tui_db::models::Latency::Real { delay: 5, ip: None })
     );
+}
+
+/// The weight column is materialized, NOT NULL, and read back as the packed
+/// bytes the law compares — an endpoint with no protocol row carries the zero
+/// ("worst") pack rather than a NULL, because a NULL here is not a mis-sort but
+/// a `profiles_anchor` error (it binds every term's value back).
+#[tokio::test]
+async fn every_rank_row_carries_a_non_null_weight() {
+    let db = seed_projection_fixture().await;
+    let mut conn = db.connection().await.expect("conn");
+    let rows = toasty::sql::query(
+        "SELECT endpoint_id, rank_weight, typeof(rank_weight) FROM endpoint_rank \
+         ORDER BY endpoint_id",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("read rank rows");
+    assert!(!rows.is_empty(), "the fixture produced rank rows");
+    for row in &rows {
+        let toasty::stmt::Value::Record(record) = row else {
+            panic!("expected a record");
+        };
+        let weight = &record.fields[1];
+        assert!(
+            !matches!(weight, toasty::stmt::Value::Null),
+            "endpoint {:?} has a NULL weight, which breaks profiles_anchor",
+            record.fields[0]
+        );
+        assert_eq!(
+            record.fields[2],
+            toasty::stmt::Value::String("blob".into()),
+            "the weight must be a BLOB: an INTEGER sorts a value >= 2^63 last"
+        );
+    }
+}
+
+/// The page's Test order is served by an index that actually carries the weight
+/// term. `CREATE INDEX IF NOT EXISTS` makes an edited column list a no-op on an
+/// existing database, so this asserts the INDEX'S OWN definition — the thing a
+/// fresh-database page test can never see.
+#[tokio::test]
+async fn the_test_order_has_an_index_that_includes_the_weight() {
+    let db = seed_projection_fixture().await;
+    let mut conn = db.connection().await.expect("conn");
+    let rows = toasty::sql::query(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'endpoint_rank'",
+    )
+    .exec(&mut conn)
+    .await
+    .expect("read indexes");
+    let ddl: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row {
+            toasty::stmt::Value::Record(record) => match (&record.fields[0], &record.fields[1]) {
+                (toasty::stmt::Value::String(name), toasty::stmt::Value::String(sql)) => {
+                    Some(format!("{name}: {sql}"))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let weight_index = ddl
+        .iter()
+        .find(|sql| sql.starts_with("endpoint_rank_test_v2:"))
+        .expect("the weight covering index exists");
+    assert!(
+        weight_index.contains("rank_weight DESC"),
+        "the weight term must be indexed DESCENDING to serve the ORDER BY: {weight_index}"
+    );
+    assert!(
+        weight_index.contains("rank_dns") && weight_index.contains("rank_tier"),
+        "the index must still lead with the terms before the weight: {weight_index}"
+    );
+}
+
+/// The compiled weight tables are code, so the DB stamps their version. A
+/// mismatch must recompute every key — the ONLY trigger that can replace the
+/// all-zero default `ADD COLUMN` materialized for pre-existing rows.
+#[tokio::test]
+async fn a_stale_weight_version_is_recomputed_at_open() {
+    let dir = std::env::temp_dir().join(format!("xray-tui-weight-version-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("data.db");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let db = Database::open(&path).await.expect("open");
+        // Real data: without a link, "no endpoint stayed at the zero pack" would
+        // hold trivially on an empty database and prove nothing.
+        let endpoint = Endpoint {
+            id: EndpointId::new(1),
+            host: "w.example".to_string(),
+            host_type: HostType::Ipv4,
+            port: 443,
+            ports: Vec::new(),
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_at: None,
+            created_at: ts(1),
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        };
+        db.upsert_endpoint(&endpoint).await.expect("endpoint");
+        let protocol = Protocol {
+            id: ProtocolId::new(11),
+            sig: 11,
+            proto_kind: ProtocolKind::Vless,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+                data: Deferred::from(Json(TransportConfig::Tcp)),
+            },
+            security: Security {
+                r#type: SecurityType::Reality,
+                sni: Some("steal.example".to_string()),
+                fp: None,
+                insecure: None,
+                data: Deferred::from(Json(SecurityConfig::default())),
+            },
+            config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
+                uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+                uuid_origin: None,
+                security: SecurityConfig::default(),
+                transport: TransportConfig::Tcp,
+                encryption: None,
+                flow: None,
+                path: None,
+                splice: None,
+                remarks: None,
+                mux: None,
+            }))),
+            created_at: ts(1),
+            links: Deferred::default(),
+        };
+        db.upsert_protocol(&protocol).await.expect("protocol");
+        db.upsert_link(&link_value(1, 11, Some(20), None, ts(2)))
+            .await
+            .expect("link");
+
+        // Pretend this database was written by an older build: wrong stamp, and
+        // every stored weight wiped back to the all-zero default.
+        let mut conn = db.connection().await.expect("conn");
+        toasty::sql::query(
+            "UPDATE rank_weight_meta SET weight_version = weight_version - 1 WHERE id = 0",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("downgrade the stamp");
+        toasty::sql::query("UPDATE endpoint_rank SET rank_weight = x'0000000000000000'")
+            .exec(&mut conn)
+            .await
+            .expect("wipe the weights");
+        drop(conn);
+        drop(db);
+    }
+
+    {
+        let db = Database::open(&path).await.expect("reopen");
+        let mut conn = db.connection().await.expect("conn");
+        let stamped =
+            toasty::sql::query("SELECT weight_version FROM rank_weight_meta WHERE id = 0")
+                .exec(&mut conn)
+                .await
+                .expect("read stamp");
+        assert_eq!(
+            stamped[0],
+            toasty::stmt::Value::Record(toasty_core::stmt::ValueRecord::from_vec(vec![
+                toasty::stmt::Value::I64(i64::from(xray_tui_db::weight::WEIGHT_VERSION)),
+            ])),
+            "the open rewrites the stamp to the running code's version"
+        );
+        let zeros = toasty::sql::query(
+            "SELECT COUNT(*) FROM endpoint_rank WHERE rank_weight = x'0000000000000000'",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("count zero weights");
+        assert_eq!(
+            zeros[0],
+            toasty::stmt::Value::Record(toasty_core::stmt::ValueRecord::from_vec(vec![
+                toasty::stmt::Value::I64(0),
+            ])),
+            "a stale stamp must rebuild the weights; every endpoint staying at the \
+             zero pack means the whole feature silently does nothing"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `profiles_anchor` binds every ordering term's value back into a comparison,
+/// and this engine refuses to type a NULL there — so `rank_weight` must be
+/// `NOT NULL`. This proves the DEFAULT is a legal anchor term: a row that has
+/// only ever had the column added to it still re-anchors instead of erroring.
+/// (The `NOT NULL` in the DDL is what makes this true; the test is what notices
+/// if that ever changes.)
+#[tokio::test]
+async fn anchoring_works_on_a_row_carrying_only_the_weight_default() {
+    let db = seed_projection_fixture().await;
+    let mut conn = db.connection().await.expect("conn");
+    toasty::sql::query("UPDATE endpoint_rank SET rank_weight = x'0000000000000000'")
+        .exec(&mut conn)
+        .await
+        .expect("reset to the default pack");
+
+    let page = db
+        .profiles_page(&request(PageSort::Test, true, 0, 100))
+        .await
+        .expect("page over default-weighted rows");
+    assert!(!page.ids.is_empty(), "the fixture still has rows");
+
+    for ascending in [true, false] {
+        for offset in [0usize, 1, 3] {
+            for id in page.ids.iter().take(3) {
+                db.profiles_anchor(&request(PageSort::Test, ascending, offset, 100), *id)
+                    .await
+                    .unwrap_or_else(|e| panic!("anchor must not error on the default pack: {e}"));
+            }
+        }
+    }
 }

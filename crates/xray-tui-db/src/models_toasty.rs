@@ -563,26 +563,54 @@ impl EndpointRow {
         Some((link, protocol))
     }
 
-    /// Ascending sort key `(tier, latency, recency, protocol_id)`. `recency`
-    /// is the negated `last_seen_at` epoch so newer links sort first on ties.
-    /// Only success tiers (0/1) rank by latency; untested and error/dns tiers
-    /// use `i32::MAX` so they order by recency then protocol id.
+    /// Ascending sort key `(tier, !weight, latency, recency, protocol_id)` —
+    /// the decision-16 law with the static config weight inside the tier.
+    /// `recency` is the negated `last_seen_at` epoch so newer links sort first
+    /// on ties. Only success tiers (0/1) rank by latency; untested and
+    /// error/dns tiers use `i32::MAX` so they order by weight, then recency,
+    /// then protocol id.
     ///
-    /// Delegates to [`crate::endpoint_rank::RankLink::key`], the single
-    /// implementation of the decision-16 law: the stored `endpoint_rank` keys,
-    /// this comparator, and the parity golden all read it, so none of them can
-    /// drift from the others.
-    fn link_test_key(link: &ProfileStats, dns_unresolved: bool) -> (u8, i32, i64, i64) {
-        crate::endpoint_rank::RankLink::from(link).key(dns_unresolved)
+    /// The weight is passed in, not derived here: a `ProfileStats` row carries
+    /// no protocol, so the caller resolves it from `self.protocols`. This is
+    /// the HOT path — `sort_links_by_test_priority` re-runs on every ping
+    /// result and every load — and it delegates to
+    /// [`crate::endpoint_rank::RankLink::key`], the single implementation the
+    /// stored `endpoint_rank` keys also read, so the panel order and the SQL
+    /// order cannot drift.
+    fn link_test_key(
+        link: &ProfileStats,
+        weight: crate::weight::ConfigWeight,
+        dns_unresolved: bool,
+    ) -> (u8, u64, i32, i64, i64) {
+        crate::endpoint_rank::RankLink::new(link, weight).key(dns_unresolved)
+    }
+
+    /// This endpoint's link weights, keyed by protocol id. One lookup per link
+    /// on the paths that have no other access to the protocol; a link whose
+    /// protocol row is absent sorts as "worst".
+    #[must_use]
+    pub fn link_weights(&self) -> HashMap<ProtocolId, crate::weight::ConfigWeight> {
+        self.protocols
+            .iter()
+            .map(|(id, p)| (*id, crate::endpoint_rank::weight_of_protocol(p)))
+            .collect()
     }
 
     /// Re-sort `links` by test priority: real-ping success first, then fast
-    /// success (latency ascending), then untested (newest `last_seen_at`
-    /// first), then persisted failures (real below fast), then DNS-unresolved
-    /// endpoints at the bottom. Deterministic tiebreak by protocol id.
+    /// success (latency ascending), then untested (highest static weight,
+    /// newest `last_seen_at` first), then persisted failures (real below fast),
+    /// then DNS-unresolved endpoints at the bottom. Deterministic tiebreak by
+    /// protocol id.
     pub fn sort_links_by_test_priority(&mut self, dns_unresolved: bool) {
-        self.links
-            .sort_by_key(|l| Self::link_test_key(l, dns_unresolved));
+        let weights = self.link_weights();
+        let zero = crate::weight::ZERO_WEIGHT;
+        self.links.sort_by_key(|l| {
+            Self::link_test_key(
+                l,
+                weights.get(&l.protocol_id).copied().unwrap_or(zero),
+                dns_unresolved,
+            )
+        });
     }
 
     /// Set `selected_protocol` (the single-row display preference) to the
@@ -625,10 +653,18 @@ impl EndpointRow {
     /// used by the main-table Test column sort. `None` when the endpoint has
     /// no links.
     #[must_use]
-    pub fn best_test_priority_key(&self, dns_unresolved: bool) -> Option<(u8, i32, i64, i64)> {
+    pub fn best_test_priority_key(&self, dns_unresolved: bool) -> Option<(u8, u64, i32, i64, i64)> {
+        let weights = self.link_weights();
+        let zero = crate::weight::ZERO_WEIGHT;
         self.links
             .iter()
-            .map(|l| Self::link_test_key(l, dns_unresolved))
+            .map(|l| {
+                Self::link_test_key(
+                    l,
+                    weights.get(&l.protocol_id).copied().unwrap_or(zero),
+                    dns_unresolved,
+                )
+            })
             .min()
     }
 
@@ -647,10 +683,15 @@ impl EndpointRow {
     /// `compute_rank`.
     #[must_use]
     pub fn representative_link_index(&self, dns_unresolved: bool) -> Option<usize> {
+        let weights = self.link_weights();
+        let zero = crate::weight::ZERO_WEIGHT;
         self.links
             .iter()
             .enumerate()
-            .map(|(i, l)| (i, Self::link_test_key(l, dns_unresolved)))
+            .map(|(i, l)| {
+                let weight = weights.get(&l.protocol_id).copied().unwrap_or(zero);
+                (i, Self::link_test_key(l, weight, dns_unresolved))
+            })
             .min_by_key(|&(_, key)| key)
             .map(|(i, _)| i)
     }
@@ -931,7 +972,13 @@ mod tests {
         // `endpoint_rank.seen` and the retiring SQL's `last_seen_at DESC`
         // compare. Two links seen inside one second tie here, and the
         // protocol id breaks it.
-        assert_eq!(r.best_test_priority_key(false), Some((0, 200, -1, 10)));
+        // The weight term is `u64::MAX - packed`; this fixture carries no
+        // protocol rows, so every link is the zero weight and the term is the
+        // maximum — the negation a "no known stack" link sorts under.
+        assert_eq!(
+            r.best_test_priority_key(false),
+            Some((0, u64::MAX, 200, -1, 10))
+        );
         // Empty links -> None
         let empty = row(&[]);
         assert_eq!(empty.best_test_priority_key(false), None);

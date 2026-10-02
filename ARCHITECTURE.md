@@ -42,7 +42,7 @@ generated core config and no share link ever names it. Design brief:
 Entry point at `crates/xray-tui/src/main.rs`. Creates the tokio async runtime, initializes all subsystems, enters the ratatui event loop.
 ### Whole-database export
 
-`xray-tui-db/src/export.rs` owns the file-backed direct Turso read path. Toasty 0.10 public/raw APIs buffer values, so export opens a fresh dedicated Turso connection, applies the existing WAL/MVCC journal-mode authority, begins the matching read transaction, and drains ordered rows before commit/rollback. `xray-tui/src/ops/export.rs` owns scope policy, Resolved host transformation, and bounded clipboard/file sinks; `ui/export.rs` owns popup interaction. Export never uses a second fallback serializer.
+`xray-tui-db/src/export.rs` owns the file-backed direct Turso read path. Toasty 0.11 public/raw APIs buffer values, so export opens a fresh dedicated Turso connection, applies the existing WAL/MVCC journal-mode authority, begins the matching read transaction, and drains ordered rows before commit/rollback. `xray-tui/src/ops/export.rs` owns scope policy, Resolved host transformation, and bounded clipboard/file sinks; `ui/export.rs` owns popup interaction. Export never uses a second fallback serializer.
 
 The clipboard sink is not a direct `arboard` call. `arboard::Clipboard` on Linux *is* the X11 selection owner, so `ops/clipboard.rs` keeps one process-lifetime handle (`LazyLock<Mutex<Option<Clipboard>>>`) and every copy/paste site goes through it — export, the three logs-copy paths, and the paste/copy-URL keys. A per-call handle destroys the serving window in `Drop`, leaving the payload readable only if a clipboard manager wins a 100 ms handover race; without one (headless, SSH, bare X) the app logs a successful export and the clipboard never changes.
 
@@ -768,7 +768,7 @@ recorded cause and measurement there).
 - `EndpointIp` — one row per resolved address of a DNS endpoint, PK `(endpoint_id, ip_key)`; `ip_key` is the address in a sortable packed encoding (family byte then big-endian octets), so B-tree byte order IS address order (ADR 0005)
 - `Protocol` — `#key id` = the identity uid (host/port excluded), plus `sig` for the grouping key; transport/security embeds; `config: Deferred<Json<ProtocolConfig>>`
 - `ProfileStats` — per `(protocol_id, endpoint_id)` pair: latency/speed/error/traffic; `last_seen_at` indexed (retention + staleness windows)
-- `EndpointRank` — the materialized ordering keys the Profiles page is ordered by (ADR 0003)
+- `EndpointRank` — the materialized ordering keys the Profiles page is ordered by (ADR 0003); `rank_weight` (a raw `BLOB NOT NULL`, added by `ALTER TABLE` so no schema-tag bump) holds the static config weight, and `endpoint_rank_test_v2` is the covering index that carries it
 - `EndpointGroup` — many-to-many Endpoint↔Group membership
 - `Group`, `RoutingRule`, `DnsSetting`, `RouteProbes`
 

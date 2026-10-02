@@ -4,8 +4,11 @@ This file is the authority for every place `crates/xray-tui-db` does **not** go
 through toasty, and for the reason each exception exists. If you are adding a
 query and wondering whether it may be raw SQL, the answer is: read this list
 first, and prefer the typed path unless your case matches one of the causes
-below. Every entry here is either (a) a capability `toasty` 0.10 does not have,
-or (b) a measured cost difference on this engine.
+below. Every entry here is either (a) a capability `toasty` **0.11** does not
+have, or (b) a measured cost difference on this engine. Entries re-verified
+against the vendored `toasty-0.11.0` source are marked as such inline — currently
+**C1 and C2 only**; C3–C6 are unverified against 0.11 and are NOT carried forward
+on trust. See §7.
 
 Related records: `docs/database.md` (schema, flows, query map),
 `docs/aegis/adr/0001-raw-sql-profiles-page-query.md` (the page query),
@@ -50,8 +53,8 @@ the engine facts cited here).
 
 | Cause | Consequence |
 | --- | --- |
-| **C1. No bulk write API.** `toasty` 0.10 has no `insert_many`, no `on_conflict`, no multi-row `insert().values([…])` — only single-item `upsert_by_*`. | Bulk paths are hand-built multi-row statements. |
-| **C2. `#[index]` is per-field and single-column.** No composite, mixed-direction, partial, or expression index. | Indexes toasty cannot express are raw `CREATE INDEX IF NOT EXISTS` at open. |
+| **C1. No upsert / conflict clause.** `toasty` 0.11 **does** have a multi-row insert — `stmt::CreateMany` (`stmt/create_many.rs`, `lib.rs:124`) — but it builds a BARE `INSERT INTO … VALUES (…), (…)` from `item.into_insert()` and carries **no** `on_conflict` / `or replace` / upsert semantics (`grep -rl "on_conflict\|OnConflict" toasty-0.11.0/src/stmt` finds nothing). `upsert_by_*` **does** exist but is macro-generated and single-row: `toasty-macros-0.11.0/src/model/expand/upsert.rs:60-82` emits `upsert_by_{field}` + `{Model}UpsertBy{suffix}`/`…OrIgnore` (documented at `toasty-macros-0.11.0/src/lib.rs:52`), and the statement it builds is documented as "A typed **single-row** upsert statement" (`toasty-0.11.0/src/stmt/upsert.rs:5`). So it is absent from the hand-written `toasty-0.11.0/src/` by construction, not missing. The blocker is therefore the conflict clause, not the row count: an idempotent re-import needs `ON CONFLICT … DO UPDATE`, which a bare multi-row insert cannot express. *(Re-verified 2026-10-01; the previous "no multi-row insert" wording was true of 0.10 and false of 0.11.)* **The link-writer upserts are NOT thereby retired**: they also rest on C6 (10.0 ms/512-patch vs 29.0 ms measured) and on per-column-group `ON CONFLICT … DO UPDATE SET col = CASE …` bucketing (RESULT/TRAFFIC/PURGE), which the typed `upsert` cannot express — the engine compares ONE `UpsertAction` per statement (`toasty-0.11.0/src/engine/lower.rs:1226`, `engine/upsert.rs:61`), so there is no per-group action to set. Migrating them is a separate task with its own measurement.* | Bulk paths are hand-built multi-row statements. |
+| **C2. `#[index]` is per-field and single-column.** *(Re-verified against `toasty-macros-0.11.0/src/lib.rs:224` / `:1155` — still "Creates a non-unique index on the field / the field's flattened column", no composite, mixed-direction, partial or expression form.)* No composite, mixed-direction, partial, or expression index. | Indexes toasty cannot express are raw `CREATE INDEX IF NOT EXISTS` at open. |
 | **C3. No per-connection hook.** The driver creates pooled connections itself. | Every per-connection PRAGMA is re-issued in `Database::conn()`. |
 | **C4. No raw connection access.** `Db::driver()` yields `&dyn Driver`, not the turso connection. | UDFs, `turso::core`, statement-cache control, `set_query_timeout`, `interrupt`, and experimental driver flags beyond the `experimental_*` setters are unreachable. |
 | **C5. Engine shape.** No `UPDATE … FROM (VALUES …)` (parse error); unknown PRAGMAs are silently ignored; `array_agg` needs an experimental flag and returns text; `BIGINT`/`BOOLEAN` are illegal in a STRICT table; expression indexes are not used for `LIKE`. | Some statements cannot be expressed at all; some "obvious" tuning is a no-op. |
@@ -78,13 +81,15 @@ the engine facts cited here).
 | `endpoint_rank.rs` `write` (band/rank_host follow-up) | Per chunk after the `INSERT OR REPLACE`, one `UPDATE … SET band = CASE WHEN rank_newest_seen >= ? …, rank_host = (SELECT host …)` — REPLACE nulls the raw columns, so they are re-set each write | C1 | n/a — it maintains the raw columns the toasty model cannot carry; band is the ttl membership from the just-written `rank_newest_seen` | `active_and_stale_windows`, the page-order parity tests |
 | `endpoint_rank.rs` `reband_expired` / `reband_all` | Directional demote `UPDATE … SET band=1 WHERE band=0 AND rank_newest_seen < ?` (retention tick) and the full-recompute `CASE` (startup) | C1/C6 | Membership is a stored `band`, maintained as `now` crosses the threshold; the directional form seeks only the drifted rows via `(band, rank_newest_seen)`, continuity-independent across downtime | `reband_sweep_demotes_rows_that_drifted_during_downtime` (demote), `reband_all_promotes_rows_the_default_backfill_demoted` (promote) |
 | `database.rs` `purge_expired` | `SELECT e.id FROM endpoints e WHERE NOT EXISTS (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id AND p.last_seen_at >= ?)` — all-links staleness, replacing toasty's `.all()` quantifier | C6 | toasty's `.all()` compiled to a whole-`endpoints` projection (145 ms, dump-3.log); this is indexed on `profile_stats.last_seen_at`. Deliberately NOT the live-only `band` — a fresh-but-purged link must keep its endpoint (ADR 0006, view-band spec §3.5) | `purge_expired_matches_all_links_semantics` |
-| `export.rs` direct reader | Whole-feed export count + one-row-at-a-time projection, with WAL `BEGIN DEFERRED` / MVCC `BEGIN CONCURRENT`, joined `protocols.config`, and deterministic protocol/transport/security/address ordering | C4/C6: Toasty 0.10 public query/raw SQL returns `Vec`; Turso driver drains physical `Rows` before Toasty sees them, so typed/page APIs cannot provide the required bounded row stream. Direct read is file-only and separate from Toasty writes | Public Toasty `.exec` buffers values; no page API preserves physical row streaming. One direct row is decoded and dropped per iteration; feed-wide row/config vectors are forbidden | `export::tests::alive_uses_canonical_link_tier_and_dns_resolution`, `export::tests::resolved_emits_each_dns_address_and_one_ip_literal`, `export::tests::mvcc_reader_rolls_back_probe`; RSS/file-reader smoke in T6 |
+| `export.rs` direct reader | Whole-feed export count + one-row-at-a-time projection, with WAL `BEGIN DEFERRED` / MVCC `BEGIN CONCURRENT`, joined `protocols.config`, and deterministic protocol/transport/security/address ordering | C4/C6: Toasty 0.11 public query/raw SQL returns `Vec`; Turso driver drains physical `Rows` before Toasty sees them, so typed/page APIs cannot provide the required bounded row stream. Direct read is file-only and separate from Toasty writes | Public Toasty `.exec` buffers values; no page API preserves physical row streaming. One direct row is decoded and dropped per iteration; feed-wide row/config vectors are forbidden | `export::tests::alive_uses_canonical_link_tier_and_dns_resolution`, `export::tests::resolved_emits_each_dns_address_and_one_ip_literal`, `export::tests::mvcc_reader_rolls_back_probe`; RSS/file-reader smoke in T6 |
 
 ## 4. Toasty blockers, with the exact failures
 
 1. **Bulk upsert** — no `insert_many`/`on_conflict` (absent from
-   `toasty-0.10.0/src`); single-item `upsert_by_*(…)` only. Cost of the missing
-   API: the hand-built statement above, plus the manual `CHECK` spellings.
+   `toasty-0.11.0/src/stmt/` — `CreateMany` exists there but has no conflict
+   clause, see C1); single-item `upsert_by_*(…)` only. Cost of the missing
+   upsert semantics: the hand-built statement above, plus the manual `CHECK`
+   spellings. **Re-verified 2026-10-01 against the vendored 0.11.0 source.**
 2. **Composite/mixed-direction/partial/expression indexes** — `#[index]`
    documents "creates a non-unique index on the field". Cost: three raw DDL
    statements at open, invisible to toasty's schema (guarded by every
@@ -136,3 +141,49 @@ the engine facts cited here).
    such a test is verified by nothing.
 6. Record the measurement (probe → this file's table or the relevant ADR). A raw
    statement without a number is a guess, and the next reader will "simplify" it.
+
+## 7. Re-verify a blocker against the vendored source before relabelling it
+
+The causes in §2 are pinned to a **toasty version**, and a version bump can retire
+them silently. Nothing detects that: the blocker is prose, so a `0.10 → 0.11`
+find-replace looks like a correction while actually *asserting* every absence still
+holds.
+
+This is not hypothetical — it happened on 2026-10-01. Blindly relabelling toasty
+0.10 → 0.11 would have kept C1's "no multi-row `insert().values([…])`" as fact,
+when `toasty-0.11.0/src/stmt/create_many.rs` now provides exactly that
+(`CreateMany`, announced at `lib.rs:124`). Re-reading the source showed C1 is
+now **half retired**: the multi-row insert exists, the *conflict clause* does not
+(`grep -rl "on_conflict\|OnConflict" …/toasty-0.11.0/src/stmt` → nothing). C1 was
+requalified to name the capability that is actually missing, which is the one that
+still forces the hand-built statement.
+
+So:
+
+1. Cite the vendored path **with its version** (`toasty-0.11.0/src/…`), never a
+   bare version number — a stale path is worse than a stale number because it
+   reads like a citation that was checked.
+2. Before changing a blocker, **grep the vendored source for the missing symbol**
+   and read what is there. A capability that APPEARED is a **retirement trigger,
+   not a retirement**: record that the trigger fired and what now carries the
+   site, then treat the migration as its own task with its own measurement. A
+   requalified blocker is a documentation change; rewriting the SQL that depends
+   on it is a code change, and it does not ride along on a doc edit.
+3. Distinguish "renamed" from "re-verified" in the text, and only claim what was
+   checked. **C1 and C2 were re-verified against `toasty-0.11.0` on 2026-10-01;
+   C3, C4, C5 and C6 have NOT been and carry no such marker.** C4/C6 were spot
+   confirmed incidentally while checking C1 (`Load::Output` for `List<M>` is
+   still `Vec<M::Output>`), but their prose is otherwise unverified against 0.11 —
+   so a future bump must re-check them rather than trusting the absence of a
+   date. A rule that claims more coverage than the table delivers is the same
+   defect it was written to catch.
+
+## Weight columns and indexes (2026-10-01)
+
+| Site | Cause | Why raw |
+| --- | --- | --- |
+| `ALTER TABLE endpoint_rank ADD COLUMN rank_weight BLOB NOT NULL DEFAULT x'0000000000000000'` (`endpoint_rank::ensure_in`, swallowed-error loop beside `band`/`rank_host`) | The weight must be materialized where SQL can `ORDER BY` it. Declaring it on the toasty model would change the pushed schema, and the only lever for that is the `PRAGMA user_version` tag — which decision 4 defines as deleting the database file. The raw-column precedent (`band`, `rank_host`) is the non-destructive path. | The model has no seat for a raw column, so the write path carries a `RankRow` instead. `NOT NULL DEFAULT` is required, not stylistic: `profiles_anchor` binds each ordering term's value back and the engine refuses to type a NULL there, so a NULL weight makes the anchor query ERROR. |
+| `CREATE INDEX IF NOT EXISTS endpoint_rank_test_v2 (rank_dns, rank_tier, rank_weight DESC, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)` | Serves the `PageSort::Test` ORDER BY as an index scan (~8.6 ms at 7,672 endpoints) instead of a ~240 ms filesort. | toasty's `#[index]` is single-column and cannot express a mixed-direction composite. **A new name is mandatory**: `IF NOT EXISTS` makes an edited column list a silent no-op on every existing database, so the old index would keep serving the new ORDER BY. |
+| `CREATE TABLE IF NOT EXISTS rank_weight_meta (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)` | The weight tables are compiled into the binary, so an app upgrade silently invalidates every stored weight. | A one-row stamp is the smallest thing that can say "these numbers came from a different build". A mismatch recomputes every rank key at open — the only trigger that can replace the all-zero default that `ADD COLUMN` materializes for pre-existing rows. |
+| `INSERT … SELECT`-free weight backfill (`backfill_all` reads `Protocol::all()`) | SQL cannot call the Rust `weight_of`. Duplicating the four tables as a SQL `CASE` expression would create a second owner of the law — exactly the drift ADR 0003 exists to prevent. | The weight is derived from `transport_type`/`security_type`/`security_sni`/`security_fp`, four small scalar columns the protocol row already stores. |
+| `refresh`'s `LEFT JOIN protocols pr ON pr.id = ps.protocol_id` | The link row carries no protocol, so the weight cannot be derived from `profile_stats` alone. | Four discriminator columns (`transport_type`, `security_type`, `security_sni`, `security_fp` — `proto_kind` is deliberately not a weight dimension) cost one indexed lookup per link inside a statement the refresh path already issues; the deferred `config` JSON stays unloaded. They are parsed with `TransportType::from_db_label`, NOT `FromStr`: toasty's embed writes `http_upgrade`/`x_http` where the wire form says `httpupgrade`/`xhttp`, and the wrong parser silently persists a zero weight for 314 of ~21k real protocol rows. |

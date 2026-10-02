@@ -6,12 +6,13 @@ pub use database::{
     Database, LinkGroups, LinkPatch, SCHEMA_VERSION, upsert_endpoint_group_links_bulk,
     upsert_endpoints_bulk, upsert_links_bulk, upsert_protocols_bulk,
 };
-pub use endpoint_rank::{compute_rank, rank_of_row};
+pub use endpoint_rank::{RankRow, compute_rank, rank_of_row, weight_of_protocol};
 pub use error::{DatabaseError, Result};
 pub use models_toasty as models;
 pub use models_toasty::EndpointRank;
 pub use models_toasty::RouteProbes;
 pub use retry::{is_busy_error, retry_on_busy};
+pub use xray_tui_proto::proto_spec::weight;
 
 mod database;
 pub mod endpoint_ip;

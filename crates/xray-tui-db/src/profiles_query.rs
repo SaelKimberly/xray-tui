@@ -230,9 +230,16 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
         asc: natural_asc == ascending,
     };
     match sort {
+        // Decision-16 law with the static weight inside the tier. The weight
+        // term is DESCENDING, and that direction is the whole point: the Rust
+        // oracle reads it NEGATED (`u64::MAX - packed`) inside one ascending
+        // tuple, so "negated ascending" and "pack descending" are the same
+        // order. Flipping this term to ASC inverts the page against the
+        // comparator — the parity test fails, not the field.
         PageSort::Test => vec![
             term(rank_col("rank_dns"), true),
             term(rank_col("rank_tier"), true),
+            term(rank_col("rank_weight"), false),
             term(rank_col("rank_latency"), true),
             term(rank_col("rank_seen"), false),
             term(rank_col("rank_protocol"), true),
@@ -431,8 +438,18 @@ impl Database {
         Ok(PageMeta { ids, total, offset })
     }
 
+    /// One page of the feed walk's ids plus (optionally) the feed-wide count.
+    ///
+    /// **No production caller since 2026-10-01**: the batch walk now freezes its
+    /// whole id set up front (`PlanWalk::next_page`) because ordering by the
+    /// decision-16 law made the walk's order result-dependent — see
+    /// `docs/aegis/specs/2026-10-01-static-config-weight-design`. This stays as
+    /// the STREAMING counterpart: it is what `ops/ping/flow_cost.rs` measures and
+    /// what the streaming tests pin. Retire it once the lab stops needing a
+    /// streaming baseline.
+    ///
     /// One page of endpoint ids for a sequential walk of the whole feed, in
-    /// display order — the batch plan loader's read.
+    /// display order.
     ///
     /// [`Self::profiles_page`] re-counts the filtered set on every call, which
     /// made a feed-wide plan walk `O(feed²/200)` (92 `COUNT(*)`s for one

@@ -21,7 +21,11 @@ use toasty_core::stmt::Value;
 
 use crate::models_toasty::{
     ConfigType, Endpoint, EndpointId, EndpointRank, EndpointRow, HostType, Latency, ProfileErr,
-    ProfileStats, ProtocolId,
+    ProfileStats, Protocol, ProtocolId,
+};
+use xray_tui_proto::proto_spec::{
+    SecurityType, TransportType,
+    weight::{ConfigWeight, ZERO_WEIGHT, weight_of},
 };
 
 /// Sentinel for "no display link": sorts before any real timestamp, matching
@@ -63,19 +67,70 @@ pub struct RankLink {
     /// The link carries a purge verdict (spec `2026-09-17-purge-reason`). It can
     /// no longer represent the endpoint while a live link exists.
     pub purged: bool,
+    /// The static config weight — the compiled "which stack is likelier to
+    /// work" prior (spec `2026-10-01-static-config-weight-design`).
+    ///
+    /// A FIELD, not something a `ProfileStats` conversion can derive: that row
+    /// carries no protocol. Every construction site resolves it and passes it
+    /// to [`RankLink::new`]; there is deliberately no weight-less constructor.
+    pub weight: ConfigWeight,
+}
+
+/// The weight as the packed `u64` the law compares and the DB stores.
+///
+/// Big-endian packing puts the dominant `security` band in the most significant
+/// bytes, so this number and the memcmp order of the stored BLOB are the same
+/// order by construction.
+#[must_use]
+pub const fn weight_u64(weight: ConfigWeight) -> u64 {
+    u64::from_be_bytes(weight.to_be_bytes())
 }
 
 impl RankLink {
-    /// Ascending key `(tier, latency, -seen, protocol_id)` — the decision-16
-    /// law, mirroring the retired SQL bands:
+    /// Build a link view. The weight is REQUIRED, not defaulted: it comes from
+    /// the link's protocol, which this row does not carry.
+    #[must_use]
+    pub fn new(link: &ProfileStats, weight: ConfigWeight) -> Self {
+        let (measured, delay) = match link.latency {
+            Some(Latency::Real { delay, .. }) => (Some(true), delay),
+            Some(Latency::Fast { delay }) => (Some(false), delay),
+            None => (None, i32::MAX),
+        };
+        Self {
+            protocol_id: link.protocol_id.get(),
+            measured,
+            delay,
+            error_kind: link.error.as_ref().map(|e| e.kind),
+            seen_secs: link.last_seen_at,
+            speed: link.speed_bps,
+            traffic: link
+                .traffic
+                .total_up
+                .saturating_add(link.traffic.total_down),
+            config: link.config_type,
+            purged: link.purge_reason.is_some(),
+            weight,
+        }
+    }
+
+    /// Ascending key `(tier, !weight, latency, -seen, protocol_id)` — the
+    /// decision-16 law with the static weight inserted INSIDE the tier.
     /// 0 real-ok, 1 fast-ok, 2 untested, 3 real/name-err, 4 fast-err,
     /// 5 dns-unresolved, 6 purged. Only success tiers carry a delay.
+    ///
+    /// The weight is NEGATED (`u64::MAX -`) so this stays ONE plain ascending
+    /// tuple consumed by a single `.min()`, exactly like `neg_seen` below: a
+    /// `Reverse` or any non-tuple wrapper would fork the single-implementation
+    /// property the panel order and the stored keys both depend on. Higher
+    /// weight = better, and — deliberately, at the accepted cost of the
+    /// feature — it outranks `latency` inside a tier, so a 900 ms REALITY link
+    /// sorts above a 40 ms TCP one.
     ///
     /// Tier 6 sits below every live band, so an endpoint's representative key is
     /// a live link whenever one exists; an endpoint whose links are all purged
     /// still gets a deterministic position for the Purgatory/All views.
     #[must_use]
-    pub const fn key(&self, dns_unresolved: bool) -> (u8, i32, i64, i64) {
+    pub const fn key(&self, dns_unresolved: bool) -> (u8, u64, i32, i64, i64) {
         let tier = if self.purged {
             6
         } else if dns_unresolved {
@@ -95,7 +150,13 @@ impl RankLink {
             }
         };
         let latency = if tier <= 1 { self.delay } else { i32::MAX };
-        (tier, latency, -self.seen_secs, self.protocol_id)
+        (
+            tier,
+            u64::MAX - weight_u64(self.weight),
+            latency,
+            -self.seen_secs,
+            self.protocol_id,
+        )
     }
 
     /// "Measured" rank of the display preference: real (0) before fast (1).
@@ -104,30 +165,6 @@ impl RankLink {
             Some(true) => Some(0),
             Some(false) => Some(1),
             None => None,
-        }
-    }
-}
-
-impl From<&ProfileStats> for RankLink {
-    fn from(link: &ProfileStats) -> Self {
-        let (measured, delay) = match link.latency {
-            Some(Latency::Real { delay, .. }) => (Some(true), delay),
-            Some(Latency::Fast { delay }) => (Some(false), delay),
-            None => (None, i32::MAX),
-        };
-        Self {
-            protocol_id: link.protocol_id.get(),
-            measured,
-            delay,
-            error_kind: link.error.as_ref().map(|e| e.kind),
-            seen_secs: link.last_seen_at,
-            speed: link.speed_bps,
-            traffic: link
-                .traffic
-                .total_up
-                .saturating_add(link.traffic.total_down),
-            config: link.config_type,
-            purged: link.purge_reason.is_some(),
         }
     }
 }
@@ -196,6 +233,65 @@ const fn config_rank(config: ConfigType) -> i64 {
     }
 }
 
+/// A rank row plus the one key that is NOT a model field.
+///
+/// `rank_weight` is a RAW column (added with `ALTER TABLE ADD COLUMN` beside
+/// `band`/`rank_host`), and the toasty model has no seat for a raw column —
+/// declaring it on `EndpointRank` instead would need schema tag 15, which
+/// decision 4 defines as a full database wipe. So the write path carries this
+/// plain row instead of the model.
+#[derive(Debug, Clone)]
+pub struct RankRow {
+    pub rank: EndpointRank,
+    /// The REPRESENTATIVE link's weight — the one the law picked, so the stored
+    /// key and the stored weight always describe the same link.
+    pub weight: ConfigWeight,
+}
+
+/// The weight of a protocol row.
+///
+/// From the discriminators it already stores in scalar columns
+/// (`transport.type`, `security.type`/`sni`/`fp`). The deferred `config` JSON
+/// is NOT read: nothing in the formula needs it.
+#[must_use]
+pub fn weight_of_protocol(protocol: &Protocol) -> ConfigWeight {
+    weight_of(
+        protocol.transport.r#type,
+        protocol.security.r#type,
+        protocol.security.sni.as_deref(),
+        protocol.security.fp.as_deref(),
+    )
+}
+
+/// The weight for one link read from the raw `protocols` columns.
+///
+/// A NULL (the LEFT JOIN missed) or an unrecognised spelling is
+/// [`ZERO_WEIGHT`] — "worst", never a guess, so a schema drift surfaces as a
+/// worst-case weight instead of a panic on the write path.
+///
+/// The transport column is read with `TransportType::from_db_label`, NOT
+/// `FromStr`: toasty's embed stores `http_upgrade`/`x_http` where the wire form
+/// says `httpupgrade`/`xhttp`, and `FromStr` rejects those — which would
+/// silently persist a ZERO weight for every such link while every typed path
+/// computes a real one, splitting the stored page order from the in-memory
+/// comparator. Verified against a real feed (145 `http_upgrade` + 169 `x_http`
+/// protocol rows).
+#[must_use]
+pub fn weight_from_discriminators(
+    transport: Option<&str>,
+    security: Option<&str>,
+    sni: Option<&str>,
+    fp: Option<&str>,
+) -> ConfigWeight {
+    let (Some(transport), Some(security)) = (
+        transport.and_then(TransportType::from_db_label),
+        security.and_then(|s| s.parse::<SecurityType>().ok()),
+    ) else {
+        return ZERO_WEIGHT;
+    };
+    weight_of(transport, security, sni, fp)
+}
+
 /// Compute the stored keys for one endpoint. `None` when it has no links: the
 /// page only ever lists endpoints that have at least one.
 #[must_use]
@@ -204,8 +300,9 @@ pub fn compute_rank(
     dns_unresolved: bool,
     override_protocol: Option<i64>,
     links: &[RankLink],
-) -> Option<EndpointRank> {
-    let (tier, latency, neg_seen, protocol) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
+) -> Option<RankRow> {
+    let (tier, neg_weight, latency, neg_seen, protocol) =
+        links.iter().map(|l| l.key(dns_unresolved)).min()?;
     let display = display_link_index(links, override_protocol).map(|i| links[i]);
     // The view windows ask whether any LIVE link falls in the band. A
     // purged-only endpoint therefore reports `NO_SEEN`, which is below every
@@ -217,25 +314,40 @@ pub fn compute_rank(
         .map(|l| l.seen_secs)
         .max()
         .unwrap_or(NO_SEEN);
-    Some(EndpointRank {
-        endpoint_id,
-        dns: i64::from(dns_unresolved),
-        tier: i64::from(tier),
-        latency: i64::from(latency),
-        seen: -neg_seen,
-        protocol,
-        display_seen: display.map_or(NO_SEEN, |l| l.seen_secs),
-        speed: display.map_or(NO_SPEED, |l| l.speed.unwrap_or(NO_SPEED)),
-        traffic: display.map_or(0, |l| l.traffic),
-        config: display.map_or(CONFIG_OTHER, |l| config_rank(l.config)),
-        newest_seen,
+    // The minimum key's weight term is `u64::MAX - weight`; invert it back.
+    let weight = ConfigWeight::from_be_bytes((u64::MAX - neg_weight).to_be_bytes());
+    Some(RankRow {
+        rank: EndpointRank {
+            endpoint_id,
+            dns: i64::from(dns_unresolved),
+            tier: i64::from(tier),
+            latency: i64::from(latency),
+            seen: -neg_seen,
+            protocol,
+            display_seen: display.map_or(NO_SEEN, |l| l.seen_secs),
+            speed: display.map_or(NO_SPEED, |l| l.speed.unwrap_or(NO_SPEED)),
+            traffic: display.map_or(0, |l| l.traffic),
+            config: display.map_or(CONFIG_OTHER, |l| config_rank(l.config)),
+            newest_seen,
+        },
+        weight,
     })
 }
 
 /// Keys for a whole row (the backfill/typed entry point).
 #[must_use]
-pub fn rank_of_row(row: &EndpointRow) -> Option<EndpointRank> {
-    let links: Vec<RankLink> = row.links.iter().map(RankLink::from).collect();
+pub fn rank_of_row(row: &EndpointRow) -> Option<RankRow> {
+    let links: Vec<RankLink> = row
+        .links
+        .iter()
+        .map(|link| {
+            let weight = row
+                .protocols
+                .get(&link.protocol_id)
+                .map_or(ZERO_WEIGHT, weight_of_protocol);
+            RankLink::new(link, weight)
+        })
+        .collect();
     compute_rank(
         row.endpoint.id,
         dns_unresolved(row),
@@ -271,9 +383,43 @@ const RANK_CHUNK: usize = 400;
 
 /// Column order the bulk insert writes (explicit so a schema reorder cannot
 /// silently mis-map values).
-const RANK_COLUMNS: &str = "endpoint_id, rank_dns, rank_tier, rank_latency, rank_seen, \
-     rank_protocol, rank_display_seen, rank_speed, rank_traffic, rank_config, \
-     rank_newest_seen";
+///
+/// `rank_weight` is a RAW column and IS listed here. `INSERT OR REPLACE`
+/// re-inserts the row, so any column missing from this list is reset to NULL
+/// on every single refresh — and a NULL there makes `profiles_anchor` fail
+/// rather than merely mis-sort, because the anchor binds each term's value back
+/// into a comparison.
+const RANK_COLUMNS: &str = "endpoint_id, rank_dns, rank_tier, rank_weight, \
+     rank_latency, rank_seen, rank_protocol, rank_display_seen, rank_speed, \
+     rank_traffic, rank_config, rank_newest_seen";
+
+/// The weight column: an 8-byte big-endian blob, `NOT NULL` so an un-refreshed
+/// row is still a legal ordering term.
+///
+/// BLOB, not INTEGER: SQLite orders blobs by memcmp, which makes `ORDER BY
+/// rank_weight DESC` the Rust comparator's order BY CONSTRUCTION over the whole
+/// 64-bit range. An INTEGER would store any value ≥ 2^63 as negative and sort
+/// it LAST, and would cost bit 15 of the dominant security band as well.
+/// `NOT NULL DEFAULT` materializes "worst" for every pre-existing row, which is
+/// a valid position; the `WEIGHT_VERSION` check below is what replaces it with
+/// real weights.
+const WEIGHT_COLUMN: &str = "ALTER TABLE endpoint_rank ADD COLUMN rank_weight BLOB \
+     NOT NULL DEFAULT x'0000000000000000'";
+
+/// The weight column's covering index — a NEW NAME, never an edit in place:
+/// `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on
+/// every existing database, and the old index would keep serving the new
+/// ORDER BY, dropping the page back to the ~240 ms filesort this index exists
+/// to avoid. The old index is kept (it costs only write time) so a rollback
+/// still has one.
+const WEIGHT_COVERING_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_test_v2 \
+     ON endpoint_rank(rank_dns, rank_tier, rank_weight DESC, rank_latency, \
+     rank_seen DESC, rank_protocol, endpoint_id)";
+
+/// One-row stamp for the compiled weight tables. A table of opinions that lives
+/// in code has no other way to know it is out of date.
+const WEIGHT_META_TABLE: &str = "CREATE TABLE IF NOT EXISTS rank_weight_meta \
+     (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)";
 
 /// The view windows read this column.
 const WINDOW_INDEX: &str =
@@ -320,17 +466,40 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     for alter in [
         "ALTER TABLE endpoint_rank ADD COLUMN band INTEGER",
         "ALTER TABLE endpoint_rank ADD COLUMN rank_host TEXT",
+        WEIGHT_COLUMN,
     ] {
         let _ = toasty::sql::query(alter).exec(conn).await;
     }
+    // A NEW index name, not an edited one: `IF NOT EXISTS` makes a changed
+    // column list a no-op on every database that already has the old index,
+    // which would keep serving the new ORDER BY and drop the page back to the
+    // ~240 ms filesort. The old index is left in place (it costs only write
+    // time) so a rollback still has one.
     for ddl in [
         COVERING_INDEX,
+        WEIGHT_COVERING_INDEX,
         WINDOW_INDEX,
         BAND_HOST_INDEX,
         BAND_WINDOW_INDEX,
+        WEIGHT_META_TABLE,
     ] {
         toasty::sql::query(ddl).exec(conn).await?;
     }
+    // The compiled weight tables are opinions that live in code, so an upgrade
+    // can invalidate every stored weight. This check MUST sit on the populated
+    // branch below: an upgraded database takes the `> 0` path, and a NULL-based
+    // fill cannot help it — `ADD COLUMN … NOT NULL DEFAULT` materializes
+    // "worst" for every pre-existing row, so there are no NULLs to find.
+    // Absence of the meta table reads as a mismatch too: that is exactly "this
+    // database predates the weight".
+    let stored_version = scalar_i64(
+        conn,
+        "SELECT weight_version FROM rank_weight_meta WHERE id = 0",
+    )
+    .await
+    .unwrap_or(0);
+    let weight_stale = stored_version != i64::from(crate::weight::WEIGHT_VERSION);
+
     if scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank").await? > 0 {
         // A database whose keys are absent or stale (written before a refresh
         // path existed, or by a path that bypassed one) heals here rather than
@@ -340,10 +509,31 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         // `repair_missing` fills only ABSENT rows, so an existing rank row
         // carries a NULL band until it is next refreshed. Fill them once here.
         backfill_bands(conn).await?;
+        if weight_stale {
+            let written = backfill_all(conn).await?;
+            stamp_weight_version(conn).await?;
+            tracing::info!(target: "xray_tui_db",
+                stored = stored_version, want = crate::weight::WEIGHT_VERSION, written,
+                "endpoint_rank: weight tables changed, keys recomputed");
+        }
         return Ok(());
     }
     let written = backfill_all(conn).await?;
+    stamp_weight_version(conn).await?;
     tracing::info!(target: "xray_tui_db", "endpoint_rank: backfilled {written} rows");
+    Ok(())
+}
+
+/// Record the compiled tables' version, so the next open can tell whether the
+/// stored weights were produced by the code that is running now.
+async fn stamp_weight_version(conn: &mut impl toasty::Executor) -> crate::Result<()> {
+    toasty::sql::query(format!(
+        "INSERT INTO rank_weight_meta (id, weight_version) VALUES (0, {}) \
+         ON CONFLICT(id) DO UPDATE SET weight_version = excluded.weight_version",
+        i64::from(crate::weight::WEIGHT_VERSION)
+    ))
+    .exec(conn)
+    .await?;
     Ok(())
 }
 
@@ -400,19 +590,21 @@ async fn scalar_i64(conn: &mut impl toasty::Executor, sql: &str) -> crate::Resul
 /// the engine charges ~0.8 ms per bound parameter.
 pub(crate) async fn write(
     conn: &mut impl toasty::Executor,
-    ranks: &[EndpointRank],
+    ranks: &[RankRow],
 ) -> crate::Result<usize> {
     let threshold = crate::models_toasty::now_epoch()
         - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
     for chunk in ranks.chunks(RANK_CHUNK) {
         let values = chunk
             .iter()
-            .map(|r| {
+            .map(|row| {
+                let r = &row.rank;
                 format!(
-                    "({},{},{},{},{},{},{},{},{},{},{})",
+                    "({},{},{},{},{},{},{},{},{},{},{},{})",
                     r.endpoint_id.get(),
                     r.dns,
                     r.tier,
+                    row.weight.sql_literal(),
                     r.latency,
                     r.seen,
                     r.protocol,
@@ -435,9 +627,12 @@ pub(crate) async fn write(
         // chunk. band is the ttl membership from the just-written
         // rank_newest_seen; rank_host mirrors the endpoint host so the
         // Active-Address page is an index seek, not a cross-table sort.
+        //
+        // `rank_weight` is NOT re-set here: it is Rust-computed, so it went
+        // into the INSERT's values tuple above and needs no second statement.
         let ids = chunk
             .iter()
-            .map(|r| r.endpoint_id.get().to_string())
+            .map(|row| row.rank.endpoint_id.get().to_string())
             .collect::<Vec<_>>()
             .join(",");
         toasty::sql::query(format!(
@@ -582,20 +777,32 @@ pub(crate) async fn prune(
 
 /// Recompute EVERY endpoint's stored keys from its current links.
 ///
-/// For the wholesale resets (`clear_all_stats`) where nothing narrower is
-/// correct: every link just lost the columns the keys are made of.
+/// For the wholesale resets (`clear_all_stats`), for an upgraded database whose
+/// stored weights came from a different version of the compiled tables, and for
+/// a database that has no keys at all: every case where nothing narrower is
+/// correct, because every link just lost — or never had — the columns the keys
+/// are made of.
 pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Result<usize> {
     let endpoints: Vec<Endpoint> = Endpoint::all().exec(conn).await?;
     let links: Vec<ProfileStats> = ProfileStats::all().exec(conn).await?;
+    // The weight lives on the PROTOCOL row, not the link, so a third typed load
+    // is what puts it in scope here. It is a scan of a small table (one row per
+    // distinct config, shared by every endpoint carrying it) and the deferred
+    // `config` JSON stays unloaded.
+    let weights = protocol_weights(conn).await?;
     let resolved = resolved_endpoint_ids(conn).await?;
     let mut by_endpoint: HashMap<EndpointId, Vec<RankLink>> = HashMap::new();
     for link in links {
+        let weight = weights
+            .get(&link.protocol_id)
+            .copied()
+            .unwrap_or(ZERO_WEIGHT);
         by_endpoint
             .entry(link.endpoint_id)
             .or_default()
-            .push(RankLink::from(&link));
+            .push(RankLink::new(&link, weight));
     }
-    let ranks: Vec<EndpointRank> = endpoints
+    let ranks: Vec<RankRow> = endpoints
         .into_iter()
         .filter_map(|endpoint| {
             let links = by_endpoint.remove(&endpoint.id)?;
@@ -608,6 +815,18 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
         })
         .collect();
     write(conn, &ranks).await
+}
+
+/// Every protocol's weight, keyed by protocol id — the one map that lets a
+/// `ProfileStats`-only row be turned into a [`RankLink`] with its weight.
+pub(crate) async fn protocol_weights(
+    conn: &mut impl toasty::Executor,
+) -> crate::Result<HashMap<ProtocolId, ConfigWeight>> {
+    let protocols: Vec<Protocol> = Protocol::all().exec(conn).await?;
+    Ok(protocols
+        .iter()
+        .map(|p| (p.id, weight_of_protocol(p)))
+        .collect())
 }
 
 /// The endpoints that have at least one resolved address, as a set.
@@ -681,12 +900,19 @@ pub(crate) async fn refresh(
         .join(",");
 
     let endpoints = load_raw_endpoints(conn, &id_list).await?;
+    // The weight comes from the link's PROTOCOL row, joined into the statement
+    // that already reads every link for these endpoints: five small
+    // discriminator columns cost one indexed lookup per link, where a separate
+    // load would re-scan the whole protocols table on every flush window. The
+    // deferred `config` JSON is NOT touched — nothing in the formula reads it.
     let mut links: HashMap<i64, Vec<RankLink>> = HashMap::new();
     let rows = toasty::sql::query(format!(
-        "SELECT endpoint_id, protocol_id, error_kind, latency, latency_delay, \
-         last_seen_at, speed_bps, traffic_total_up, traffic_total_down, config_type, \
-         purge_reason \
-         FROM profile_stats WHERE endpoint_id IN ({id_list})"
+        "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, ps.latency, ps.latency_delay, \
+         ps.last_seen_at, ps.speed_bps, ps.traffic_total_up, ps.traffic_total_down, \
+         ps.config_type, ps.purge_reason, \
+         pr.transport_type, pr.security_type, pr.security_sni, pr.security_fp \
+         FROM profile_stats ps LEFT JOIN protocols pr ON pr.id = ps.protocol_id \
+         WHERE ps.endpoint_id IN ({id_list})"
     ))
     .exec(conn)
     .await?;
@@ -696,8 +922,9 @@ pub(crate) async fn refresh(
         let Some(endpoint_id) = field(0).and_then(as_i64) else {
             continue;
         };
+        let protocol_id = field(1).and_then(as_i64).unwrap_or(0);
         links.entry(endpoint_id).or_default().push(RankLink {
-            protocol_id: field(1).and_then(as_i64).unwrap_or(0),
+            protocol_id,
             error_kind: field(2)
                 .and_then(as_text)
                 .and_then(|k| parse_error_kind(&k)),
@@ -721,10 +948,19 @@ pub(crate) async fn refresh(
             // A NULL column is a live link; any stored spelling is a verdict
             // (the value itself is the page's business, not the rank law's).
             purged: field(10).and_then(as_text).is_some(),
+            // A link whose protocol row is absent (the join is LEFT) has no
+            // known stack, so it sorts as "worst" — the same value an
+            // un-refreshed endpoint carries, never a silent average.
+            weight: weight_from_discriminators(
+                field(11).and_then(as_text).as_deref(),
+                field(12).and_then(as_text).as_deref(),
+                field(13).and_then(as_text).as_deref(),
+                field(14).and_then(as_text).as_deref(),
+            ),
         });
     }
 
-    let ranks: Vec<EndpointRank> = ids
+    let ranks: Vec<RankRow> = ids
         .iter()
         .filter_map(|id| {
             let endpoint = endpoints.get(id)?;
@@ -814,6 +1050,148 @@ mod tests {
             traffic: 0,
             config: ConfigType::ShareUrl,
             purged: false,
+            weight: ZERO_WEIGHT,
+        }
+    }
+
+    /// A weight with a known packing, so a test can reason about the negated
+    /// term without depending on any particular cell value.
+    const fn weight(security: u16) -> ConfigWeight {
+        ConfigWeight {
+            security,
+            mimicry: 0,
+            sec_cost: 0,
+            transport_cost: 0,
+        }
+    }
+
+    #[test]
+    fn a_higher_weight_outranks_latency_inside_a_tier() {
+        // The accepted inversion: measurement no longer decides within a tier.
+        let mut slow_reality = link(1, Some(true), 900, 10);
+        slow_reality.weight = weight(10);
+        let mut fast_tcp = link(2, Some(true), 40, 10);
+        fast_tcp.weight = weight(2);
+        assert!(
+            slow_reality.key(false) < fast_tcp.key(false),
+            "900ms reality must lead 40ms tcp inside tier 0"
+        );
+        // …but the tier still dominates: a failed high-weight link never leads.
+        let mut failed = slow_reality;
+        failed.error_kind = Some(ProfileErr::Real);
+        assert!(
+            fast_tcp.key(false) < failed.key(false),
+            "a measured success outranks a failed reality link whatever its weight"
+        );
+    }
+
+    #[test]
+    fn equal_weights_fall_through_to_latency_recency_and_id() {
+        let fast = link(1, Some(false), 30, 100);
+        let slow = link(2, Some(false), 300, 100);
+        assert!(
+            fast.key(false) < slow.key(false),
+            "weight ties, latency decides"
+        );
+        let newer = link(3, Some(false), 30, 200);
+        assert!(
+            newer.key(false) < fast.key(false),
+            "weight and latency tie, the newer link leads"
+        );
+        let lower_id = link(0, Some(false), 30, 200);
+        assert!(
+            lower_id.key(false) < newer.key(false),
+            "protocol id is the last tiebreak"
+        );
+    }
+
+    #[test]
+    fn the_stored_weight_is_the_representative_links_own() {
+        let mut weak = link(1, Some(true), 10, 5);
+        weak.weight = weight(2);
+        let mut strong = link(2, Some(true), 10, 5);
+        strong.weight = weight(10);
+        let row = compute_rank(EndpointId::new(7), false, None, &[weak, strong]).expect("rank");
+        assert_eq!(
+            row.rank.protocol, 2,
+            "the heavier link is the representative"
+        );
+        assert_eq!(
+            row.weight,
+            weight(10),
+            "the stored weight must describe the SAME link the tier came from"
+        );
+    }
+
+    #[test]
+    fn a_missing_protocol_yields_the_zero_weight_not_a_mid_band() {
+        assert_eq!(
+            weight_from_discriminators(None, None, None, None),
+            ZERO_WEIGHT,
+            "an unknown stack must sort as worst, not as an unexamined average"
+        );
+        assert_eq!(
+            weight_from_discriminators(Some("tcp"), Some("not-a-security"), None, None),
+            ZERO_WEIGHT,
+            "an unparseable spelling is a schema drift, not a guess"
+        );
+    }
+
+    /// The transports whose DATABASE label differs from their wire spelling.
+    /// `toasty`'s embed derive writes `snake_case` idents, so these two rows used
+    /// to parse as `Err` on the refresh path and persist a ZERO weight while
+    /// every typed path computed a real one — the stored page order then
+    /// disagreed with the panel. Pinned here so the label set cannot drift.
+    #[test]
+    fn toasty_storage_labels_for_multiword_transports_parse() {
+        for (label, wire) in [("http_upgrade", "httpupgrade"), ("x_http", "xhttp")] {
+            assert_eq!(
+                TransportType::from_db_label(label).map(TransportType::as_str),
+                Some(wire),
+                "{label} is what toasty writes"
+            );
+            assert_eq!(
+                label.parse::<TransportType>().ok(),
+                None,
+                "FromStr is the WIRE parser and must keep rejecting the storage label"
+            );
+        }
+    }
+
+    /// The invariant the page actually depends on: the RAW-column read and the
+    /// TYPED read must produce the SAME weight for every transport.
+    ///
+    /// This is the revert-proof. A test that merely checks "the `x_http` weight
+    /// differs from the `tcp` weight" passes under the bug too, because a ZERO
+    /// weight also differs — it proves nothing. Comparing against the typed
+    /// path's own answer is the only form that goes red when the raw reader
+    /// stops understanding a label.
+    #[test]
+    fn the_raw_column_read_agrees_with_the_typed_read_for_every_transport() {
+        for (label, wire) in [
+            ("tcp", TransportType::Tcp),
+            ("ws", TransportType::Ws),
+            ("grpc", TransportType::Grpc),
+            ("http", TransportType::Http),
+            ("quic", TransportType::Quic),
+            ("kcp", TransportType::Kcp),
+            ("http_upgrade", TransportType::HttpUpgrade),
+            ("x_http", TransportType::XHttp),
+        ] {
+            for security in ["none", "tls", "reality"] {
+                let typed = weight_of(wire, security.parse::<SecurityType>().unwrap(), None, None);
+                let raw = weight_from_discriminators(Some(label), Some(security), None, None);
+                assert_eq!(
+                    raw, typed,
+                    "{label}+{security}: the stored label must read as the same weight \
+                     the typed protocol does, or the SQL page order and the panel \
+                     disagree"
+                );
+                assert_ne!(
+                    raw, ZERO_WEIGHT,
+                    "{label}+{security} must not collapse to the zero pack"
+                );
+            }
         }
     }
 
@@ -824,7 +1202,7 @@ mod tests {
         assert_eq!(purged.key(false).0, 6, "purged is its own band");
         assert_eq!(purged.key(true).0, 6, "and it outranks the DNS collapse");
         assert_eq!(
-            purged.key(false).1,
+            purged.key(false).2,
             i32::MAX,
             "a purged link carries no latency into the order"
         );
@@ -843,18 +1221,21 @@ mod tests {
         let links = [link(2, None, 0, 100), purged];
         let rank = compute_rank(EndpointId::new(1), false, None, &links).expect("rank");
         assert_eq!(
-            rank.newest_seen, 100,
+            rank.rank.newest_seen, 100,
             "a purged link's recency does not keep the endpoint in the Active window"
         );
-        assert_eq!(rank.tier, 2, "the live untested link is the representative");
+        assert_eq!(
+            rank.rank.tier, 2,
+            "the live untested link is the representative"
+        );
 
         let all_purged = [purged];
         let rank = compute_rank(EndpointId::new(1), false, None, &all_purged).expect("rank");
         assert_eq!(
-            rank.newest_seen, NO_SEEN,
+            rank.rank.newest_seen, NO_SEEN,
             "no live link -> below every window bound (Purgatory)"
         );
-        assert_eq!(rank.tier, 6);
+        assert_eq!(rank.rank.tier, 6);
     }
 
     #[test]

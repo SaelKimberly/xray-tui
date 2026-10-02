@@ -1,7 +1,7 @@
 # 0008 — Batch-feed scaling: id-ordered walk, per-protocol loads, throttled page refetch
 
 Date: 2026-09-18
-Status: accepted
+Status: accepted — decision 1 SUPERSEDED 2026-10-01 by the static config weight (see "Superseded decision 1" below)
 Related: decisions 15 (batch pipeline), 16 (tiers + labels), 21 (SQL page + materialized keys),
 22 (write-behind RESULT group); ADR 0003 (stored ordering keys), 0005 (address table)
 Spec: `docs/aegis/specs/2026-09-17-batch-ping-pipeline-design.md` (the pipeline this amends)
@@ -29,6 +29,16 @@ structural query cost the tab pays on every result-driven refetch:
    an order no write can move while the batch runs; ids satisfy it exactly as host text did,
    and they are 3.2× cheaper (11.9 → 3.9 ms per page raw, 12.1 → 3.0 ms in the walk, both
    through the app's own driver). Nothing displays this order.
+
+   **SUPERSEDED 2026-10-01** (spec
+   `docs/aegis/specs/2026-10-01-static-config-weight-design`). The walk now orders by the
+   decision-16 law (`PageSort::Test`), so the most reliable links are probed first. The
+   requirement this decision met — an order no write can move — is deliberately given up:
+   the new order is the weight/metric ranking the batch itself rewrites. It is restored by
+   other means instead: `PlanScope::All` now reads its whole id set ONCE before the first
+   probe and serves it in page-sized chunks, the same freeze the scoped walks already used
+   for exactly this reason. The 3.2× cost advantage of the id order is the price paid; the
+   title's "id-ordered walk" no longer describes decision 1.
 2. **Real probes load each `ProtocolId` once per batch** (`BatchShared::protocols`,
    `DashMap<ProtocolId, Arc<LoadedProtocol>>`). A `Protocol` row is shared by every endpoint
    carrying the same config (identity ignores host/port: 6,283 rows for 9,090 links on the
