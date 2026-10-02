@@ -3,8 +3,12 @@
 //! A plugin row's wire is `TCP → [TLS] → plugin framing → [mux] → SS codec`, and
 //! the obfs modes here are **stream transformers**, not transports: they rewrite
 //! the first bytes and then pass everything through. The v2ray-plugin modes
-//! (websocket) arrive in `ws.rs`; `mode=quic` replaces the dial entirely and is
-//! the protocol phase's business (§5.2 item 4).
+//! (websocket) arrive in `ws.rs`. `mode=quic` would replace the dial entirely,
+//! so it has NO arm in this layer — and none is promised: it is refused at
+//! `capability` before any dial, because its client wire could not be pinned
+//! from evidence. `protocol::connect_quic` is NOT the plugin's arm (it covers
+//! Hysteria2/1/TUIC). See the T22 evidence note in
+//! `docs/aegis/plans/2026-09-30-ss-plugin.md` before adding one.
 //!
 //! This layer is **framing only**: it never applies TLS and never produces the
 //! mux multiplexer (`transport::upgrade` returns a `BoxStream`, and a
