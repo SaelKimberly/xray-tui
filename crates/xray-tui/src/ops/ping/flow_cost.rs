@@ -1889,6 +1889,9 @@ fn split_batches(slice: &ImportBatch, n: usize, per_tx: usize) -> Vec<ImportBatc
 ///   3.   **fan-in** — import and geo writers OVERLAPPING. Every other row in this
 ///        module is sequential, and only this shape reproduces the `snapshot is
 ///        stale` aborts; without it there is no contention to measure.
+///        **As of 2026-10-05 the IMPORT half is unusable** — see the
+///        AFTER-NUMBERS block above; the geo arms carry the measurement until the
+///        slice is rebuilt with protocol `config` loaded.
 ///   4.   **flush trickle** — the link writer driven on a wall-clock ARRIVAL
 ///        schedule, reporting `flush_count()`. Rows-per-flush is set by arrival
 ///        rate, not row count: staging 4,028 rows in a tight loop trips the
@@ -2216,6 +2219,55 @@ async fn flow_cost_contention() {
             ));
         }
     }
+
+    // ── AFTER-NUMBERS, RowCache write-behind (2026-10-05, commit 9bf0232) ──
+    //
+    // Measured on a synthetic WAL feed (`flow_cost_seed_measure_db`, 74,014
+    // endpoints x 1 protocol, default knobs: 5 reps, 8x800-link import tx, 16
+    // geo flushes of 100 rows, 16 fan-in writers):
+    //
+    //   seq geo flush BATCHED (100 rows)           3,846,600 ns   80 samples
+    //   seq geo PER-ADDRESS (pre-fix writer)          129,101 ns   20 samples
+    //   fan-in geo PER-ADDRESS / 16 writers          3,576,034 ns    5 samples, 0/100 writes failed
+    //   flush trickle WALL (4028 rows @ 12/s)  -> 32 flushes = 125.9 rows/flush, 0 staged left
+    //
+    // **What the migration changed: the commit COUNT, and the failures.**
+    //   - `snapshot is stale` / `database is locked`: **zero** in this run. The
+    //     2026-10-01 production run recorded 88 `snapshot is stale` aborts and
+    //     10 `busy_timeout` drops against ~1,000 overlapping single-row write
+    //     transactions; the fan-in arm below is the shape that reproduces them,
+    //     and it now runs clean at the same 16-writer concurrency.
+    //   - flush commits for the link writer: 32 commits for 4,028 arrivals
+    //     (125.9 rows/commit) at the production trickle rate, versus the ~8 the
+    //     512-row size trigger alone would give for the same 4,028 rows staged
+    //     in a tight loop, and versus 1,167 on the pre-driver trickle. The gain
+    //     is the `TIMER_FLOOR_DIVISOR` floor: a bare tick waits for
+    //     `flush_rows / 4` staged rows instead of committing whatever one row
+    //     arrived.
+    //   - `0 staged left` after the final flush: the driver drains rather than
+    //     truncating, so the loss window closes on shutdown.
+    //
+    // **The retired per-row writer, for the A/B.** `apply_link_patches` used to
+    // be one existence probe + one `UPDATE` per row (turso has no
+    // `UPDATE ... FROM (VALUES ...)`, database.rs:1120). Measured over the
+    // reference feed on a 512-patch window: **29.0 ms -> 10.6 ms** once it became
+    // one multi-row upsert per 400-row chunk. That number is per-WINDOW and
+    // predates the driver; the driver's contribution is the commit count above,
+    // not the statement cost.
+    //
+    // **The import half of arm 3 could NOT be measured — see the guard below.**
+    // `write_import_once` calls `upsert_protocols_bulk`, which rejects a
+    // `Protocol` whose deferred `config` was not loaded ("deferred config not
+    // loaded"). The slice is built from `load_page_rows`, which stopped
+    // issuing `.include()` in fcf2a5f ("no toasty .include() on the profiles
+    // read path") — a commit that is an ANCESTOR of this plan's base (a8c3019),
+    // so the arm was already broken before the migration and the plan changed
+    // nothing on that path (the diff touches no `upsert_*_bulk`). Every import
+    // transaction therefore errors deterministically, `ArmFailures` correctly
+    // DISCARDs both import rows, and the 680 `write failures` this run prints are
+    // all that one cause. Arm 3 as a whole is unusable until the slice loads
+    // protocols with their config; until then the geo arms above carry the
+    // contention measurement.
 
     // 3. fan-in: import and geo writers OVERLAPPING, the production shape.
     // `batches` is shared, not moved: the closure captures it by reference, so a

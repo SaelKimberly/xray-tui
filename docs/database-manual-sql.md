@@ -257,3 +257,32 @@ staleness DEADLINE as the net for a trickle too slow to reach it. The deadline i
 hand-rolled loop had. Results are delayed, not lost: `spawn_geo_drain` takes one final `flush()`
 when `shutdown_token` is set, and the page seed persists its own rows. This is the same trade the link writer's
 `max_staged_age` makes, and it is recorded here for the same reason.
+
+## RowCache write-behind: the same statements, a caller-owned transaction (2026-10-05)
+
+**No new raw SQL.** The RowCache migration replaced three bespoke writers (`LinkWriter`,
+`GeoQueue`, the per-chunk import commits) with the generic `WriteBehind<Spec>` driver
+(`crates/xray-tui-db/src/write_behind.rs`, added in this change). It added **zero** statements to
+this inventory: `write_behind.rs` contains no production SQL at all — only test fixtures
+(`fake_state`) and an assertion statement. Every site below is a **move**, recorded here so a
+reader diffing the file does not mistake a relocated statement for a new exception.
+
+| Site | Change | Why |
+| --- | --- | --- |
+| `database.rs` `apply_link_patches_tx` | **MOVED.** The upsert loop was extracted out of `apply_link_patches_once` and now takes `(&mut impl toasty::Executor, &[LinkPatch], now)` instead of opening and committing its own transaction. The SQL text, the eight group buckets, and `LINK_STATEMENT_ROWS = 400` are unchanged; so is the wrapper's post-commit `endpoint_rank::refresh` on a second connection. | `LinkSpec` must run the write inside the transaction the DRIVER opened, so the retry and the commit belong to one owner. The wrapper `apply_link_patches_once` keeps its old signature and still calls it, so **nothing moved out of a transaction**. The one deliberate behaviour change is the driver's: `LinkSpec::refresh` calls `endpoint_rank::refresh` on the transaction it is about to commit, making the rank keys atomic with the write that invalidated them instead of a post-commit repair whose failure was only logged. |
+| `database.rs` `set_endpoint_ip_countries_once` (`pub`) | **MOVED.** The per-row loop that was inlined in `set_endpoint_ip_countries`'s retry closure became a free `pub async fn` over `&mut impl Executor`. The statement is still `endpoint_ip::set_country` per row; no statement was rewritten. | `CountrySpec` opens its own transaction. A call that opened a *second* connection inside the driver's tx would deadlock on itself, and a second `retry_on_busy` inside the driver's retry would double the retry budget. |
+| `upsert_endpoints_bulk`, `upsert_endpoint_group_links_bulk`, `upsert_protocols_bulk`, `upsert_links_bulk` | **UNCHANGED**, but their callers moved: `stream_import` now hands whole batches to `WriteBehind<SourceSpec>`, which commits once per window instead of once per chunk. | Same statements, fewer commits around them. |
+
+**The transaction count is the thing that changed, so it is the thing to measure.** §3's numbers
+are per-statement costs and are unaffected; what the migration removes is the *number of
+transactions* around them. The counter-evidence for that claim lives in
+`crates/xray-tui/src/ops/ping/flow_cost.rs` (`flow_cost_contention`, the ADR-0008 perf lab): the
+fan-in arm runs overlapping import + geo writers against the same file, and its rows are recorded
+there with the before/after comment.
+
+**No `db_method` span on the tx-scoped pair.** `apply_link_patches_tx` and
+`set_endpoint_ip_countries_once` deliberately carry no `#[tracing::instrument(target =
+"db_method")]` while their public wrappers do. A span is an attribution, and `DbMonitor`
+attributes a write to the span that produced it — the driver flushes from a background task, so a
+short inner span would win the attribution over the wrapper's longer one and make the write look
+cheaper and shorter than the transaction it is actually inside.
