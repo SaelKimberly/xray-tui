@@ -31,6 +31,7 @@ uuid.workspace = true
 
 # ============ Async Runtime & I/O ============
 tokio.workspace = true
+dashmap = "6.2.1"
 xray-tui-hakari = { version = "0.1", path = "../xray-tui-hakari" }
 
 [lints]

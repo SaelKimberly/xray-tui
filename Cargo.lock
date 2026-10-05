@@ -8035,6 +8035,7 @@ dependencies = [
 name = "xray-tui-db"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "jiff",
  "serde_json",
  "tempfile",
