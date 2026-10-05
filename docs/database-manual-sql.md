@@ -249,9 +249,11 @@ re-stages the failing window AND every later one, and a re-stage never clobbers 
 same endpoint, so it cannot grow without bound.
 
 **Durability window:** the driver's tick is `GEO_DRAIN_INTERVAL = 5 s` and its window is
-`GEO_FLUSH_AT = 256` rows; a bare tick additionally waits for the driver's own row floor
-(`flush_rows / 4`) or its staleness deadline (`75` ticks), so a small trickle can sit longer than
-5 s by design — the trade documented on `TIMER_FLOOR_DIVISOR`. Results are delayed, not lost:
-`spawn_geo_drain` takes one final `flush()` when `shutdown_token` is set, and the page seed
-persists its own rows. This is the same trade the link writer's
+`GEO_FLUSH_AT = 256` rows. A bare tick commits only once the row floor (`flush_rows / 4`, i.e. 64)
+is staged — that is what buys transaction size, per the `TIMER_FLOOR_DIVISOR` table — with the
+staleness DEADLINE as the net for a trickle too slow to reach it. The deadline is **pinned at
+`GEO_MAX_STAGED_AGE = 15 s`** through `WriteBehind::new_with_deadline`, not left at the driver's
+`75`-tick default, which at a 5 s tick would have been 375 s: sixty-odd times the hard ceiling the
+hand-rolled loop had. Results are delayed, not lost: `spawn_geo_drain` takes one final `flush()`
+when `shutdown_token` is set, and the page seed persists its own rows. This is the same trade the link writer's
 `max_staged_age` makes, and it is recorded here for the same reason.

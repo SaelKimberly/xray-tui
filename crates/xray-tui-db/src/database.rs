@@ -1930,7 +1930,10 @@ pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -
 /// opens its OWN transaction and owns the commit, so a call that opened a
 /// second connection (and retried it) inside the driver's tx would deadlock on
 /// itself. Every other one-shot caller keeps the public wrapper.
-#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+// No `db_method` span here, matching `apply_link_patches_once`: the public
+// wrapper already carries one, and the driver calls this from INSIDE its own
+// flush — a second, shorter span would be the one `DbMonitor` attributes the
+// write to.
 pub async fn set_endpoint_ip_countries_once(
     tx: &mut impl Executor,
     rows: &[(EndpointId, std::net::IpAddr, String)],

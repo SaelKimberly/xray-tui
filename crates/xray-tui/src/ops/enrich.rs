@@ -61,6 +61,14 @@ pub const GEO_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// without waiting for the tick.
 const GEO_FLUSH_AT: usize = 256;
 
+/// Ceiling on how long a staged country may sit unpersisted.
+///
+/// NOT the drain interval: the driver's default deadline is 75 ticks, which at
+/// a 5 s tick is 375 s — sixty-odd times the hard 5 s ceiling the hand-rolled
+/// loop had, and far outside the seconds-long loss window the enrichment path
+/// is allowed. The deadline is therefore named here, at 3 ticks.
+const GEO_MAX_STAGED_AGE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The country driver, installed by [`spawn_geo_drain`] at the top of
 /// `ui::run` — before any resolution task exists, so every
 /// [`queue_country`] call finds it.
@@ -95,18 +103,19 @@ pub(crate) fn queue_country(endpoint_id: EndpointId, ip: std::net::IpAddr, iso: 
 /// Install the country driver and run it until shutdown.
 ///
 /// The driver owns the whole cadence — the `GEO_FLUSH_AT` window, the
-/// `GEO_DRAIN_INTERVAL` tick, its staleness deadline, and the re-stage of a
-/// failed write — so this only supplies the database and the shutdown edge.
-/// The final `flush` before the flush task is aborted is today's "one last
-/// drain": a quit must not strand what is staged.
+/// `GEO_DRAIN_INTERVAL` tick, the [`GEO_MAX_STAGED_AGE`] deadline, and the
+/// re-stage of a failed write — so this only supplies the database and the
+/// shutdown edge. The final `flush` before the flush task is aborted is
+/// today's "one last drain": a quit must not strand what is staged.
 pub(crate) fn spawn_geo_drain(
     db: std::sync::Arc<xray_tui_db::Database>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let driver = xray_tui_db::WriteBehind::<xray_tui_db::CountrySpec>::new(
+    let driver = xray_tui_db::WriteBehind::<xray_tui_db::CountrySpec>::new_with_deadline(
         db,
         GEO_FLUSH_AT,
         GEO_DRAIN_INTERVAL,
+        GEO_MAX_STAGED_AGE,
     );
     if GEO_DRIVER.set(std::sync::Arc::clone(&driver)).is_err() {
         tracing::warn!(

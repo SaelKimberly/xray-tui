@@ -161,21 +161,44 @@ pub struct WriteBehind<S: CacheSpec> {
 }
 
 impl<S: CacheSpec> WriteBehind<S> {
-    /// Build a driver with the given flush policy.
+    /// Build a driver with the default staleness deadline.
     ///
     /// `flush_rows` is clamped to at least 1; the timer floor is a quarter of
     /// it (see [`TIMER_FLOOR_DIVISOR`]) and the staleness deadline is
-    /// [`MAX_STAGED_AGE_TICKS`] intervals.
+    /// [`MAX_STAGED_AGE_TICKS`] intervals. A spec whose loss window must be
+    /// shorter than that product uses [`Self::new_with_deadline`].
     #[must_use]
     pub fn new(db: Arc<crate::Database>, flush_rows: usize, flush_interval: Duration) -> Arc<Self> {
-        let flush_rows = flush_rows.max(1);
+        let max_staged_age = flush_interval.saturating_mul(MAX_STAGED_AGE_TICKS);
+        Self::new_with_deadline(db, flush_rows, flush_interval, max_staged_age)
+    }
+
+    /// Build a driver whose staleness deadline is stated outright.
+    ///
+    /// The default deadline is a MULTIPLE of the tick — 75 of them — because
+    /// the tick is the coarsest knob a caller usually has. That is right for a
+    /// table whose loss window is "minutes at worst" and wrong for one that
+    /// promises seconds: at a 5 s tick the default is **375 s**, sixty-odd times
+    /// the old hard ceiling. Naming the deadline keeps the durability contract
+    /// visible at the call site instead of leaving it to a multiplication.
+    ///
+    /// `max_staged_age` is clamped to at least one tick, so a deadline shorter
+    /// than the tick degrades to "write every tick" rather than to a busy loop
+    /// that writes on every wake.
+    #[must_use]
+    pub fn new_with_deadline(
+        db: Arc<crate::Database>,
+        flush_rows: usize,
+        flush_interval: Duration,
+        max_staged_age: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pending: DashMap::new(),
             staged: AtomicU64::new(0),
-            flush_rows,
-            timer_flush_floor: (flush_rows / TIMER_FLOOR_DIVISOR).max(1),
+            flush_rows: flush_rows.max(1),
+            timer_flush_floor: (flush_rows.max(1) / TIMER_FLOOR_DIVISOR).max(1),
             flush_interval,
-            max_staged_age: flush_interval.saturating_mul(MAX_STAGED_AGE_TICKS),
+            max_staged_age: max_staged_age.max(flush_interval),
             db,
             gate: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
@@ -692,6 +715,54 @@ mod tests {
         let driver = WriteBehind::<FakeSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
         assert_eq!(driver.flush().await.expect("flush"), 0);
         assert_eq!(driver.flush_count(), 0);
+    }
+
+    /// The default deadline is a multiple of the tick, which is the wrong
+    /// contract for a table that promises a seconds-long loss window: 75 ticks
+    /// of 5 s is 375 s.
+    #[tokio::test]
+    async fn the_default_deadline_is_the_tick_times_the_tick_budget() {
+        let db = fake_db().await;
+        let driver = WriteBehind::<FakeSpec>::new(Arc::clone(&db), 512, Duration::from_secs(5));
+        assert_eq!(
+            driver.max_staged_age(),
+            Duration::from_secs(5) * super::MAX_STAGED_AGE_TICKS,
+        );
+    }
+
+    /// Naming the deadline keeps the durability contract at the call site, and
+    /// it is what the country driver uses: a 15 s ceiling under a 5 s tick,
+    /// three ticks rather than seventy-five.
+    #[tokio::test]
+    async fn an_explicit_deadline_is_kept_verbatim() {
+        let db = fake_db().await;
+        let driver = WriteBehind::<FakeSpec>::new_with_deadline(
+            Arc::clone(&db),
+            256,
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+        );
+        assert_eq!(driver.max_staged_age(), Duration::from_secs(15));
+        assert_eq!(
+            driver.timer_flush_floor(),
+            64,
+            "the floor is still a quarter of the window, deadline or not",
+        );
+    }
+
+    /// A deadline shorter than the tick would otherwise be unreachable — the
+    /// loop only observes the clock once per tick — so it degrades to "write
+    /// every tick", which is the tightest window the cadence can express.
+    #[tokio::test]
+    async fn a_deadline_shorter_than_the_tick_clamps_to_one_tick() {
+        let db = fake_db().await;
+        let driver = WriteBehind::<FakeSpec>::new_with_deadline(
+            Arc::clone(&db),
+            256,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        assert_eq!(driver.max_staged_age(), Duration::from_secs(5));
     }
 
     /// A flush wider than `flush_rows` becomes one transaction per chunk.
