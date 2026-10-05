@@ -938,14 +938,12 @@ median of 5, on a copy of the live 74,014-endpoint database:
 4. So the size argument is irrelevant and the covering argument is the real one — and it is
    *conditional on statistics existing*.
 
-**Consequence for T10's Step 2: the cheapest fix is not the one the plan proposed.** Running
-`ANALYZE` (and keeping the statistics fresh, which an import changes constantly) is the first move;
-the band-partial index is the second, and is worth nothing until the first is done. This is a
-**planner-statistics gap, not an index gap**, and it belongs in the band spec's acceptance rather
-than being recorded as a Test-sort index problem.
+> **⚠ SUPERSEDED by the "T10 FINAL" section below.** This paragraph concluded that
+> `ANALYZE`-at-open was "the first move". That conclusion was **wrong and the change was
+> reverted** — see T10 FINAL. Do NOT re-add `ANALYZE`-at-open and do NOT write it into the band
+> spec's acceptance as a first move. Retained only as the record of what was measured here.
 
-Step 2 remains **conditional on the
-`adr/0010` / band-spec review**; this measurement closes `adr/0010:79`'s pending N∈{50k, 200k} gap.
+This measurement closed `adr/0010:79`'s pending N∈{50k, 200k} gap.
 
 ### T10 FINAL — both candidate fixes measured, **neither works**; the cost is toasty's execution layer
 

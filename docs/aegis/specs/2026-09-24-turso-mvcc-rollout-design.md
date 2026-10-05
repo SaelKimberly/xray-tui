@@ -116,7 +116,7 @@ decisive point, because MVCC only ever removed *lock wait*, never the work causi
 | | before | after |
 | --- | --- | --- |
 | link-writer commits per batch | 1,167 | **32** |
-| import statements | ~409,467 | **~774** (two of three families multi-row) |
+| import statements | ~409,467 | **~100,500** (two of three families multi-row) |
 | country writes | ~790 single-row transactions | **one per drain** |
 | a 3 s full-table scan holding the write lock | every 10 min | **a plain read** |
 

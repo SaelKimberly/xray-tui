@@ -412,7 +412,7 @@
   QUIC client's key/header/ALPN. Evidence: `docs/aegis/plans/2026-09-30-ss-plugin.md` (T22).
 - ✅ Static config weight — a compiled, versioned prior over each link's transport/security discriminators (`proto_spec/weight.rs`), inserted into the decision-16 key inside the tier and materialized as `endpoint_rank.rank_weight` (raw BLOB column + `endpoint_rank_test_v2` covering index + `WEIGHT_VERSION` rebuild, no schema-tag bump); the `PlanScope::All` feed walk now orders by the law and freezes its ids before the first probe
 
-## Phase 17 — Write contention, import integrity, DNS timing ✅
+## Phase 31 — Write contention, import integrity, DNS timing ✅
 
 From the 2026-10-01 production run (74,014 endpoints / 145,268 links; 4,028-link Fast+Real
 batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes.md` (15 tasks).
@@ -424,8 +424,9 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
 - ✅ **Full jitter in `retry_on_busy`** — a fixed ladder is metastable; the callers that collide
   are the concurrent ones, so an un-jittered retry re-synchronises exactly what it was meant to
   break. Same attempt count and ceiling.
-- ✅ **Import upserts are multi-row** for `endpoints` and `endpoint_groups` — **~409,467 statements
-  → ~774**. `upsert_protocols_bulk` is deliberately NOT converted (deferred third family: its
+- ✅ **Import upserts are multi-row** for `endpoints` and `endpoint_groups` — those two families
+  went **309,739 statements → 774**; the whole import is **~409,467 → ~100,500**, because
+  `upsert_protocols_bulk` is deliberately NOT converted (deferred third family: its
   stored enum labels are the embed derive's `snake_case` idents and the JSON column encoding is
   unverified; it stays the next real win at a measured 117 µs/row).
 - ✅ **Country writes are queued** — one owner, one transaction per drain, re-queue on failure.
