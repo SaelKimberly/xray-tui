@@ -505,8 +505,10 @@ pub const PERSIST_CHUNK: usize = 500;
 /// duplicate (host, port) lines upsert once per run.
 ///
 /// The writes are DEFERRED: each chunk is staged on
-/// [`xray_tui_db::WriteBehind`] and the run ends with a coordinated flush, so
-/// the returned count is what was STORED (see [`ImportOutcome`]'s `links`).
+/// [`xray_tui_db::WriteBehind`] and drained by a live flush task DURING the run,
+/// then the run ends with a coordinated flush. So the returned count is what
+/// was STORED (see [`ImportOutcome`]'s `links`) and a crash mid-run loses at
+/// most the driver's staleness window, not the whole feed.
 /// Returns `(links stored, whole-run summary)`.
 pub async fn persist_parsed_urls(
     db: &Arc<Database>,
@@ -523,7 +525,7 @@ pub async fn persist_parsed_urls(
     // Monotonic per-chunk staging ids: two chunks pending at once must be two
     // pending-map entries.
     let mut next_seq = 0u64;
-    let driver = crate::ops::stream_import::import_driver(db);
+    let driver = crate::ops::stream_import::ImportRun::new(db);
     // Deterministic-id dedup sets: a protocol row is shared across endpoints
     // (identity excludes host/port), so subscription feeds that repeat one
     // protocol config over hundreds of server URLs collapse to one upsert.
@@ -590,8 +592,9 @@ pub async fn persist_parsed_urls(
     }
 
     // Coordinated end-of-run flush: the staged rows are written now, so the
-    // returned count is what was STORED.
-    let flushed = crate::ops::stream_import::flush_import(&driver).await;
+    // returned count is what was STORED. Run-wide, baseline included — see
+    // `ImportRun`.
+    let flushed = driver.finish().await;
     let flush_dropped = staged_count.saturating_sub(flushed.stored);
     if flush_dropped > 0 {
         tracing::error!(

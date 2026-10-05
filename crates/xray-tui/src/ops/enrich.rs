@@ -49,11 +49,12 @@ pub(crate) fn extract_sni(protocol: &Protocol, endpoint_host: &str) -> Option<St
 /// — and the window was the shorter of the pair.
 pub const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// How long a resolved country may sit staged before a flush is forced.
+/// The tick interval of the country driver's flush task.
 ///
-/// This is the driver's tick interval, in the same spirit as the link writer's
-/// `max_staged_age`: results are NOT lost on a crash, only delayed by up to
-/// this long. It is not the poll interval — the driver also writes as soon as
+/// NOT the loss window. Results are not lost on a crash, only delayed, and the
+/// ceiling on that delay is `GEO_MAX_STAGED_AGE` (15 s) — the tick is only how
+/// often the deadline is checked, in the same spirit as the link writer's
+/// `max_staged_age`. The driver also writes well before the tick, as soon as
 /// `GEO_FLUSH_AT` rows are staged.
 pub const GEO_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -570,7 +571,8 @@ pub fn spawn_dns_resolve_host(
         // as **790 invocations / 8,608 statements / 88 aborts** at a p99 of
         // 1,051 ms against an isolated 108 µs: the cost was contention from
         // concurrent single-row transactions, not the writes themselves. Rows now
-        // accumulate ACROSS hosts and leave in one transaction (see `GeoQueue`).
+        // accumulate ACROSS hosts and leave in one transaction (see
+        // `WriteBehind<CountrySpec>`).
         if let Some((ip, iso)) =
             fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await
         {

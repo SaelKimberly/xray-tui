@@ -315,6 +315,33 @@ impl<S> tracing_subscriber::Layer<S> for DbMonitorLayer
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
+    /// Never cache a callsite verdict — see the note.
+    ///
+    /// `tracing` decides ONCE per `#[instrument]` callsite whether the span
+    /// will ever be enabled, and that decision is PROCESS-GLOBAL: it is taken
+    /// the first time the instrumented function runs, on whatever thread
+    /// happens to get there first. Return `never` (the default when no
+    /// subscriber is current, which is every thread but the instrumented
+    /// /// caller's) and the span is a no-op for the rest of the process — no
+    /// `on_new_span`, no registry row, statements unattributed, however correct
+    /// the code is. The write-behind flush hit exactly this: its span is
+    /// reached from many threads (the geo drain task, the import barrier, ping
+    /// batches), so under the parallel test runner a subscriber-less thread
+    /// would win the race and poison the cache.
+    ///
+    /// `sometimes` makes `enabled` run per creation instead, so the verdict is
+    /// always taken against the dispatcher actually current at the call. The
+    /// default `enabled` is a constant `true`, so this costs one predictable
+    /// branch per span/event and buys immunity to the cache. The monitor is
+    /// already always-on (bounded ~1.3 MiB); a branch is not the thing to
+    /// optimize here.
+    fn register_callsite(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
         if attrs.metadata().target() != METHOD_TARGET {
             return;
@@ -506,6 +533,99 @@ mod tests {
         assert!(
             dump.contains("get_all_groups"),
             "real query attributed to method: {dump}"
+        );
+        assert!(
+            !dump.contains(UNATTRIBUTED),
+            "no leakage to unattributed: {dump}"
+        );
+    }
+
+    /// F1 (final review 2026-10-05): the write-behind driver's flush is a
+    /// `db_method` span, so its statements attribute to `write_behind_flush`
+    /// rather than falling into the `unattributed` bucket.
+    ///
+    /// The tx-scoped callees carry no span by design, and the flush runs on a
+    /// background task with no enclosing `Database` method — before the span
+    /// this dump named only `unattributed`.
+    #[tokio::test]
+    async fn write_behind_flush_statements_attribute_to_the_flush_span() {
+        // Attempts before giving up on the callsite registering at all.
+        const ATTEMPTS: usize = 200;
+        use tracing_subscriber::layer::SubscriberExt;
+        // Build the DB BEFORE installing the subscriber so schema-push
+        // statements are not counted.
+        let db = std::sync::Arc::new(
+            xray_tui_db::Database::in_memory()
+                .await
+                .expect("in-memory db"),
+        );
+
+        let monitor = DbMonitor::new();
+        let subscriber = tracing_subscriber::registry().with(DbMonitorLayer::new(monitor.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Re-arm the global interest cache before every attempt. See
+        // `DbMonitorLayer::register_callsite` for why it can go stale.
+        tracing::callsite::rebuild_interest_cache();
+
+        // An endpoint to hang the resolved address off: `endpoint_ip` rows
+        // carry a foreign key to it.
+        let endpoint_id = xray_tui_db::models::EndpointId::new(1);
+        db.upsert_endpoint(&xray_tui_db::models::Endpoint {
+            id: endpoint_id,
+            host: "198.51.100.7".to_owned(),
+            host_type: xray_tui_db::models::HostType::Ipv4,
+            port: 443,
+            ports: Vec::new(),
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_at: None,
+            created_at: xray_tui_db::models::now_epoch(),
+            links: toasty::Deferred::default(),
+            group_links: toasty::Deferred::default(),
+        })
+        .await
+        .expect("endpoint");
+
+        let driver = xray_tui_db::WriteBehind::<xray_tui_db::CountrySpec>::new(
+            std::sync::Arc::clone(&db),
+            256,
+            std::time::Duration::from_secs(5),
+        );
+        // Retry the flush until the span registers. The code under test is
+        // deterministic; what is not is WHEN the `write_behind_flush`
+        // callsite is first evaluated, because that verdict is cached
+        // process-globally and other tests in this binary call
+        // `WriteBehind::flush` from threads with no subscriber (the geo drain,
+        // ping batches, import barriers). Re-arming the cache immediately
+        // before each attempt makes the next `Span::new` decide against THIS
+        // thread's dispatcher; the loop exists only because a concurrent
+        // thread can re-poison the cache between the re-arm and the call. A
+        // fresh row per attempt keeps every attempt a real write.
+        let mut dump = String::new();
+        for attempt in 0..ATTEMPTS {
+            driver.push(xray_tui_db::CountryRow {
+                endpoint_id,
+                ip: "198.51.100.7".parse().expect("ip"),
+                iso: "US".to_owned(),
+            });
+            tracing::callsite::rebuild_interest_cache();
+            driver.flush().await.expect("flush");
+            dump = monitor.dump(10).join("\n");
+            if dump.contains("write_behind_flush") {
+                break;
+            }
+            assert!(
+                attempt + 1 < ATTEMPTS,
+                "the flush span never registered after {ATTEMPTS} attempts: {dump}"
+            );
+            // Yield so a competing thread's cached verdict can settle before
+            // the next re-arm.
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            dump.contains("write_behind_flush"),
+            "flush statements attributed to the flush span: {dump}"
         );
         assert!(
             !dump.contains(UNATTRIBUTED),

@@ -46,9 +46,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Default)]
 #[must_use]
 pub struct ImportOutcome {
-    /// Links STORED. Writes are deferred to the write-behind driver, so this
-    /// is what the end-of-import flush reported, NOT the parsed count — the
-    /// "only what was STORED" invariant.
+    /// Links STORED over the WHOLE run. Writes go through the write-behind
+    /// driver's background task and its end-of-run barrier, so this is the
+    /// driver's run-wide committed-row count — NOT the parsed count, and not
+    /// just the barrier's own return value. That is the "only what was STORED"
+    /// invariant.
     pub links: usize,
     pub summary: ValidationSummary,
     pub ended_early: Option<String>,
@@ -200,7 +202,7 @@ where
     // pending at once must be two pending-map entries, or the later one
     // overwrites the earlier and its rows are never written.
     let mut next_seq = 0u64;
-    let driver = import_driver(db);
+    let driver = ImportRun::new(db);
     // Set by every non-natural end of the stream (stall, source error,
     // undecodable bytes): the loop still drains what it has, but the caller
     // learns the run was cut short.
@@ -320,8 +322,9 @@ where
 
     // End of import: the coordinated flush. Persist-time failures surface HERE
     // (not per batch) and are attributed to the run as a whole — still
-    // reported, never swallowed.
-    let flushed = flush_import(&driver).await;
+    // reported, never swallowed. `stored` is the RUN-WIDE total: the baseline
+    // was taken before the parse loop, so background flushes are inside it.
+    let flushed = driver.finish().await;
     let staged_left = flushed.staged_left;
     // A driver re-stages a window it could not write, so the shortfall is what
     // the caller loses. `saturating_sub` because a link written by an EARLIER
@@ -450,6 +453,79 @@ pub fn import_driver(db: &Arc<Database>) -> Arc<xray_tui_db::WriteBehind<xray_tu
     xray_tui_db::WriteBehind::new(Arc::clone(db), IMPORT_FLUSH_BATCHES, IMPORT_FLUSH_INTERVAL)
 }
 
+/// One import run's driver, its background flush task, and the counter snapshot
+/// its stored count is measured from.
+///
+/// # Why the task is spawned (F2, final review 2026-10-05)
+///
+/// The design spec's durability contract (§3.3) promises an import loses at
+/// most `max_staged_age` — 15 s at this driver's 200 ms tick × 75 ticks — on a
+/// crash. That promise needs a flush task: `spawn_flush_task` is what drains
+/// the staging map during the run. Nothing spawned one, so every staged
+/// [`xray_tui_db::SourceBatch`] stayed pending for the WHOLE run — a crash lost
+/// the entire feed, not 15 s of it, and the pending map grew with the feed.
+///
+/// The task makes the stored count harder to state, not impossible: `flush`
+/// returns `Err` for a flush that committed some windows and then failed, and
+/// a retry writes only the re-staged remainder, so neither the `Err` nor the
+/// retry's `Ok` accounts for the windows in between. Snapshotting
+/// `committed_total` at RUN START and taking the delta at the end does account
+/// for them: the counter only ever advances when a transaction COMMITS, and
+/// every background flush's commits land inside the delta exactly once. So one
+/// baseline, taken before the first [`Self::push`], covers the background
+pub(crate) struct ImportRun {
+    driver: Arc<xray_tui_db::WriteBehind<xray_tui_db::SourceSpec>>,
+    committed_at_start: u64,
+    flush_task: tokio::task::JoinHandle<()>,
+}
+
+impl ImportRun {
+    /// Start a run: snapshot the baseline, then spawn the flush task.
+    ///
+    /// The snapshot is taken BEFORE the task exists, so no background commit
+    /// can slip in under it.
+    pub(crate) fn new(db: &Arc<Database>) -> Self {
+        let driver = import_driver(db);
+        let committed_at_start = driver.committed_total();
+        let flush_task = driver.spawn_flush_task();
+        Self {
+            driver,
+            committed_at_start,
+            flush_task,
+        }
+    }
+
+    /// Stage one parsed batch. Never awaits; see
+    /// [`xray_tui_db::WriteBehind::push`].
+    pub(crate) fn push(&self, batch: xray_tui_db::SourceBatch) {
+        self.driver.push(batch);
+    }
+
+    /// The run's final barrier, then the run-wide stored count.
+    ///
+    /// Ordering is load-bearing. The barrier runs FIRST: it takes the driver's
+    /// gate, so it waits out any background flush already in flight and then
+    /// drains everything the run staged. Only then is the task aborted, and by
+    /// then a successful barrier has left nothing staged — a background flush
+    /// woken in that window drains an empty map and returns `Ok(0)`. Aborting
+    /// first would be the unsafe order: a task aborted mid-transaction loses
+    /// the rows its drain already removed from the pending map, with no
+    /// re-stage to put them back.
+    pub(crate) async fn finish(self) -> FinalFlush {
+        let Self {
+            driver,
+            committed_at_start,
+            flush_task,
+        } = self;
+        let mut flushed = flush_import(&driver, committed_at_start).await;
+        flush_task.abort();
+        // Read the leftovers AFTER the abort, so the number describes the map
+        // as the run leaves it.
+        flushed.staged_left = driver.staged_len();
+        flushed
+    }
+}
+
 /// The result of the end-of-import coordinated flush: links actually STORED,
 /// and staged entries still pending afterwards (non-zero only when every
 /// attempt failed).
@@ -460,19 +536,25 @@ pub(crate) struct FinalFlush {
 }
 
 /// Write everything the run staged, with a bounded retry, and report what
-/// landed.
+/// landed over the WHOLE run.
+///
+/// `committed_at_start` is [`ImportRun`]'s pre-spawn baseline, so the delta
+/// spans the background flushes the task performed during the run AND this
+/// barrier's own windows. Two things make it exact rather than approximate:
+///
+/// * `flush` returns `Err` for a flush that committed some windows and then
+///   failed, and the next attempt writes only the re-staged remainder — so
+///   neither the `Err` nor the retry's `Ok` accounts for the windows in
+///   between. The counter does.
+/// * The counter only advances when a transaction COMMITS, so a window a retry
+///   re-writes is counted once, at the attempt that landed it.
 ///
 /// Whatever did not reach the database is the caller's `dropped_total` (see
 /// [`run_streaming_import`]), which reconciles against `staged_count`.
-pub(crate) async fn flush_import(
+async fn flush_import(
     driver: &xray_tui_db::WriteBehind<xray_tui_db::SourceSpec>,
+    committed_at_start: u64,
 ) -> FinalFlush {
-    // `flush` returns `Err` for a flush that committed some windows and then
-    // failed, and the next attempt writes only the re-staged remainder — so
-    // neither the `Err` nor the retry's `Ok` accounts for the windows in
-    // between. The DELTA of the driver's cumulative counter does, and a row is
-    // counted only when its transaction commits, so no window is counted twice.
-    let before = driver.committed_total();
     let mut last_error = None;
     for attempt in 0..FINAL_FLUSH_ATTEMPTS {
         match driver.flush().await {
@@ -499,8 +581,8 @@ pub(crate) async fn flush_import(
             "import flush failed after {FINAL_FLUSH_ATTEMPTS} attempts: {error}",
         );
     }
-    let stored =
-        usize::try_from(driver.committed_total().saturating_sub(before)).unwrap_or(usize::MAX);
+    let stored = usize::try_from(driver.committed_total().saturating_sub(committed_at_start))
+        .unwrap_or(usize::MAX);
     FinalFlush {
         stored,
         staged_left: driver.staged_len(),
@@ -884,6 +966,85 @@ mod tests {
         assert!(
             message.contains("stored"),
             "the message must say what survived, not imply a full feed: {message}"
+        );
+    }
+
+    /// F2 (final review 2026-10-05): the import stages onto a LIVE flush task,
+    /// so the run's staged rows reach the database while the run is still
+    /// going — and the run-wide `stored` count still reports them exactly once.
+    ///
+    /// Two properties, both of which the old shape failed. Nothing spawned the
+    /// task, so every batch stayed pending until the end-of-import barrier: a
+    /// crash lost the whole feed against the spec's 15 s promise, and the
+    /// pending map grew with the feed. And once a task DOES flush mid-run, the
+    /// barrier's own `Ok(n)` no longer accounts for those windows — only the
+    /// baseline delta does.
+    #[tokio::test]
+    async fn the_import_flushes_during_the_run_and_counts_stored_exactly_once() {
+        const BATCHES: usize = super::IMPORT_FLUSH_BATCHES;
+        const PER_BATCH: usize = 2;
+
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+        let run = ImportRun::new(&db);
+
+        let mut seen_protocols = std::collections::HashSet::new();
+        let mut seen_endpoints = std::collections::HashSet::new();
+        let mut seen_links = std::collections::HashSet::new();
+        let mut staged_links = 0usize;
+        for seq in 0..BATCHES {
+            let urls: Vec<String> = (0..PER_BATCH)
+                .map(|i| valid_vmess_url(&format!("10.0.{seq}.{i}")))
+                .collect();
+            let (batch, _) = parse_batch(
+                seq as u64,
+                &urls,
+                Some("g1"),
+                &validation,
+                &mut seen_protocols,
+                &mut seen_endpoints,
+                &mut seen_links,
+            );
+            staged_links += batch.links.len();
+            run.push(batch);
+        }
+
+        // The staged rows are PHYSICALLY stored before `finish` runs. Without
+        // a flush task the barrier below is the only writer, so this poll times
+        // out — which is the loss window the finding is about.
+        let physical = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let meta = db
+                    .profiles_page(&group_page_request("g1"))
+                    .await
+                    .expect("rows");
+                if meta.ids.len() >= staged_links {
+                    break meta.ids.len();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the background flush task must store rows DURING the run");
+        assert_eq!(
+            physical, staged_links,
+            "every staged link is on disk before the barrier runs"
+        );
+
+        let flushed = run.finish().await;
+        assert_eq!(
+            flushed.stored, staged_links,
+            "the run-wide count includes the background flushes, each link once"
+        );
+        assert_eq!(flushed.staged_left, 0, "the barrier drained the map");
+        let meta = db
+            .profiles_page(&group_page_request("g1"))
+            .await
+            .expect("rows");
+        assert_eq!(
+            meta.ids.len(),
+            staged_links,
+            "the reported count and the physical rows agree"
         );
     }
 }

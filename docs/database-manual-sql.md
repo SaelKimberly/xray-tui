@@ -290,9 +290,17 @@ and `ArmFailures` correctly DISCARDs both import rows, so **the arm emits no row
 the geo arms and the trickle row instead, and do not read a before/after into a number that was
 never recorded.
 
-**No `db_method` span on the tx-scoped pair.** `apply_link_patches_tx` and
-`set_endpoint_ip_countries_once` deliberately carry no `#[tracing::instrument(target =
-"db_method")]` while their public wrappers do. A span is an attribution, and `DbMonitor`
-attributes a write to the span that produced it — the driver flushes from a background task, so a
-short inner span would win the attribution over the wrapper's longer one and make the write look
-cheaper and shorter than the transaction it is actually inside.
+**No `db_method` span on the tx-scoped pair; one on the flush instead.** `apply_link_patches_tx`
+and `set_endpoint_ip_countries_once` deliberately carry no
+`#[tracing::instrument(target = "db_method")]` while their public wrappers do. A span is an
+attribution, and `DbMonitor` attributes a write to the span that produced it — the driver flushes
+from a background task, so a short inner span on a tx-scoped callee would win the attribution over
+the wrapper's longer one and make the write look cheaper and shorter than the transaction it is
+actually inside.
+
+So the span sits one level UP, on `WriteBehind::flush` itself, named `write_behind_flush`: it is
+the span that owns the transaction the driver opened, and it is what carries the write-behind
+statements and the `retries` count. Without it the tx-scoped callees' deliberate silence left every
+write-behind `toasty::query` event with no enclosing `db_method` span, so they all landed in the
+`unattributed` bucket and the public `apply_link_patches` / `set_endpoint_ip_countries` rows read
+zero in production even though those methods were being called.

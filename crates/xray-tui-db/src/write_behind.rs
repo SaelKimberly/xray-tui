@@ -276,6 +276,25 @@ impl<S: CacheSpec> WriteBehind<S> {
     /// the whole remainder on the next tick. Re-staging only the failing window
     /// would drop the rest of the drained batch — silent loss for any window
     /// wider than one chunk.
+    ///
+    /// The span is the ATTRIBUTION for every statement this flush issues, so it
+    /// carries `target = "db_method"` (the literal `DbMonitorLayer`'s
+    /// `on_new_span` gate matches on) and the `retries` field
+    /// `retry_on_busy` records into.
+    ///
+    /// Without it the driver is invisible to the monitor: the tx-scoped
+    /// callees (`apply_link_patches_tx`, `set_endpoint_ip_countries_once`)
+    /// deliberately carry no span of their own, and the flush runs on a
+    /// background task with no enclosing `Database` method — so every
+    /// write-behind `toasty::query` event landed in the `unattributed`
+    /// bucket and the public `apply_link_patches` /
+    /// `set_endpoint_ip_countries` rows read zero in production.
+    #[tracing::instrument(
+        target = "db_method",
+        name = "write_behind_flush",
+        skip_all,
+        fields(retries = tracing::field::Empty)
+    )]
     pub async fn flush(&self) -> crate::Result<usize> {
         let _guard = self.gate.lock().await;
         let drained = self.drain();
