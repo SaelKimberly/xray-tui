@@ -471,8 +471,9 @@ pub fn import_driver(db: &Arc<Database>) -> Arc<xray_tui_db::WriteBehind<xray_tu
 /// retry's `Ok` accounts for the windows in between. Snapshotting
 /// `committed_total` at RUN START and taking the delta at the end does account
 /// for them: the counter only ever advances when a transaction COMMITS, and
-/// every background flush's commits land inside the delta exactly once. So one
-/// baseline, taken before the first [`Self::push`], covers the background
+/// every background flush's commits land inside the delta. So one baseline,
+/// taken before the first [`Self::push`], covers the background commits, and
+/// the end-of-run delta counts each of them exactly once.
 pub(crate) struct ImportRun {
     driver: Arc<xray_tui_db::WriteBehind<xray_tui_db::SourceSpec>>,
     committed_at_start: u64,
@@ -501,28 +502,54 @@ impl ImportRun {
         self.driver.push(batch);
     }
 
+    /// The driver, for tests that must observe it across the run's drop.
+    #[cfg(test)]
+    fn driver(&self) -> Arc<xray_tui_db::WriteBehind<xray_tui_db::SourceSpec>> {
+        Arc::clone(&self.driver)
+    }
+
     /// The run's final barrier, then the run-wide stored count.
     ///
-    /// Ordering is load-bearing. The barrier runs FIRST: it takes the driver's
-    /// gate, so it waits out any background flush already in flight and then
-    /// drains everything the run staged. Only then is the task aborted, and by
-    /// then a successful barrier has left nothing staged — a background flush
-    /// woken in that window drains an empty map and returns `Ok(0)`. Aborting
-    /// first would be the unsafe order: a task aborted mid-transaction loses
-    /// the rows its drain already removed from the pending map, with no
+    /// Ordering is load-bearing. The barrier runs FIRST and the task is aborted
+    /// only once it has returned — the abort comes from `Drop` below, which fires
+    /// when `self` goes out of scope at the end of this function. The barrier
+    /// takes the driver's gate, so it waits out any background flush already in
+    /// flight and then drains everything the run staged; by the time `Drop`
+    /// aborts, a successful barrier has left nothing staged, and a background
+    /// flush woken in that window drains an empty map and returns `Ok(0)`.
+    /// Aborting first would be the unsafe order: a task aborted mid-transaction
+    /// loses the rows its drain already removed from the pending map, with no
     /// re-stage to put them back.
     pub(crate) async fn finish(self) -> FinalFlush {
-        let Self {
-            driver,
-            committed_at_start,
-            flush_task,
-        } = self;
-        let mut flushed = flush_import(&driver, committed_at_start).await;
-        flush_task.abort();
-        // Read the leftovers AFTER the abort, so the number describes the map
-        // as the run leaves it.
-        flushed.staged_left = driver.staged_len();
+        let mut flushed = flush_import(&self.driver, self.committed_at_start).await;
+        // Read the leftovers while `self` — and its flush task — is still alive.
+        flushed.staged_left = self.driver.staged_len();
         flushed
+    }
+}
+
+impl Drop for ImportRun {
+    /// Abort the flush task when a run is dropped WITHOUT finishing.
+    ///
+    /// `finish` is the happy path, but an import can end without reaching it:
+    /// `do_update_subscription`'s 30-minute timeout, a cancelled task, a panic
+    /// anywhere in the parse loop. Dropping a `JoinHandle` only DETACHES it —
+    /// the task keeps running, and [`xray_tui_db::WriteBehind::run`] is an
+    /// infinite loop. So a dropped run would leave behind, for the life of the
+    /// process, a task holding the driver `Arc` and its staged rows and waking
+    /// every 200 ms to drain a map nobody will push to again — one per aborted
+    /// import.
+    ///
+    /// Aborting here loses whatever was still staged, which is the right
+    /// outcome: an abandoned import has no barrier to write it, and holding it
+    /// in memory forever is strictly worse. It is the same trade the tail of
+    /// `finish` already makes when a barrier fails, and it introduces no new
+    /// class of loss — rows no flush ever wrote were never reported as stored.
+    ///
+    /// `finish` relies on this too: it runs the barrier first and lets `self`'s
+    /// drop perform the abort, so the ordering that matters is stated once.
+    fn drop(&mut self) {
+        self.flush_task.abort();
     }
 }
 
@@ -1046,5 +1073,93 @@ mod tests {
             staged_links,
             "the reported count and the physical rows agree"
         );
+    }
+
+    /// R1 (fix-wave re-review): an import that never reaches `finish` — a
+    /// `do_update_subscription` timeout, a cancelled task, a panic in the parse
+    /// loop — used to leave its flush task running for the life of the process.
+    /// Dropping a `JoinHandle` only detaches it, and
+    /// [`xray_tui_db::WriteBehind::run`] is an infinite loop, so the task kept
+    /// the driver `Arc`, the staged rows, and a 200 ms wake alive with nothing
+    /// left to push.
+    ///
+    /// `ImportRun::drop` aborts it. The probe is the driver's transaction count:
+    /// it is monotonic and only a live flush task advances it, so a count that
+    /// stops moving is proof the task is gone.
+    #[tokio::test]
+    async fn dropping_a_run_stops_its_flush_task() {
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+
+        let (driver, seqs, mut parse_sets) = {
+            let run = ImportRun::new(&db);
+            let driver = run.driver();
+            let mut parse_sets = (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            );
+            // Stage enough to cross `flush_rows` so the size trigger fires and
+            // the task commits — proof it is live before the drop.
+            for seq in 0..super::IMPORT_FLUSH_BATCHES {
+                run.push(staged_batch(seq, &mut parse_sets, &validation));
+            }
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if driver.flush_count() > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the flush task must commit before the run is dropped");
+            (driver, super::IMPORT_FLUSH_BATCHES, parse_sets)
+        }; // `run` drops here — this is the path under test.
+        // Stage a FRESH window through the driver handle we kept. The drain
+        // empties the map on every flush, so leftover rows from before the drop
+        // are not evidence: a live task would simply find nothing to do. Fresh
+        // rows cross `flush_rows` again, so a surviving task is guaranteed to
+        // commit — and one that was aborted never will.
+        for seq in seqs..seqs + super::IMPORT_FLUSH_BATCHES {
+            driver.push(staged_batch(seq, &mut parse_sets, &validation));
+        }
+        let at_drop = driver.flush_count();
+
+        // Several 200 ms ticks: ample for a live task to notice the new window
+        // and commit it.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            driver.flush_count(),
+            at_drop,
+            "a transaction committed after the drop: the flush task outlived \
+             the run",
+        );
+    }
+
+    /// One parsed batch on fresh hosts, so `seq` never collides with an
+    /// earlier batch's dedup keys.
+    fn staged_batch(
+        seq: usize,
+        seen: &mut (
+            std::collections::HashSet<i64>,
+            std::collections::HashSet<i64>,
+            std::collections::HashSet<(i64, i64)>,
+        ),
+        validation: &ValidationSettings,
+    ) -> xray_tui_db::SourceBatch {
+        let urls: Vec<String> = (0..2)
+            .map(|i| valid_vmess_url(&format!("10.{}.{seq}.{i}", seq / 250)))
+            .collect();
+        parse_batch(
+            seq as u64,
+            &urls,
+            Some("g1"),
+            validation,
+            &mut seen.0,
+            &mut seen.1,
+            &mut seen.2,
+        )
+        .0
     }
 }

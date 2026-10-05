@@ -322,7 +322,7 @@ where
     /// the first time the instrumented function runs, on whatever thread
     /// happens to get there first. Return `never` (the default when no
     /// subscriber is current, which is every thread but the instrumented
-    /// /// caller's) and the span is a no-op for the rest of the process — no
+    /// caller's) and the span is a no-op for the rest of the process — no
     /// `on_new_span`, no registry row, statements unattributed, however correct
     /// the code is. The write-behind flush hit exactly this: its span is
     /// reached from many threads (the geo drain task, the import barrier, ping
