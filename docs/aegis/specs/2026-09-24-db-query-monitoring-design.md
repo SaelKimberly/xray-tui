@@ -80,3 +80,38 @@ Span-field carrier: each wrapped method records `db_method = <name>` and, at com
 - Persisting monitoring data to Turso or heed.
 - Normalized-statement-text keying.
 - Instrumenting non-`Database` SQL (route/sniff paths do not touch Turso).
+
+## 11. Amendment — two-destination field capture, and `.log_statement_params` (2026-10-02)
+
+§6 and `plans/2026-09-24-db-query-monitoring.md` Task 5 pinned `LogVisitor` to capture **only**
+`duration_ms` + `db.statement`, and that pinning test rejected anything wider. That was correct when
+written, and it was too narrow: every other field hit `_ => {}` and was lost. The 2026-10-01 run
+left **12 stuck-deferral warnings in heed naming no row**, because `ops/ping.rs` emits
+`endpoint_id`, `half` and `waited_ms` on that line and the visitor discarded them.
+
+**What changed.** `LogVisitor` now renders **two strings with two destinations**:
+
+| | contents | destination |
+| --- | --- | --- |
+| `into_message` / `split().0` | message + `duration_ms` + `db.statement` | **`LogMessage` → heed** (persisted) |
+| `split().1` (`detail`) | **every** other field, including `db.params` | `CoreEvent::TuiLog` → the Logs panel (**session only**) |
+
+`.log_statement_params(true)` is now wired on the ONE production `Db::builder()` site —
+`try_open_db` (`database.rs`). `in_memory` is deliberately NOT wired: it backs the test
+suites, where param formatting on every statement is noise and costs time, not signal. It was
+named in §3 as opt-in and was referenced **nowhere in the tree**, so the `OFFSET` bind of a paged
+query was invisible — which is why the `profiles_page` p99 could not be attributed to a shape or an
+offset from the logs.
+
+**The split is a SECURITY boundary, not a convenience.** toasty's own docstring on the knob warns
+that parameter values "are application data and may contain secrets (password hashes, personal
+information)" and to enable it "only when the log destination is trusted". One of our binds is
+`protocols.config` — the parsed protocol config, carrying UUIDs and passwords. heed is not a trusted
+destination. So `db.params` **must never enter `LogMessage`**, which is what §10's "persisting
+monitoring data to Turso or heed" forbids. The Logs panel *is* the trusted destination, so the bind
+values are rendered there and nowhere else. Non-goal 10 is **strengthened, not relaxed**: it now
+constrains the capture side too, not just the registry.
+
+**Amended in place:** §6's capture list and the Task 5 pinning test (replaced by
+`structured_fields_split_between_persisted_and_session_only`, which asserts the persisted line does
+NOT contain the bind value and the session detail does).

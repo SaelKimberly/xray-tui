@@ -185,8 +185,11 @@ Rejected alternatives:
 
 A single background task owns flushing (one writer, so no OCC contention):
 
-- flush when `pending.len() >= flush_rows` (512) or every `flush_interval`
-  (200 ms) while non-empty;
+- flush when `pending.len() >= flush_rows` (512) — the **size trigger** always writes;
+- otherwise a **timer tick** writes only once `timer_flush_floor`
+  (`flush_rows / TIMER_FLOOR_DIVISOR` = 128) rows are staged, or once `max_staged_age`
+  (`MAX_STAGED_AGE_TICKS` = 75 × `flush_interval` = 15 s) has elapsed since the last
+  write — see the amendment below;
 - `stage` never awaits; if a flush is in flight, staging keeps filling the map.
   The drain is a **remove**, not a snapshot copy: each drained entry is owned by
   the flush, and a `stage` landing for the same `(link, group)` during the write
@@ -243,8 +246,10 @@ awaits a flush.
 
 - No schema or data-format change; existing databases open unchanged.
 - Durability window: staged mutations are lost on a crash/power loss up to
-  `flush_interval` (200 ms) — the same class of loss the `synchronous=NORMAL`
-  change already accepts, and strictly narrower than "the batch's results".
+  `max_staged_age` (**15 s** with the default `flush_interval`) — the same class
+  of loss the `synchronous=NORMAL` change already accepts, and strictly
+  narrower than "the batch's results". **Amended 2026-10-02:** this was
+  `flush_interval` (200 ms) before `TIMER_FLOOR_DIVISOR`; see §10.
 - A crash mid-batch leaves at most one flush window of results unwritten and
   stale `task_id`s that the startup orphan sweep clears.
 - Subscription/import writes keep their existing transactional path.
@@ -285,7 +290,7 @@ awaits a flush.
 | Gate reads stale DB state | Read-through is the design (§4.2); test §7.1 is the regression |
 | Two writers on one row (typed OCC + batch UPDATE) | The scheduler's only write path becomes `stage`; grep gate for `update_scheduler_state` in the batch path |
 | Flush task starves under a long transaction | Flush is one transaction per window; `flush_rows` caps its size |
-| WAL growth | Checkpoint at batch end; `flush_interval` bounds in-flight work |
+| WAL growth | Checkpoint at batch end; `max_staged_age` (15 s) bounds in-flight staged work, not `flush_interval` — **amended 2026-10-02**, see §10 |
 | Lost results on crash | Named in §6; the orphan sweep covers task state |
 | `pending` map memory during a 100k-link batch | Bounded by distinct changed links (≤ links) and drained each window |
 
@@ -297,3 +302,49 @@ awaits a flush.
 | `TaskScheduler` `read_link`/`update_scheduler_state` per transition | retired for the batch path | read-through lands |
 | `update_scheduler_state` OCC retry | kept for non-batch callers; delete when none remain | last caller migrates |
 | `PROFILES_SQL_DEBUG`-style probes | already removed | — |
+
+## 10. Amendment — timer floor and staleness deadline (2026-10-02)
+
+The 2026-10-01 production run (WAL, 74,014 endpoints, 4,028-link Fast+Real batch)
+measured **1,167 commits for 4,028 rows — 3.45 rows per transaction**. The loop
+flushed on a *single* staged row from the timer path, so a trickle of results
+spread over 327 s committed once per tick, and the write path competed with
+itself for the lock. `flow_cost_contention` reproduces it exactly:
+1,668 / 1,668 / 1,669 flushes across three runs at the same arrival rate.
+
+**What changed.** Two named constants, both in `link_writer.rs` with the trade
+table in their doc comments:
+
+| constant | value | meaning |
+| --- | --- | --- |
+| `TIMER_FLOOR_DIVISOR` | 4 | floor = `flush_rows / 4` = **128** rows |
+| `MAX_STAGED_AGE_TICKS` | 75 | ceiling = 75 × `flush_interval` = **15 s** |
+
+The size trigger is unchanged and still always writes. A **tick count was tried
+and rejected**: the wait to reach N ticks is rate-dependent, so an 8-tick backoff
+at 12 rows/s forced a write at ~89 rows — *under* the floor — pre-empting the
+coalescing it was meant to back up (measured: 46 commits, 87.6 rows each). A
+deadline is rate-independent.
+
+**Measured result: 32 flushes / 125.9 rows per commit — a 52× reduction.**
+
+**What this costs, stated plainly.** Two things, not one:
+
+1. **Durability.** A staged result can sit unpersisted for up to ~10.7 s at the
+   observed trickle, hard-capped at 15 s, where it previously lagged ~200 ms.
+   Nothing is *lost* — batch end, quit and reload flush explicitly — but
+   results are *delayed*.
+2. **Ordering-key staleness, the same window.** `endpoint_rank::refresh` runs
+   inside `apply_link_patches` after the commit (`database.rs:1182-1190`), i.e.
+   at **flush** time, not at `stage`. So a Test-sorted page refetch during a
+   batch (`filter_cache_valid = false`) places a row by its **stale rank** for up
+   to that same ~10.7 s. The Test cell and the expanded sub-table order are
+   unaffected — `sort_links_by_test_priority` is patched in memory at event
+   time — so this is only **a row's position in the window**. ADR 0008 §3 sized
+   that refetch around UI cost and never considered staleness.
+
+Refreshing ranks at `stage` time instead would reintroduce per-row writes, which
+is exactly what ADR 0003 retired.
+
+**Superseded statements in this spec** (all amended in place above): the flush
+trigger at line 188, the durability window at §6, and the WAL-growth risk row.

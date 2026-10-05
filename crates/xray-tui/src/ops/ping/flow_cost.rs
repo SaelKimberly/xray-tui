@@ -690,6 +690,67 @@ async fn flow_cost_report() {
                 }
                 rows_out.push(page_acc.row("profiles_page (one page, real feed)", 1.0));
 
+                // The Test sort across OFFSETS on the REAL feed. This is the
+                // 2026-10-01 question: `profiles_page` p99 was 1,004.3 ms on a
+                // 74,014-endpoint feed, four CONSECUTIVE slow statements (the
+                // deep-offset page-walk shape), while the same window reported
+                // p50 = 1.2 ms — a shape that is cheap and a tail that is not.
+                // The synthetic `XRAY_TUI_SCALE` lab already sweeps
+                // (Address|Port|Test) x {0, total/2, N-200}; this is the same
+                // sweep against the real rows, which is what closes
+                // `adr/0010:79`'s pending N in {50k, 200k} acceptance.
+                let mut total = 0usize;
+                for (view, vtag) in [
+                    (PurgatoryView::All, "All"),
+                    (PurgatoryView::Active, "Active"),
+                ] {
+                    for (sort, tag) in [(PageSort::Address, "Address"), (PageSort::Test, "Test")] {
+                        let head = PageRequest {
+                            view,
+                            active_threshold: 0,
+                            scope: PlanScope::All,
+                            search: None,
+                            group_id: None,
+                            sort,
+                            ascending: true,
+                            offset: 0,
+                            limit: 1,
+                        };
+                        total = db.profiles_page(&head).await.expect("count").total as usize;
+                        if total == 0 {
+                            continue;
+                        }
+                        let deep = total.saturating_sub(PROFILES_PAGE_SIZE);
+                        for off in [0usize, total / 2, deep] {
+                            let req = PageRequest {
+                                view,
+                                active_threshold: 0,
+                                scope: PlanScope::All,
+                                search: None,
+                                group_id: None,
+                                sort,
+                                ascending: true,
+                                offset: off,
+                                limit: PROFILES_PAGE_SIZE,
+                            };
+                            let mut acc = Acc::new();
+                            for _ in 0..5 {
+                                let started = Instant::now();
+                                let page = db.profiles_page(&req).await.expect("page");
+                                acc.add(started.elapsed());
+                                black_box(page.ids.len());
+                            }
+                            rows_out.push(
+                                acc.row(&format!("profiles_page {vtag} {tag} offset={off}"), 1.0),
+                            );
+                        }
+                    }
+                }
+
+                if total > 0 {
+                    println!("real feed: {total} endpoints, sweep over Address and Test");
+                }
+
                 let ids = db.profiles_page(&request).await.expect("page").ids;
                 let mut hydrate_acc = Acc::new();
                 for _ in 0..10 {
@@ -1673,4 +1734,668 @@ async fn hit_miss_rows(hit: bool) -> Vec<TableRow> {
         ns: elapsed.as_nanos() as f64 / f64::from(results),
         n: 1,
     }]
+}
+
+/// The four row families of one import transaction. Every row carries the
+/// values it already holds, so replaying a batch is idempotent.
+#[derive(Clone, Default)]
+struct ImportBatch {
+    endpoints: Vec<Endpoint>,
+    protocols: Vec<xray_tui_db::models::Protocol>,
+    links: Vec<ProfileStats>,
+    group_links: Vec<xray_tui_db::models::EndpointGroup>,
+}
+
+impl ImportBatch {
+    fn len(&self) -> usize {
+        self.links.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.links.is_empty()
+    }
+}
+
+/// One import transaction — all four bulk families in a single commit, the
+/// exact shape `stream_import::persist_batch` writes.
+///
+/// All four, not just the links: `upsert_endpoints_bulk`,
+/// `upsert_protocols_bulk` and `upsert_endpoint_group_links_bulk` are the
+/// PER-ROW writers, and `upsert_links_bulk` is the one already chunked at
+/// `LINK_STATEMENT_ROWS`. Replaying only the links would measure the writer that
+/// is NOT the subject, and this row is worthless as a before/after for the
+/// import-upsert work if it does.
+async fn write_import_once(
+    db: Arc<xray_tui_db::Database>,
+    batch: Arc<ImportBatch>,
+) -> xray_tui_db::Result<()> {
+    let mut conn = db.connection().await?;
+    let mut tx = conn.transaction().await?;
+    xray_tui_db::upsert_endpoints_bulk(&mut tx, &batch.endpoints).await?;
+    xray_tui_db::upsert_protocols_bulk(&mut tx, &batch.protocols).await?;
+    xray_tui_db::upsert_links_bulk(&mut tx, &batch.links).await?;
+    xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &batch.group_links).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Per-arm failure accounting. A single shared counter let a run in which
+/// EVERY import transaction failed report a plausible-looking millisecond figure
+/// for two consecutive runs; the only symptom was a failure total nobody could
+/// attribute. Every arm now owns its own counter, and an arm that failed on
+/// every sample is called out by name instead of being averaged into the table.
+struct ArmFailures {
+    arm: &'static str,
+    samples: usize,
+    failures: usize,
+}
+
+impl ArmFailures {
+    const fn new(arm: &'static str) -> Self {
+        Self {
+            arm,
+            samples: 0,
+            failures: 0,
+        }
+    }
+
+    fn record(&mut self, ok: bool) {
+        self.samples += 1;
+        self.failures += usize::from(!ok);
+    }
+
+    /// Returns true when the arm is unusable as a measurement.
+    fn report(&self) -> bool {
+        if self.samples == 0 {
+            println!("  arm {:<44} NO SAMPLES — not a measurement", self.arm);
+            return true;
+        }
+        if self.failures == self.samples {
+            println!(
+                "  arm {:<44} FAILED ON ALL {} SAMPLES — DISCARD this row",
+                self.arm, self.samples
+            );
+            return true;
+        }
+        println!(
+            "  arm {:<44} {}/{} writes failed",
+            self.arm, self.failures, self.samples
+        );
+        false
+    }
+}
+
+/// Split a slice into `n` transactions of roughly `per_tx` links, keeping all
+/// four families consistent: whole endpoint units only, so a protocol or group
+/// link is never separated from its endpoint.
+///
+/// Without this, every "transaction" replays the WHOLE slice — ~9x production's
+/// ~500-URL batch — and the row is useless as the import-upsert task's reference.
+fn split_batches(slice: &ImportBatch, n: usize, per_tx: usize) -> Vec<ImportBatch> {
+    let mut out: Vec<ImportBatch> = Vec::new();
+    let mut cur = ImportBatch::default();
+    let mut cursor = 0usize;
+    while cursor < slice.links.len() {
+        let endpoint_id = slice.links[cursor].endpoint_id;
+        // How many consecutive links belong to this endpoint?
+        let end = slice.links[cursor..]
+            .iter()
+            .position(|link| link.endpoint_id != endpoint_id)
+            .map_or(slice.links.len(), |skip| cursor + skip);
+        let unit = &slice.links[cursor..end];
+        if !cur.links.is_empty() && cur.links.len() + unit.len() > per_tx {
+            out.push(std::mem::take(&mut cur));
+            if out.len() == n {
+                return out;
+            }
+        }
+        if let Some(idx) = slice.endpoints.iter().position(|e| e.id == endpoint_id) {
+            cur.endpoints.push(slice.endpoints[idx].clone());
+        }
+        for protocol in slice
+            .protocols
+            .iter()
+            .filter(|p| unit.iter().any(|l| l.protocol_id == p.id))
+        {
+            cur.protocols.push(protocol.clone());
+        }
+        for gl in slice
+            .group_links
+            .iter()
+            .filter(|gl| gl.endpoint_id == endpoint_id)
+        {
+            cur.group_links.push(gl.clone());
+        }
+        cur.links.extend_from_slice(unit);
+        cursor = end;
+    }
+    if !cur.links.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Replays the **import + geo + link-writer** write mix against the real measure
+/// database.
+///
+/// `specs/2026-09-24-turso-mvcc-rollout-design.md` §DB-API A/B probed this mix
+/// (8×800-link import transactions + 16×100-row country flushes, 5 repetitions,
+/// WAL-vs-MVCC) and then declared it **disposable** — which is why the open
+/// "production workload benchmark" has no harness. It is the same mix the
+/// 2026-10-01 production run spent its write budget in, so it lives here now.
+///
+/// Four rows, each answering a different question:
+///   1-2. sequential import tx / geo flush — per-operation cost, nothing else running
+///   3.   **fan-in** — import and geo writers OVERLAPPING. Every other row in this
+///        module is sequential, and only this shape reproduces the `snapshot is
+///        stale` aborts; without it there is no contention to measure.
+///   4.   **flush trickle** — the link writer driven on a wall-clock ARRIVAL
+///        schedule, reporting `flush_count()`. Rows-per-flush is set by arrival
+///        rate, not row count: staging 4,028 rows in a tight loop trips the
+///        512-row size trigger and yields ~8 flushes, while the production
+///        trickle (~3.45 rows per 200 ms tick) produced 1,167.
+///
+/// The geo half replays addresses that already carry a country. A `None` country
+/// is skipped, never given a placeholder — `set_endpoint_ip_countries` takes a
+/// concrete `String`, so writing one would persist a fake ISO code into the very
+/// column the WAL-vs-MVCC comparison reads. Addresses come from
+/// `endpoint_resolutions` (i.e. `endpoint_ip`), not the page row's `resolved_ips`,
+/// because the abort path is an UPDATE that misses or an INSERT that races;
+/// replaying an address with no `endpoint_ip` row measures the wrong statement.
+///
+/// All four families are idempotent replays. Run against a COPY.
+///
+/// **The MVCC arm cannot come from this path.** An existing file stays WAL
+/// (`read_version=2`); MVCC needs a fresh file created with
+/// `XRAY_TUI_TURSO_CONCURRENT_WRITES=1`. The synthetic-feed builder in
+/// `measure_page_scale` is the piece to reuse for that arm — not a second copy.
+///
+/// Knobs:
+///   `XRAY_TUI_MEASURE_DB`             path to a COPY of data.db (required)
+///   `XRAY_TUI_MEASURE_REPS`           repetitions of the whole mix (default 5)
+///   `XRAY_TUI_MEASURE_IMPORT_TX`      import transactions per rep (default 8)
+///   `XRAY_TUI_MEASURE_LINKS_PER_TX`   links per import tx (default 800)
+///   `XRAY_TUI_MEASURE_GEO_FLUSH`      country flushes per rep (default 16)
+///   `XRAY_TUI_MEASURE_ROWS_PER_FLUSH` addresses per country flush (default 100)
+///   `XRAY_TUI_MEASURE_FANIN`          concurrent writer tasks (default 16)
+///   `XRAY_TUI_MEASURE_TRICKLE_ROWS`   link-writer arrivals (default 4_028)
+///   `XRAY_TUI_MEASURE_TRICKLE_RPS`    arrival rate, rows/s (default 12)
+#[ignore = "perf lab: run explicitly with --ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flow_cost_contention() {
+    let Ok(path) = std::env::var("XRAY_TUI_MEASURE_DB") else {
+        println!("SKIP flow_cost_contention: set XRAY_TUI_MEASURE_DB=<copy of data.db>");
+        return;
+    };
+    let reps = env_usize("XRAY_TUI_MEASURE_REPS", 5);
+    let import_tx = env_usize("XRAY_TUI_MEASURE_IMPORT_TX", 8);
+    let links_per_tx = env_usize("XRAY_TUI_MEASURE_LINKS_PER_TX", 800);
+    let geo_flush = env_usize("XRAY_TUI_MEASURE_GEO_FLUSH", 16);
+    let rows_per_flush = env_usize("XRAY_TUI_MEASURE_ROWS_PER_FLUSH", 100);
+    let fanin = env_usize("XRAY_TUI_MEASURE_FANIN", 16).max(1);
+    let trickle_rows = env_usize("XRAY_TUI_MEASURE_TRICKLE_ROWS", 4_028);
+    let trickle_rps = env_usize("XRAY_TUI_MEASURE_TRICKLE_RPS", 12).max(1);
+
+    let db = Arc::new(
+        xray_tui_db::Database::open(&path)
+            .await
+            .expect("open measure db"),
+    );
+    println!(
+        "\nmeasure db: {path}\njournal mode: {}",
+        if db.uses_concurrent_writes() {
+            "MVCC (concurrent_writes)"
+        } else {
+            "WAL"
+        }
+    );
+
+    // Pre-flight: `Database::open` DESTROYS a file whose `user_version` does not
+    // match (database.rs:274-288 — it calls `push_schema`, and on error drops
+    // the file and rebuilds). A wiped or re-created copy therefore opens cleanly
+    // with an empty schema, and an empty slice would otherwise be recorded as a
+    // baseline of zero. Check the population BEFORE the page loop and name the
+    // cause, so a destroyed file can never pose as a measurement.
+    let populated = db
+        .profiles_page(&PageRequest {
+            view: PurgatoryView::All,
+            active_threshold: 0,
+            scope: PlanScope::All,
+            search: None,
+            group_id: None,
+            sort: PageSort::Id,
+            ascending: true,
+            offset: 0,
+            limit: 1,
+        })
+        .await
+        .map(|page| page.total)
+        .unwrap_or(0);
+    if populated == 0 {
+        println!(
+            "ABORT flow_cost_contention: {path} holds no rows.\n\
+             It was most likely wiped — `Database::open` drops and rebuilds a file whose\n\
+             PRAGMA user_version != the schema tag, so a concurrent open destroyed it.\n\
+             Re-copy from a QUIESCENT data.db, verify pragma_user_version, and run ONE\n\
+             lab process at a time. Never point this env var at anything but a\n\
+             disposable copy."
+        );
+        return;
+    }
+    println!("feed: {populated} endpoints");
+
+    // A REAL group id, so the group-link family upserts rows that already exist
+    // instead of inventing membership the feed does not have.
+    let group_id = db
+        .get_all_groups()
+        .await
+        .expect("groups")
+        .into_iter()
+        .next()
+        .map(|g| g.id);
+
+    // Real rows, pinned in ID order — an order no write can move, so every
+    // repetition and every writer replays the same slice.
+    //
+    // The slice is BOUNDED to `want_links` and the four families are kept
+    // consistent with it, because the production reference is one ~500-URL
+    // batch (~2,500 rows across the four families). An unbounded slice makes
+    // "one import transaction" a ~154,000-row write, which is neither the
+    // production shape nor the import-upsert task's reference — and it measures
+    // statement-building CPU rather than the write path.
+    let want_links = (import_tx * links_per_tx).max(trickle_rows);
+    let want_ips = geo_flush * rows_per_flush;
+    let mut slice = ImportBatch::default();
+    let mut geo: Vec<(xray_tui_db::models::EndpointId, std::net::IpAddr, String)> = Vec::new();
+    let mut offset = 0usize;
+    // Links are the bound. Geo is collected opportunistically over the same walk
+    // and truncated separately — letting the geo requirement drive the paging
+    // is what produced an unbounded slice, since stored countries are sparse.
+    'walk: while slice.len() < want_links {
+        let request = PageRequest {
+            view: PurgatoryView::All,
+            active_threshold: 0,
+            scope: PlanScope::All,
+            search: None,
+            group_id: None,
+            sort: PageSort::Id,
+            ascending: true,
+            offset,
+            limit: PROFILES_PAGE_SIZE,
+        };
+        let ids = db.profiles_page(&request).await.expect("page").ids;
+        if ids.is_empty() {
+            break;
+        }
+        let rows = db.load_page_rows(&ids, false).await.expect("rows");
+        let resolutions = db.endpoint_resolutions(&ids).await.expect("resolutions");
+        for row in &rows {
+            if slice.len() >= want_links {
+                break 'walk;
+            }
+            // One endpoint = one consistent unit across all four families, so
+            // truncating the link budget can never orphan a protocol or a group
+            // link from its endpoint.
+            slice.endpoints.push(row.endpoint.clone());
+            for protocol in row.protocols.values() {
+                slice.protocols.push(protocol.clone());
+            }
+            for link in &row.links {
+                if let Some(gid) = &group_id {
+                    slice.group_links.push(xray_tui_db::models::EndpointGroup {
+                        endpoint_id: row.endpoint.id,
+                        group_id: gid.clone(),
+                        last_seen_at: link.last_seen_at,
+                        sort_order: None,
+                        endpoint: toasty::Deferred::default(),
+                        group: toasty::Deferred::default(),
+                    });
+                }
+            }
+            slice.links.extend(row.links.iter().cloned());
+            if geo.len() < want_ips
+                && let Some(addrs) = resolutions.get(&row.endpoint.id)
+            {
+                for (ip, country) in addrs {
+                    if let Some(iso) = country {
+                        geo.push((row.endpoint.id, *ip, iso.clone()));
+                    }
+                }
+            }
+        }
+        offset += PROFILES_PAGE_SIZE;
+    }
+    geo.truncate(want_ips);
+    if geo.len() < want_ips {
+        println!(
+            "note: only {} of {want_ips} address rows carry a country in the walked slice; the geo rows use what exists",
+            geo.len()
+        );
+    }
+    println!(
+        "slice: {} links, {} endpoints, {} protocols, {} group links, {} address rows (group {:?})",
+        slice.links.len(),
+        slice.endpoints.len(),
+        slice.protocols.len(),
+        slice.group_links.len(),
+        geo.len(),
+        group_id,
+    );
+    if slice.is_empty() {
+        println!("SKIP flow_cost_contention: measure db has no links to replay");
+        return;
+    }
+
+    let mut out: Vec<TableRow> = Vec::new();
+    let mut failures = 0usize;
+    let mut arm_import = ArmFailures::new("seq import tx");
+    let mut arm_geo_batch = ArmFailures::new("seq geo flush BATCHED");
+    let mut arm_geo_solo = ArmFailures::new("seq geo PER-ADDRESS (pre-fix)");
+    let mut arm_geo_fan = ArmFailures::new("fan-in geo PER-ADDRESS");
+    let mut arm_mix = ArmFailures::new("fan-in import+geo");
+
+    // Hoisted out of every timed region: cloning the slice once per writer per
+    // repetition would rival the collision this row exists to quantify.
+    let slice = Arc::new(slice);
+    let geo = Arc::new(geo);
+    // One transaction == one production-shaped batch (~`links_per_tx` links and
+    // the endpoint/protocol/group rows that belong to them), NOT the whole slice.
+    let batches: Vec<Arc<ImportBatch>> = split_batches(&slice, import_tx, links_per_tx)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    let families = format!(
+        "{}ep/{}proto/{}gl per tx",
+        batches.first().map_or(0, |b| b.endpoints.len()),
+        batches.first().map_or(0, |b| b.protocols.len()),
+        batches.first().map_or(0, |b| b.group_links.len()),
+    );
+
+    // 1. sequential import transaction
+    let mut acc = Acc::new();
+    for _ in 0..reps {
+        for batch in &batches {
+            let started = Instant::now();
+            let r = write_import_once(Arc::clone(&db), Arc::clone(batch)).await;
+            acc.add(started.elapsed());
+            failures += usize::from(r.is_err());
+            arm_import.record(r.is_ok());
+        }
+    }
+    if !arm_import.report() {
+        out.push(acc.row(&format!("seq import tx (4 families {families})"), 1.0));
+    }
+
+    // 2. sequential geo flush — skipped, not fatal, when no country is stored
+    let mut acc = Acc::new();
+    for _ in 0..reps {
+        for rows in geo.chunks(rows_per_flush) {
+            let started = Instant::now();
+            let r = db.set_endpoint_ip_countries(rows).await;
+            acc.add(started.elapsed());
+            failures += usize::from(r.is_err());
+            arm_geo_batch.record(r.is_ok());
+        }
+    }
+    if geo.is_empty() {
+        println!("note: no persisted country rows; the geo rows are not meaningful");
+    } else {
+        if !arm_geo_batch.report() {
+            out.push(acc.row(
+                &format!("seq geo flush BATCHED ({rows_per_flush} rows)"),
+                1.0,
+            ));
+        }
+    }
+
+    // 2b. **Pre-fix** geo arm: the PER-ADDRESS writer `enrich.rs:444` used and
+    // that T7 replaces. The batched row above is already the FIXED writer, so
+    // without this arm the lab would measure only healthy code and T7 would have
+    // no before. Small N on purpose: production ran p99 ~1,051 ms per address,
+    // so 20 rows is already a multi-second measurement.
+    let geo_singular = env_usize("XRAY_TUI_MEASURE_GEO_SINGULAR_ROWS", 20);
+    if geo_singular > 0 && !geo.is_empty() {
+        let take = geo_singular.min(geo.len());
+        let mut acc = Acc::new();
+        for (endpoint_id, ip, iso) in geo.iter().take(take) {
+            let started = Instant::now();
+            let r = db.set_endpoint_ip_country(*endpoint_id, *ip, iso).await;
+            acc.add(started.elapsed());
+            failures += usize::from(r.is_err());
+            arm_geo_solo.record(r.is_ok());
+        }
+        if !arm_geo_solo.report() {
+            out.push(acc.row("seq geo PER-ADDRESS (pre-fix writer)", 1.0));
+        }
+    }
+
+    // 2c. **Pre-fix writer, CONCURRENTLY** — the arm that can actually reach the
+    // failure regime. Aborts scale with the number of *concurrent* transactions,
+    // not with the number of rows: 2b awaits one `set_endpoint_ip_country` at a
+    // time, so it is a single writer and can never collide, and row 3 fans out
+    // the BATCHED writer, which opens one transaction per flush. Production's
+    // 88 `snapshot is stale` aborts and 10 `busy_timeout` drops came from ~1,000
+    // overlapping single-row write transactions — this is the only row that
+    // recreates that shape, and therefore the only one T12's WAL-vs-MVCC
+    // decision can be read against.
+    let geo_fanin = env_usize("XRAY_TUI_MEASURE_GEO_FANIN_TASKS", 16).max(1);
+    if geo_singular > 0 && !geo.is_empty() {
+        let take = geo_singular.min(geo.len());
+        let rows: Vec<_> = geo.iter().take(take).cloned().collect();
+        let mut acc = Acc::new();
+        for _ in 0..reps {
+            let started = Instant::now();
+            let mut set = tokio::task::JoinSet::new();
+            for shard in rows.chunks(rows.len().div_ceil(geo_fanin).max(1)) {
+                let db = Arc::clone(&db);
+                let shard = shard.to_vec();
+                set.spawn(async move {
+                    let mut local = 0usize;
+                    for (endpoint_id, ip, iso) in &shard {
+                        local += usize::from(
+                            db.set_endpoint_ip_country(*endpoint_id, *ip, iso)
+                                .await
+                                .is_err(),
+                        );
+                    }
+                    local
+                });
+            }
+            let before = failures;
+            while let Some(joined) = set.join_next().await {
+                failures += joined.unwrap_or(0);
+            }
+            arm_geo_fan.samples += rows.len();
+            arm_geo_fan.failures += failures - before;
+            acc.add(started.elapsed());
+        }
+        if !arm_geo_fan.report() {
+            out.push(acc.row(
+                &format!("fan-in geo PER-ADDRESS / {geo_fanin} writers (pre-fix)"),
+                1.0,
+            ));
+        }
+    }
+
+    // 3. fan-in: import and geo writers OVERLAPPING, the production shape.
+    // `batches` is shared, not moved: the closure captures it by reference, so a
+    // second repetition would otherwise find it gone.
+    let batches = Arc::new(batches);
+    let mut acc = Acc::new();
+    for _ in 0..reps {
+        let started = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..fanin {
+            let db = Arc::clone(&db);
+            let batches = Arc::clone(&batches);
+            let geo = Arc::clone(&geo);
+            set.spawn(async move {
+                let mut local = 0usize;
+                for batch in batches.iter() {
+                    local += usize::from(
+                        write_import_once(Arc::clone(&db), Arc::clone(batch))
+                            .await
+                            .is_err(),
+                    );
+                }
+                for rows in geo.chunks(rows_per_flush) {
+                    local += usize::from(db.set_endpoint_ip_countries(rows).await.is_err());
+                }
+                local
+            });
+        }
+        // Samples are counted UNCONDITIONALLY. Counting them only on a clean
+        // round made any arm with one failure report "NO SAMPLES" and drop the
+        // row — losing the measurement exactly when a partial failure is the
+        // interesting result.
+        arm_mix.samples += fanin * batches.len();
+        let before = failures;
+        while let Some(joined) = set.join_next().await {
+            failures += joined.unwrap_or(0);
+        }
+        arm_mix.failures += failures - before;
+        acc.add(started.elapsed());
+    }
+    if !arm_mix.report() {
+        out.push(acc.row(&format!("fan-in import+geo mix / {fanin} writers"), 1.0));
+    }
+
+    // 4. link-writer flush on a wall-clock ARRIVAL schedule. The metric is
+    // rows-per-flush, and arrival rate is what sets it.
+    if slice.links.len() >= 2 {
+        let writer = crate::ops::link_writer::LinkWriter::with_defaults(Arc::clone(&db));
+        let task = writer.spawn_flush_task();
+        let arrivals: Vec<ProfileStats> = slice.links.iter().take(trickle_rows).cloned().collect();
+        let gap = Duration::from_secs_f64(1.0 / trickle_rps as f64);
+        let schedule_started = Instant::now();
+        for link in &arrivals {
+            writer.stage(link, xray_tui_db::LinkGroups::RESULT);
+            tokio::time::sleep(gap).await;
+        }
+        let drain_deadline = Instant::now() + Duration::from_secs(30);
+        while writer.staged_len() > 0 && Instant::now() < drain_deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // Drain what the 30 s deadline left, BEFORE aborting: aborting mid-flush
+        // can leave a partially-written window in a file the next run re-opens.
+        if writer.staged_len() > 0 {
+            writer.flush().await.expect("final trickle flush");
+        }
+        let flushes = writer.flush_count();
+        let elapsed = schedule_started.elapsed();
+        let staged_left = writer.staged_len();
+        task.abort();
+        if staged_left > 0 {
+            println!(
+                "  arm {:<44} {staged_left} rows still staged after the final flush — DISCARD",
+                "flush trickle"
+            );
+        }
+        let n = arrivals.len();
+        out.push(TableRow {
+            // ns here is the ARRIVAL-SCHEDULE wall (the sum of the sleeps), NOT a
+            // per-flush cost. `n` carries the flush count, and the ratio printed
+            // below is the number this row exists for.
+            name: format!("flush trickle WALL ({n} rows @ {trickle_rps}/s) -> flushes"),
+            ns: elapsed.as_nanos() as f64,
+            n: u32::try_from(flushes).unwrap_or(u32::MAX),
+        });
+        println!(
+            "\nlink writer: {n} arrivals @ {trickle_rps}/s over {elapsed:?} -> {flushes} flushes ({:.2} rows/flush, {staged_left} staged left)",
+            n as f64 / flushes.max(1) as f64,
+        );
+    }
+
+    print_table("contention: import + geo + link-writer mix", &out);
+    println!("\nwrite failures: {failures}");
+}
+
+/// Seed `XRAY_TUI_MEASURE_DB` with a synthetic feed of `XRAY_TUI_MEASURE_SEED`
+/// endpoints, so `flow_cost_contention` can be run against a WAL database and
+/// against an MVCC one **without touching a real feed**.
+///
+/// MVCC needs a FRESH file created with `XRAY_TUI_TURSO_CONCURRENT_WRITES=1`:
+/// an existing file keeps its `read_version` and stays WAL. So the two arms are
+/// seeded separately, each into a file that does not exist yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "perf lab: run explicitly with --ignored"]
+async fn flow_cost_seed_measure_db() {
+    let Ok(path) = std::env::var("XRAY_TUI_MEASURE_DB") else {
+        println!("SKIP flow_cost_seed_measure_db: set XRAY_TUI_MEASURE_DB");
+        return;
+    };
+    let n = env_usize("XRAY_TUI_MEASURE_SEED", 74_014);
+    // PROTOCOLS PER ENDPOINT, not a total: `synth_rows` is (endpoints,
+    // protocols-per-endpoint), so passing a total here would ask for
+    // endpoints x protocols rows and never finish.
+    let protos_per_endpoint = env_usize("XRAY_TUI_MEASURE_SEED_PROTOS", 1);
+    let mut state = test_state(Vec::new()).await;
+    state.db = Arc::new(
+        xray_tui_db::Database::open(&path)
+            .await
+            .expect("open seed db"),
+    );
+    let rows = synth_rows(n, protos_per_endpoint);
+    seed_db(&mut state, &rows).await;
+    // Address rows too. Without them the contention mix skips its geo half
+    // entirely ("no persisted country rows") — and the geo writer is the one
+    // that produced the 2026-10-01 contention, so an A/B without it would
+    // measure only the import arm.
+    let addrs: Vec<(xray_tui_db::models::EndpointId, std::net::IpAddr, String)> = (1..=n as i64)
+        .map(|i| {
+            (
+                xray_tui_db::models::EndpointId::new(i),
+                std::net::IpAddr::from([
+                    10,
+                    (i / 65536) as u8,
+                    ((i / 256) % 256) as u8,
+                    (i % 256) as u8,
+                ]),
+                "ZZ".to_owned(),
+            )
+        })
+        .collect();
+    state
+        .db
+        .set_endpoint_ip_countries(&addrs)
+        .await
+        .expect("address rows");
+    println!(
+        "seeded {path}: {n} endpoints x {protos_per_endpoint} protocols, journal mode {}",
+        if state.db.uses_concurrent_writes() {
+            "MVCC"
+        } else {
+            "WAL"
+        },
+    );
+}
+
+/// Time the per-row `upsert_protocols_bulk` against its multi-row sibling's
+/// scale. `upsert_protocols_bulk` is still ONE TYPED UPSERT PER ROW — the third
+/// import family T6 deliberately deferred — so this is the cost of the writer
+/// that no journal mode can make fast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "perf lab: run explicitly with --ignored"]
+async fn flow_cost_protocol_writer_cost() {
+    let n = env_usize("XRAY_TUI_MEASURE_SEED_PROTOS", 200);
+    let mut state = test_state(Vec::new()).await;
+    let rows = synth_rows(n, n);
+    let protocols: Vec<xray_tui_db::models::Protocol> = rows
+        .iter()
+        .flat_map(|r| r.protocols.values().cloned())
+        .collect();
+    println!("probing {} protocols", protocols.len());
+    let started = Instant::now();
+    let mut conn = state.db.connection().await.expect("conn");
+    let mut tx = conn.transaction().await.expect("tx");
+    xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols)
+        .await
+        .expect("protocols");
+    tx.commit().await.expect("commit");
+    let elapsed = started.elapsed();
+    let rows = protocols.len().max(1);
+    println!(
+        "upsert_protocols_bulk (PER ROW): {rows} protocols in {elapsed:?} = {:.1} us/row",
+        elapsed.as_secs_f64() * 1e6 / rows as f64,
+    );
 }

@@ -62,3 +62,16 @@ Code change required. A driver-construction flag cannot solve the reported long 
 - Passive checkpoint incompatibility is handled by skipping the WAL checkpoint for MVCC handles; no nonexistent driver flag is called.
 - MVCC reader overhead may affect reload latency.
 - Default fresh-file mode remains WAL after the negative A/B. Keep MVCC opt-in/recreated-only until a real contention-heavy benchmark proves its benefit exceeds the tax; otherwise retire the mode rather than adding another fallback layer.
+
+## Outcome (2026-10-02)
+
+**CLOSED — WAL stays the default.** The production-workload benchmark this plan left open was run
+NON-DESTRUCTIVELY on synthetic feeds rather than by wiping the 74,014-endpoint database: WAL is
+1.2-4.8x FASTER than MVCC at 32 concurrent writers (72.3 ms vs 15.0 ms on the contention row), with
+identical failures, against this plan's own recorded tax of wall +32% / import p50 +47%.
+
+The contention MVCC existed to remove has been addressed at the source instead (link-writer
+1,167 -> 32 commits per batch; import ~409k -> ~774 statements; country writes one transaction per
+drain; the 3 s write-lock-holding scan is now a plain read). See
+`specs/2026-09-24-turso-mvcc-rollout-design.md` §12 for the table and the measurement's honest
+limits.

@@ -316,8 +316,11 @@ pub fn update_group_subscriptions(state: &mut AppState, group_id: &str) {
     let user_agent = group.user_agent.unwrap_or_else(|| "xray-tui/0.1".into());
     let db = state.db.clone();
     let validation: ValidationSettings = state.config.parsing.clone().into();
+    // The feed ceilings are configuration, not constants baked into the import
+    // path (`specs/2026-10-02-import-budget-design.md`).
+    let budget = state.config.import;
     tokio::spawn(async move {
-        update_one_group(url, user_agent, gid, db, validation, tx).await;
+        update_one_group(url, user_agent, gid, db, validation, budget, tx).await;
     });
 }
 
@@ -332,6 +335,9 @@ async fn update_one_group(
     gid: String,
     db: Arc<Database>,
     validation: ValidationSettings,
+    // The feed ceilings are configuration, not constants baked into the import
+    // path (`specs/2026-10-02-import-budget-design.md`).
+    import_budget: xray_tui_config::app_config::ImportConfig,
     tx: Option<tokio::sync::mpsc::Sender<CoreEvent>>,
 ) {
     let Some(flight) = InFlightGuard::acquire(&gid) else {
@@ -347,7 +353,15 @@ async fn update_one_group(
     };
     let result = tokio::time::timeout(
         std::time::Duration::from_mins(30),
-        do_update_subscription(url, user_agent, gid.clone(), db, validation, &flight),
+        do_update_subscription(
+            url,
+            user_agent,
+            gid.clone(),
+            db,
+            validation,
+            import_budget,
+            &flight,
+        ),
     )
     .await;
     if let Ok(inner) = result {
@@ -388,6 +402,7 @@ async fn do_update_subscription(
     group_id: String,
     db: Arc<Database>,
     validation: ValidationSettings,
+    budget: xray_tui_config::app_config::ImportConfig,
     _flight: &InFlightGuard,
 ) -> (String, usize, ValidationSummary, Option<String>) {
     // Warn on HTTP (non-HTTPS) subscription URLs
@@ -403,9 +418,30 @@ async fn do_update_subscription(
         &db,
         Some(&group_id),
         &validation,
+        budget,
     )
     .await;
-    tracing::info!(target: "tui::ops::subscriptions", "DB upsert succeeded: {} links, {} errors, {} insecure-profile warnings", outcome.links, outcome.summary.total_errors, outcome.summary.security_warning_count);
+    // `links` counts only what was STORED. A run that dropped a batch, or hit a
+    // budget, stored less than it parsed — so "succeeded" is only true for a
+    // clean run, and the reason travels in the same line rather than only in the
+    // group row the user may never open.
+    if let Some(reason) = outcome.ended_early.as_deref() {
+        tracing::warn!(
+            target: "tui::ops::subscriptions",
+            "DB upsert INCOMPLETE: {} links stored, {} errors, {} insecure-profile warnings — {reason}",
+            outcome.links,
+            outcome.summary.total_errors,
+            outcome.summary.security_warning_count,
+        );
+    } else {
+        tracing::info!(
+            target: "tui::ops::subscriptions",
+            "DB upsert succeeded: {} links, {} errors, {} insecure-profile warnings",
+            outcome.links,
+            outcome.summary.total_errors,
+            outcome.summary.security_warning_count,
+        );
+    }
 
     record_import_result(&db, &group_id, &outcome).await;
 
@@ -416,7 +452,16 @@ async fn do_update_subscription(
 /// The user-facing statement of a truncated import: that it was cut short and
 /// how many links survived. One owner, so the group row's `error_message` and
 /// the `SubscriptionsUpdated` log line cannot drift apart.
-fn partial_import_message(outcome: &ImportOutcome) -> Option<String> {
+/// Test seam: the same owner the group row and the log line read. `cfg(test)`
+/// because only the import tests call it, and it would otherwise be dead code
+/// in a lib build.
+#[cfg(test)]
+pub(crate) fn partial_import_message_for_test(outcome: &ImportOutcome) -> String {
+    partial_import_message(outcome).unwrap_or_default()
+}
+
+#[must_use]
+pub(crate) fn partial_import_message(outcome: &ImportOutcome) -> Option<String> {
     outcome.ended_early.as_ref().map(|reason| {
         format!(
             "subscription import ended early after {} link(s) stored — the feed is incomplete, stored rows were kept: {reason}",
@@ -599,6 +644,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
     let tx = state.core_event_tx.clone();
     let db = state.db.clone();
     let validation: ValidationSettings = state.config.parsing.clone().into();
+    let budget = state.config.import;
     for (gid, _url, _ua) in &groups {
         state.updating_groups.insert(gid.clone());
     }
@@ -611,6 +657,7 @@ pub fn update_all_subscriptions(state: &mut AppState) {
                 gid,
                 db.clone(),
                 validation.clone(),
+                budget,
                 tx.clone(),
             )
             .await;
@@ -673,6 +720,7 @@ pub fn spawn_auto_update(state: &mut AppState) {
                     gid.clone(),
                     db.clone(),
                     validation.clone(),
+                    Default::default(),
                     &flight,
                 )
                 .await;

@@ -254,6 +254,7 @@ pub fn render_route_event(ev: &xray_tui_route::RouteEvent) -> crate::LogLine {
         level: "info".into(),
         target: "route".into(),
         message: msg,
+        detail: None,
         timestamp_nanos: at.as_second() * 1_000_000_000 + i64::from(at.subsec_nanosecond()),
     }
 }
@@ -445,6 +446,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 target,
                 level,
                 message,
+                detail,
                 timestamp_nanos,
                 persisted,
             } => {
@@ -469,6 +471,9 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     level: level.to_lowercase(),
                     target,
                     message,
+                    // The live line keeps its structured fields; the heed copy
+                    // deliberately does not.
+                    detail,
                     timestamp_nanos,
                 });
                 if state.log_cache.len() > 10_000 {
@@ -501,7 +506,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
             } => {
                 state.updating_groups.remove(&group_id);
                 if summary.total_errors > 0 || summary.security_warning_count > 0 {
-                    let msg = format!(
+                    let mut msg = format!(
                         "Subscription validation: {} error(s) (missing fields: {}, host validation: {}, other: {}), {} warning(s) (profiles with insecure=true)",
                         summary.total_errors,
                         summary.missing_field_count,
@@ -509,6 +514,19 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         summary.other_count,
                         summary.security_warning_count,
                     );
+                    // WHY, not just how many. The counters alone left the
+                    // 2026-10-01 run's `1 links, 1 errors` subscription
+                    // undiagnosable — it failed 4/4 with every bucket zero
+                    // except `other`, and the reason was discarded at the parse
+                    // site. Bounded: a 90k-link feed must not become a wall.
+                    if !summary.sample_errors.is_empty() {
+                        msg.push_str(" — first reasons: ");
+                        msg.push_str(&summary.sample_errors.join("; "));
+                        if summary.sample_errors_omitted > 0 {
+                            use std::fmt::Write as _;
+                            let _ = write!(msg, " (+{} more)", summary.sample_errors_omitted);
+                        }
+                    }
                     state.log_trace("warn", "tui::ops::subscriptions", &msg);
                 }
                 if let Some(err) = error {
@@ -788,6 +806,21 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // progress itself and re-arms the flag when it ends.
                 if state.testing_profiles.is_empty() && state.batch_progress.is_none() {
                     state.speed_test_stop.store(false, Ordering::Relaxed);
+                    // The last SINGLE (non-batch) test has settled. A batch
+                    // flushes at `finish_batch`, and a manual ping stages 1-3
+                    // column groups — far below the timer floor — so nothing
+                    // would write it before `max_staged_age` (15 s). The Test
+                    // cell already shows the result (patched in memory), so the
+                    // lag is invisible until a reload or restart.
+                    //
+                    // WAKE, do not flush: `draining_results_performs_no_commit_
+                    // on_the_ui_task` is a standing guard that draining a result
+                    // must not commit on the UI task. The background loop's
+                    // size-trigger arm always writes, so waking it gets the
+                    // latency without the commit. The `batch_progress` guard
+                    // keeps this out of the batch path, where T3's coalescing is
+                    // the point.
+                    state.link_writer.flush_soon();
                 }
 
                 // Real ping happened — record the exit IP + country on the

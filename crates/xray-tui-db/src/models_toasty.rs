@@ -106,6 +106,40 @@ pub enum HostType {
     Undefined,
 }
 
+impl HostType {
+    /// The `host_type` column's stored spelling — the **embed derive's**
+    /// `snake_case` of the Rust variant ident, which is NEITHER `Debug` NOR any
+    /// wire form. Verified against the 2026-10-01 feed: `ipv4`, `dns`, `ipv6`
+    /// across 74,014 endpoints, no other spelling present.
+    ///
+    /// This exists because the raw multi-row import writer needs the label and
+    /// the typed upsert cannot supply it. A wrong label does not fail the
+    /// write — `host_type` is unconstrained text — it silently mis-classifies the
+    /// endpoint, so the DNS gate starts disagreeing with the row.
+    #[must_use]
+    pub const fn as_db_label(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Dns => "dns",
+            Self::Undefined => "undefined",
+        }
+    }
+
+    /// Parse a stored label back, accepting only what [`Self::as_db_label`]
+    /// writes. The round-trip is pinned by a test against a real database.
+    #[must_use]
+    pub fn from_db_label(label: &str) -> Option<Self> {
+        match label {
+            "ipv4" => Some(Self::Ipv4),
+            "ipv6" => Some(Self::Ipv6),
+            "dns" => Some(Self::Dns),
+            "undefined" => Some(Self::Undefined),
+            _ => None,
+        }
+    }
+}
+
 /// How a protocol row was configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum ConfigType {

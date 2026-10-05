@@ -34,6 +34,7 @@ async fn streaming_import_real_feed_completes() {
         &db,
         None,
         &validation,
+        Default::default(),
     )
     .await;
     let t_all = t0.elapsed();

@@ -400,6 +400,24 @@ impl TaskScheduler {
         false
     }
 
+    /// A stamp that changes whenever this endpoint's DNS-deferral state is
+    /// RE-ARMED — a lookup starts, or a fresh failure window opens.
+    ///
+    /// `defer_retry`'s budget is a wall clock from its first deferral, while
+    /// the state it waits on is re-armed at report time. A stamp lets the retry
+    /// restart that clock when the state moves, so a host that fails twice
+    /// inside one batch is not booked unprobed by a clock that started before
+    /// the second failure existed. `None` when the endpoint carries no DNS
+    /// state at all (not deferred by DNS).
+    pub fn dns_state_stamp(&self, endpoint: EndpointId) -> Option<i64> {
+        if let Some(pending) = self.dns_pending.get(&endpoint) {
+            return Some(pending.as_second());
+        }
+        self.dns_failures
+            .get(&endpoint)
+            .map(|entry| entry.as_second())
+    }
+
     /// Drop all DNS-failure entries older than the deferral window.
     fn sweep_dns_failures(&self, now: Timestamp) {
         let defer_secs = self.dns_defer_secs.load(Ordering::Relaxed);

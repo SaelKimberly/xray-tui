@@ -269,6 +269,63 @@ impl HeedLogStorage {
         Ok(results)
     }
 
+    /// Read EVERY entry strictly older than `before_ns`, paging backwards by
+    /// `page` so one call cannot build an unbounded `Vec`, and returning them in
+    /// **chronological order** (oldest first).
+    ///
+    /// This exists for EXPORT. `read_older_than` is a paged backward read for the
+    /// Logs panel's scrollback and is fine for that, but nothing could read the
+    /// whole store in one go — so an export had to be built from the in-memory
+    /// cache, which is seeded with the 500 newest entries and only grows
+    /// forward. The 2026-10-01 dump was 575 of 1,313 stored lines (44%) with no
+    /// indication that anything was missing.
+    ///
+    /// `cap` bounds the WORK, not just the result: paging **stops** once the cap
+    /// is reached, so a store larger than `cap` is never materialized in full.
+    /// The result is truncated to `cap`; a caller that cares can tell by
+    /// comparing `len()` against it.
+    pub fn read_all_older_than(
+        &self,
+        before_ns: u64,
+        page: usize,
+        cap: usize,
+    ) -> Result<Vec<LogMessage>> {
+        let page = page.max(1);
+        let mut out: Vec<LogMessage> = Vec::new();
+        let mut cursor = before_ns;
+        while out.len() < cap {
+            let want = page.min(cap - out.len());
+            let batch = self.read_older_than(cursor, want)?;
+            if batch.is_empty() {
+                break;
+            }
+            // `read_older_than` is newest-first within its range, so the LAST
+            // element is the oldest of the page and the next cursor.
+            let oldest = batch.last().map_or(0, |m| m.timestamp_nanos);
+            out.extend(batch);
+            if oldest == 0 || oldest >= cursor {
+                break; // reached the start of the store, or no progress
+            }
+            cursor = oldest;
+        }
+        out.truncate(cap);
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Async wrapper for [`Self::read_all_older_than`], for the export path.
+    pub async fn read_all_older_than_async(
+        self: &Arc<Self>,
+        before_ns: u64,
+        page: usize,
+        cap: usize,
+    ) -> Result<Vec<LogMessage>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.read_all_older_than(before_ns, page, cap))
+            .await
+            .map_err(|e| HeedError::Txn(e.to_string()))?
+    }
+
     /// Read entries strictly newer than `after_ns` (newest-first within range).
     pub fn read_newer_than(&self, after_ns: u64, limit: usize) -> Result<Vec<LogMessage>> {
         let rtxn = self
@@ -532,6 +589,87 @@ mod tests {
         assert_eq!(recent[0].target, "my_target");
         assert_eq!(recent[0].message, "test error");
         assert_eq!(recent[0].timestamp_nanos, 500);
+    }
+
+    /// The EXPORT read must return the WHOLE store in chronological order,
+    /// across page boundaries — that is the property the 2026-10-01 export
+    /// lacked, when it copied a 500-entry cache and produced 575 of 1,313
+    /// stored lines.
+    #[test]
+    fn read_all_older_than_spans_every_page_in_order() {
+        let dir = tempdir().expect("tempdir");
+        let store = HeedLogStorage::new(dir.path()).expect("new");
+        // 1,250 entries in 5 pages of 250 — deliberately NOT a page multiple.
+        for i in 0..1_250u64 {
+            store
+                .write_log_batch(&[make_msg(1_000 + i, i as usize)])
+                .expect("write");
+        }
+        let all = store
+            .read_all_older_than(u64::MAX, 250, 10_000)
+            .expect("read all");
+        assert_eq!(
+            all.len(),
+            1_250,
+            "every stored entry must be returned, not one page of it",
+        );
+        // Chronological: oldest first, ascending.
+        assert!(
+            all.windows(2)
+                .all(|w| w[0].timestamp_nanos < w[1].timestamp_nanos),
+            "results must be in ascending timestamp order",
+        );
+        assert_eq!(all.first().map(|m| m.timestamp_nanos), Some(1_000));
+        assert_eq!(all.last().map(|m| m.timestamp_nanos), Some(2_249));
+    }
+
+    /// The RESULT is capped, so an export of a store far larger than the cap
+    /// does not hand the clipboard a multi-million-line string.
+    ///
+    /// What this does NOT pin: that paging *stops* (the work bound). With
+    /// `out.truncate(cap)` still in place, replacing the loop's `out.len() < cap`
+    /// with an unbounded condition leaves this test green — verified by
+    /// falsification. The work bound is the loop condition, so it is a reading
+    /// claim, not a tested one.
+    #[test]
+    fn read_all_older_than_stops_at_the_cap() {
+        let dir = tempdir().expect("tempdir");
+        let store = HeedLogStorage::new(dir.path()).expect("new");
+        for i in 0..600u64 {
+            store
+                .write_log_batch(&[make_msg(1_000 + i, i as usize)])
+                .expect("write");
+        }
+        let capped = store
+            .read_all_older_than(u64::MAX, 100, 250)
+            .expect("read capped");
+        assert_eq!(capped.len(), 250, "the cap must bound the result");
+        // The KEPT entries are the NEWEST ones (the cap stops the backward walk),
+        // still in ascending order.
+        assert!(
+            capped
+                .windows(2)
+                .all(|w| w[0].timestamp_nanos < w[1].timestamp_nanos),
+            "still chronological",
+        );
+        assert_eq!(
+            capped.last().map(|m| m.timestamp_nanos),
+            Some(1_599),
+            "the walk stops at the cap, keeping the newest entries",
+        );
+    }
+
+    /// A one-page store must terminate rather than loop: the cursor must stop
+    /// when it can no longer move backwards.
+    #[test]
+    fn read_all_older_than_terminates_on_a_small_store() {
+        let dir = tempdir().expect("tempdir");
+        let store = HeedLogStorage::new(dir.path()).expect("new");
+        store.write_log_batch(&[make_msg(10, 0)]).expect("write");
+        let all = store
+            .read_all_older_than(u64::MAX, 5_000, 10_000)
+            .expect("read");
+        assert_eq!(all.len(), 1);
     }
 
     #[test]

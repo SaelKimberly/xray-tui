@@ -45,6 +45,12 @@ static SINGLE_TEST_SEMAPHORE: std::sync::LazyLock<Semaphore> =
 /// (`default_real_ping_concurrency` in `xray-tui-config`), repeated because the
 /// warning below is only actionable against it — the config file's own value is
 /// what a stale override silently replaces.
+/// First re-entry poll for a DNS-deferred half; it doubles up to the deferral
+/// window. The window is the MAXIMUM wait, never the poll interval: a flat
+/// short poll would be ~60 gate acquisitions per deferred half, and with
+/// 1,577 deferred halves ~95k spurious dispatches per batch.
+const DEFER_POLL_MIN: Duration = Duration::from_millis(250);
+
 const REAL_CONCURRENCY_DEFAULT: u32 = 100;
 
 /// Below this, a real phase is throughput-bound rather than feed-bound. A real
@@ -1979,13 +1985,48 @@ impl BatchShared {
         // Bounded by WAITED TIME, not by attempt count: the poll interval and
         // the window are independent (the tests poll every 50ms against a 2s
         // window), so any fixed attempt count is either too small to outlast a
-        // real window or too large to catch a leak promptly.
-        let budget =
-            Duration::from_secs(self.sched.dns_defer_secs().max(1) as u64).saturating_mul(2);
+        //
+        // The budget must provably exceed the worst time a lookup can take to
+        // REPORT, because `mark_dns_failure` arms its window at report time
+        // while this clock starts at the FIRST deferral. The 2026-10-01 run
+        // booked 12 halves unprobed exactly that way: `2 × dns_defer_secs` (30 s)
+        // against a window armed later still open.
+        //
+        // Now that the resolver's permit wait is bounded by
+        // `DNS_LOOKUP_TIMEOUT` (see `enrich::spawn_dns_resolve_host`), report
+        // time is a function of that timeout alone, so
+        // `window + timeout + slack` cannot be beaten.
+        let budget = Duration::from_secs(self.sched.dns_defer_secs().max(1) as u64)
+            .saturating_add(crate::ops::enrich::DNS_LOOKUP_TIMEOUT)
+            .saturating_add(Duration::from_secs(1));
         let mut waited = Duration::ZERO;
+        // Backoff schedule for the re-entry polls: 250 ms, then doubling, capped
+        // at the deferral window. NOT a flat 250 ms — that would be ~60 gate
+        // acquisitions per deferred half, and with 1,577 deferred halves ~95k
+        // spurious dispatches per batch, which is the very contention the
+        // original full-window sleep avoided. Capped at the window so gate
+        // pressure stays ~6 acquisitions per half rather than 60.
+        let window = Duration::from_secs(self.sched.dns_defer_secs().max(1) as u64);
+        // Seeded from `defer_delay` (the test seam) but never above
+        // `DEFER_POLL_MIN`: production sets `defer_delay` to the whole window,
+        // and sleeping that first is the 15 s floor this task removes.
+        let mut backoff = self
+            .defer_delay
+            .min(DEFER_POLL_MIN)
+            .max(Duration::from_millis(1));
+        // The budget is a wall clock from the FIRST deferral, but the state it
+        // waits on is re-armed at report time — a lookup that starts (or fails)
+        // again mid-batch moves that state forward. Without this, a host that
+        // fails twice inside one batch is booked unprobed by a clock that
+        // started before the second failure existed: the fixed budget formula
+        // cannot express that, which is why the stamp is polled here.
+        let mut seen_stamp = self.sched.dns_state_stamp(link.endpoint_id);
         loop {
-            tokio::time::sleep(self.defer_delay).await;
-            waited = waited.saturating_add(self.defer_delay);
+            tokio::time::sleep(backoff).await;
+            waited = waited.saturating_add(backoff);
+            // Double, capped at the deferral window: past that, polling more
+            // often cannot help, and the window is what bounds the wait.
+            backoff = (backoff.saturating_mul(2)).min(window);
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1996,14 +2037,21 @@ impl BatchShared {
             if reached_gate {
                 break;
             }
+            // The deferral state moved: this is a NEW wait, not more of the old
+            // one, so the budget starts again rather than being cut off.
+            let now_stamp = self.sched.dns_state_stamp(link.endpoint_id);
+            if now_stamp != seen_stamp {
+                seen_stamp = now_stamp;
+                waited = Duration::ZERO;
+                continue;
+            }
             if waited >= budget {
                 // The link was counted in its level's `total` when the page
                 // dispatched it, so dropping it here silently would leave the
                 // summary's denominator one above its numerators — the exact
                 // mismatch the per-level meters exist to prevent. Book it as
                 // settled-but-unprobed, under `deferred` (which already means
-                // "the gate refused this link"), and name the endpoint so the
-                // stuck resolution is traceable to a row.
+                // "the gate refused this link").
                 match half {
                     Half::Fast => {
                         self.meters.fast.done.fetch_add(1, Ordering::Relaxed);
@@ -2017,20 +2065,16 @@ impl BatchShared {
                     endpoint_id = link.endpoint_id.get(),
                     half = half.as_str(),
                     waited_ms = waited.as_millis() as u64,
-                    "batch: a half stayed DNS-deferred for {:?} and was booked \
-                     unprobed — this endpoint's resolution state is stuck",
+                    "batch: a half stayed DNS-deferred past {:?} and was booked unprobed — its lookup never reported in time",
                     budget,
                 );
                 break;
             }
-            // Still deferred: the window is whole seconds, so wait it out again
-            // rather than spinning on the gate.
             tracing::debug!(
                 target: "tui::ops::ping",
                 "batch: {} half still DNS-deferred",
                 half.as_str(),
             );
-            tokio::time::sleep(self.defer_delay.min(Duration::from_millis(250))).await;
         }
         if self.pending_deferred.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.settled.notify_waiters();
@@ -4348,6 +4392,86 @@ mod tests {
             h.state.endpoints[0].links[0].latency,
             Some(Latency::Fast { .. })
         ));
+    }
+
+    /// `dns_state_stamp` is the SIGNAL part 3 depends on: it must move when
+    /// the endpoint's DNS state is re-armed, and hold still otherwise. That is
+    /// the whole observable contract of the reset, and it can be tested
+    /// directly — whereas driving it through `defer_retry` cannot discriminate,
+    /// because the budget (`window + DNS_LOOKUP_TIMEOUT + 1s`) always exceeds
+    /// the window by ~9 s, so the link is released at window expiry long before
+    /// the budget could expire. See T9 in the plan: parts 1-3 are accepted
+    /// STRUCTURALLY, and this is the test that carries what can be tested.
+    #[tokio::test]
+    async fn the_dns_state_stamp_moves_exactly_when_the_state_is_re_armed() {
+        let sched = TaskScheduler::new(3, 2);
+        let endpoint = EndpointId::new(7);
+        assert_eq!(
+            sched.dns_state_stamp(endpoint),
+            None,
+            "an endpoint with no DNS state carries no stamp",
+        );
+
+        // A failure opens a window.
+        sched.mark_dns_failure(endpoint);
+        let after_failure = sched.dns_state_stamp(endpoint);
+        assert!(after_failure.is_some(), "a failure must produce a stamp");
+
+        // An in-flight lookup is DNS state too, and overwrites it.
+        //
+        // The stamp is SECOND-granular, matching `is_dns_unresolved`'s own
+        // arithmetic, so a re-arm inside the same second is invisible. That is
+        // acceptable: the budget outlasts the window by ~9 s, so missing one
+        // same-second re-arm cannot expire it. Cross the boundary explicitly
+        // rather than asserting a move the granularity cannot express.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        sched.begin_dns_lookup(endpoint);
+        assert_ne!(
+            sched.dns_state_stamp(endpoint),
+            after_failure,
+            "starting a lookup must move the stamp once a second has passed",
+        );
+        sched.end_dns_lookup(endpoint);
+
+        // The stamp holds STILL when nothing re-arms: a stable stamp is what
+        // lets the budget keep counting instead of restarting every poll.
+        let settled = sched.dns_state_stamp(endpoint);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            sched.dns_state_stamp(endpoint),
+            settled,
+            "an unchanged state must not move the stamp, or the budget would reset forever",
+        );
+    }
+
+    /// The backoff must stay bounded: a flat short poll is ~60 gate
+    /// acquisitions per deferred half, and 1,577 deferred halves made that
+    /// ~95k spurious dispatches per batch — the contention this task removes.
+    /// The schedule is 250 ms doubling to the window, so the FIRST poll is the
+    /// bound on gate pressure before the doubling takes effect.
+    #[test]
+    fn the_deferral_poll_schedule_is_capped_at_the_window() {
+        // Production sets `defer_delay` to the whole window; the loop must clamp
+        // it, never sleep the window first.
+        let window = Duration::from_secs(15);
+        let mut backoff = window.min(DEFER_POLL_MIN).max(Duration::from_millis(1));
+        assert_eq!(backoff, DEFER_POLL_MIN, "the first poll is clamped");
+        // Walk the schedule and count acquisitions over one budget.
+        let budget = window + Duration::from_secs(8) + Duration::from_secs(1);
+        let mut waited = Duration::ZERO;
+        let mut polls = 0usize;
+        loop {
+            waited = waited.saturating_add(backoff);
+            polls += 1;
+            backoff = (backoff.saturating_mul(2)).min(window);
+            if waited >= budget {
+                break;
+            }
+        }
+        assert!(
+            polls <= 10,
+            "a doubling schedule capped at the window must stay near 6-8 polls, got {polls}",
+        );
     }
 
     /// A DNS deferral is a `DnsDeferred` answer from `schedule`, which is

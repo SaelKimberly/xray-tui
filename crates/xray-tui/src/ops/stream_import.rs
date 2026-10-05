@@ -160,6 +160,7 @@ pub async fn run_streaming_import<F>(
     validation: &ValidationSettings,
     batch_size: usize,
     on_progress: Option<&F>,
+    budget: xray_tui_config::app_config::ImportConfig,
 ) -> ImportOutcome
 where
     F: Fn(usize) + Send + Sync,
@@ -167,12 +168,24 @@ where
     // Bound each source chunk: a hung source (open socket, no data) must
     // degrade to a partial result, never hang the import.
     const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
-    // Aggregate budgets for one feed. reqwest transparently decodes gzip, so
-    // `chunk.len()` is the DECODED size: a feed host answering with an
-    // unbounded body (or an endless stream) must be cut off, and a feed that
-    // yields unbounded rows must stop too (finding f12).
-    const MAX_FEED_BYTES: usize = 64 * 1024 * 1024;
-    const MAX_FEED_LINKS: usize = 200_000;
+    // Aggregate budgets for one feed, now CONFIGURABLE
+    // (`specs/2026-10-02-import-budget-design.md`). reqwest transparently
+    // decodes gzip, so `chunk.len()` is the DECODED size: a feed host answering
+    // with an unbounded body (or an endless stream) must be cut off, and a feed
+    // that yields unbounded rows must stop too (finding f12). `0` disables.
+    //
+    // The defaults are the constants that used to live here, so a config with no
+    // `import` section behaves exactly as before.
+    let max_feed_bytes = if budget.max_feed_bytes == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(budget.max_feed_bytes).unwrap_or(usize::MAX)
+    };
+    let max_feed_links = if budget.max_feed_links == 0 {
+        usize::MAX
+    } else {
+        budget.max_feed_links
+    };
     let mut feed_bytes = 0usize;
     let mut batcher = UrlBatcher::new(batch_size);
     let mut summary = ValidationSummary::default();
@@ -181,6 +194,11 @@ where
     // undecodable bytes): the loop still drains what it has, but the caller
     // learns the run was cut short.
     let mut ended_early: Option<String> = None;
+    // URLs that parsed but whose batch could not be persisted after every
+    // retry. Distinct from `links`, which counts only what was STORED, and
+    // from the budget paths: a dropped batch is silent data loss, so it must
+    // surface through `ended_early` like any other short run.
+    let mut dropped_total = 0usize;
     // Deterministic-id dedup across the WHOLE run (protocol rows are shared
     // across endpoints; feeds repeat one protocol config over many servers).
     let mut seen_protocols = std::collections::HashSet::new();
@@ -214,12 +232,12 @@ where
                 }
                 Some(Ok(chunk)) => {
                     feed_bytes = feed_bytes.saturating_add(chunk.len());
-                    if feed_bytes > MAX_FEED_BYTES {
+                    if feed_bytes > max_feed_bytes {
                         tracing::warn!(
                             target: "tui::ops::subscriptions",
-                            "Feed exceeded the {MAX_FEED_BYTES}-byte budget ({feed_bytes} bytes) — stopping with partial results"
+                            "Feed exceeded the {max_feed_bytes}-byte budget ({feed_bytes} bytes) — stopping with partial results"
                         );
-                        ended_early = Some(format!("feed over the {MAX_FEED_BYTES}-byte budget"));
+                        ended_early = Some(format!("feed over the {max_feed_bytes}-byte budget"));
                         break None;
                     }
                     if let Err(e) = batcher.feed(&chunk) {
@@ -242,7 +260,7 @@ where
                 tracing::debug!(target: "tui::ops::subscriptions", "Finalize had undecodable trailing bytes: {e}");
             }
             while let Some(tail) = batcher.take_batch() {
-                let (n, s) = persist_batch(
+                let (n, dropped, s) = persist_batch(
                     db,
                     &tail,
                     group_id,
@@ -253,6 +271,7 @@ where
                 )
                 .await;
                 count += n;
+                dropped_total += dropped;
                 summary.merge(&s);
                 if let Some(cb) = on_progress {
                     cb(count);
@@ -261,7 +280,7 @@ where
             break;
         };
 
-        let (n, s) = persist_batch(
+        let (n, dropped, s) = persist_batch(
             db,
             &batch,
             group_id,
@@ -272,19 +291,31 @@ where
         )
         .await;
         count += n;
+        dropped_total += dropped;
         summary.merge(&s);
         if let Some(cb) = on_progress {
             cb(count);
         }
-        if count > MAX_FEED_LINKS {
+        if count > max_feed_links {
             tracing::warn!(
                 target: "tui::ops::subscriptions",
-                "Feed exceeded the {MAX_FEED_LINKS}-link budget ({count} links) — stopping with partial results"
+                "Feed exceeded the {max_feed_links}-link budget ({count} links) — stopping with partial results"
             );
-            ended_early = Some(format!("feed over the {MAX_FEED_LINKS}-link budget"));
+            ended_early = Some(format!("feed over the {max_feed_links}-link budget"));
             break;
         }
         tokio::task::yield_now().await;
+    }
+
+    if dropped_total > 0 {
+        tracing::error!(
+            target: "tui::ops::subscriptions",
+            "{dropped_total} URL(s) were parsed but NOT stored: every retry of their batch failed",
+        );
+        let base = format!("{dropped_total} URL(s) dropped after failed persists");
+        ended_early = Some(
+            ended_early.map_or_else(|| base.clone(), |reason| format!("{reason}; plus {base}")),
+        );
     }
 
     ImportOutcome {
@@ -305,7 +336,7 @@ async fn persist_batch(
     seen_protocols: &mut std::collections::HashSet<i64>,
     seen_endpoints: &mut std::collections::HashSet<i64>,
     seen_links: &mut std::collections::HashSet<(i64, i64)>,
-) -> (usize, ValidationSummary) {
+) -> (usize, usize, ValidationSummary) {
     let (profiles, batch_summary) =
         xray_tui_config::subscription::parse_url_batch(batch, validation);
 
@@ -380,9 +411,12 @@ async fn persist_batch(
                 "bulk persist failed for a {}-URL batch: {e}",
                 batch.len(),
             );
-            (0, batch_summary)
+            // The batch's URLs are NOT counted, and its loss must reach the
+            // caller: returning `(0, …)` is why a dropped batch used to report a
+            // clean success. The middle value is how many URLs went missing.
+            (0, batch.len(), batch_summary)
         }
-        Ok(()) => (batch_links, batch_summary),
+        Ok(()) => (batch_links, 0, batch_summary),
     }
 }
 
@@ -395,6 +429,7 @@ pub async fn import_http_subscription(
     db: &Arc<Database>,
     group_id: Option<&str>,
     validation: &ValidationSettings,
+    budget: xray_tui_config::app_config::ImportConfig,
 ) -> ImportOutcome {
     // Two budgets, never one total deadline: the total deadline used to cover
     // the whole body AND the consumer's persist work between reads, so a
@@ -432,6 +467,7 @@ pub async fn import_http_subscription(
         validation,
         PERSIST_CHUNK,
         None::<&fn(usize)>,
+        budget,
     )
     .await
 }
@@ -506,6 +542,7 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
+            Default::default(),
         )
         .await;
         assert_eq!(outcome.links, 4, "one link per unique host");
@@ -530,14 +567,87 @@ mod tests {
         let mut source = ScriptedSource {
             chunks: std::iter::once(Ok(huge)),
         };
-        let outcome =
-            run_streaming_import(&mut source, &db, None, &validation, 2, None::<&fn(usize)>).await;
+        let outcome = run_streaming_import(
+            &mut source,
+            &db,
+            None,
+            &validation,
+            2,
+            None::<&fn(usize)>,
+            Default::default(),
+        )
+        .await;
         let reason = outcome.ended_early.expect("budget must end the run early");
         assert!(
             reason.contains("byte budget"),
             "reason must name the budget: {reason}"
         );
         assert_eq!(outcome.links, 0);
+    }
+
+    /// A CONFIGURED byte budget must cut the feed off, and the reason must name
+    /// it — the path the 2026-10-01 run took with the hard-coded constant.
+    #[tokio::test]
+    async fn a_configured_byte_budget_ends_the_run_and_names_itself() {
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+        let mut source = ScriptedSource {
+            chunks: std::iter::once(Ok(bytes::Bytes::from(vec![b'x'; 4096]))),
+        };
+        let budget = xray_tui_config::app_config::ImportConfig {
+            max_feed_bytes: 1024,
+            max_feed_links: 0,
+        };
+        let outcome = run_streaming_import(
+            &mut source,
+            &db,
+            None,
+            &validation,
+            2,
+            None::<&fn(usize)>,
+            budget,
+        )
+        .await;
+        let reason = outcome
+            .ended_early
+            .expect("a configured budget must end the run");
+        assert!(
+            reason.contains("byte budget"),
+            "the reason must name the budget that fired: {reason}",
+        );
+    }
+
+    /// `0` disables a budget. A feed larger than any non-zero ceiling must still
+    /// import whole when the ceiling is 0 — otherwise "unbounded" is a lie and
+    /// the knob is a trap.
+    #[tokio::test]
+    async fn a_zero_budget_is_unbounded() {
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+        let url =
+            "vless://11111111-1111-1111-1111-111111111111@a.example:443?security=tls&type=tcp#n1";
+        let mut source = ScriptedSource {
+            chunks: std::iter::once(Ok(bytes::Bytes::from(url.as_bytes().to_vec()))),
+        };
+        let budget = xray_tui_config::app_config::ImportConfig {
+            max_feed_bytes: 0,
+            max_feed_links: 0,
+        };
+        let outcome = run_streaming_import(
+            &mut source,
+            &db,
+            None,
+            &validation,
+            2,
+            None::<&fn(usize)>,
+            budget,
+        )
+        .await;
+        assert_eq!(
+            outcome.ended_early, None,
+            "a zero budget must not truncate anything",
+        );
+        assert_eq!(outcome.links, 1, "the link must still import");
     }
 
     #[tokio::test]
@@ -564,6 +674,7 @@ mod tests {
             &validation,
             2,
             None::<&fn(usize)>,
+            Default::default(),
         )
         .await;
         assert_eq!(
@@ -580,5 +691,112 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(meta.ids.len(), 2, "no rows after the failure point");
+    }
+
+    /// A dropped batch must reach `ended_early`, so the group row comes back
+    /// `Error` and the "succeeded" line is suppressed.
+    ///
+    /// This is the regression T5 exists for: `persist_batch` returned
+    /// `(0, summary)` on final failure, so `links` under-counted, `ended_early`
+    /// stayed `None`, and the user was told "N profiles" for a feed that had
+    /// silently lost whole 500-URL batches. A budget-exit test does NOT pin this
+    /// — it would still pass with the wiring removed — so the failure is injected
+    /// the way `link_writer`'s own contention tests do it: a second connection
+    /// holds the write lock, so every persist attempt and every retry fails.
+    #[tokio::test]
+    async fn a_dropped_batch_is_reported_not_swallowed() {
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+
+        // Seed one real link so the batch has something to write.
+        let url =
+            "vless://11111111-1111-1111-1111-111111111111@a.example:443?security=tls&type=tcp#n1";
+        let parsed =
+            xray_tui_config::import_export::parse_share_url(url, &validation).expect("parse");
+        for profile in &parsed.parsed.endpoints {
+            let ep = crate::state::endpoint_from_essentials(profile);
+            db.upsert_endpoint(&ep).await.expect("endpoint");
+        }
+
+        // Hold the write lock on a SEPARATE connection: every write the import
+        // attempts now fails, and `retry_on_busy` exhausts all five attempts.
+        let mut blocker = db.connection().await.expect("blocker connection");
+        let mut lock = blocker.transaction().await.expect("lock transaction");
+        toasty::sql::statement("UPDATE profile_stats SET version = version + 0")
+            .exec(&mut lock)
+            .await
+            .expect("take the write lock");
+
+        let mut source = ScriptedSource {
+            chunks: std::iter::once(Ok(bytes::Bytes::from(url.as_bytes().to_vec()))),
+        };
+        let outcome = run_streaming_import(
+            &mut source,
+            &db,
+            None,
+            &validation,
+            1,
+            None::<&fn(usize)>,
+            Default::default(),
+        )
+        .await;
+
+        lock.rollback().await.expect("release the lock");
+        drop(blocker);
+
+        assert_eq!(
+            outcome.links, 0,
+            "nothing could be stored while the lock was held",
+        );
+        let reason = outcome
+            .ended_early
+            .clone()
+            .expect("a dropped batch must be reported, not swallowed");
+        assert!(
+            reason.contains("dropped after failed persists"),
+            "the reason must name the dropped batch: {reason}",
+        );
+        let message = crate::ops::subscriptions::partial_import_message_for_test(&outcome);
+        assert!(
+            message.contains("dropped"),
+            "the user-facing message must say rows were lost: {message}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_run_names_its_reason() {
+        let db = Arc::new(Database::in_memory().await.expect("db"));
+        let validation = ValidationSettings::default();
+        // One chunk over the 64 MiB decode budget: a guaranteed-early exit whose
+        // reason must survive into the outcome and the user-facing message.
+        let huge = bytes::Bytes::from(vec![b'x'; 64 * 1024 * 1024 + 1]);
+        let mut source = ScriptedSource {
+            chunks: std::iter::once(Ok(huge)),
+        };
+        let outcome = run_streaming_import(
+            &mut source,
+            &db,
+            None,
+            &validation,
+            2,
+            None::<&fn(usize)>,
+            Default::default(),
+        )
+        .await;
+
+        let reason = outcome
+            .ended_early
+            .clone()
+            .expect("an early exit must carry a reason");
+        // The message is the ONE owner both the group row and the log line read.
+        let message = crate::ops::subscriptions::partial_import_message_for_test(&outcome);
+        assert!(
+            message.contains(&reason),
+            "the user-facing message must carry the reason: {message}"
+        );
+        assert!(
+            message.contains("stored"),
+            "the message must say what survived, not imply a full feed: {message}"
+        );
     }
 }

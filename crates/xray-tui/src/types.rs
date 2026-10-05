@@ -242,6 +242,9 @@ pub struct LogLine {
     pub level: String,
     pub target: String,
     pub message: String,
+    /// Session-only structured-field rendering. Rendered by the Logs panel and
+    /// never persisted.
+    pub detail: Option<String>,
     pub timestamp_nanos: i64,
 }
 
@@ -495,6 +498,11 @@ pub enum CoreEvent {
         target: String,
         level: String,
         message: String,
+        /// Session-only rendering of every structured field the tracing layer
+        /// captured, INCLUDING `db.params`. It deliberately does not go into
+        /// `LogMessage`: bind values are application data and one of ours
+        /// (`protocols.config`) carries credentials.
+        detail: Option<String>,
         timestamp_nanos: i64,
         persisted: bool,
     },

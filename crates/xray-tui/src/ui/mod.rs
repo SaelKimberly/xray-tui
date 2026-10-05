@@ -83,6 +83,12 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     // the runtime waiting on a reader nobody would ever feed again. Poll in
     // slices and exit on the shutdown flag instead.
     let reader_shutdown = state.shutdown_token.clone();
+
+    // The country drain: one owner for every `(endpoint, address, country)`
+    // write the enrichment fan-out produces. Without it each row opened its own
+    // transaction inside the resolution task (T7).
+    crate::ops::enrich::spawn_geo_drain(state.db.clone(), state.shutdown_token.clone());
+
     tokio::task::spawn_blocking(move || {
         /// Idle poll slice: the quit path waits at most this long for the reader.
         const IDLE_POLL: Duration = Duration::from_millis(200);

@@ -411,3 +411,45 @@
   server answering on UDP/443. Unblocking needs the plugin's source or an upstream statement of its
   QUIC client's key/header/ALPN. Evidence: `docs/aegis/plans/2026-09-30-ss-plugin.md` (T22).
 - ✅ Static config weight — a compiled, versioned prior over each link's transport/security discriminators (`proto_spec/weight.rs`), inserted into the decision-16 key inside the tier and materialized as `endpoint_rank.rank_weight` (raw BLOB column + `endpoint_rank_test_v2` covering index + `WEIGHT_VERSION` rebuild, no schema-tag bump); the `PlanScope::All` feed walk now orders by the law and freezes its ids before the first probe
+
+## Phase 17 — Write contention, import integrity, DNS timing ✅
+
+From the 2026-10-01 production run (74,014 endpoints / 145,268 links; 4,028-link Fast+Real
+batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes.md` (15 tasks).
+
+- ✅ **Timer floor + staleness deadline on the link writer** — the old loop wrote on a single
+  staged row, so a 200 ms trickle committed 4,028 rows in **1,167** transactions; now **32** (52×).
+  A single (non-batch) ping stages 1-3 groups, far below the floor, so `flush_soon()` wakes the
+  task when the last one settles (a wake, never a UI-task commit).
+- ✅ **Full jitter in `retry_on_busy`** — a fixed ladder is metastable; the callers that collide
+  are the concurrent ones, so an un-jittered retry re-synchronises exactly what it was meant to
+  break. Same attempt count and ceiling.
+- ✅ **Import upserts are multi-row** for `endpoints` and `endpoint_groups` — **~409,467 statements
+  → ~774**. `upsert_protocols_bulk` is deliberately NOT converted (deferred third family: its
+  stored enum labels are the embed derive's `snake_case` idents and the JSON column encoding is
+  unverified; it stays the next real win at a measured 117 µs/row).
+- ✅ **Country writes are queued** — one owner, one transaction per drain, re-queue on failure.
+  Per-host batching was a no-op (`waiters.len() ≈ 1`); the 88 aborts came from the old `break`.
+- ✅ **A dropped import batch is reported** — it used to return `(0, …)` and leave the group `Ok`.
+- ✅ **The purge scan left the write transaction** — it was holding the write lock for 3.1 s every
+  10 minutes from a read-only full-table walk.
+- ✅ **DNS deferral** — the permit wait is bounded by `DNS_LOOKUP_TIMEOUT` (report time is now a
+  function of the timeout), the budget exceeds that bound, the poll backs off instead of spinning,
+  and the clock resets when the state is re-armed.
+- ✅ **Log fidelity** — the export pages heed instead of copying a 500-row cache (the 2026-10-01
+  dump was 575 of 1,313 lines); the writer flushes in-flight on shutdown; the DNS-resolution
+  `info!` line that was 79% of the persisted log is now `debug`.
+- ✅ **Tracing fields split by destination** — `db.params` rides the session-only `detail` and can
+  never reach `LogMessage`, because one bind is `protocols.config` (UUIDs, passwords).
+- ✅ **Subscription failures say why** — a bounded `ValidationSummary` sample, classified by kind
+  so a parse message cannot leak credentials into the persisted log.
+- ✅ **Turso journal mode decided: WAL stays** — an A/B on synthetic feeds (no wipe of the real
+  database) found MVCC 1.2-4.8x slower at 32 concurrent writers. See
+  `docs/aegis/specs/2026-09-24-turso-mvcc-rollout-design.md` §12.
+- ☐ **The `profiles_page` Active+Test cost is toasty's, not the plan's** — ~98 ms at 74k, flat in
+  offset and flat in plan, against ~1.2 ms for the identical raw SQL. Neither `ANALYZE` nor a
+  band-partial index changes it. The escalation is **keyset pagination**, which ADR 0001 and the
+  band spec already name; not an index, not a statistics gap.
+- ☐ **`upsert_protocols_bulk` is still one statement per row** — needs writer-side `as_db_label`
+  for `TransportType`/`SecurityType`/`ProtocolKind` (each with a DB round-trip test) and the
+  confirmed encoding of the two JSON blob columns.

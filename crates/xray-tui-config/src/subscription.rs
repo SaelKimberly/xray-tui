@@ -354,12 +354,31 @@ fn file_profile(
                 || lower.starts_with("unspecified")
             {
                 summary.host_validation_count += 1;
+                summary.record_error(msg.as_str());
             } else {
                 summary.other_count += 1;
+                summary.record_error(msg.as_str());
             }
         }
-        Err(_) => {
+        // NOT `other.to_string()`: `ImportError::Parse`'s Display embeds
+        // `ParseError`, and several variants carry the raw URL or its userinfo
+        // (`naive.rs` "missing host:port in {raw}", `ss.rs` "{userinfo}",
+        // same shape in the hysteria parsers). That string would reach
+        // `log_trace` and be PERSISTED to the LMDB store, writing a base64
+        // method:password into the log. Classify by KIND instead, and say so.
+        Err(other) => {
             summary.other_count += 1;
+            summary.record_error(match &other {
+                // The variants whose payload can carry the URL or its userinfo.
+                ImportError::UnsupportedScheme => "unsupported URL scheme".to_owned(),
+                ImportError::Parse(_) => {
+                    "parse error (details withheld: the message can carry the URL)".to_owned()
+                }
+                ImportError::Json(_) | ImportError::Url(_) | ImportError::MissingField(_) => {
+                    other.to_string()
+                }
+                ImportError::Validation(msg) => msg.clone(),
+            });
         }
     }
 }
@@ -712,14 +731,69 @@ mod tests {
         format!("vmess://{b64}")
     }
 
+    /// A failure must carry its REASON, not only a counter. The 2026-10-01 run
+    /// had a subscription that reported `1 links, 1 errors` four times with
+    /// every bucket zero except `other: 1`, and nothing said why.
+    #[test]
+    fn a_failed_entry_records_why_it_failed() {
+        let settings = crate::import_export::ValidationSettings::default();
+        let good =
+            "vless://11111111-1111-1111-1111-111111111111@a.example:443?security=tls&type=tcp#ok"
+                .to_owned();
+        let garbage = "not-a-url-at-all".to_owned();
+        let (_, summary) = parse_url_batch(&[good, garbage], &settings);
+        assert_eq!(summary.other_count, 1);
+        assert!(
+            !summary.sample_errors.is_empty(),
+            "the reason must survive to the summary",
+        );
+    }
+
+    /// The recorded reason must NEVER carry credentials. `ImportError::Parse`'s
+    /// Display embeds `ParseError`, and several variants include the raw URL or
+    /// its userinfo — which `log_trace` would then PERSIST to the LMDB store.
+    #[test]
+    fn a_recorded_reason_never_carries_the_url_or_userinfo() {
+        let settings = crate::import_export::ValidationSettings::default();
+        // An ss URL with a real base64 userinfo: `ss.rs` reports it as
+        // `InvalidUserInfo("{userinfo}")`, so the raw value is in the error.
+        let url = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@x.example:8388#n".to_owned();
+        let (_, summary) = parse_url_batch(std::slice::from_ref(&url), &settings);
+        for reason in &summary.sample_errors {
+            assert!(
+                !reason.contains("YWVzLTI1Ni1nY206cGFzc3dvcmQ"),
+                "a credential leaked into the persisted log: {reason}",
+            );
+            assert!(
+                !reason.contains("x.example"),
+                "the host leaked into the persisted log: {reason}",
+            );
+        }
+    }
+
+    /// The sample is bounded, and says how much it dropped rather than
+    /// pretending the list is complete.
+    #[test]
+    fn the_error_sample_is_bounded_and_counts_what_it_dropped() {
+        let mut summary = ValidationSummary::default();
+        for i in 0..20 {
+            summary.record_error(format!("reason {i}"));
+        }
+        assert_eq!(
+            summary.sample_errors.len(),
+            ValidationSummary::SAMPLE_ERROR_CAP
+        );
+        assert_eq!(summary.sample_errors_omitted, 15);
+    }
+
     #[test]
     fn parse_url_batch_counts_valid_and_invalid() {
-        let settings = crate::import_export::ValidationSettings::default();
         let urls = vec![
             valid_vmess_url(),
             // Garbage that cannot parse: lands in other_count.
             "vmess://!!!not-base64!!!".to_string(),
         ];
+        let settings = crate::import_export::ValidationSettings::default();
         let (profiles, summary) = parse_url_batch(&urls, &settings);
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].parsed.protocol.proto_kind, ProtocolKind::Vmess);

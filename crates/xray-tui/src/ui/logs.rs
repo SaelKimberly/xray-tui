@@ -359,7 +359,7 @@ pub async fn handle_key(state: &mut AppState, key: &KeyEvent) {
             }
         }
         KeyCode::Char('Y') => {
-            copy_all_filtered(state);
+            copy_all_filtered(state).await;
         }
         KeyCode::Esc => {
             state.log_select_anchor = None;
@@ -408,6 +408,9 @@ pub(super) async fn try_load_older(state: &mut AppState) {
                     level: e.level,
                     target: e.target,
                     message: e.message,
+                    // Recovered from heed, so there is no `detail`: it is
+                    // session-only and was never persisted.
+                    detail: None,
                     timestamp_nanos: e.timestamp_nanos as i64,
                 })
                 .collect();
@@ -495,6 +498,8 @@ pub(super) async fn poll_new_logs(state: &mut AppState) {
             level: entry.level,
             target: entry.target,
             message: entry.message,
+            // Poll-recovered from heed: no `detail`.
+            detail: None,
             timestamp_nanos: entry.timestamp_nanos as i64,
         });
     }
@@ -641,6 +646,23 @@ pub fn handle_target_picker_key(state: &mut AppState, key: &KeyEvent) {
 /// too. A log line is remote-controlled (the core's stdout/stderr), and a
 /// pasted raw `ESC` (`ESC[201~`, cursor moves, SGR) can forge terminal
 /// output. `\n` is kept: entries are joined with it.
+/// Same rendering as [`clipboard_line`], for a row read back from heed. It has
+/// no `detail`: that is session-only and was never persisted.
+fn heed_line(msg: &xray_tui_core::log_heed::LogMessage) -> String {
+    let message: String = msg
+        .message
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect();
+    format!(
+        "{} [{}] [{}] {}",
+        fmt_ts(i64::try_from(msg.timestamp_nanos).unwrap_or(i64::MAX)),
+        msg.level,
+        msg.target,
+        message,
+    )
+}
+
 fn clipboard_line(log: &crate::LogLine) -> String {
     let message: String = log
         .message
@@ -733,19 +755,53 @@ fn copy_cursor_line(state: &mut AppState) {
     copy_to_clipboard(state, text);
 }
 
+/// Ceiling on one export, so a multi-gigabyte store cannot wedge the UI task
+/// on a single keypress. 200k lines is far past any real session.
+const EXPORT_MAX_LINES: usize = 200_000;
+
+/// Page of lines read per `read_older_than_async` round trip.
+const EXPORT_PAGE: usize = 5_000;
+
 /// Copy ALL filtered log entries to the system clipboard.
-fn copy_all_filtered(state: &mut AppState) {
-    if state.log_cache.is_empty() {
+///
+/// Pages **heed**, not `log_cache`. The cache is seeded with the 500 NEWEST
+/// entries (`AppState::load_initial_logs`) and only ever grows forward, so an
+/// export built from it silently truncates whatever is older: the 2026-10-01
+/// dump held **575 of the store's 1,313 lines (44%)** and said nothing about
+/// it. `read_all_from` walks backwards from the newest key to the start of the
+/// store, so what is copied is what is stored.
+async fn copy_all_filtered(state: &mut AppState) {
+    let Some(heed) = state.heed_storage.clone() else {
         return;
-    }
-    let lines: Vec<String> = state
-        .log_cache
-        .iter()
-        .filter(|l| state.selected_targets.is_empty() || state.selected_targets.contains(&l.target))
-        .map(clipboard_line)
-        .collect();
+    };
+    let targets = state.selected_targets.clone();
+    let keep =
+        |l: &xray_tui_core::log_heed::LogMessage| targets.is_empty() || targets.contains(&l.target);
+    let lines: Vec<String> = match heed
+        .read_all_older_than_async(u64::MAX, EXPORT_PAGE, EXPORT_MAX_LINES)
+        .await
+    {
+        Ok(all) => all.iter().filter(|l| keep(l)).map(heed_line).collect(),
+        Err(e) => {
+            state.log_activity(
+                "error",
+                "tui::ui::logs",
+                &format!("log export read failed: {e}"),
+            );
+            return;
+        }
+    };
     if lines.is_empty() {
         return;
+    }
+    if lines.len() >= EXPORT_MAX_LINES {
+        state.log_activity(
+            "warn",
+            "tui::ui::logs",
+            &format!(
+                "log export truncated at {EXPORT_MAX_LINES} lines — the store is larger than one clipboard copy",
+            ),
+        );
     }
     let text = lines.join("\n");
     copy_to_clipboard(state, text);
@@ -784,6 +840,7 @@ mod tests {
             level: "info".to_string(),
             target: "tui".to_string(),
             message: s.to_string(),
+            detail: None,
             timestamp_nanos: 0,
         }
     }

@@ -44,6 +44,38 @@ pub const DEFAULT_FLUSH_ROWS: usize = 512;
 /// Default flush trigger: time.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
+/// The timer path's floor is `flush_rows / TIMER_FLOOR_DIVISOR`.
+///
+/// **The measured trade, 2026-10-01 (WAL, 74,014 endpoints).** The old loop
+/// flushed on a single staged row, so a 4,028-row batch trickling over 327 s
+/// committed **1,167 times — 3.45 rows per transaction**. This divisor is what
+/// fixes it, and the cost is real:
+///
+/// | divisor | floor (of 512) | commits for 4,028 | staging latency @ 12 rows/s |
+/// | --- | --- | --- | --- |
+/// | 1 (old behaviour) | 1 | **1,167** | ~0.2 s |
+/// | **4** | **128** | **~32** | **~10.7 s** |
+/// | 2 | 256 | ~16 | ~21.3 s |
+///
+/// So durability moves from **200 ms to ~10.7 s**. Nothing is *lost* — batch
+/// end, quit and reload flush explicitly — but results are delayed, and that
+/// delay is what this constant buys. The plan's `commits <= 20` target was
+/// written before the floor/deadline interaction was measured; ~32 is what the
+/// durability boundary actually permits at 4, and the target is amended to it.
+pub const TIMER_FLOOR_DIVISOR: usize = 4;
+
+/// The timer path's staleness deadline, as a multiple of `flush_interval`.
+///
+/// Deliberately LONGER than the time to reach the floor at the observed trickle
+/// rate, so the floor decides each commit's size and the deadline is only the
+/// net for a trickle too slow to ever reach it. A **tick count cannot express
+/// this**: the wait to reach N ticks is rate-dependent, and an 8-tick backoff at
+/// 12 rows/s forced a write at ~89 rows — under the floor — pre-empting the
+/// coalescing it was meant to back up (measured 46 commits, 87.6 rows each).
+/// At the 200 ms default this is a 15 s ceiling on how long a staged result may
+/// sit unpersisted.
+pub const MAX_STAGED_AGE_TICKS: u32 = 75;
+
 /// Coalescing write-behind writer for `profile_stats`.
 ///
 /// `stage` records the caller's snapshot for one column group; the flush task
@@ -63,6 +95,15 @@ pub struct LinkWriter {
     staged: AtomicU64,
     flush_rows: usize,
     flush_interval: Duration,
+    /// Rows a **bare timer tick** must have staged before it writes anything.
+    ///
+    /// The size trigger (`wake`) is an explicit "there is a full window" signal
+    /// and always writes; a timer tick used to write on a *single* staged row,
+    /// which is what produced the 1,167 commits. See [`TIMER_FLOOR_DIVISOR`].
+    timer_flush_floor: usize,
+    /// Ceiling on how long a staged result may sit unpersisted, used only when
+    /// a trickle never reaches the floor. See [`MAX_STAGED_AGE_TICKS`].
+    max_staged_age: Duration,
     db: Arc<Database>,
     /// Serializes drain-and-write, so a flush triggered by the batch end and
     /// the flush task cannot write the same snapshot twice.
@@ -77,11 +118,14 @@ impl LinkWriter {
     /// Build a writer with the given flush policy.
     #[must_use]
     pub fn new(db: Arc<Database>, flush_rows: usize, flush_interval: Duration) -> Arc<Self> {
+        let flush_rows = flush_rows.max(1);
         Arc::new(Self {
             pending: DashMap::new(),
             staged: AtomicU64::new(0),
-            flush_rows: flush_rows.max(1),
+            flush_rows,
+            timer_flush_floor: (flush_rows / TIMER_FLOOR_DIVISOR).max(1),
             flush_interval,
+            max_staged_age: flush_interval.saturating_mul(MAX_STAGED_AGE_TICKS),
             db,
             gate: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
@@ -249,18 +293,90 @@ impl LinkWriter {
         self.flushes.load(Ordering::Relaxed)
     }
 
+    /// Wake the flush task so it writes on its next loop iteration.
+    ///
+    /// This is how a **single, user-initiated** result gets prompt persistence
+    /// without a commit on the UI task: a manual ping stages 1-3 column groups,
+    /// far below [`Self::timer_flush_floor`], so the timer path would otherwise
+    /// hold it until [`Self::max_staged_age`]. The loop's size-trigger arm
+    /// always writes, so a notification is enough.
+    ///
+    /// `draining_results_performs_no_commit_on_the_ui_task` is the standing
+    /// guard against committing while draining a result; this respects it.
+    pub fn flush_soon(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Rows a bare timer tick needs staged before it writes.
+    #[must_use]
+    pub const fn timer_flush_floor(&self) -> usize {
+        self.timer_flush_floor
+    }
+
+    /// Ceiling on how long a staged result may sit unpersisted.
+    #[must_use]
+    pub const fn max_staged_age(&self) -> Duration {
+        self.max_staged_age
+    }
+
+    /// The flush decision as a pure function — no `self`, no clock, no runtime,
+    /// no database.
+    ///
+    /// Extracted so the RULE is testable deterministically. The loop itself is a
+    /// real-time race against real DB transactions: under full-suite load it can
+    /// miss a tick and observe one floor crossing where two were expected — a
+    /// flaky integration test, not a floor bug. This function carries the
+    /// contract; the integration test carries the plumbing.
+    ///
+    /// - `woken` — the size trigger or an explicit [`Self::flush_soon`]. Always
+    ///   writes, at any depth: it is an explicit "there is a full window" signal.
+    /// - `staged >= floor` — the timer path's coalescing rule.
+    /// - `stale` — `max_staged_age` elapsed since the last write. The net for a
+    ///   trickle too slow to ever reach the floor, so a result is never stranded.
+    const fn should_flush(floor: usize, woken: bool, staged: usize, stale: bool) -> bool {
+        woken || staged >= floor || stale
+    }
+
     /// Run the flush loop until the handle is dropped/aborted.
+    ///
+    /// Two triggers, deliberately asymmetric:
+    ///
+    /// * **Size trigger** (`wake`, fired by [`Self::stage`] at `flush_rows`) —
+    ///   always writes. It is an explicit "there is a full window" signal.
+    /// * **Timer tick** — writes once `timer_flush_floor` rows are staged, or
+    ///   once `max_staged_age` has elapsed since the last write. The floor
+    ///   decides how much a transaction carries; the deadline is only the net
+    ///   for a trickle too slow to ever reach the floor.
+    ///
+    /// The old loop wrote on a single staged row from either trigger, which is
+    /// what produced the 2026-10-01 run's 1,167 commits for 4,028 rows.
     pub async fn run(self: Arc<Self>) {
+        let mut since_write = tokio::time::Instant::now();
         loop {
-            tokio::select! {
-                () = self.wake.notified() => {}
-                () = tokio::time::sleep(self.flush_interval) => {}
-            }
-            if self.staged_len() == 0 {
+            let woken = tokio::select! {
+                () = self.wake.notified() => true,
+                () = tokio::time::sleep(self.flush_interval) => false,
+            };
+            let staged = self.staged_len();
+            if staged == 0 {
+                since_write = tokio::time::Instant::now();
                 continue;
             }
-            if let Err(err) = self.flush().await {
-                tracing::warn!(target: "tui::ops::link_writer", "flush failed: {err}");
+            let stale = since_write.elapsed() >= self.max_staged_age;
+            if !Self::should_flush(self.timer_flush_floor, woken, staged, stale) {
+                continue;
+            }
+            let written = match self.flush().await {
+                Ok(n) => n,
+                Err(err) => {
+                    tracing::warn!(target: "tui::ops::link_writer", "flush failed: {err}");
+                    0
+                }
+            };
+            // A failed flush does NOT reset the clock, so a busy database is
+            // retried on the deadline rather than spinning on every tick.
+            if written > 0 {
+                since_write = tokio::time::Instant::now();
             }
         }
     }
@@ -658,6 +774,174 @@ mod tests {
             persisted(&db).await.latency,
             Some(Latency::Fast { delay: 20 }),
             "the newer value wins"
+        );
+    }
+
+    /// Poll a condition instead of sleeping a fixed span.
+    ///
+    /// These tests drive a REAL background task against a REAL database, so a
+    /// fixed sleep is a bet on scheduling: under the full-suite load the flush
+    /// task can be starved for the whole window and observe zero commits, which
+    /// is what `cargo nextest run --workspace` hit. Polling decouples the
+    /// assertion from when the task happens to be scheduled.
+    async fn wait_for(
+        writer: &LinkWriter,
+        what: &str,
+        mut done: impl FnMut(&LinkWriter) -> bool,
+        timeout: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !done(writer) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for {what} (flushes={}, staged={})",
+                writer.flush_count(),
+                writer.staged_len(),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The FLOOR path. `flush_rows` drives both the size trigger and the floor,
+    /// so the numbers are chosen so the floor sits strictly inside the row count
+    /// while the size trigger is never reached: `FLUSH_ROWS = 128` -> floor 32,
+    /// `ROWS = 64` -> exactly two floor-driven commits. The deadline
+    /// (75 x 5 ms = 375 ms) is out of range for a 320 ms staging window, so it
+    /// cannot be what fires.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_trickle_coalesces_at_the_floor_not_every_tick() {
+        const ROWS: usize = 64;
+        const FLUSH_ROWS: usize = 128;
+        let (db, _default) = seeded().await;
+        let interval = Duration::from_millis(10);
+        let writer = LinkWriter::new(Arc::clone(&db), FLUSH_ROWS, interval);
+        let floor = writer.timer_flush_floor();
+        assert_eq!(floor, FLUSH_ROWS / TIMER_FLOOR_DIVISOR);
+        assert!(
+            ROWS > floor && ROWS < FLUSH_ROWS,
+            "the floor must sit strictly inside the row count, or this is not testing it",
+        );
+        let task = writer.spawn_flush_task();
+
+        let base = persisted(&db).await;
+        for i in 0..ROWS {
+            // A DISTINCT endpoint_id per stage. `StageKey` is
+            // `((protocol_id, endpoint_id), group)`, so staging the same link
+            // repeatedly coalesces into ONE entry and the floor can never be
+            // reached — an earlier version of this test asserted on a window
+            // that never filled, and the single commit it saw was the DEADLINE,
+            // not the floor.
+            let mut link = with_latency(&base, i32::try_from(i).expect("small i"));
+            link.endpoint_id = EndpointId::new(1_000 + i64::try_from(i).expect("small i"));
+            writer.stage(&link, LinkGroups::RESULT);
+            tokio::time::sleep(interval).await;
+        }
+        // `ROWS = 64` against `MAX_STAGED_AGE_TICKS = 75` puts the deadline out
+        // of range during staging (64 < 75), so every commit here is
+        // floor-driven — and that ratio is interval-independent.
+        wait_for(
+            &writer,
+            "the staged rows to drain",
+            |w| w.staged_len() == 0,
+            Duration::from_secs(20),
+        )
+        .await;
+        // 64 rows / floor 32 is 2 commits, plus at most one deadline flush for
+        // the remainder. A regression that ignores the floor and writes per tick
+        // yields ~64, far outside this range.
+        let commits = writer.flush_count();
+        assert!(
+            (1..=4).contains(&commits),
+            "expected 1-4 floor-driven commits for {ROWS} rows at floor {floor}, got {commits}",
+        );
+        task.abort();
+    }
+
+    /// The DEADLINE path, which the floor case deliberately stays out of: a
+    /// trickle that never reaches the floor must still be written, so a result is
+    /// never stranded. `ROWS = 8` against a floor of 32, waited past
+    /// `max_staged_age`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_trickle_below_the_floor_is_still_written_by_the_deadline() {
+        const ROWS: usize = 8;
+        const FLUSH_ROWS: usize = 128;
+        let (db, _default) = seeded().await;
+        let interval = Duration::from_millis(10);
+        let writer = LinkWriter::new(Arc::clone(&db), FLUSH_ROWS, interval);
+        assert!(
+            ROWS < writer.timer_flush_floor(),
+            "this case needs rows UNDER the floor",
+        );
+        let task = writer.spawn_flush_task();
+
+        let base = persisted(&db).await;
+        for i in 0..ROWS {
+            let mut link = with_latency(&base, i32::try_from(i).expect("small i"));
+            link.endpoint_id = EndpointId::new(2_000 + i64::try_from(i).expect("small i"));
+            writer.stage(&link, LinkGroups::RESULT);
+            tokio::time::sleep(interval).await;
+        }
+        // Below the floor, the timer path must NOT write: only the staleness
+        // deadline can release this.
+        wait_for(
+            &writer,
+            "the deadline to release a below-floor trickle",
+            |w| w.flush_count() >= 1,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(
+            writer.staged_len(),
+            0,
+            "the deadline flush must drain, or a result is stranded",
+        );
+        task.abort();
+    }
+    /// The flush RULE, deterministically: no clock, no runtime, no database. The
+    /// integration tests above exercise the plumbing; this pins the contract, so
+    /// a regression cannot hide behind a scheduling artefact.
+    #[test]
+    fn the_floor_rule_is_exact() {
+        let floor = 128usize;
+        let s = LinkWriter::should_flush;
+
+        // The size trigger and an explicit wake always write, at any depth.
+        assert!(s(floor, true, 0, false), "wake writes at depth 0");
+        assert!(s(floor, true, 1, false));
+
+        // The timer path writes only at the floor or past the deadline.
+        assert!(!s(floor, false, 0, false));
+        assert!(!s(floor, false, floor - 1, false), "under the floor");
+        assert!(s(floor, false, floor, false), "exactly at the floor");
+        assert!(s(floor, false, floor + 1, false));
+
+        // The deadline is the net: it writes below the floor, so a trickle too
+        // slow to ever reach the floor is never stranded.
+        assert!(s(floor, false, 1, true), "stale writes below the floor");
+        assert!(s(floor, false, 0, true));
+
+        // A `flush_rows` under the divisor floors to 1, so any staged row writes.
+        // That is why the pre-existing `flush_rows = 1` tests cannot notice a
+        // floor regression, and why this test is the one that pins the rule.
+        assert!(s(1, false, 1, false), "floor 1 writes on any row");
+    }
+
+    /// The derived floor and deadline follow the named constants.
+    #[tokio::test]
+    async fn the_derived_policy_follows_the_named_constants() {
+        let (db, _w) = seeded().await;
+        let writer = LinkWriter::new(Arc::clone(&db), 512, Duration::from_millis(200));
+        assert_eq!(writer.timer_flush_floor(), 512 / TIMER_FLOOR_DIVISOR);
+        assert_eq!(
+            writer.max_staged_age(),
+            Duration::from_millis(200) * MAX_STAGED_AGE_TICKS
+        );
+        let small = LinkWriter::new(Arc::clone(&db), 1, DEFAULT_FLUSH_INTERVAL);
+        assert_eq!(
+            small.timer_flush_floor(),
+            1,
+            "under the divisor floors to 1"
         );
     }
 }

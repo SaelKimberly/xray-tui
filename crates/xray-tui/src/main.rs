@@ -24,25 +24,72 @@ struct TuiLogLayer {
     dropped_logs: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Captures the `message` field, plus the `toasty::query` structured fields
-/// (`duration_ms`, `db.statement`) so the slow-query line can be rendered
-/// with the statement and timing instead of the bare "slow query".
+/// Captures the `message` field, plus the `toasty::query` structured fields, and
+/// renders them into TWO strings with different destinations.
+///
+/// * `message` — what heed PERSISTS. Carries the timing and the statement text,
+///   which is what the Logs tab reads back after a restart.
+/// * `detail` — what only the SESSION sees (the Logs panel, this run). Every
+///   other field lands here, including `db.params`.
+///
+/// The split is a SECURITY boundary, not a convenience. Enabling toasty's
+/// `.log_statement_params(true)` makes bind values appear on the `toasty::query`
+/// event, and one of our binds is `protocols.config` — the parsed protocol
+/// config, which carries UUIDs and passwords. toasty's own docstring says
+/// parameter values "may contain secrets" and to enable them "only when the log
+/// destination is trusted"; heed is not that destination. So params must never
+/// enter `LogMessage`. This is the same reason `specs/2026-09-24-db-query-
+/// monitoring-design.md` §10 non-goal 10 forbids persisting monitoring detail.
+///
+/// Before this, every other field hit `_ => {}` and was lost: the stuck-deferral
+/// warning at `ops/ping.rs` carries `endpoint_id`, `half` and `waited_ms`, and
+/// the 2026-10-01 run left 12 such warnings in heed that named no row.
+/// Report lines the BOUNDED log channel dropped. Written to stderr, not
+/// through the channel that dropped them.
+fn report_dropped_logs(counter: &std::sync::atomic::AtomicU64) {
+    let dropped = counter.load(std::sync::atomic::Ordering::Relaxed);
+    if dropped > 0 {
+        eprintln!(
+            "[xray-tui] {dropped} log line(s) were dropped: the writer channel (capacity 4096) was full",
+        );
+    }
+}
+
 #[derive(Default)]
 struct LogVisitor {
     message: String,
     duration_ms: Option<f64>,
     statement: Option<String>,
+    /// Every non-message field, rendered. SESSION-ONLY.
+    detail: Vec<String>,
 }
 
 impl LogVisitor {
-    /// The message enriched with query timing/statement when present,
-    /// otherwise the bare message.
-    fn into_message(self) -> String {
-        match (self.duration_ms, self.statement) {
-            (Some(ms), Some(sql)) => format!("{} [{ms:.1}ms]: {sql}", self.message),
-            (Some(ms), None) => format!("{} [{ms:.1}ms]", self.message),
-            _ => self.message,
-        }
+    /// Split into the persisted message and the session-only `detail`.
+    ///
+    /// The message half is what heed stores and deliberately excludes `detail`.
+    fn split(self) -> (String, Option<String>) {
+        let Self {
+            message,
+            duration_ms,
+            statement,
+            detail,
+        } = self;
+        let detail = if detail.is_empty() {
+            None
+        } else {
+            Some(detail.join(" "))
+        };
+        let message = match (duration_ms, statement) {
+            (Some(ms), Some(sql)) => format!("{message} [{ms:.1}ms]: {sql}"),
+            (Some(ms), None) => format!("{message} [{ms:.1}ms]"),
+            _ => message,
+        };
+        (message, detail)
+    }
+
+    fn push_detail(&mut self, name: &str, rendered: &str) {
+        self.detail.push(format!("{name}={rendered}"));
     }
 }
 
@@ -50,20 +97,31 @@ impl Visit for LogVisitor {
     fn record_f64(&mut self, field: &Field, value: f64) {
         if field.name() == "duration_ms" {
             self.duration_ms = Some(value);
+        } else {
+            self.push_detail(field.name(), &value.to_string());
         }
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.push_detail(field.name(), &value.to_string());
+    }
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.push_detail(field.name(), &value.to_string());
+    }
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.push_detail(field.name(), &value.to_string());
     }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         match field.name() {
             "message" => self.message = format!("{value:?}"),
             "db.statement" => self.statement = Some(format!("{value:?}")),
-            _ => {}
+            other => self.detail.push(format!("{other}={value:?}")),
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
             "message" => self.message = value.to_string(),
             "db.statement" => self.statement = Some(value.to_string()),
-            _ => {}
+            other => self.detail.push(format!("{other}={value}")),
         }
     }
 }
@@ -90,7 +148,9 @@ where
 
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
-        let message = visitor.into_message();
+        // Split BEFORE either consumer: `message` is persisted, `detail` is
+        // session-only and is where `db.params` lands (see `LogVisitor`).
+        let (message, detail) = visitor.split();
         let target = event.metadata().target();
 
         let timestamp_nanos = u64::try_from(
@@ -141,6 +201,9 @@ where
             // `i64` nanos, saturating: a clock past 2262 would otherwise wrap
             // to a negative stamp and sort ahead of every real line.
             timestamp_nanos: i64::try_from(timestamp_nanos).unwrap_or(i64::MAX),
+            // Session-only. Never reaches `LogMessage`, so `db.params` cannot
+            // be persisted by way of this line.
+            detail,
             // The heed copy is written above; the watermark may pass it.
             persisted: true,
         });
@@ -241,8 +304,13 @@ async fn main() -> Result<()> {
     // canonical shutdown flag instead (the same `AppState::shutdown_token` every other
     // background loop checks — installed on the state below, so there is one owner).
     let shutdown_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let writer_shutdown = shutdown_token.clone();
     let writer_heed = heed.clone();
+    // The channel is BOUNDED (4096), so a burst can drop lines. The counter was
+    // incremented but never reported anywhere; this task owns the writer's
+    // lifetime, so it is where the total becomes visible.
+    let writer_drops = dropped_logs.clone();
     let _writer_handle = tokio::task::spawn_blocking(move || {
         /// Idle poll slice: the quit path waits at most this long for the writer.
         const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -253,6 +321,13 @@ async fn main() -> Result<()> {
                 Ok(msg) => msg,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if writer_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Flush before leaving. This branch used to `return`
+                        // WITHOUT flushing, so a quit inside the 500 ms batch
+                        // deadline silently lost up to 100 lines.
+                        if !batch.is_empty() {
+                            let _ = writer_heed.write_log_batch(&batch);
+                        }
+                        report_dropped_logs(&writer_drops);
                         return;
                     }
                     continue;
@@ -262,6 +337,7 @@ async fn main() -> Result<()> {
                     if !batch.is_empty() {
                         let _ = writer_heed.write_log_batch(&batch);
                     }
+                    report_dropped_logs(&writer_drops);
                     return;
                 }
             };
@@ -557,34 +633,56 @@ mod tests {
         assert!(!stderr_mirror_enabled(Some("False")));
     }
 
-    /// Falsifier B: a populated `LogVisitor` renders the slow-query line with
-    /// its statement and timing, not the bare message.
+    /// The visitor splits a line into a PERSISTED message and a SESSION-ONLY
+    /// detail. This is the security property T1 exists for: with toasty's
+    /// `.log_statement_params(true)` wired, `db.params` lands on the
+    /// `toasty::query` event, and one of our binds (`protocols.config`) carries
+    /// UUIDs and passwords. The persisted half must never see it.
     #[test]
-    fn log_visitor_enriches_the_slow_query_line() {
-        let v = LogVisitor {
+    fn structured_fields_split_between_persisted_and_session_only() {
+        let mut v = LogVisitor {
             message: "slow query".to_string(),
             duration_ms: Some(312.4),
             statement: Some("SELECT * FROM profile_stats".to_string()),
+            detail: Vec::new(),
         };
-        assert_eq!(
-            v.into_message(),
-            "slow query [312.4ms]: SELECT * FROM profile_stats"
+        v.push_detail("db.params", "[1000, secret-uuid]");
+        let (message, detail) = v.split();
+        let detail = detail.expect("detail");
+        assert!(
+            message.contains("312.4ms") && message.contains("profile_stats"),
+            "the persisted line keeps timing and statement: {message}",
         );
+        assert!(
+            !message.contains("secret-uuid"),
+            "bind values must NEVER reach the persisted line: {message}",
+        );
+        assert!(
+            detail.contains("secret-uuid"),
+            "the session-only detail must carry them: {detail}",
+        );
+    }
 
-        // Duration without a statement still gets the timing.
+    /// Duration without a statement still gets the timing, and a line with no
+    /// structured fields produces NO detail at all.
+    #[test]
+    fn log_visitor_still_enriches_timing() {
         let v = LogVisitor {
             message: "slow query".to_string(),
             duration_ms: Some(5.0),
             statement: None,
+            detail: Vec::new(),
         };
-        assert_eq!(v.into_message(), "slow query [5.0ms]");
+        let (message, detail) = v.split();
+        assert_eq!(message, "slow query [5.0ms]");
+        assert_eq!(detail, None, "no extra fields, no detail");
 
-        // A non-query event (no structured fields) is left untouched.
         let v = LogVisitor {
             message: "plain log".to_string(),
             duration_ms: None,
             statement: None,
+            detail: Vec::new(),
         };
-        assert_eq!(v.into_message(), "plain log");
+        assert_eq!(v.split().0, "plain log");
     }
 }

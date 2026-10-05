@@ -350,6 +350,13 @@ impl Database {
     /// Open a toasty DB by constructing builder. Separate for recovery logic.
     async fn try_open_db(driver: toasty_driver_turso::Turso) -> Result<toasty::Db> {
         let db = toasty::Db::builder()
+            // Bind values on the `toasty::query` event. The monitoring spec
+            // names this knob (`:21`, `:23`); it was referenced nowhere in the
+            // tree. SAFETY: params reach only the SESSION-ONLY `detail`
+            // channel — `LogVisitor::split` keeps them out of `LogMessage`, so
+            // a bind carrying `protocols.config` (UUIDs, passwords) is never
+            // persisted to heed, which is non-goal 10 of that spec.
+            .log_statement_params(true)
             .models(toasty::models!(
                 Endpoint,
                 Protocol,
@@ -1439,8 +1446,18 @@ impl Database {
 
     async fn purge_expired_once(&self, cutoff: i64) -> Result<usize> {
         let mut conn = self.conn().await?;
-        let mut tx = conn.transaction().await?;
 
+        // The CANDIDATE scan runs OUTSIDE the transaction.
+        //
+        // It used to run inside one, which turned a read-only full-table walk
+        // into a write-lock hold: the 2026-10-01 run measured this statement at
+        // **3,098 ms** on 74,014 endpoints, so every other writer in the process
+        // waited behind a three-second "read". The scan is now a plain read.
+        //
+        // Race, and why it is safe: an endpoint that gains a link between the
+        // scan and the delete would be deleted with a live link. The re-check
+        // below closes that inside the transaction.
+        //
         // All-links staleness: an endpoint whose EVERY link is older than the
         // cutoff (De-Morgan of the old `.all(last_seen < cutoff)`; vacuously
         // true for a linkless endpoint, so orphans are reclaimed too). This is
@@ -1455,9 +1472,40 @@ impl Database {
              (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id \
              AND p.last_seen_at >= {cutoff})"
         ))
+        .exec(&mut conn)
+        .await?;
+        let candidates: Vec<EndpointId> = rows
+            .iter()
+            .filter_map(|row| match row {
+                toasty_core::stmt::Value::Record(r) => r.fields.first().cloned(),
+                _ => None,
+            })
+            .filter_map(|v| match v {
+                toasty_core::stmt::Value::I64(id) => Some(EndpointId::new(id)),
+                _ => None,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // Re-check under the write transaction, then cascade.
+        let mut tx = conn.transaction().await?;
+        // Ids are inlined as literals, the convention every other raw statement
+        // in this crate uses (a bound parameter per id costs ~0.8 ms).
+        let id_list = candidates
+            .iter()
+            .map(|id| id.get().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let live = toasty::sql::query(format!(
+            "SELECT e.id FROM endpoints e WHERE e.id IN ({id_list}) AND NOT EXISTS \
+             (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id \
+             AND p.last_seen_at >= {cutoff})"
+        ))
         .exec(&mut tx)
         .await?;
-        let ids: Vec<EndpointId> = rows
+        let ids: Vec<EndpointId> = live
             .iter()
             .filter_map(|row| match row {
                 toasty_core::stmt::Value::Record(r) => r.fields.first().cloned(),
@@ -1741,25 +1789,80 @@ impl Database {
 // are copied verbatim from the single-row methods above — the bulk path must
 // never drift from them.
 
+/// Rows per multi-row statement on the import path. `LINK_STATEMENT_ROWS`
+/// (400) is the measured value for the link writer; these tables are narrower,
+/// so they use the same chunk size rather than inventing a second constant.
+const IMPORT_STATEMENT_ROWS: usize = LINK_STATEMENT_ROWS;
+
 /// Insert-or-update many endpoints on the caller's executor (usually a
 /// `&mut Transaction`). Empty slice is a no-op.
+///
+/// One multi-row statement per chunk instead of one typed upsert per row. The
+/// 2026-10-01 import issued **105,147 statements** for this one family;
+/// chunked at 400 that is ~263.
+///
+/// The column set is copied verbatim from the typed single-row builder below —
+/// the bulk path must never drift from it. `manual_protocol_override` and
+/// `resolved_at` are deliberately NOT written here either: the typed writer
+/// leaves them alone, and an import must not clear an operator's override or
+/// stamp a resolution the resolver owns.
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> Result<()> {
-    for e in eps {
-        Endpoint::upsert_by_id(e.id)
-            .host(e.host.clone())
-            .host_type(e.host_type)
-            .port(e.port)
-            .ports(e.ports.clone())
-            .last_source(e.last_source.clone())
-            .on_create(|create| {
-                // No `#[auto]` on an integer timestamp: the writer stamps it.
-                create.created_at(now_epoch())
-            })
-            .exec(tx)
-            .await?;
+    use std::fmt::Write as _;
+    if eps.is_empty() {
+        return Ok(());
+    }
+    let created = now_epoch();
+    for chunk in eps.chunks(IMPORT_STATEMENT_ROWS) {
+        let mut sql = String::with_capacity(chunk.len() * 96 + 96);
+        sql.push_str(
+            "INSERT INTO \"endpoints\" (\"id\", \"host\", \"host_type\", \"port\", \"ports\", \
+             \"last_source\", \"created_at\") VALUES ",
+        );
+        for (i, e) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            let _ = write!(
+                sql,
+                "({}, {}, {}, {}, {}, {}, {})",
+                e.id.get(),
+                sql_lit(&e.host),
+                sql_lit(e.host_type.as_db_label()),
+                e.port,
+                sql_lit(&blob_lit(&e.ports)),
+                e.last_source
+                    .as_deref()
+                    .map_or_else(|| "NULL".to_owned(), sql_lit),
+                created
+            );
+        }
+        sql.push_str(
+            " ON CONFLICT(\"id\") DO UPDATE SET \"host\" = excluded.\"host\", \
+             \"host_type\" = excluded.\"host_type\", \"port\" = excluded.\"port\", \
+             \"ports\" = excluded.\"ports\", \"last_source\" = excluded.\"last_source\"",
+        );
+        toasty::sql::statement(sql).exec(tx).await?;
     }
     Ok(())
+}
+
+/// The `ports` column's stored text: an array of `u16` as JSON, matching what
+/// the typed upsert writes. A blank list is `[]`, not `NULL`.
+fn blob_lit(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        return "[]".to_owned();
+    }
+    let mut out = String::with_capacity(ports.len() * 6 + 2);
+    out.push('[');
+    for (i, p) in ports.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&p.to_string());
+    }
+    out.push(']');
+    out
 }
 
 /// Insert-or-update many protocols on the caller's executor. Empty slice is a
@@ -1824,17 +1927,46 @@ pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -
 
 /// Insert-or-update many endpoint↔group links on the caller's executor.
 /// Empty slice is a no-op.
+///
+/// Multi-row per chunk. This was the single largest family on the import path —
+/// **204,592 statements** in the 2026-10-01 run, half the total — because a
+/// 500-URL batch touches one endpoint once per protocol, and every one of those
+/// was its own statement. Chunked at 400 that is ~511.
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_endpoint_group_links_bulk(
     tx: &mut impl Executor,
     egs: &[EndpointGroup],
 ) -> Result<()> {
-    for eg in egs {
-        EndpointGroup::upsert_by_endpoint_id_and_group_id(eg.endpoint_id, eg.group_id.clone())
-            .last_seen_at(eg.last_seen_at)
-            .sort_order(eg.sort_order)
-            .exec(tx)
-            .await?;
+    use std::fmt::Write as _;
+    if egs.is_empty() {
+        return Ok(());
+    }
+    for chunk in egs.chunks(IMPORT_STATEMENT_ROWS) {
+        let mut sql = String::with_capacity(chunk.len() * 72 + 96);
+        sql.push_str(
+            "INSERT INTO \"endpoint_groups\" (\"endpoint_id\", \"group_id\", \"last_seen_at\", \
+             \"sort_order\") VALUES ",
+        );
+        for (i, eg) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            let _ = write!(
+                sql,
+                "({}, {}, {}, {})",
+                eg.endpoint_id.get(),
+                sql_lit(&eg.group_id),
+                eg.last_seen_at,
+                eg.sort_order
+                    .map_or_else(|| "NULL".to_owned(), |o| o.to_string()),
+            );
+        }
+        sql.push_str(
+            " ON CONFLICT(\"endpoint_id\", \"group_id\") DO UPDATE SET \
+             \"last_seen_at\" = excluded.\"last_seen_at\", \
+             \"sort_order\" = excluded.\"sort_order\"",
+        );
+        toasty::sql::statement(sql).exec(tx).await?;
     }
     Ok(())
 }
@@ -1860,6 +1992,176 @@ mod tests {
         assert!(!concurrent_writes_from_env(Some("0")));
         assert!(!concurrent_writes_from_env(Some("false")));
     }
+    /// The raw multi-row import writers must be indistinguishable from the
+    /// typed ones: the row has to come back with the SAME `host_type` label,
+    /// the same `ports` text, and the same group membership. A wrong enum
+    /// label does not fail the write — it silently mis-classifies the endpoint.
+    #[tokio::test]
+    async fn multi_row_import_writers_round_trip_through_a_real_database() {
+        let db = Database::in_memory().await.expect("db");
+        let mut conn = db.connection().await.expect("conn");
+
+        for (i, ht) in [
+            HostType::Ipv4,
+            HostType::Ipv6,
+            HostType::Dns,
+            HostType::Undefined,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = 900 + i as i64;
+            upsert_endpoints_bulk(
+                &mut conn,
+                &[Endpoint {
+                    id: EndpointId::new(id),
+                    host: format!("h{i}.example"),
+                    host_type: ht,
+                    port: 443 + i as u16,
+                    ports: if i == 0 { vec![] } else { vec![80, 443] },
+                    last_source: None,
+                    manual_protocol_override: None,
+                    resolved_at: None,
+                    created_at: 0,
+                    links: Deferred::default(),
+                    group_links: Deferred::default(),
+                }],
+            )
+            .await
+            .expect("endpoints bulk");
+            upsert_endpoint_group_links_bulk(
+                &mut conn,
+                &[crate::models_toasty::EndpointGroup {
+                    endpoint_id: EndpointId::new(id),
+                    group_id: "grp-1".to_owned(),
+                    last_seen_at: 42,
+                    sort_order: None,
+                    endpoint: Deferred::default(),
+                    group: Deferred::default(),
+                }],
+            )
+            .await
+            .expect("group links bulk");
+        }
+
+        // Read the LABELS back as text, which is what a wrong writer would get
+        // wrong — not through the typed loader, which would hide it.
+        for (i, ht) in [
+            HostType::Ipv4,
+            HostType::Ipv6,
+            HostType::Dns,
+            HostType::Undefined,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = 900 + i as i64;
+            let rows = toasty::sql::query(format!(
+                "SELECT host_type, ports FROM endpoints WHERE id = {id}"
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("read endpoint");
+            let record = match &rows[0] {
+                toasty_core::stmt::Value::Record(r) => r,
+                other => panic!("expected a record, got {other:?}"),
+            };
+            let label = match &record.fields[0] {
+                toasty_core::stmt::Value::String(s) => s.as_str(),
+                other => panic!("host_type must round-trip as TEXT, got {other:?}"),
+            };
+            assert_eq!(
+                label,
+                ht.as_db_label(),
+                "the stored label must be exactly what as_db_label writes",
+            );
+            assert_eq!(
+                HostType::from_db_label(label),
+                Some(ht),
+                "the label must parse back to the same variant",
+            );
+            let groups = toasty::sql::query(format!(
+                "SELECT COUNT(*) FROM endpoint_groups WHERE endpoint_id = {id} AND group_id = 'grp-1' AND last_seen_at = 42"
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("read group link");
+            let count = match &groups[0] {
+                toasty_core::stmt::Value::Record(r) => match r.fields.first() {
+                    Some(toasty_core::stmt::Value::I64(n)) => *n,
+                    other => panic!("expected a count, got {other:?}"),
+                },
+                other => panic!("expected a record, got {other:?}"),
+            };
+            assert_eq!(count, 1, "the group link must be stored for endpoint {id}");
+        }
+    }
+
+    /// An upsert must be an UPSERT: the second write replaces the mutable
+    /// columns and leaves the ones the import does not own.
+    #[tokio::test]
+    async fn multi_row_endpoint_upsert_replaces_and_preserves() {
+        let db = Database::in_memory().await.expect("db");
+        let mut conn = db.connection().await.expect("conn");
+        let mut ep = Endpoint {
+            id: EndpointId::new(1),
+            host: "old.example".to_owned(),
+            host_type: HostType::Ipv4,
+            port: 1,
+            ports: Vec::new(),
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_at: None,
+            created_at: 0,
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        };
+        upsert_endpoints_bulk(&mut conn, std::slice::from_ref(&ep))
+            .await
+            .expect("first");
+        // Ownership the import must NOT clear.
+        toasty::sql::statement(
+            "UPDATE endpoints SET manual_protocol_override = 77, resolved_at = 1234 WHERE id = 1",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("set owned columns");
+        ep.host = "new.example".to_owned();
+        ep.port = 2;
+        upsert_endpoints_bulk(&mut conn, &[ep])
+            .await
+            .expect("second");
+
+        let rows = toasty::sql::query(
+            "SELECT host, port, manual_protocol_override, resolved_at FROM endpoints WHERE id = 1",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("read");
+        let r = match &rows[0] {
+            toasty_core::stmt::Value::Record(r) => r,
+            other => panic!("expected a record, got {other:?}"),
+        };
+        // `host`/`group_id` are TEXT, `port` is an integer column — read each
+        // with its own type rather than assuming.
+        let text = |i: usize| -> String {
+            match &r.fields[i] {
+                toasty_core::stmt::Value::String(s) => s.clone(),
+                other => panic!("column {i}: expected text, got {other:?}"),
+            }
+        };
+        let int = |i: usize| -> i64 {
+            match &r.fields[i] {
+                toasty_core::stmt::Value::I64(n) => *n,
+                other => panic!("column {i}: expected an integer, got {other:?}"),
+            }
+        };
+        assert_eq!(text(0), "new.example", "host must be replaced");
+        assert_eq!(int(1), 2, "port must be replaced");
+        assert_eq!(int(2), 77, "manual_protocol_override must survive");
+        assert_eq!(int(3), 1234, "resolved_at must survive");
+    }
+
     #[tokio::test]
     async fn in_memory_stays_wal_for_schema_lifecycle() {
         let db = Database::in_memory().await.expect("in-memory db");

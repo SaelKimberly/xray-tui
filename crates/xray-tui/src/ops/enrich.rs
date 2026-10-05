@@ -49,6 +49,118 @@ pub(crate) fn extract_sni(protocol: &Protocol, endpoint_host: &str) -> Option<St
 /// — and the window was the shorter of the pair.
 pub const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// How long a resolved country may sit in the accumulator before a drain is
+/// forced. This is T7's durability window, in the same spirit as the link
+/// writer's `max_staged_age`: results are NOT lost on a crash, only delayed by
+/// up to this long. It is a hard ceiling, not the poll interval — the drain also
+/// runs as soon as the buffer reaches `GEO_FLUSH_AT`.
+pub const GEO_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Buffer occupancy that forces a drain without waiting for the deadline.
+const GEO_FLUSH_AT: usize = 256;
+
+/// A cross-host buffer of `(endpoint, address, country)` rows awaiting one
+/// batched write.
+///
+/// **Why a buffer and not per-host batching.** `spawn_dns_resolve_host` already
+/// loops its waiters, so collecting "the per-host rows and calling
+/// `set_endpoint_ip_countries` once" would only collapse transactions when a
+/// host has more than one waiter — and the 2026-10-01 run says it almost never
+/// does: 933 lookups for 1,577 deferred HALVES (≈788 distinct links) and **790**
+/// invocations of the per-address writer, i.e. `waiters.len() ≈ 1`. Per-host
+/// batching would have been very nearly a no-op.
+///
+/// Accumulating across hosts is what actually reduces the transaction count, and
+/// it is also where the damage came from: the per-address writer's isolated cost
+/// is 108 µs but production p99 was 1,051 ms — a ~9,700× multiplier produced by
+/// *concurrent* single-row write transactions, not by cheap writes.
+#[derive(Default)]
+pub(crate) struct GeoQueue {
+    rows: dashmap::DashMap<EndpointId, (std::net::IpAddr, String)>,
+    wake: tokio::sync::Notify,
+}
+
+static GEO_QUEUE: std::sync::LazyLock<std::sync::Arc<GeoQueue>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(GeoQueue::default()));
+
+/// Queue one resolved country for the next batched write. Non-blocking: the
+/// resolution task must not await a database write, or a fan-out of a few
+/// thousand hosts would serialise behind it.
+pub(crate) fn queue_country(endpoint_id: EndpointId, ip: std::net::IpAddr, iso: String) {
+    let queue = GEO_QUEUE.clone();
+    queue.rows.insert(endpoint_id, (ip, iso));
+    if queue.rows.len() >= GEO_FLUSH_AT {
+        queue.wake.notify_one();
+    }
+}
+
+/// Take everything currently queued, **removing** it from the buffer.
+///
+/// Removal matters: a drain that only copied would rewrite the entire buffer on
+/// every tick, forever, and the buffer would never shrink.
+fn take_queued() -> Vec<(EndpointId, std::net::IpAddr, String)> {
+    let keys: Vec<EndpointId> = GEO_QUEUE.rows.iter().map(|e| *e.key()).collect();
+    keys.into_iter()
+        .filter_map(|id| {
+            GEO_QUEUE
+                .rows
+                .remove(&id)
+                .map(|(_, entry)| (id, entry.0, entry.1))
+        })
+        .collect()
+}
+
+/// Run the drain loop until the shutdown flag is set.
+///
+/// A failed drain puts the rows **back**: the old per-address loop `break`ed on
+/// the first error and abandoned the host's remaining waiters, which is where the
+/// 88 `country persist failed` aborts of the 2026-10-01 run came from.
+pub(crate) fn spawn_geo_drain(
+    db: std::sync::Arc<xray_tui_db::Database>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = GEO_QUEUE.wake.notified() => {}
+                () = tokio::time::sleep(GEO_DRAIN_INTERVAL) => {}
+            }
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                // One last drain so a quit does not strand what is queued.
+                drain_once(&db).await;
+                return;
+            }
+            drain_once(&db).await;
+        }
+    });
+}
+
+/// One drain: take the buffer, write it in ONE transaction, re-queue on failure.
+async fn drain_once(db: &xray_tui_db::Database) {
+    let mut rows = take_queued();
+    if rows.is_empty() {
+        return;
+    }
+    let total = rows.len();
+    if let Err(e) = db.set_endpoint_ip_countries(&rows).await {
+        tracing::warn!(
+            target: "tui::ops::enrich",
+            "country persist failed for {total} rows: {e} — re-queued for the next drain",
+        );
+        // Re-queue rather than abandon. A later resolution of the same endpoint
+        // overwrites the entry, so this cannot grow without bound.
+        for (id, ip, iso) in rows.drain(..) {
+            GEO_QUEUE.rows.entry(id).or_insert((ip, iso));
+        }
+        GEO_QUEUE.wake.notify_one();
+        return;
+    }
+    tracing::debug!(
+        target: "tui::ops::enrich",
+        "country drain wrote {total} row(s) in one transaction",
+    );
+}
+
 /// True when a resolution must run: no entry, no address and no attempt, or a
 /// DNS entry older than the TTL, or `force`.
 ///
@@ -273,7 +385,8 @@ pub fn spawn_dns_resolve_host(
     let dns = state.dns_resolver.clone();
     let geo = state.geo_ip.clone();
     let checker = state.host_features.clone();
-    let db = state.db.clone();
+    // No `db` clone: the country write is QUEUED (see `queue_country`), so this
+    // task no longer opens a transaction of its own.
     let tx = state.core_event_tx.clone();
 
     // The endpoint is now waiting on an answer that does not exist yet, so the
@@ -299,22 +412,6 @@ pub fn spawn_dns_resolve_host(
     let waiters_key = key;
 
     tokio::spawn(async move {
-        // One permit per in-flight lookup — see [`RESOLVE_SEM`]. A FORCED
-        // lookup (the `x` key, the connect path) bypasses the bound: the
-        // semaphore is fair, so a user-triggered resolve would otherwise queue
-        // behind an entire feed's fan-out and look dead, and a single request
-        // cannot flood anything.
-        let _permit = if force {
-            None
-        } else {
-            let Ok(permit) = Arc::clone(&RESOLVE_SEM).acquire_owned().await else {
-                // The runtime is gone; release the waiters this lookup was
-                // registered for, or their endpoints defer forever.
-                release_waiters(waiters_key.as_ref(), endpoint_id, &scheduler);
-                return;
-            };
-            Some(permit)
-        };
         let now = unix_now();
         // Whether the resolution produced a usable answer; `false` feeds the
         // scheduler's DNS-failure gate below. IP hosts and hosts without a
@@ -339,14 +436,52 @@ pub fn spawn_dns_resolve_host(
                             // Overall deadline: resolver init (DNSCrypt list
                             // download) plus lookups over many name servers
                             // can otherwise stall indefinitely.
-                            match tokio::time::timeout(
-                                DNS_LOOKUP_TIMEOUT,
-                                r.lookup_ip(&host, false),
-                            )
-                            .await
-                            {
-                                Ok(Ok(ips)) => {
-                                    tracing::info!(
+                            //
+                            // The semaphore permit is acquired INSIDE this
+                            // deadline, deliberately — one permit per in-flight
+                            // lookup ([`RESOLVE_SEM`]). A FORCED lookup (the `x`
+                            // key, the connect path) bypasses the bound: the
+                            // semaphore is fair, so a user-triggered resolve
+                            // would otherwise queue behind a whole feed's
+                            // fan-out and look dead, and one request cannot
+                            // flood anything.
+                            //
+                            // Acquiring it OUTSIDE (as this did) left the queue
+                            // wait unbounded and uncounted, so request→report was
+                            // unbounded — and that is what broke the batch's
+                            // deferral. `defer_retry` measures its budget from
+                            // the FIRST deferral while `mark_dns_failure` arms
+                            // its 15 s window at REPORT time, so a tail lookup
+                            // that queued past the budget armed a window the
+                            // budget could never outlast; the 2026-10-01 run
+                            // booked 12 halves unprobed that way. Bounding the
+                            // wait to `DNS_LOOKUP_TIMEOUT` makes report time a
+                            // function of the timeout alone.
+                            let bounded = async {
+                                let _permit = if force {
+                                    None
+                                } else {
+                                    let permit =
+                                        Arc::clone(&RESOLVE_SEM).acquire_owned().await.ok()?;
+                                    Some(permit)
+                                };
+                                Some(r.lookup_ip(&host, false).await)
+                            };
+                            match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, bounded).await {
+                                // `Some(...)` means the permit was taken and the
+                                // lookup ran inside the deadline.
+                                Ok(Some(Ok(ips))) => {
+                                    // SESSION-ONLY, deliberately. This was `info`,
+                                    // and the 2026-10-01 run showed it was **933 of
+                                    // the 1,313 persisted entries (79%)** — one
+                                    // LMDB row per resolved host, kept forever.
+                                    // The information is already durable in
+                                    // `endpoint_ip` and `endpoints.resolved_at`,
+                                    // and `ping.rs` made its per-result lines
+                                    // session-only for the same reason. The same
+                                    // flood is what filled the 10,000-row
+                                    // `log_cache` cap that truncated the export.
+                                    tracing::debug!(
                                         target: "tui::ops::enrich",
                                         "Resolved {host}: {} IP(s)",
                                         ips.len()
@@ -355,7 +490,7 @@ pub fn spawn_dns_resolve_host(
                                     // allocation, no copy.
                                     (Vec::from(ips), Some(now))
                                 }
-                                Ok(Err(e)) => {
+                                Ok(Some(Err(e))) => {
                                     resolved_ok = false;
                                     if e.to_string().contains("no records found") {
                                         // Host without any DNS record — the
@@ -372,6 +507,15 @@ pub fn spawn_dns_resolve_host(
                                         );
                                     }
                                     (Vec::new(), Some(now))
+                                }
+                                // `None` means the permit was never taken: the
+                                // semaphore closed (the runtime is going away).
+                                // Release the waiters so their endpoints do not
+                                // defer forever — the old `acquire_owned`
+                                // failure path did exactly this.
+                                Ok(None) => {
+                                    release_waiters(waiters_key.as_ref(), endpoint_id, &scheduler);
+                                    return;
                                 }
                                 Err(_) => {
                                     resolved_ok = false;
@@ -438,17 +582,19 @@ pub fn spawn_dns_resolve_host(
         // A country the mmdb just produced is written to `endpoint_ip` (the
         // table owns the address's flag; `replace` keeps it across
         // re-resolutions), so the next launch renders it without a lookup.
+        //
+        // QUEUED, not written here. This used to call the per-address writer once
+        // per waiter — its own connection, transaction and commit — and `break` on
+        // the first error, abandoning the rest. The 2026-10-01 run measured that
+        // as **790 invocations / 8,608 statements / 88 aborts** at a p99 of
+        // 1,051 ms against an isolated 108 µs: the cost was contention from
+        // concurrent single-row transactions, not the writes themselves. Rows now
+        // accumulate ACROSS hosts and leave in one transaction (see `GeoQueue`).
         if let Some((ip, iso)) =
             fill_features(&mut info, geo.as_ref(), checker.as_ref(), sni.as_deref()).await
         {
             for id in &waiters {
-                if let Err(e) = db
-                    .set_endpoint_ip_country(EndpointId::new(*id), ip, &iso)
-                    .await
-                {
-                    tracing::warn!(target: "tui::ops::enrich", "country persist failed: {e}");
-                    break;
-                }
+                queue_country(EndpointId::new(*id), ip, iso.clone());
             }
         }
         if let Some(t) = tx {
@@ -1088,5 +1234,89 @@ mod tests {
             None,
             "a plaintext ws row has no SNI at all"
         );
+    }
+
+    /// `GEO_QUEUE` is process-global, so the two tests that drive it must not
+    /// overlap — otherwise each one's rows land in the other's drain.
+    static GEO_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The whole point of T7: N resolutions across N DIFFERENT hosts must leave
+    /// as ONE batched write. Per-host batching could not do this — the
+    /// 2026-10-01 run had `waiters.len() ≈ 1` (933 lookups, 790 per-address
+    /// invocations), so only cross-host accumulation reduces the count.
+    #[tokio::test]
+    async fn countries_from_many_hosts_coalesce_into_one_write() {
+        let _guard = GEO_TEST_LOCK.lock().await;
+        let db = xray_tui_db::Database::in_memory().await.expect("db");
+        GEO_QUEUE.rows.clear();
+        for i in 1..=500i64 {
+            queue_country(
+                EndpointId::new(i),
+                format!("1.2.3.{}", i % 250).parse().expect("ip"),
+                "ZZ".to_owned(),
+            );
+        }
+        assert_eq!(GEO_QUEUE.rows.len(), 500, "all hosts queued");
+
+        drain_once(&db).await;
+
+        assert_eq!(
+            GEO_QUEUE.rows.len(),
+            0,
+            "a successful drain empties the buffer in ONE write"
+        );
+        let stored = db
+            .endpoint_resolutions(&[EndpointId::new(1), EndpointId::new(250)])
+            .await
+            .expect("read back");
+        assert!(
+            stored
+                .values()
+                .flatten()
+                .any(|(_, iso)| iso.as_deref() == Some("ZZ")),
+            "the batched rows must be PERSISTED, not merely dropped from the buffer",
+        );
+        GEO_QUEUE.rows.clear();
+    }
+
+    /// A FAILED drain must RE-QUEUE, not abandon. The old per-address loop
+    /// `break`ed on the first error and lost the remaining waiters — the 88
+    /// `country persist failed` aborts of the 2026-10-01 run.
+    #[tokio::test]
+    async fn a_failed_drain_requeues_rather_than_abandoning() {
+        let _guard = GEO_TEST_LOCK.lock().await;
+        let db = xray_tui_db::Database::in_memory().await.expect("db");
+        // A SECOND connection holding the write lock makes every write attempt
+        // fail — the same injection the link-writer tests use.
+        let mut blocker = db.connection().await.expect("blocker");
+        let mut lock = blocker.transaction().await.expect("lock");
+        toasty::sql::statement("UPDATE endpoint_ip SET country = country")
+            .exec(&mut lock)
+            .await
+            .expect("take the write lock");
+
+        GEO_QUEUE.rows.clear();
+        for i in 1..=5i64 {
+            queue_country(
+                EndpointId::new(i),
+                format!("5.5.5.{}", i).parse().expect("ip"),
+                "ZZ".to_owned(),
+            );
+        }
+        drain_once(&db).await;
+        assert_eq!(
+            GEO_QUEUE.rows.len(),
+            5,
+            "a failed drain must put every row back, not abandon it",
+        );
+
+        lock.rollback().await.expect("release the lock");
+        drain_once(&db).await;
+        assert_eq!(
+            GEO_QUEUE.rows.len(),
+            0,
+            "the re-queued rows must land on the next drain",
+        );
+        GEO_QUEUE.rows.clear();
     }
 }

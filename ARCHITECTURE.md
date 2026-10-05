@@ -748,7 +748,9 @@ acquisition; the pragma in `open()` is per-connection and never reaches
 pool-created conns. Rank DDL uses `TransactionMode::Immediate` so MVCC data
 transactions do not own schema initialization.
 
-**Journal mode:** fresh/recreated file DBs default to WAL.
+**Journal mode:** fresh/recreated file DBs default to WAL. **WAL is deliberate** (2026-10-02): an A/B on synthetic feeds found MVCC **1.2-4.8x slower** than WAL at 32 concurrent writers, so MVCC stays opt-in behind `XRAY_TUI_TURSO_CONCURRENT_WRITES=1`.
+
+**Import upserts:** `upsert_endpoints_bulk` and `upsert_endpoint_group_links_bulk` are multi-row (chunked at `IMPORT_STATEMENT_ROWS` = `LINK_STATEMENT_ROWS` = 400); `upsert_protocols_bulk` is still one typed upsert per row and is the largest surviving import cost at a measured 117 us/row. Raw SQL writers that touch an embed-enum column must go through a tested `as_db_label` (`HostType::as_db_label`) — the stored spelling is the derive's `snake_case` ident, which is neither `Debug` nor the wire form, and a wrong one fails silently.
 `XRAY_TUI_TURSO_CONCURRENT_WRITES=1` opts them into Turso MVCC; existing WAL
 files remain WAL, existing MVCC files retain MVCC, and intentional schema wipes
 remove `-wal`, `-shm`, and `-log` sidecars before recreation. Turso 0.7.2 cannot
@@ -1039,6 +1041,8 @@ poll_core_events EndpointInfoUpdated handler: merge by field group into
   failed lookups (empty IPs) materialize TTL-gated attempt entries
 ```
 
+
+**Country writes are queued, not written inline** (2026-10-02): the resolution task pushes `(endpoint, address, country)` into a process-global `GeoQueue` (`DashMap` + `Notify`) and returns WITHOUT awaiting. A single drain task — started from `ui::run`, owned by `ops::enrich::spawn_geo_drain` — wakes on the notify, on `GEO_FLUSH_AT` (256 rows), or every `GEO_DRAIN_INTERVAL` (5 s), and writes the whole buffer in one `set_endpoint_ip_countries` transaction. A failed drain **re-queues** its rows (an `or_insert`, so a later resolution of the same endpoint overwrites) rather than abandoning them. The drain takes a final pass when `shutdown_token` is set. Rationale: the loop already iterated `waiters`, and the 2026-10-01 run had `waiters.len() ≈ 1`, so per-host batching was a no-op; accumulating ACROSS hosts is what reduces the transaction count. See `docs/database-manual-sql.md`.
 ## gRPC API Services
 
 | Service | Proto Path | Backend | Usage |

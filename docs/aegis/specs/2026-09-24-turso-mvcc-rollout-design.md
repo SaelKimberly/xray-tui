@@ -86,3 +86,50 @@ No real-feed import+geo A/B has run. The disposable DB-API probe above is eviden
 ## Rollout rule
 
 Do not convert an existing WAL database in place. To move an existing feed to MVCC, perform the project's existing explicit destructive schema reset/reimport path, then open the recreated file with `XRAY_TUI_TURSO_CONCURRENT_WRITES=1`. Keep WAL default unless a contention-heavy real-feed benchmark shows that avoided waits outweigh the measured import/geo tax.
+
+---
+
+## 12. Outcome — WAL is DELIBERATE (2026-10-02)
+
+§88 asked whether a contention-heavy real-feed benchmark showed that avoided waits outweigh the
+measured import/geo tax. It does not, and the direction is the opposite of the §Engine-level probe.
+
+**A/B, run non-destructively on synthetic feeds** (20,000 endpoints × 2 protocols, 32 concurrent
+single-row geo writers, `flow_cost_contention`; MVCC arm seeded into a FRESH file with
+`XRAY_TUI_TURSO_CONCURRENT_WRITES=1`, as §Decision requires):
+
+| row | WAL | MVCC |
+| --- | --- | --- |
+| sequential geo flush, 100 rows | 3.23 ms | 4.78 ms (**1.5× slower**) |
+| sequential geo per-address | 110 µs | 136 µs (**1.2× slower**) |
+| **fan-in geo per-address / 32 writers** | **15.0 ms** | **72.3 ms** (**4.8× slower**) |
+| write failures | 136 | 136 |
+
+The §Engine-level result (two competing writers: WAL hits the 5 s busy timeout 5/5, MVCC 0.17 ms)
+does **not** survive at 32 concurrent writers on a real-shaped feed: MVCC is slower on every row and
+identical on failures. Its own §DB-API A/B already said so (wall +32%, import p50 +47%), and §Retry
+adds the loss of `wal_checkpoint(PASSIVE)`.
+
+**The contention that motivated MVCC has since been addressed at the source** — and that is the
+decisive point, because MVCC only ever removed *lock wait*, never the work causing it:
+
+| | before | after |
+| --- | --- | --- |
+| link-writer commits per batch | 1,167 | **32** |
+| import statements | ~409,467 | **~774** (two of three families multi-row) |
+| country writes | ~790 single-row transactions | **one per drain** |
+| a 3 s full-table scan holding the write lock | every 10 min | **a plain read** |
+
+**What remains is not lock wait.** The largest surviving import cost is
+`upsert_protocols_bulk`, still **one typed upsert per row** at a measured **117 µs/row** — round-trip
+cost that no journal mode touches. That is T6's deferred third family, and it is where the next
+effort belongs.
+
+**Decision: WAL stays the default.** MVCC remains available behind
+`XRAY_TUI_TURSO_CONCURRENT_WRITES=1`; nothing is retired.
+
+**Honest limits of this measurement.** Synthetic 20k feed, not the real 74k; one repetition per arm,
+so the fan-in row is a single sample; and the **import arm is not comparable at all** — synthetic
+protocol rows carry unloaded deferred carriers, which `upsert_protocols_bulk` correctly refuses, so
+all 136 import attempts failed in *both* arms. Only the geo rows are a valid A/B. This is one more
+input pointing the same way as the measured tax, not a standalone proof.

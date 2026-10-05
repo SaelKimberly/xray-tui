@@ -1701,7 +1701,18 @@ fn render_group_list_inner(
             GroupListItem {
                 name: g.name.clone().unwrap_or_else(|| "Unnamed".to_string()),
                 url: url_display,
-                status: status.to_string(),
+                // On an error, show WHY. The bare word "error" is what left the
+                // 2026-10-01 truncated import undiagnosable — the reason was in
+                // the activity log, which the user has to know to look in.
+                // `specs/2026-10-02-import-budget-design.md` §5.
+                status: match (&g.status, g.error_message.as_deref()) {
+                    (Some(GroupStatus::Error), Some(reason)) if !reason.is_empty() => {
+                        let reason = reason.trim();
+                        let tail: String = reason.chars().take(60).collect();
+                        format!("error: {tail}")
+                    }
+                    _ => status.to_string(),
+                },
                 selected: selected_mask.get(i).copied().unwrap_or(false),
             }
         })

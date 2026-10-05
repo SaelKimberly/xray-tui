@@ -94,3 +94,47 @@ reband/page shapes; tests `active_and_stale_windows`,
 
 Retirement trigger: toasty aggregation / partial-index support that lets the
 page express membership + ordering typed in one statement.
+
+### Pending N∈{50k, 200k} acceptance — measured 2026-10-02
+
+`flow_cost_report` on a **copy** of the live 74,014-endpoint feed (WAL, idle), median of 5:
+
+| query | offset 0 | offset 37,007 | offset 73,814 |
+| --- | --- | --- | --- |
+| All view, `Address` | 20.7 ms | 20.3 ms | 21.0 ms |
+| All view, `Test` | 4.3 ms | 5.9 ms | 7.8 ms |
+| **Active (`band = 0`), `Test`** | **102.6 ms** | — | — |
+| Active, `Address` | 4.8 ms | — | — |
+
+Offset depth is **not** the cost (Address is flat; Test grows 1.8× end-to-end). The `band = 0`
+predicate is: adding it to the `Test` order costs ~20×, because `endpoint_rank_test_v2` does not
+contain `band` and the predicate forfeits the covering scan. `Address` does not pay this, because
+`endpoint_rank_band_host` leads with `band`.
+
+At 74k this is **~100 ms on the render task** against a 16 ms tick, with hydration (`load_page_projection`)
+only 3.3 ms of it. A partial index is therefore justified by a measured cause — **not** by size,
+since `band = 0` is 99.5% of rows.
+
+### Correction — the cost is missing planner statistics, not a missing index (2026-02, same day)
+
+The measurement above ran on a copy that had been `ANALYZE`d. The **live database has no
+`sqlite_stat1` table**, and on a fresh copy the `Active + Test` plan is:
+
+```
+SEARCH k USING INDEX endpoint_rank_band_window (band=?)
+USE TEMP B-TREE FOR ORDER BY
+```
+
+— a filesort of all ~73,666 matching rows per page. Raw SQL, median of 5:
+
+| variant | offset 0 | offset 37,007 | offset 73,814 |
+| --- | --- | --- | --- |
+| as production is (no statistics) | 20.4 ms | 58.2 ms | 64.9 ms |
+| + band-partial index (**no statistics**) | 20.0 ms | 61.4 ms | 65.0 ms |
+| + `ANALYZE` | 0.1 ms | 9.8 ms | 19.4 ms |
+| + `ANALYZE` + band-partial index | 0.0 ms | **0.6 ms** | **1.2 ms** |
+
+**The index alone changes nothing** — the planner will not choose it without statistics. `ANALYZE`
+alone is a 4–16× win; the index then buys a further ~16× by removing the per-skipped-row table
+lookup that the missing `band` column causes. A partial index is the right idea for the wrong
+reason: it is covering, not small (`band = 0` is 99.5% of rows).

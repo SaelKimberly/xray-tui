@@ -678,6 +678,9 @@ impl AppState {
                         level: e.level,
                         target: e.target,
                         message: e.message,
+                        // Read back from heed: `detail` is session-only by
+                        // design and was never persisted, so it is absent here.
+                        detail: None,
                         timestamp_nanos: e.timestamp_nanos as i64,
                     })
                     .collect();
@@ -779,6 +782,8 @@ impl AppState {
                 target: target.to_string(),
                 level: level.to_string(),
                 message: message.to_string(),
+                // `log_trace` has no tracing fields to render.
+                detail: None,
                 timestamp_nanos: i64::try_from(timestamp_nanos).unwrap_or(i64::MAX),
                 // Sent to the heed channel just above.
                 persisted: true,
@@ -801,6 +806,8 @@ impl AppState {
                 target: target.to_string(),
                 level: level.to_string(),
                 message: message.to_string(),
+                // `log_activity` has no tracing fields to render.
+                detail: None,
                 // Event time, for the same reason as `log_trace`.
                 timestamp_nanos: std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)

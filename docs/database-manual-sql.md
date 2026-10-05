@@ -187,3 +187,67 @@ So:
 | `CREATE TABLE IF NOT EXISTS rank_weight_meta (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)` | The weight tables are compiled into the binary, so an app upgrade silently invalidates every stored weight. | A one-row stamp is the smallest thing that can say "these numbers came from a different build". A mismatch recomputes every rank key at open — the only trigger that can replace the all-zero default that `ADD COLUMN` materializes for pre-existing rows. |
 | `INSERT … SELECT`-free weight backfill (`backfill_all` reads `Protocol::all()`) | SQL cannot call the Rust `weight_of`. Duplicating the four tables as a SQL `CASE` expression would create a second owner of the law — exactly the drift ADR 0003 exists to prevent. | The weight is derived from `transport_type`/`security_type`/`security_sni`/`security_fp`, four small scalar columns the protocol row already stores. |
 | `refresh`'s `LEFT JOIN protocols pr ON pr.id = ps.protocol_id` | The link row carries no protocol, so the weight cannot be derived from `profile_stats` alone. | Four discriminator columns (`transport_type`, `security_type`, `security_sni`, `security_fp` — `proto_kind` is deliberately not a weight dimension) cost one indexed lookup per link inside a statement the refresh path already issues; the deferred `config` JSON stays unloaded. They are parsed with `TransportType::from_db_label`, NOT `FromStr`: toasty's embed writes `http_upgrade`/`x_http` where the wire form says `httpupgrade`/`xhttp`, and the wrong parser silently persists a zero weight for 314 of ~21k real protocol rows. |
+
+## Purge candidate scan moved out of the write transaction (2026-10-02)
+
+| Site | Cause | Why raw |
+| --- | --- | --- |
+| `purge_expired_once`'s candidate `SELECT e.id FROM endpoints e WHERE NOT EXISTS (…)` split into an **outside-transaction** scan plus an in-transaction **re-check** over the candidate ids only (`database.rs:1440+`) | The scan used to run INSIDE the write transaction, which turned a read-only full-table walk into a write-lock hold. The 2026-10-01 run measured that statement at **3,098 ms** on 74,014 endpoints — a three-second lock on the single database handle, from a statement that only reads. Every concurrent writer (import chunks, the enrichment geo flush, the link-writer window) queued behind it, and that queue is where the `snapshot is stale` aborts came from. | Unchanged as raw: toasty's `.all()` quantifier compiles to a whole-table projection (145 ms, dump-3). What changed is **placement, not the statement**: the scan is now a plain read on `conn`, and the write transaction opens only for the re-check and the cascade. The re-check is what closes the race the split introduces — an endpoint that gained a link between the two statements must not be deleted with a live link — and it is bounded by the candidate set, so it is an index seek rather than a scan. Ids are inlined as literals in the re-check, the convention every other raw statement here uses (~0.8 ms per bound id). |
+
+**Measured effect:** the write transaction is now bounded by the DELETE count, not by the scan. `purge_expired`'s cost moves to a plain read that blocks no writer.
+
+## Import upserts: two of three families moved to multi-row (2026-10-02)
+
+| Site | Cause | Measured |
+| --- | --- | --- |
+| `upsert_endpoints_bulk` — one multi-row `INSERT … VALUES (…),(…) ON CONFLICT("id") DO UPDATE` per 400 rows, replacing one typed upsert per row | The typed builder cannot batch. The 2026-10-01 run issued **105,147 statements** for this family alone. | ~263 statements for the same rows. `AGENTS.md` decision 22 already carried the finding ("the import path's per-row typed upserts 360 ms per 2,000 links against 44.3 ms"); the fix had never been applied to this path. |
+| `upsert_endpoint_group_links_bulk` — same shape on `("endpoint_id","group_id")` | The largest single family: **204,592 statements**, half the import's total, because a 500-URL batch touches one endpoint once per protocol and each was its own statement. | ~511 statements. |
+
+**Both need `HostType::as_db_label()`, added for this.** The stored spelling is the embed
+derive's `snake_case` of the Rust ident — `ipv4` / `dns` / `ipv6` / `undefined`, verified against
+the 2026-10-01 feed (74,014 endpoints, no other spelling). It is **not** `Debug` and **not** any
+wire form. A wrong label does not fail the write: `host_type` is unconstrained text, so a typo
+silently mis-classifies the endpoint and the DNS gate starts disagreeing with the row. The
+round-trip is pinned by `multi_row_import_writers_round_trip_through_a_real_database`, which reads
+the column back **as text** rather than through the typed loader (which would hide the error), and
+by `multi_row_endpoint_upsert_replaces_and_preserves`, which proves the upsert replaces `host`/`port`
+and leaves `manual_protocol_override` and `resolved_at` alone — the import does not own them.
+
+### `upsert_protocols_bulk` is DELIBERATELY NOT converted
+
+99,728 statements, the remaining quarter. It needs three enum labels (`proto_kind`,
+`transport_type`, `security_type` — the feed stores `shadowsocks2022`, `http_upgrade`, `x_http`,
+which are **not** `as_str()`/`FromStr` spellings; see the same trap documented in
+`proto_spec/kinds.rs`) **and** the storage encoding of the `transport.data` / `security.data`
+JSON columns, which has not been verified here. Writing raw SQL against `protocols.config` without
+that would risk a row the connect path cannot read — a worse failure than a slow import. **Blocker:
+a writer-side `as_db_label` for `TransportType`/`SecurityType`/`ProtocolKind`, each with a
+DB round-trip test**, and the confirmed encoding of the two JSON blob columns. This entry is the
+record of that deferral, not an omission.
+
+## Enrichment country writes: one owner, one transaction per drain (2026-10-02)
+
+The resolution task no longer writes. It **queues** `(endpoint, address, country)` into a
+process-global `GeoQueue` and returns without awaiting; a single drain task started from
+`ui::run` writes the whole buffer with `set_endpoint_ip_countries` — **one transaction**.
+
+**Why a cross-host buffer and not per-host batching.** `spawn_dns_resolve_host` already loops its
+`waiters`, so "collect the per-host rows and call `set_endpoint_ip_countries` once" only collapses
+transactions when a host has more than one waiter — and the 2026-10-01 run says it almost never
+does: **933 lookups, 1,577 deferred HALVES (≈788 distinct links), 790 per-address invocations**, so
+`waiters.len() ≈ 1`. Per-host batching would have been very nearly a no-op.
+
+**What the damage actually was.** The per-address writer's isolated cost is **108 µs**; production
+p99 was **1,051 ms** — a ~9,700× multiplier produced by *concurrent* single-row write transactions,
+not by cheap writes. So the transaction count is the thing to reduce, and only accumulation across
+hosts reduces it.
+
+**A failed drain RE-QUEUES.** The old loop `break`ed on the first error and abandoned the host's
+remaining waiters — the source of the run's **88 `country persist failed` aborts**. Re-queue cannot
+grow without bound: a later resolution of the same endpoint overwrites the entry, and the insert is
+an `or_insert` on the failure path.
+
+**Durability window:** `GEO_DRAIN_INTERVAL = 5 s` is a ceiling on how long a country sits queued,
+and the buffer also drains at `GEO_FLUSH_AT = 256` rows or on `wake`. Results are delayed, not lost;
+the page seed refills anything still queued. This is the same trade the link writer's
+`max_staged_age` makes, and it is recorded here for the same reason.

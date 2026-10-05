@@ -742,17 +742,43 @@ pub struct ValidationSummary {
     /// Profiles that imported but demand no certificate verification.
     pub security_warning_count: usize,
     pub other_count: usize,
+    /// A bounded sample of WHY entries failed.
+    ///
+    /// The counters alone could not diagnose the 2026-10-01 run's
+    /// `1 links, 1 errors` subscription: it failed 4/4 with every count zero
+    /// except `other: 1`, and the message explaining why was discarded right
+    /// where it was produced. Capped, because a 90k-link feed with 1,498 errors
+    /// must not turn the log into a wall of text.
+    pub sample_errors: Vec<String>,
+    /// Errors not represented in `sample_errors`, because the cap was reached.
+    pub sample_errors_omitted: usize,
 }
 
 impl ValidationSummary {
+    /// Cap on `sample_errors`.
+    pub const SAMPLE_ERROR_CAP: usize = 5;
+
+    /// Record one failure reason — the **message only**, never the URL, which
+    /// carries credentials.
+    pub fn record_error(&mut self, reason: impl Into<String>) {
+        if self.sample_errors.len() < Self::SAMPLE_ERROR_CAP {
+            self.sample_errors.push(reason.into());
+        } else {
+            self.sample_errors_omitted += 1;
+        }
+    }
     /// Add `other`'s counters into `self` (chunked imports sum per-batch
     /// summaries into one whole-run summary).
-    pub const fn merge(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) {
         self.total_errors += other.total_errors;
         self.missing_field_count += other.missing_field_count;
         self.host_validation_count += other.host_validation_count;
         self.security_warning_count += other.security_warning_count;
         self.other_count += other.other_count;
+        for reason in &other.sample_errors {
+            self.record_error(reason.clone());
+        }
+        self.sample_errors_omitted += other.sample_errors_omitted;
     }
 }
 

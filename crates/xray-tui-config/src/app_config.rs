@@ -36,6 +36,49 @@ pub struct AppConfig {
     pub clash_mixin: Option<String>,
     #[serde(default)]
     pub purgatory: PurgatoryConfig,
+    #[serde(default)]
+    pub import: ImportConfig,
+}
+
+/// Ceilings on ONE subscription feed.
+///
+/// These were two function-local `const`s in `run_streaming_import`, invisible
+/// and unchangeable: on 2026-10-01 a 90,688-profile feed hit the byte budget and
+/// was cut off with the reason reachable only from the activity log.
+/// `specs/2026-10-02-import-budget-design.md` owns this.
+///
+/// The DEFAULTS are the values that were hard-coded, so adding the section
+/// changes no behaviour at all — that is the compatibility boundary the spec
+/// requires. Raising the byte ceiling is a one-line edit below, and once
+/// surfaced in Settings it is a runtime change, not a rebuild.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ImportConfig {
+    /// Decoded-feed ceiling in bytes; `0` disables it. 64 MiB is the value that
+    /// was hard-coded, and it is MARGINAL: the 2026-10-01 feed decoded to just
+    /// over it (67,112,960 bytes) and was truncated.
+    #[serde(default = "default_max_feed_bytes")]
+    pub max_feed_bytes: u64,
+    /// Stored-link ceiling; `0` disables it. A runaway guard, not a real limit —
+    /// 90,688 links fit comfortably.
+    #[serde(default = "default_max_feed_links")]
+    pub max_feed_links: usize,
+}
+
+const fn default_max_feed_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+const fn default_max_feed_links() -> usize {
+    200_000
+}
+
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self {
+            max_feed_bytes: default_max_feed_bytes(),
+            max_feed_links: default_max_feed_links(),
+        }
+    }
 }
 
 /// The Purgatory windows: `ttl_days` is the Active/Purgatory bound a reload
@@ -314,6 +357,31 @@ fn normalize_protocol_key(key: &str) -> String {
         other => other,
     }
     .to_owned()
+}
+
+/// An EXISTING `config.json` must load unchanged: the `import` section is
+/// `#[serde(default)]`, so a file written before this change still parses
+/// and still gets the values that were hard-coded. This is the spec's
+/// compatibility boundary, and it is the whole reason the section is additive.
+#[test]
+fn a_config_without_an_import_section_loads_with_the_previous_defaults() {
+    let cfg: AppConfig = serde_json::from_str("{}").expect("empty config must load");
+    assert_eq!(cfg.import.max_feed_bytes, 64 * 1024 * 1024);
+    assert_eq!(cfg.import.max_feed_links, 200_000);
+}
+
+/// Overrides must survive a round trip, including `0` meaning "unbounded".
+#[test]
+fn import_budget_overrides_round_trip_and_zero_disables() {
+    let cfg: AppConfig =
+        serde_json::from_str(r#"{"import":{"max_feed_bytes":0,"max_feed_links":1234}}"#)
+            .expect("override must load");
+    assert_eq!(cfg.import.max_feed_bytes, 0, "0 must mean unbounded");
+    assert_eq!(cfg.import.max_feed_links, 1234);
+    let back = serde_json::to_string(&cfg.import).expect("serialize");
+    let again: ImportConfig = serde_json::from_str(&back).expect("reparse");
+    assert_eq!(again.max_feed_bytes, 0);
+    assert_eq!(again.max_feed_links, 1234);
 }
 
 #[cfg(test)]
