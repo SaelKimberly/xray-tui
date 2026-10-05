@@ -1394,9 +1394,7 @@ impl Database {
             move || async move {
                 let mut conn = db.conn().await?;
                 let mut tx = conn.transaction().await?;
-                for (endpoint_id, ip, iso) in rows {
-                    crate::endpoint_ip::set_country(&mut tx, *endpoint_id, *ip, iso).await?;
-                }
+                set_endpoint_ip_countries_once(&mut tx, rows).await?;
                 tx.commit().await?;
                 Ok(())
             },
@@ -1922,6 +1920,24 @@ pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -
         return Ok(());
     }
     crate::endpoint_rank::refresh(tx, &touched).await?;
+    Ok(())
+}
+
+/// The statement half of [`Database::set_endpoint_ip_countries`], on the
+/// caller's executor.
+///
+/// Split out for [`crate::write_behind::CountrySpec`]: the write-behind driver
+/// opens its OWN transaction and owns the commit, so a call that opened a
+/// second connection (and retried it) inside the driver's tx would deadlock on
+/// itself. Every other one-shot caller keeps the public wrapper.
+#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+pub async fn set_endpoint_ip_countries_once(
+    tx: &mut impl Executor,
+    rows: &[(EndpointId, std::net::IpAddr, String)],
+) -> Result<()> {
+    for (endpoint_id, ip, iso) in rows {
+        crate::endpoint_ip::set_country(&mut *tx, *endpoint_id, *ip, iso).await?;
+    }
     Ok(())
 }
 

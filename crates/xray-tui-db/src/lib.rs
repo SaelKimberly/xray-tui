@@ -12,7 +12,7 @@ pub use models_toasty as models;
 pub use models_toasty::EndpointRank;
 pub use models_toasty::RouteProbes;
 pub use retry::{is_busy_error, retry_on_busy};
-pub use write_behind::{CacheSpec, Coalesced, WriteBehind};
+pub use write_behind::{CacheSpec, Coalesced, CountryPatch, CountryRow, CountrySpec, WriteBehind};
 pub use xray_tui_proto::proto_spec::weight;
 
 mod database;

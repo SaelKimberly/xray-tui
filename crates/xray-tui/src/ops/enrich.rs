@@ -49,116 +49,88 @@ pub(crate) fn extract_sni(protocol: &Protocol, endpoint_host: &str) -> Option<St
 /// — and the window was the shorter of the pair.
 pub const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// How long a resolved country may sit in the accumulator before a drain is
-/// forced. This is T7's durability window, in the same spirit as the link
-/// writer's `max_staged_age`: results are NOT lost on a crash, only delayed by
-/// up to this long. It is a hard ceiling, not the poll interval — the drain also
-/// runs as soon as the buffer reaches `GEO_FLUSH_AT`.
+/// How long a resolved country may sit staged before a flush is forced.
+///
+/// This is the driver's tick interval, in the same spirit as the link writer's
+/// `max_staged_age`: results are NOT lost on a crash, only delayed by up to
+/// this long. It is not the poll interval — the driver also writes as soon as
+/// `GEO_FLUSH_AT` rows are staged.
 pub const GEO_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Buffer occupancy that forces a drain without waiting for the deadline.
+/// Rows a flush window carries, and so the occupancy that forces a write
+/// without waiting for the tick.
 const GEO_FLUSH_AT: usize = 256;
 
-/// A cross-host buffer of `(endpoint, address, country)` rows awaiting one
-/// batched write.
-///
-/// **Why a buffer and not per-host batching.** `spawn_dns_resolve_host` already
-/// loops its waiters, so collecting "the per-host rows and calling
-/// `set_endpoint_ip_countries` once" would only collapse transactions when a
-/// host has more than one waiter — and the 2026-10-01 run says it almost never
-/// does: 933 lookups for 1,577 deferred HALVES (≈788 distinct links) and **790**
-/// invocations of the per-address writer, i.e. `waiters.len() ≈ 1`. Per-host
-/// batching would have been very nearly a no-op.
-///
-/// Accumulating across hosts is what actually reduces the transaction count, and
-/// it is also where the damage came from: the per-address writer's isolated cost
-/// is 108 µs but production p99 was 1,051 ms — a ~9,700× multiplier produced by
-/// *concurrent* single-row write transactions, not by cheap writes.
-#[derive(Default)]
-pub(crate) struct GeoQueue {
-    rows: dashmap::DashMap<EndpointId, (std::net::IpAddr, String)>,
-    wake: tokio::sync::Notify,
-}
+/// The country driver, installed by [`spawn_geo_drain`] at the top of
+/// `ui::run` — before any resolution task exists, so every
+/// [`queue_country`] call finds it.
+static GEO_DRIVER: std::sync::OnceLock<
+    std::sync::Arc<xray_tui_db::WriteBehind<xray_tui_db::CountrySpec>>,
+> = std::sync::OnceLock::new();
 
-static GEO_QUEUE: std::sync::LazyLock<std::sync::Arc<GeoQueue>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(GeoQueue::default()));
+/// Warned once, not per row: a queue call with no driver is a lifecycle bug
+/// (the UI was torn down), not a per-row condition worth a log line each.
+static GEO_DRIVER_MISSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Queue one resolved country for the next batched write. Non-blocking: the
 /// resolution task must not await a database write, or a fan-out of a few
 /// thousand hosts would serialise behind it.
 pub(crate) fn queue_country(endpoint_id: EndpointId, ip: std::net::IpAddr, iso: String) {
-    let queue = GEO_QUEUE.clone();
-    queue.rows.insert(endpoint_id, (ip, iso));
-    if queue.rows.len() >= GEO_FLUSH_AT {
-        queue.wake.notify_one();
-    }
+    let Some(driver) = GEO_DRIVER.get() else {
+        if !GEO_DRIVER_MISSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                target: "tui::ops::enrich",
+                "country queued before the drain driver was installed — dropped",
+            );
+        }
+        return;
+    };
+    driver.push(xray_tui_db::CountryRow {
+        endpoint_id,
+        ip,
+        iso,
+    });
 }
 
-/// Take everything currently queued, **removing** it from the buffer.
+/// Install the country driver and run it until shutdown.
 ///
-/// Removal matters: a drain that only copied would rewrite the entire buffer on
-/// every tick, forever, and the buffer would never shrink.
-fn take_queued() -> Vec<(EndpointId, std::net::IpAddr, String)> {
-    let keys: Vec<EndpointId> = GEO_QUEUE.rows.iter().map(|e| *e.key()).collect();
-    keys.into_iter()
-        .filter_map(|id| {
-            GEO_QUEUE
-                .rows
-                .remove(&id)
-                .map(|(_, entry)| (id, entry.0, entry.1))
-        })
-        .collect()
-}
-
-/// Run the drain loop until the shutdown flag is set.
-///
-/// A failed drain puts the rows **back**: the old per-address loop `break`ed on
-/// the first error and abandoned the host's remaining waiters, which is where the
-/// 88 `country persist failed` aborts of the 2026-10-01 run came from.
+/// The driver owns the whole cadence — the `GEO_FLUSH_AT` window, the
+/// `GEO_DRAIN_INTERVAL` tick, its staleness deadline, and the re-stage of a
+/// failed write — so this only supplies the database and the shutdown edge.
+/// The final `flush` before the flush task is aborted is today's "one last
+/// drain": a quit must not strand what is staged.
 pub(crate) fn spawn_geo_drain(
     db: std::sync::Arc<xray_tui_db::Database>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = GEO_QUEUE.wake.notified() => {}
-                () = tokio::time::sleep(GEO_DRAIN_INTERVAL) => {}
-            }
-            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                // One last drain so a quit does not strand what is queued.
-                drain_once(&db).await;
-                return;
-            }
-            drain_once(&db).await;
-        }
-    });
-}
-
-/// One drain: take the buffer, write it in ONE transaction, re-queue on failure.
-async fn drain_once(db: &xray_tui_db::Database) {
-    let mut rows = take_queued();
-    if rows.is_empty() {
-        return;
-    }
-    let total = rows.len();
-    if let Err(e) = db.set_endpoint_ip_countries(&rows).await {
+    let driver = xray_tui_db::WriteBehind::<xray_tui_db::CountrySpec>::new(
+        db,
+        GEO_FLUSH_AT,
+        GEO_DRAIN_INTERVAL,
+    );
+    if GEO_DRIVER.set(std::sync::Arc::clone(&driver)).is_err() {
         tracing::warn!(
             target: "tui::ops::enrich",
-            "country persist failed for {total} rows: {e} — re-queued for the next drain",
+            "country drain driver already installed — keeping the first",
         );
-        // Re-queue rather than abandon. A later resolution of the same endpoint
-        // overwrites the entry, so this cannot grow without bound.
-        for (id, ip, iso) in rows.drain(..) {
-            GEO_QUEUE.rows.entry(id).or_insert((ip, iso));
-        }
-        GEO_QUEUE.wake.notify_one();
-        return;
     }
-    tracing::debug!(
-        target: "tui::ops::enrich",
-        "country drain wrote {total} row(s) in one transaction",
-    );
+    let flush_task = driver.spawn_flush_task();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(GEO_DRAIN_INTERVAL).await;
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
+        // One last flush so a quit does not strand what is queued.
+        if let Err(e) = driver.flush().await {
+            tracing::warn!(
+                target: "tui::ops::enrich",
+                "final country flush failed: {e}",
+            );
+        }
+        flush_task.abort();
+    });
 }
 
 /// True when a resolution must run: no entry, no address and no attempt, or a
@@ -1236,9 +1208,29 @@ mod tests {
         );
     }
 
-    /// `GEO_QUEUE` is process-global, so the two tests that drive it must not
-    /// overlap — otherwise each one's rows land in the other's drain.
-    static GEO_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// A driver over an in-memory database, sized like production so the
+    /// window behaviour under test is the shipped one.
+    async fn country_driver() -> (
+        std::sync::Arc<xray_tui_db::Database>,
+        std::sync::Arc<xray_tui_db::WriteBehind<xray_tui_db::CountrySpec>>,
+    ) {
+        let db = std::sync::Arc::new(xray_tui_db::Database::in_memory().await.expect("db"));
+        let driver = xray_tui_db::WriteBehind::<xray_tui_db::CountrySpec>::new(
+            std::sync::Arc::clone(&db),
+            GEO_FLUSH_AT,
+            Duration::from_millis(50),
+        );
+        (db, driver)
+    }
+
+    fn stage(driver: &xray_tui_db::WriteBehind<xray_tui_db::CountrySpec>, id: i64, iso: &str) {
+        driver.push(xray_tui_db::CountryRow {
+            endpoint_id: EndpointId::new(id),
+            // Keep the octet in range: these ids are row numbers, not addresses.
+            ip: format!("1.2.3.{}", id % 250).parse().expect("ip"),
+            iso: iso.to_owned(),
+        });
+    }
 
     /// The whole point of T7: N resolutions across N DIFFERENT hosts must leave
     /// as ONE batched write. Per-host batching could not do this — the
@@ -1246,24 +1238,18 @@ mod tests {
     /// invocations), so only cross-host accumulation reduces the count.
     #[tokio::test]
     async fn countries_from_many_hosts_coalesce_into_one_write() {
-        let _guard = GEO_TEST_LOCK.lock().await;
-        let db = xray_tui_db::Database::in_memory().await.expect("db");
-        GEO_QUEUE.rows.clear();
+        let (db, driver) = country_driver().await;
         for i in 1..=500i64 {
-            queue_country(
-                EndpointId::new(i),
-                format!("1.2.3.{}", i % 250).parse().expect("ip"),
-                "ZZ".to_owned(),
-            );
+            stage(&driver, i, "ZZ");
         }
-        assert_eq!(GEO_QUEUE.rows.len(), 500, "all hosts queued");
+        assert_eq!(driver.staged_len(), 500, "all hosts staged");
 
-        drain_once(&db).await;
+        assert_eq!(driver.flush().await.expect("flush"), 500);
 
         assert_eq!(
-            GEO_QUEUE.rows.len(),
+            driver.staged_len(),
             0,
-            "a successful drain empties the buffer in ONE write"
+            "a successful flush empties the buffer in ONE write"
         );
         let stored = db
             .endpoint_resolutions(&[EndpointId::new(1), EndpointId::new(250)])
@@ -1276,16 +1262,36 @@ mod tests {
                 .any(|(_, iso)| iso.as_deref() == Some("ZZ")),
             "the batched rows must be PERSISTED, not merely dropped from the buffer",
         );
-        GEO_QUEUE.rows.clear();
     }
 
-    /// A FAILED drain must RE-QUEUE, not abandon. The old per-address loop
+    /// Two resolutions of the SAME endpoint collapse to the last writer — the
+    /// queue's `DashMap` insert overwrote, and so does the coalesce rule.
+    #[tokio::test]
+    async fn two_resolutions_of_one_endpoint_write_only_the_last() {
+        let (db, driver) = country_driver().await;
+        stage(&driver, 1, "US");
+        stage(&driver, 1, "DE");
+        assert_eq!(driver.staged_len(), 1, "one endpoint, one staged row");
+
+        driver.flush().await.expect("flush");
+
+        let stored = db
+            .endpoint_resolutions(&[EndpointId::new(1)])
+            .await
+            .expect("read back");
+        let iso = stored
+            .values()
+            .flatten()
+            .find_map(|(_, iso)| iso.as_deref());
+        assert_eq!(iso, Some("DE"), "the LAST resolution wins");
+    }
+
+    /// A FAILED flush must RE-STAGE, not abandon. The old per-address loop
     /// `break`ed on the first error and lost the remaining waiters — the 88
     /// `country persist failed` aborts of the 2026-10-01 run.
     #[tokio::test]
-    async fn a_failed_drain_requeues_rather_than_abandoning() {
-        let _guard = GEO_TEST_LOCK.lock().await;
-        let db = xray_tui_db::Database::in_memory().await.expect("db");
+    async fn a_failed_flush_restages_rather_than_abandoning() {
+        let (db, driver) = country_driver().await;
         // A SECOND connection holding the write lock makes every write attempt
         // fail — the same injection the link-writer tests use.
         let mut blocker = db.connection().await.expect("blocker");
@@ -1295,28 +1301,22 @@ mod tests {
             .await
             .expect("take the write lock");
 
-        GEO_QUEUE.rows.clear();
         for i in 1..=5i64 {
-            queue_country(
-                EndpointId::new(i),
-                format!("5.5.5.{}", i).parse().expect("ip"),
-                "ZZ".to_owned(),
-            );
+            stage(&driver, i, "ZZ");
         }
-        drain_once(&db).await;
+        driver.flush().await.expect_err("the write lock is held");
         assert_eq!(
-            GEO_QUEUE.rows.len(),
+            driver.staged_len(),
             5,
-            "a failed drain must put every row back, not abandon it",
+            "a failed flush must put every row back, not abandon it",
         );
 
         lock.rollback().await.expect("release the lock");
-        drain_once(&db).await;
+        driver.flush().await.expect("flush after unlock");
         assert_eq!(
-            GEO_QUEUE.rows.len(),
+            driver.staged_len(),
             0,
-            "the re-queued rows must land on the next drain",
+            "the re-staged rows must land on the next flush",
         );
-        GEO_QUEUE.rows.clear();
     }
 }

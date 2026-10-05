@@ -227,9 +227,10 @@ record of that deferral, not an omission.
 
 ## Enrichment country writes: one owner, one transaction per drain (2026-10-02)
 
-The resolution task no longer writes. It **queues** `(endpoint, address, country)` into a
-process-global `GeoQueue` and returns without awaiting; a single drain task started from
-`ui::run` writes the whole buffer with `set_endpoint_ip_countries` — **one transaction**.
+The resolution task no longer writes. It **stages** `(endpoint, address, country)` into the
+process-global `xray_tui_db::WriteBehind<CountrySpec>` driver and returns without awaiting; the
+driver task started from `ui::run` writes the window with `set_endpoint_ip_countries_once` on the
+transaction IT opened — **one transaction**, no nested connection.
 
 **Why a cross-host buffer and not per-host batching.** `spawn_dns_resolve_host` already loops its
 `waiters`, so "collect the per-host rows and call `set_endpoint_ip_countries` once" only collapses
@@ -242,12 +243,15 @@ p99 was **1,051 ms** — a ~9,700× multiplier produced by *concurrent* single-r
 not by cheap writes. So the transaction count is the thing to reduce, and only accumulation across
 hosts reduces it.
 
-**A failed drain RE-QUEUES.** The old loop `break`ed on the first error and abandoned the host's
-remaining waiters — the source of the run's **88 `country persist failed` aborts**. Re-queue cannot
-grow without bound: a later resolution of the same endpoint overwrites the entry, and the insert is
-an `or_insert` on the failure path.
+**A failed flush RE-STAGES.** The old loop `break`ed on the first error and abandoned the host's
+remaining waiters — the source of the run's **88 `country persist failed` aborts**. The driver
+re-stages the failing window AND every later one, and a re-stage never clobbers a newer push for the
+same endpoint, so it cannot grow without bound.
 
-**Durability window:** `GEO_DRAIN_INTERVAL = 5 s` is a ceiling on how long a country sits queued,
-and the buffer also drains at `GEO_FLUSH_AT = 256` rows or on `wake`. Results are delayed, not lost;
-the page seed refills anything still queued. This is the same trade the link writer's
+**Durability window:** the driver's tick is `GEO_DRAIN_INTERVAL = 5 s` and its window is
+`GEO_FLUSH_AT = 256` rows; a bare tick additionally waits for the driver's own row floor
+(`flush_rows / 4`) or its staleness deadline (`75` ticks), so a small trickle can sit longer than
+5 s by design — the trade documented on `TIMER_FLOOR_DIVISOR`. Results are delayed, not lost:
+`spawn_geo_drain` takes one final `flush()` when `shutdown_token` is set, and the page seed
+persists its own rows. This is the same trade the link writer's
 `max_staged_age` makes, and it is recorded here for the same reason.

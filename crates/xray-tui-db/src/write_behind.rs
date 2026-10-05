@@ -19,6 +19,7 @@
 //! Both spec hooks therefore take `&mut impl toasty::Executor` and never open a
 //! transaction of their own.
 
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -406,6 +407,111 @@ impl<S: CacheSpec> WriteBehind<S> {
     }
 }
 
+/// One staged country write: the endpoint, the address its country belongs to,
+/// and the ISO code.
+///
+/// The staging identity is the ENDPOINT, not the address: the queue this
+/// replaced keyed `endpoint_id → (ip, iso)` and an insert overwrote, so a
+/// second resolution of the same endpoint replaced the first. That is
+/// [`CountrySpec`]'s coalesce rule.
+#[derive(Debug, Clone)]
+pub struct CountryRow {
+    /// The endpoint whose address carries the country.
+    pub endpoint_id: crate::models_toasty::EndpointId,
+    /// The resolved address the country belongs to.
+    pub ip: std::net::IpAddr,
+    /// ISO 3166-1 alpha-2 code from mmdb.
+    pub iso: String,
+}
+
+/// The write side of a country row: 1:1 with [`CountryRow`], so the patch IS
+/// the row.
+///
+/// Kept as its own type because the driver hands the write path a patch slice
+/// and the re-stage path the row — the shapes must not be able to drift apart
+/// by accident.
+#[derive(Debug, Clone)]
+pub struct CountryPatch {
+    /// The endpoint whose address carries the country.
+    pub endpoint_id: crate::models_toasty::EndpointId,
+    /// The resolved address the country belongs to.
+    pub ip: std::net::IpAddr,
+    /// ISO 3166-1 alpha-2 code from mmdb.
+    pub iso: String,
+}
+
+/// The write-behind spec for resolved-address countries (`endpoint_ip.country`).
+///
+/// The first migrated table, and the simplest: one upsert per row, no derived
+/// state. `refresh` is a no-op because a country write touches `endpoint_ip`
+/// only — rank keys are a function of an endpoint's links and protocols, not of
+/// which country its address resolved to.
+pub struct CountrySpec;
+
+impl CacheSpec for CountrySpec {
+    type Key = crate::models_toasty::EndpointId;
+    type Row = CountryRow;
+    type Patch = CountryPatch;
+
+    fn key_of(row: &Self::Row) -> Self::Key {
+        row.endpoint_id
+    }
+
+    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
+        // Last-writer-wins per endpoint, first-seen order preserved: the queue's
+        // `DashMap::insert` overwrote an existing entry in place, and its key
+        // order is not part of any contract.
+        let mut latest: HashMap<Self::Key, CountryRow> = HashMap::new();
+        let mut order: Vec<Self::Key> = Vec::new();
+        for row in rows {
+            let key = row.endpoint_id;
+            if latest.insert(key, row).is_none() {
+                order.push(key);
+            }
+        }
+        order
+            .into_iter()
+            .filter_map(|key| {
+                let row = latest.remove(&key)?;
+                let patch = CountryPatch {
+                    endpoint_id: row.endpoint_id,
+                    ip: row.ip,
+                    iso: row.iso.clone(),
+                };
+                Some(Coalesced { key, row, patch })
+            })
+            .collect()
+    }
+
+    async fn write_window<'a>(
+        tx: &'a mut impl toasty::Executor,
+        patches: &'a [Self::Patch],
+    ) -> crate::Result<usize> {
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        let rows: Vec<(crate::models_toasty::EndpointId, std::net::IpAddr, String)> = patches
+            .iter()
+            .map(|patch| (patch.endpoint_id, patch.ip, patch.iso.clone()))
+            .collect();
+        crate::database::set_endpoint_ip_countries_once(tx, &rows).await?;
+        Ok(patches.len())
+    }
+
+    // The trait mandates a future; a country write derives nothing, so the
+    // async-ness is the contract, not a bug.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "trait-mandated async signature"
+    )]
+    async fn refresh<'a>(
+        _tx: &'a mut impl toasty::Executor,
+        _patches: &'a [Self::Patch],
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -413,6 +519,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{CacheSpec, Coalesced, WriteBehind};
+    use crate::models_toasty::EndpointId;
+    use crate::{CountryRow, CountrySpec};
 
     /// A fake spec backed by a real in-memory table: `write_window` runs one
     /// upsert per patch on the driver's transaction, `refresh` is a no-op.
@@ -705,5 +813,33 @@ mod tests {
             Some(&99),
             "the re-stage did not roll the row back to the stale drained value"
         );
+    }
+
+    fn country_row(id: i64, ip: &str, iso: &str) -> CountryRow {
+        CountryRow {
+            endpoint_id: EndpointId::new(id),
+            ip: ip.parse().expect("ip"),
+            iso: iso.to_owned(),
+        }
+    }
+
+    /// The country buffer's identity is the ENDPOINT, and the queue's insert
+    /// overwrote: two resolutions of one endpoint must collapse to the last,
+    /// not write both.
+    #[test]
+    fn country_coalesce_last_writer_wins() {
+        let rows = vec![
+            country_row(1, "1.1.1.1", "US"),
+            country_row(1, "1.1.1.1", "DE"),
+            country_row(2, "2.2.2.2", "FR"),
+        ];
+        let patches = CountrySpec::coalesce(rows);
+        assert_eq!(patches.len(), 2);
+        let one = patches
+            .iter()
+            .find(|p| p.key == EndpointId::new(1))
+            .expect("endpoint 1 survived");
+        assert_eq!(one.patch.iso, "DE");
+        assert_eq!(one.row.iso, "DE");
     }
 }
