@@ -47,8 +47,10 @@ pub struct AppState {
     /// Write-behind persistence for `profile_stats` mutations. Result writes
     /// and scheduler transitions `stage()` here instead of committing on the
     /// UI task; the flush task turns a window of staged rows into one
-    /// transaction (see `docs/aegis/specs/2026-09-11-write-behind-link-writer-design.md`).
-    pub link_writer: Arc<crate::ops::link_writer::LinkWriter>,
+    /// transaction — a `WriteBehind<LinkSpec>` driver, the generic form of the
+    /// `LinkWriter` this field replaced (see
+    /// `docs/aegis/specs/2026-10-05-rowcache-write-behind-design.md`).
+    pub link_stage: Arc<xray_tui_db::WriteBehind<xray_tui_db::LinkSpec>>,
     /// Currently selected theme name from config or UI selection.
     pub theme_name: ratatui_themes::ThemeName,
     pub current_tab: Tab,
@@ -528,12 +530,16 @@ impl AppState {
         // settings save.
         let queue_limit = config.speed_test.task_queue_limit;
         let dns_defer_secs = clamp_dns_defer_secs(config.speed_test.dns_failure_defer_secs);
-        let link_writer = crate::ops::link_writer::LinkWriter::with_defaults(Arc::clone(&db));
+        let link_stage = xray_tui_db::WriteBehind::<xray_tui_db::LinkSpec>::new(
+            Arc::clone(&db),
+            xray_tui_db::write_behind::DEFAULT_FLUSH_ROWS,
+            xray_tui_db::write_behind::DEFAULT_FLUSH_INTERVAL,
+        );
         let mut state = Self {
             db,
             config,
             scheduler: Arc::new(scheduler::TaskScheduler::new(queue_limit, dns_defer_secs)),
-            link_writer,
+            link_stage,
             theme_name,
             current_tab: Tab::Profiles,
             update_status: HashMap::new(),

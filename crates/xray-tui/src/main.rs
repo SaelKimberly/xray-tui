@@ -389,7 +389,7 @@ async fn main() -> Result<()> {
     state.shutdown_token = shutdown_token;
     // Write-behind flush loop: result/stats/scheduler writes are staged and
     // flushed from here, never on the UI task.
-    let _flush_task = state.link_writer.spawn_flush_task();
+    let _flush_task = state.link_stage.spawn_flush_task();
     state.heed_storage = Some(heed.clone());
     state.log_sender_tx = Some(log_sender_tx.clone());
     // Create core process log channel (stdout/stderr lines from xray-core/sing-box subprocesses).

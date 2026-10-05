@@ -788,7 +788,7 @@ mod tests {
     /// stayed `None`, and the user was told "N profiles" for a feed that had
     /// silently lost whole 500-URL batches. A budget-exit test does NOT pin this
     /// — it would still pass with the wiring removed — so the failure is injected
-    /// the way `link_writer`'s own contention tests do it: a second connection
+    /// the way the link writer's own contention tests do it: a second connection
     /// holds the write lock, so every persist attempt and every retry fails.
     #[tokio::test]
     async fn a_dropped_batch_is_reported_not_swallowed() {

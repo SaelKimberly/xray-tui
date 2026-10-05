@@ -1300,7 +1300,7 @@ async fn clear_all_stats_zeroes_traffic_and_clears_results() {
 /// (The scheduler used to be the OCC client that retried; its state is
 /// runtime-only now, so this pins the guard itself.)
 #[tokio::test]
-async fn occ_rejects_a_stale_link_writer() {
+async fn occ_rejects_a_stale_link_stage() {
     let db = test_db().await;
     let mut conn = db.connection().await.expect("connection");
     seed_endpoint(&mut conn, 1, 1001, "a.example", HostType::Ipv4, 443, 100).await;

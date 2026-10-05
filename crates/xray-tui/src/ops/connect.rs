@@ -643,12 +643,12 @@ pub fn disconnect(state: &mut AppState) {
         // (one transaction per window), and the UI task never waits on it.
         for link in &flushed {
             state
-                .link_writer
+                .link_stage
                 .stage(link, xray_tui_db::LinkGroups::TRAFFIC);
         }
         // `disconnect` is synchronous, so the flush is spawned (as the old
         // per-row writes were) — but it is now one transaction, not N.
-        let writer = std::sync::Arc::clone(&state.link_writer);
+        let writer = std::sync::Arc::clone(&state.link_stage);
         tokio::spawn(async move {
             if let Err(e) = writer.flush().await {
                 tracing::warn!(target: "tui::ops::connect", "final stats flush failed: {e}");

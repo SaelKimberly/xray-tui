@@ -122,6 +122,17 @@ pub trait CacheSpec: Send + Sync + 'static {
         tx: &'a mut impl toasty::Executor,
         patches: &'a [Self::Patch],
     ) -> impl Future<Output = crate::Result<()>> + Send + 'a;
+
+    /// The pending entries a drained row is re-staged as after a failed write.
+    ///
+    /// Defaults to the identity: one row, under the key it was drained from.
+    /// A spec whose staging key is FINER than its patch identity overrides
+    /// this, because re-staging under the patch's own key would insert an
+    /// entry no later push or drain would ever match — the rows would sit in
+    /// the map forever and be written by nothing.
+    fn restage_entries(row: &Self::Row) -> Vec<(Self::Key, Self::Row)> {
+        vec![(Self::key_of(row), row.clone())]
+    }
 }
 
 /// A coalescing write-behind drain for one table.
@@ -330,16 +341,30 @@ impl<S: CacheSpec> WriteBehind<S> {
     /// already [`Entry::Occupied`] with a **newer** snapshot than the drained
     /// one — overwriting it would roll the row back and could re-write a value
     /// the caller has since replaced, so it is left untouched.
+    ///
+    /// One row may expand into several entries — see
+    /// [`CacheSpec::restage_entries`].
     fn restage(&self, rows: &[(S::Key, S::Row)]) {
-        for (key, row) in rows {
-            match self.pending.entry(*key) {
+        for (key, row) in rows.iter().flat_map(|(_, row)| S::restage_entries(row)) {
+            match self.pending.entry(key) {
                 Entry::Occupied(_) => {}
                 Entry::Vacant(slot) => {
-                    slot.insert(row.clone());
+                    slot.insert(row);
                     self.staged.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+    }
+
+    /// The snapshot currently staged under `key`, if any.
+    ///
+    /// A read-through view of the pending map, for a caller that must see a
+    /// staged row BEFORE it is committed. Never awaits: it is a single
+    /// `DashMap` read (one shard, one hash), which is what makes it safe on
+    /// the UI task — the same reason [`Self::push`] does not await either.
+    #[must_use]
+    pub fn get(&self, key: &S::Key) -> Option<S::Row> {
+        self.pending.get(key).map(|entry| entry.value().clone())
     }
 
     /// Number of staged entries.
@@ -704,6 +729,218 @@ impl CacheSpec for SourceSpec {
         _patches: &'a [Self::Patch],
     ) -> crate::Result<()> {
         Ok(())
+    }
+}
+
+/// The pending-map key of a staged link row: the link, plus the ONE column
+/// group the row carries.
+///
+/// The group is part of the key, not just the patch: `profile_stats` has three
+/// independent writers (ping results, the traffic poller, the classifier), and
+/// keying on the link alone would let a traffic tick overwrite the result
+/// staged a millisecond earlier. One entry per `(link, group)` is what makes
+/// the disjointness the write already relies on visible in the staging map.
+pub type LinkStageKey = (
+    crate::models_toasty::ProtocolId,
+    crate::models_toasty::EndpointId,
+    crate::LinkGroups,
+);
+
+/// One staged link snapshot, for one column group (or for the union of them,
+/// after a failed flush re-staged a merged patch).
+#[derive(Debug, Clone)]
+pub struct LinkRow {
+    /// The caller's snapshot of the `profile_stats` row.
+    pub link: crate::models_toasty::ProfileStats,
+    /// The column groups this snapshot is authoritative for.
+    pub groups: crate::LinkGroups,
+}
+
+/// Fold one staged column group onto `base`.
+///
+/// The groups are disjoint by construction, so the order they are applied in
+/// never matters: RESULT owns latency/speed/error, PURGE the verdict, TRAFFIC
+/// the four counters.
+fn merge_group(
+    base: &mut crate::models_toasty::ProfileStats,
+    flag: crate::LinkGroups,
+    staged: &crate::models_toasty::ProfileStats,
+) {
+    use crate::LinkGroups;
+    if flag == LinkGroups::RESULT {
+        base.latency.clone_from(&staged.latency);
+        base.speed_bps = staged.speed_bps;
+        base.error.clone_from(&staged.error);
+    } else if flag == LinkGroups::PURGE {
+        base.purge_reason = staged.purge_reason;
+    } else {
+        base.traffic = staged.traffic;
+    }
+}
+
+/// The write-behind spec for `profile_stats` — the per-link result, verdict and
+/// traffic patches.
+///
+/// One patch per link per flush: the map holds one entry per `(link, group)`,
+/// so a link touched by a result, its traffic poll and the gate's transition
+/// would otherwise be written three times. `coalesce` folds those entries into
+/// ONE patch carrying the union of their groups, with the same overlay
+/// [`merge_group`] applies, so the two writers stay disjoint.
+///
+/// The staging key is per `(link, group)` while the patch is per link, so a
+/// re-staged merged row carries the union — see [`LinkSpec::coalesce`], which
+/// reads a union bit as "this snapshot is authoritative for that group".
+pub struct LinkSpec;
+
+impl CacheSpec for LinkSpec {
+    type Key = LinkStageKey;
+    type Row = LinkRow;
+    type Patch = crate::LinkPatch;
+
+    fn key_of(row: &Self::Row) -> Self::Key {
+        (row.link.protocol_id, row.link.endpoint_id, row.groups)
+    }
+
+    /// The old `LinkWriter::drain` merge, verbatim: one patch per link, the
+    /// union of its staged groups, and the merged snapshot carrying every
+    /// column those groups own.
+    ///
+    /// A re-staged row holds a union of groups and ONE snapshot that is
+    /// already the merge of its per-group sources, so each bit it carries is
+    /// overlaid from that same snapshot — which is exactly what the per-group
+    /// rows it replaced would have contributed.
+    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
+        use crate::LinkGroups;
+        let mut order: Vec<(
+            crate::models_toasty::ProtocolId,
+            crate::models_toasty::EndpointId,
+        )> = Vec::new();
+        let mut merged: HashMap<
+            (
+                crate::models_toasty::ProtocolId,
+                crate::models_toasty::EndpointId,
+            ),
+            (crate::LinkGroups, crate::models_toasty::ProfileStats),
+        > = HashMap::new();
+        for row in rows {
+            let link_key = (row.link.protocol_id, row.link.endpoint_id);
+            match merged.entry(link_key) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let (groups, base) = slot.get_mut();
+                    for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+                        if row.groups.contains(flag) {
+                            merge_group(base, flag, &row.link);
+                        }
+                    }
+                    *groups = groups.union(row.groups);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let mut link = row.link.clone();
+                    for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+                        if row.groups.contains(flag) {
+                            merge_group(&mut link, flag, &row.link);
+                        }
+                    }
+                    order.push(link_key);
+                    slot.insert((row.groups, link));
+                }
+            }
+        }
+
+        order
+            .into_iter()
+            .filter_map(|link_key| {
+                let (groups, link) = merged.remove(&link_key)?;
+                Some(Coalesced {
+                    key: (link_key.0, link_key.1, groups),
+                    row: LinkRow {
+                        link: link.clone(),
+                        groups,
+                    },
+                    patch: crate::LinkPatch { link, groups },
+                })
+            })
+            .collect()
+    }
+
+    /// Re-stage a merged row as ONE ENTRY PER FLAG.
+    ///
+    /// The default would re-stage under the union key — a key neither
+    /// [`WriteBehind::<LinkSpec>::stage`] nor [`Self::key_of`] ever produces,
+    /// so the retry would write nothing and the drained results would be lost.
+    /// Per-flag entries are addressable again, which is the whole reason the
+    /// staging key is finer than the patch identity.
+    fn restage_entries(row: &Self::Row) -> Vec<(Self::Key, Self::Row)> {
+        use crate::LinkGroups;
+        [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC]
+            .into_iter()
+            .filter(|flag| row.groups.contains(*flag))
+            .map(|flag| {
+                let single = LinkRow {
+                    link: row.link.clone(),
+                    groups: flag,
+                };
+                (Self::key_of(&single), single)
+            })
+            .collect()
+    }
+
+    /// The chunked upsert of [`Database::apply_link_patches`], on the driver's
+    /// transaction: this is `apply_link_patches_tx`, so the driver owns the
+    /// commit and the retry.
+    async fn write_window<'a>(
+        tx: &'a mut impl toasty::Executor,
+        patches: &'a [Self::Patch],
+    ) -> crate::Result<usize> {
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        crate::database::Database::apply_link_patches_tx(
+            tx,
+            patches,
+            crate::models_toasty::now_epoch(),
+        )
+        .await
+    }
+
+    /// Refresh the ordering keys of every endpoint a window touched.
+    ///
+    /// NOT a no-op, unlike [`SourceSpec::refresh`]: `apply_link_patches_once`
+    /// refreshed rank AFTER its commit, on a separate connection, and only
+    /// logged a failure. The driver calls `refresh` on the transaction it is
+    /// about to commit, so the rank keys become ATOMIC with the write that
+    /// invalidated them — a reader can no longer observe a link with stale
+    /// keys, and a refresh that fails now fails the window instead of being
+    /// swallowed.
+    async fn refresh<'a>(
+        tx: &'a mut impl toasty::Executor,
+        patches: &'a [Self::Patch],
+    ) -> crate::Result<()> {
+        let mut touched: Vec<crate::models_toasty::EndpointId> =
+            patches.iter().map(|p| p.link.endpoint_id).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        crate::endpoint_rank::refresh(tx, &touched).await?;
+        Ok(())
+    }
+}
+
+impl WriteBehind<LinkSpec> {
+    /// Stage a link's current snapshot for `groups`.
+    ///
+    /// Never touches the database and never awaits, so callers on the UI task
+    /// stay responsive. `groups` is normalised to one entry per flag, so a
+    /// stage of `ALL` and a later stage of `RESULT` do not shadow each other.
+    pub fn stage(&self, link: &crate::models_toasty::ProfileStats, groups: crate::LinkGroups) {
+        use crate::LinkGroups;
+        for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+            if groups.contains(flag) {
+                self.push(LinkRow {
+                    link: link.clone(),
+                    groups: flag,
+                });
+            }
+        }
     }
 }
 
@@ -1432,6 +1669,427 @@ mod tests {
             driver.staged_len(),
             2,
             "the failed window is re-staged, not dropped"
+        );
+    }
+
+    // ── LinkSpec (profile_stats write-behind) ─────────────────────────────
+
+    use super::{LinkRow, LinkSpec};
+    use crate::models_toasty::{Latency, PurgeReason};
+    use crate::{LinkGroups, LinkPatch};
+
+    /// A database with one endpoint, one protocol and one link row — the shape
+    /// a link patch writes.
+    async fn seeded_links() -> (Arc<crate::Database>, Arc<WriteBehind<LinkSpec>>) {
+        let db = Arc::new(crate::Database::in_memory().await.expect("db"));
+        db.upsert_endpoint(&endpoint_row(1))
+            .await
+            .expect("endpoint");
+        db.upsert_protocol(&loaded_protocol(1))
+            .await
+            .expect("protocol");
+        db.upsert_link(&link_row(1)).await.expect("link");
+        let driver = WriteBehind::<LinkSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
+        (db, driver)
+    }
+
+    fn with_latency(base: &ProfileStats, delay: i32) -> ProfileStats {
+        let mut row = base.clone();
+        row.latency = Some(Latency::Fast { delay });
+        row
+    }
+
+    /// The stored `profile_stats` row, read back through the model.
+    async fn stored_link(db: &crate::Database, endpoint_id: i64) -> ProfileStats {
+        let mut conn = db.connection().await.expect("conn");
+        ProfileStats::filter_by_protocol_id_and_endpoint_id(
+            ProtocolId::new(1),
+            EndpointId::new(endpoint_id),
+        )
+        .first()
+        .exec(&mut conn)
+        .await
+        .expect("read")
+        .expect("row")
+    }
+
+    /// Hold the write lock on a second connection, so every write the flush
+    /// attempts fails with "database is locked".
+    async fn hold_write_lock(conn: &mut toasty::Connection) -> toasty::Transaction<'_> {
+        let mut lock = conn.transaction().await.expect("lock transaction");
+        toasty::sql::statement("UPDATE profile_stats SET version = version + 0")
+            .exec(&mut lock)
+            .await
+            .expect("take the write lock");
+        lock
+    }
+
+    /// The drain's MERGE, verbatim from `LinkWriter::drain`: one patch per
+    /// link, the union of its staged groups, and a snapshot carrying every
+    /// column those groups own.
+    #[test]
+    fn link_coalesce_unions_groups_per_link() {
+        let base = link_row(7);
+        let result = LinkRow {
+            link: with_latency(&base, 100),
+            groups: LinkGroups::RESULT,
+        };
+        let mut traffic_link = base;
+        traffic_link.traffic.total_up = 9;
+        let traffic = LinkRow {
+            link: traffic_link,
+            groups: LinkGroups::TRAFFIC,
+        };
+
+        let out = LinkSpec::coalesce(vec![result, traffic]);
+        assert_eq!(out.len(), 1, "one patch per link");
+        assert_eq!(
+            out[0].patch.groups,
+            LinkGroups::RESULT.union(LinkGroups::TRAFFIC),
+            "the union of the staged groups"
+        );
+        assert_eq!(
+            out[0].patch.link.latency,
+            Some(Latency::Fast { delay: 100 }),
+            "the RESULT columns are carried"
+        );
+        assert_eq!(
+            out[0].patch.link.traffic.total_up, 9,
+            "and so are the TRAFFIC counters"
+        );
+    }
+
+    /// A group staged for one link must not leak its bit onto another's patch,
+    /// nor onto a second drain.
+    #[test]
+    fn link_coalesce_keeps_each_links_groups_to_itself() {
+        let base = link_row(1);
+        let rows = vec![
+            LinkRow {
+                link: with_latency(&base, 5),
+                groups: LinkGroups::RESULT,
+            },
+            LinkRow {
+                link: with_latency(&link_row(2), 6),
+                groups: LinkGroups::PURGE,
+            },
+        ];
+        let out = LinkSpec::coalesce(rows);
+        assert_eq!(out.len(), 2, "one patch per link");
+        assert!(
+            out.iter().all(
+                |e| e.patch.groups == LinkGroups::RESULT || e.patch.groups == LinkGroups::PURGE
+            ),
+            "no union across links"
+        );
+    }
+
+    /// Every staged group must leave the map when the window drains. A group
+    /// the fold skipped stayed behind and re-added its bit to the next drain's
+    /// union — which is how a PURGE-only entry wrote a verdict from a snapshot
+    /// that never classified one.
+    #[tokio::test]
+    async fn a_purge_verdict_survives_the_drain_and_empties_the_window() {
+        let (db, driver) = seeded_links().await;
+        let mut row = with_latency(&link_row(1), 44);
+        row.purge_reason = Some(PurgeReason::NotTls);
+        driver.stage(&row, LinkGroups::RESULT.union(LinkGroups::PURGE));
+        assert_eq!(driver.staged_len(), 2, "one entry per group");
+
+        driver.flush().await.expect("flush");
+        assert_eq!(
+            driver.staged_len(),
+            0,
+            "the drain removes EVERY group's entry, not just the ones it folds"
+        );
+
+        let stored = stored_link(&db, 1).await;
+        assert_eq!(stored.purge_reason, Some(PurgeReason::NotTls));
+        assert_eq!(
+            stored.latency,
+            Some(Latency::Fast { delay: 44 }),
+            "and the result half landed too"
+        );
+    }
+
+    /// A real probe stages `RESULT | PURGE`, so the re-staged remainder must be
+    /// findable by the next drain. Re-staging under the UNION key would insert
+    /// a key neither `stage` nor `key_of` ever matches: the retry would write
+    /// nothing and the result would be lost.
+    #[tokio::test]
+    async fn a_failed_window_restages_a_multi_group_patch_so_the_retry_lands() {
+        let (db, driver) = seeded_links().await;
+        let mut row = with_latency(&link_row(1), 33);
+        row.purge_reason = Some(PurgeReason::RealityFallback);
+        driver.stage(&row, LinkGroups::RESULT.union(LinkGroups::PURGE));
+
+        let mut blocker = db.connection().await.expect("blocker connection");
+        let lock = hold_write_lock(&mut blocker).await;
+        assert!(
+            driver.flush().await.is_err(),
+            "the write lock fails the flush"
+        );
+        assert_eq!(driver.staged_len(), 2, "one entry per group, re-staged");
+        lock.rollback().await.expect("release the lock");
+        drop(blocker);
+
+        assert_eq!(
+            driver.flush().await.expect("retry after contention"),
+            1,
+            "the re-staged patch is found and written by the retry"
+        );
+        assert_eq!(driver.staged_len(), 0);
+        let stored = stored_link(&db, 1).await;
+        assert_eq!(stored.latency, Some(Latency::Fast { delay: 33 }));
+        assert_eq!(
+            stored.purge_reason,
+            Some(PurgeReason::RealityFallback),
+            "both groups land, not just the first"
+        );
+    }
+
+    /// The LINK-shaped floor values: `flush_rows = 1` makes three staged links
+    /// three windows, and each link's three column groups coalesce into ONE
+    /// patch. Three groups staged per link must still be three entries.
+    #[tokio::test]
+    async fn link_flush_chunks_one_patch_per_link_at_flush_rows_one() {
+        let (db, _) = seeded_links().await;
+        let driver = WriteBehind::<LinkSpec>::new(Arc::clone(&db), 1, Duration::from_millis(200));
+        let base = link_row(1);
+        for idx in 0..3 {
+            let mut link = with_latency(&base, idx);
+            link.endpoint_id = EndpointId::new(i64::from(idx) + 2);
+            link.protocol_id = ProtocolId::new(i64::from(idx) + 202);
+            driver.stage(&link, LinkGroups::ALL);
+        }
+        assert_eq!(
+            driver.staged_len(),
+            9,
+            "ALL normalises to one entry per group, per link"
+        );
+        assert_eq!(
+            driver.flush().await.expect("flush"),
+            3,
+            "one patch per link"
+        );
+        assert_eq!(driver.flush_count(), 3, "one transaction per chunk");
+    }
+
+    /// Both groups belong to the same link: they coalesce into ONE write whose
+    /// merged row carries both the result and the counters.
+    #[tokio::test]
+    async fn link_flush_writes_both_groups_in_one_transaction() {
+        let (db, driver) = seeded_links().await;
+        let base = link_row(1);
+        let mut result = with_latency(&base, 44);
+        result.speed_bps = Some(1_000_000);
+        let mut traffic = base.clone();
+        traffic.traffic.total_up = 5;
+
+        driver.stage(&result, LinkGroups::RESULT);
+        driver.stage(&traffic, LinkGroups::TRAFFIC);
+        assert_eq!(driver.staged_len(), 2, "one entry per (link, group)");
+
+        assert_eq!(driver.flush().await.expect("flush"), 1);
+        assert_eq!(driver.flush_count(), 1, "one transaction per window");
+
+        let row = stored_link(&db, 1).await;
+        assert_eq!(row.latency, Some(Latency::Fast { delay: 44 }));
+        assert_eq!(row.speed_bps, Some(1_000_000));
+        assert_eq!(row.traffic.total_up, 5);
+    }
+
+    /// `stage` never awaits a write: the flush task's transactions are the only
+    /// writer, and the same `(link, group)` coalesces.
+    #[tokio::test]
+    async fn link_stage_never_awaits_a_write() {
+        let (_db, driver) = seeded_links().await;
+        let base = link_row(1);
+        for delay in 0..500 {
+            driver.stage(&with_latency(&base, delay), LinkGroups::RESULT);
+        }
+        assert_eq!(driver.flush_count(), 0, "no transaction without a flush");
+        assert_eq!(driver.staged_len(), 1, "same (link, group) coalesces");
+    }
+
+    /// The read-through: a caller that must see a staged row BEFORE it commits
+    /// reads it through `get`, with no await.
+    #[tokio::test]
+    async fn link_get_reads_a_staged_row_through() {
+        let (_db, driver) = seeded_links().await;
+        let row = with_latency(&link_row(1), 12);
+        assert!(
+            driver
+                .get(&LinkSpec::key_of(&LinkRow {
+                    link: row.clone(),
+                    groups: LinkGroups::RESULT,
+                }))
+                .is_none(),
+            "nothing staged yet"
+        );
+
+        driver.stage(&row, LinkGroups::RESULT);
+        let staged = driver
+            .get(&(row.protocol_id, row.endpoint_id, LinkGroups::RESULT))
+            .expect("the staged RESULT row");
+        assert_eq!(staged.link.latency, Some(Latency::Fast { delay: 12 }));
+        assert!(
+            driver
+                .get(&(row.protocol_id, row.endpoint_id, LinkGroups::PURGE,))
+                .is_none(),
+            "one group does not make another visible"
+        );
+    }
+
+    /// Poll a condition instead of sleeping a fixed span: these drive a REAL
+    /// background task against a REAL database, so a fixed sleep is a bet on
+    /// scheduling under full-suite load.
+    async fn wait_for(
+        driver: &WriteBehind<LinkSpec>,
+        what: &str,
+        mut done: impl FnMut(&WriteBehind<LinkSpec>) -> bool,
+        timeout: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !done(driver) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out after {timeout:?} waiting for {what} (flushes={}, staged={})",
+                driver.flush_count(),
+                driver.staged_len(),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The FLOOR path, for link rows. `flush_rows` drives both the size trigger
+    /// and the floor, so the numbers put the floor strictly inside the row
+    /// count while the size trigger is never reached: 128 -> floor 32, 64 rows
+    /// -> exactly two floor-driven commits. The deadline (75 x 10 ms = 750 ms)
+    /// is out of range for a 640 ms staging window, so it cannot be what fires.
+    ///
+    /// Every stage is a DISTINCT `endpoint_id`: the staging key is
+    /// `(link, group)`, so staging the same link repeatedly coalesces into one
+    /// entry and the floor could never be reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_link_trickle_coalesces_at_the_floor_not_every_tick() {
+        const ROWS: usize = 64;
+        const FLUSH_ROWS: usize = 128;
+        let (db, _) = seeded_links().await;
+        let interval = Duration::from_millis(10);
+        let driver = WriteBehind::<LinkSpec>::new(Arc::clone(&db), FLUSH_ROWS, interval);
+        let floor = driver.timer_flush_floor();
+        assert_eq!(floor, FLUSH_ROWS / super::TIMER_FLOOR_DIVISOR);
+        assert!(
+            ROWS > floor && ROWS < FLUSH_ROWS,
+            "the floor must sit strictly inside the row count, or this is not testing it",
+        );
+        let task = driver.spawn_flush_task();
+
+        let base = link_row(1);
+        for i in 0..ROWS {
+            let mut link = with_latency(&base, i32::try_from(i).expect("small i"));
+            link.endpoint_id = EndpointId::new(1_000 + i64::try_from(i).expect("small i"));
+            driver.stage(&link, LinkGroups::RESULT);
+            tokio::time::sleep(interval).await;
+        }
+        wait_for(
+            &driver,
+            "the staged rows to drain",
+            |d| d.staged_len() == 0,
+            Duration::from_secs(20),
+        )
+        .await;
+        // 64 rows / floor 32 is 2 commits, plus at most one deadline flush for
+        // the remainder. Ignoring the floor yields ~64, far outside this range.
+        let commits = driver.flush_count();
+        assert!(
+            (1..=4).contains(&commits),
+            "expected 1-4 floor-driven commits for {ROWS} rows at floor {floor}, got {commits}",
+        );
+        task.abort();
+    }
+
+    /// The DEADLINE path, which the floor case deliberately stays out of: a
+    /// trickle that never reaches the floor must still be written, so a result
+    /// is never stranded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_link_trickle_below_the_floor_is_still_written_by_the_deadline() {
+        const ROWS: usize = 8;
+        const FLUSH_ROWS: usize = 128;
+        let (db, _) = seeded_links().await;
+        let interval = Duration::from_millis(10);
+        let driver = WriteBehind::<LinkSpec>::new(Arc::clone(&db), FLUSH_ROWS, interval);
+        assert!(
+            ROWS < driver.timer_flush_floor(),
+            "this case needs rows UNDER the floor",
+        );
+        let task = driver.spawn_flush_task();
+
+        let base = link_row(1);
+        for i in 0..ROWS {
+            let mut link = with_latency(&base, i32::try_from(i).expect("small i"));
+            link.endpoint_id = EndpointId::new(2_000 + i64::try_from(i).expect("small i"));
+            driver.stage(&link, LinkGroups::RESULT);
+            tokio::time::sleep(interval).await;
+        }
+        wait_for(
+            &driver,
+            "the deadline to release a below-floor trickle",
+            |d| d.flush_count() >= 1,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(
+            driver.staged_len(),
+            0,
+            "the deadline flush must drain, or a result is stranded",
+        );
+        task.abort();
+    }
+
+    /// The derived floor and deadline for the LINK policy, from the named
+    /// constants the driver exports.
+    #[tokio::test]
+    async fn the_link_flush_policy_follows_the_named_constants() {
+        let (db, _) = seeded_links().await;
+        let driver = WriteBehind::<LinkSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
+        assert_eq!(driver.timer_flush_floor(), 512 / super::TIMER_FLOOR_DIVISOR);
+        assert_eq!(
+            driver.max_staged_age(),
+            Duration::from_millis(200) * super::MAX_STAGED_AGE_TICKS
+        );
+        let small = WriteBehind::<LinkSpec>::new(Arc::clone(&db), 1, super::DEFAULT_FLUSH_INTERVAL);
+        assert_eq!(
+            small.timer_flush_floor(),
+            1,
+            "under the divisor floors to 1"
+        );
+    }
+
+    /// `LinkPatch` stays 1:1 with the coalesced patch the write consumes, so a
+    /// patch built straight from a spec row carries the same identity the
+    /// pending map holds.
+    #[test]
+    fn link_coalesced_patch_matches_its_row() {
+        let row = with_latency(&link_row(1), 3);
+        let staged = LinkRow {
+            link: row.clone(),
+            groups: LinkGroups::TRAFFIC,
+        };
+        let out = LinkSpec::coalesce(vec![staged]);
+        assert_eq!(out.len(), 1);
+        let expected = LinkPatch {
+            link: row,
+            groups: LinkGroups::TRAFFIC,
+        };
+        assert_eq!(out[0].patch.link.protocol_id, expected.link.protocol_id);
+        assert_eq!(out[0].patch.link.endpoint_id, expected.link.endpoint_id);
+        assert_eq!(out[0].patch.groups, expected.groups);
+        assert_eq!(
+            out[0].key,
+            LinkSpec::key_of(&out[0].row),
+            "the re-stage key matches the row it came from"
         );
     }
 }

@@ -240,7 +240,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
 
     // Persist anything still staged (ping results, scheduler transitions)
     // before the runtime goes away.
-    if let Err(e) = state.link_writer.flush().await {
+    if let Err(e) = state.link_stage.flush().await {
         tracing::warn!(target: "tui::ui", "final link flush failed: {e}");
     }
 
@@ -272,7 +272,7 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
             tracing::info!(
                 target: "tui::ops::ping",
                 "batch interrupted at quit: fast {fast_done}/{fast_total} probe(s), real {real_done}/{real_total} probe(s) reported, no batch summary; staged writes flushed, {} left staged",
-                state.link_writer.staged_len(),
+                state.link_stage.staged_len(),
             );
         }
     }

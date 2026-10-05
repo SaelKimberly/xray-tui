@@ -5,7 +5,6 @@ pub mod db_monitor;
 pub mod enrich;
 pub mod events;
 pub mod export;
-pub mod link_writer;
 pub mod native_connect;
 pub mod ping;
 pub mod ping_native;

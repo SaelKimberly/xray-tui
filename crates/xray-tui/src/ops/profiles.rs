@@ -214,7 +214,7 @@ pub async fn reload_profiles(state: &mut AppState) {
     // error-TTL sweep, which writes the same error columns a staged result
     // patch carries — flushing afterwards would resurrect the markers the
     // sweep just cleared.
-    if let Err(e) = state.link_writer.flush().await {
+    if let Err(e) = state.link_stage.flush().await {
         tracing::warn!(target: "tui::ops::profiles", "flush before reload: {e}");
     }
     let load = ProfilesLoad::from(&*state);
@@ -2174,7 +2174,7 @@ mod ttl_tests {
         let mut retested = row.links[0].clone();
         retested.error = None;
         retested.latency = Some(xray_tui_db::models::Latency::Fast { delay: 7 });
-        state.link_writer.stage(&retested, LinkGroups::RESULT);
+        state.link_stage.stage(&retested, LinkGroups::RESULT);
 
         reload_profiles(&mut state).await;
 
@@ -2188,10 +2188,10 @@ mod ttl_tests {
             None,
             "the expired marker of a row with nothing pending is swept"
         );
-        assert_eq!(state.link_writer.staged_len(), 0, "nothing left to write");
+        assert_eq!(state.link_stage.staged_len(), 0, "nothing left to write");
 
         // A later flush cannot bring the swept marker back.
-        state.link_writer.flush().await.expect("flush");
+        state.link_stage.flush().await.expect("flush");
         assert_eq!(
             link_error_kind(&db, 101, 1).await,
             None,

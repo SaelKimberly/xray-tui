@@ -402,7 +402,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                 // own it (never the endpoint id). Patch the link's traffic
                 // in-memory and stage the traffic group (the gRPC stats poller
                 // writes only these columns).
-                let stats_writer = Arc::clone(&state.link_writer);
+                let stats_writer = Arc::clone(&state.link_stage);
                 if apply_stats_delta(
                     &mut state.endpoints,
                     protocol_id,
@@ -646,7 +646,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                         (r.endpoint.id.get(), r.endpoint.host_type == HostType::Dns)
                     });
                 let ip_info_clone = ip_info.clone();
-                let writer = Arc::clone(&state.link_writer);
+                let writer = Arc::clone(&state.link_stage);
 
                 let mut on_page = true;
                 let name = {
@@ -820,7 +820,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     // latency without the commit. The `batch_progress` guard
                     // keeps this out of the batch path, where T3's coalescing is
                     // the point.
-                    state.link_writer.flush_soon();
+                    state.link_stage.flush_soon();
                 }
 
                 // Real ping happened — record the exit IP + country on the
@@ -1858,18 +1858,18 @@ mod tests {
         }
 
         assert_eq!(
-            state.link_writer.flush_count(),
+            state.link_stage.flush_count(),
             0,
             "a drain tick must not commit anything on the UI task"
         );
         assert!(
-            state.link_writer.staged_len() > 0,
+            state.link_stage.staged_len() > 0,
             "the result is staged for the flush task"
         );
 
         // The flush task (here: an explicit flush) is what writes it.
-        state.link_writer.flush().await.expect("flush");
-        assert_eq!(state.link_writer.flush_count(), 1, "one transaction");
+        state.link_stage.flush().await.expect("flush");
+        assert_eq!(state.link_stage.flush_count(), 1, "one transaction");
     }
 
     #[tokio::test]
@@ -1934,7 +1934,7 @@ mod tests {
 
         // The accumulated row is STAGED, not committed on the UI task: flush
         // the write-behind writer, then re-read.
-        state.link_writer.flush().await.expect("flush");
+        state.link_stage.flush().await.expect("flush");
         let mut conn = state.db.connection().await.unwrap();
         let stored = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
             xray_tui_db::models::ProtocolId::new(7),

@@ -1135,15 +1135,22 @@ impl Database {
         retry_on_busy(|| self.apply_link_patches_once(patches), 5).await
     }
 
-    async fn apply_link_patches_once(&self, patches: &[LinkPatch]) -> Result<usize> {
+    /// The write half of [`Self::apply_link_patches_once`], scoped to a
+    /// transaction the CALLER opened and will commit.
+    ///
+    /// Split out for [`crate::write_behind::LinkSpec`]: the write-behind driver
+    /// owns its transaction (and its retry), so the upsert loop has to be
+    /// callable on a borrowed executor rather than opening one of its own.
+    /// `now` is the stamp the rows are written with, for the same reason — the
+    /// caller's clock is the driver's.
+    pub(crate) async fn apply_link_patches_tx(
+        tx: &mut impl toasty::Executor,
+        patches: &[LinkPatch],
+        now: i64,
+    ) -> Result<usize> {
         if patches.is_empty() {
             return Ok(0);
         }
-        let mut conn = self.conn().await?;
-        let now = now_epoch();
-        let mut touched: Vec<EndpointId> = Vec::with_capacity(patches.len());
-
-        let mut tx = conn.transaction().await?;
         // The `ON CONFLICT` action is per-STATEMENT, so the patches are
         // bucketed by the action they need (both groups / RESULT / TRAFFIC /
         // none) rather than by their exact bit pattern — `contains` is what
@@ -1180,14 +1187,27 @@ impl Database {
                     sql.push_str(&link_values_sql(&patch.link, now));
                 }
                 sql.push_str(&conflict);
-                toasty::sql::statement(sql).exec(&mut tx).await?;
+                toasty::sql::statement(sql).exec(tx).await?;
             }
-            touched.extend(shape.iter().map(|p| p.link.endpoint_id));
         }
+
+        Ok(patches.len())
+    }
+
+    async fn apply_link_patches_once(&self, patches: &[LinkPatch]) -> Result<usize> {
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn().await?;
+        let now = now_epoch();
+
+        let mut tx = conn.transaction().await?;
+        Self::apply_link_patches_tx(&mut tx, patches, now).await?;
         tx.commit().await?;
 
         // Derived state: the patched endpoints' ordering keys follow their
         // links. Done after the commit (the page is read later, never here).
+        let mut touched: Vec<EndpointId> = patches.iter().map(|p| p.link.endpoint_id).collect();
         touched.sort_unstable();
         touched.dedup();
         if let Err(e) = crate::endpoint_rank::refresh(&mut conn, &touched).await {

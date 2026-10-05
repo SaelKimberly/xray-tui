@@ -190,7 +190,7 @@ fn batch_params(
     BatchParams {
         scheduler: state.scheduler.clone(),
         db: state.db.clone(),
-        writer: state.link_writer.clone(),
+        writer: state.link_stage.clone(),
         tx,
         runner,
         stop: state.speed_test_stop.clone(),
@@ -270,19 +270,19 @@ async fn flow_cost_report() {
     // snapshot the caller already holds.
     let prebuilt: Vec<ProfileStats> = (0..512).map(make_staged).collect();
 
-    let writer = state.link_writer.clone();
+    let writer = state.link_stage.clone();
     let stage_acc = bench_sync(200_000, || {
         let link = &prebuilt[black_box(0)];
         writer.stage(link, xray_tui_db::LinkGroups::RESULT);
     });
-    rows_out.push(stage_acc.row("LinkWriter::stage (RESULT)", 1.0));
+    rows_out.push(stage_acc.row("WriteBehind<LinkSpec>::stage (RESULT)", 1.0));
     writer.flush().await.expect("flush");
 
     let stage3_acc = bench_sync(100_000, || {
         let link = &prebuilt[black_box(1)];
         writer.stage(link, xray_tui_db::LinkGroups::ALL);
     });
-    rows_out.push(stage3_acc.row("LinkWriter::stage (ALL: 3 group inserts)", 1.0));
+    rows_out.push(stage3_acc.row("WriteBehind<LinkSpec>::stage (ALL: 3 group inserts)", 1.0));
     writer.flush().await.expect("flush");
 
     let mut patch_acc = Acc::new();
@@ -2263,7 +2263,11 @@ async fn flow_cost_contention() {
     // 4. link-writer flush on a wall-clock ARRIVAL schedule. The metric is
     // rows-per-flush, and arrival rate is what sets it.
     if slice.links.len() >= 2 {
-        let writer = crate::ops::link_writer::LinkWriter::with_defaults(Arc::clone(&db));
+        let writer = xray_tui_db::WriteBehind::<xray_tui_db::LinkSpec>::new(
+            Arc::clone(&db),
+            xray_tui_db::write_behind::DEFAULT_FLUSH_ROWS,
+            xray_tui_db::write_behind::DEFAULT_FLUSH_INTERVAL,
+        );
         let task = writer.spawn_flush_task();
         let arrivals: Vec<ProfileStats> = slice.links.iter().take(trickle_rows).cloned().collect();
         let gap = Duration::from_secs_f64(1.0 / trickle_rps as f64);

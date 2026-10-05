@@ -874,7 +874,7 @@ pub(crate) struct BatchShared {
     sched: Arc<TaskScheduler>,
     db: Arc<Database>,
     /// Gate persistence seam: staged transitions, never a commit per call.
-    writer: Arc<crate::ops::link_writer::LinkWriter>,
+    writer: Arc<xray_tui_db::WriteBehind<xray_tui_db::LinkSpec>>,
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -1020,7 +1020,7 @@ pub(crate) struct BatchParams {
     scheduler: Arc<TaskScheduler>,
     db: Arc<Database>,
     /// Gate persistence seam (staged transitions).
-    writer: Arc<crate::ops::link_writer::LinkWriter>,
+    writer: Arc<xray_tui_db::WriteBehind<xray_tui_db::LinkSpec>>,
     tx: mpsc::Sender<CoreEvent>,
     runner: Arc<dyn BatchProbeRunner>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -1424,7 +1424,7 @@ impl PlanWalk {
 /// waits `busy_timeout` (5 s) inside each attempt — so this is a short bounded
 /// retry, not a stacked backoff. A dedicated failure-injection test is not
 /// written: every injected failure costs the driver's full busy wait (measured
-/// in `link_writer`'s lock test), and the retry only decides how many times the
+/// in the link writer's lock test), and the retry only decides how many times the
 /// same single call is repeated.
 const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 
@@ -1444,7 +1444,7 @@ async fn finish_batch(shared: &BatchShared) {
     //
     // Retried: this is the batch's durability point, and the background flush
     // loop may not outlive it. A failed attempt re-stages the whole unwritten
-    // remainder (see `LinkWriter::flush`), so a later attempt writes it all.
+    // remainder (see `WriteBehind::flush`), so a later attempt writes it all.
     let mut flush_error = None;
     for attempt in 0..FINAL_FLUSH_ATTEMPTS {
         match shared.writer.flush().await {
@@ -2586,7 +2586,7 @@ fn start_batch(state: &mut AppState, plan: PlanSource, real_phase: bool, dedup_e
     };
     let runner: Arc<dyn BatchProbeRunner> = Arc::new(EngineProbeRunner);
     let db = state.db.clone();
-    let writer = state.link_writer.clone();
+    let writer = state.link_stage.clone();
     let scheduler = state.scheduler.clone();
     let stop = state.speed_test_stop.clone();
     // The meters hold no denominator until the walk fills one, which the status
@@ -3276,7 +3276,7 @@ mod tests {
         BatchParams {
             scheduler: h.state.scheduler.clone(),
             db: h.state.db.clone(),
-            writer: h.state.link_writer.clone(),
+            writer: h.state.link_stage.clone(),
             tx: h.tx.clone(),
             runner: h.runner.clone(),
             stop: h.state.speed_test_stop.clone(),
@@ -3788,7 +3788,7 @@ mod tests {
         // …and the fast probe's `[fast]` marker is NOT persisted: the fast level
         // cannot measure a QUIC server, so its TCP verdict is not a statement
         // about this row. Flush the writer to see what the batch actually wrote.
-        h.state.link_writer.flush().await.expect("flush");
+        h.state.link_stage.flush().await.expect("flush");
         let row = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
             link.protocol_id,
             link.endpoint_id,
@@ -3929,7 +3929,7 @@ mod tests {
         // gets its `[fast]` marker. It is the honest statement about a row whose
         // TCP probe measured it and found it down — and its ABSENCE here would
         // be the silent de-optimization the row exists to prevent.
-        h.state.link_writer.flush().await.expect("flush");
+        h.state.link_stage.flush().await.expect("flush");
         let persisted = xray_tui_db::models::ProfileStats::filter_by_protocol_id_and_endpoint_id(
             link.protocol_id,
             link.endpoint_id,
@@ -4150,7 +4150,7 @@ mod tests {
 
         // The batch's staged patches are the only place its result lives until
         // the flush: make them durable, then read the row back.
-        h.state.link_writer.flush().await.expect("flush");
+        h.state.link_stage.flush().await.expect("flush");
         let stored = h
             .state
             .db
