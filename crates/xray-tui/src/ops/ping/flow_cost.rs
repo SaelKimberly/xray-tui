@@ -2245,7 +2245,8 @@ async fn flow_cost_contention() {
     //     pre-fix control, so a clean run there is evidence that the ENGINE is no
     //     longer losing writes under this feed's concurrency, NOT evidence that
     //     `WriteBehind<CountrySpec>` fixed anything. The driver's own evidence is
-    //     the commit count in the next bullet, measured through the driver.
+    //     the "flush commits for the link writer" bullet below, the only figure in
+    //     this block measured THROUGH the driver.
     //   - The arm physically below (block 3, `fan-in: import and geo writers
     //     OVERLAPPING`) is the mixed import+geo shape, and it is unusable — see
     //     its own paragraph at the end of this block.
@@ -2268,7 +2269,8 @@ async fn flow_cost_contention() {
     // The neighbouring 11.1 / 10.6 / 10.6 ms figures are the STATEMENT-WIDTH
     // probe at 400 / 1,000 / 2,000 rows per statement, not this window. That
     // number is per-WINDOW and predates the driver; the driver's contribution is
-    // the commit count above, not the statement cost.
+    // the "flush commits for the link writer" count quoted above, not the
+    // statement cost.
     //
     // **The import half of the mixed fan-in arm below could NOT be measured.**
     // `write_import_once` calls `upsert_protocols_bulk`, which rejects a
