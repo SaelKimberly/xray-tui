@@ -352,7 +352,8 @@ impl<S: CacheSpec> WriteBehind<S> {
     /// - `staged >= floor` — the timer path's coalescing rule.
     /// - `stale` — `max_staged_age` elapsed since the last write. The net for a
     ///   trickle too slow to ever reach the floor, so a row is never stranded.
-    const fn should_flush(floor: usize, woken: bool, staged: usize, stale: bool) -> bool {
+    #[must_use]
+    pub const fn should_flush(floor: usize, woken: bool, staged: usize, stale: bool) -> bool {
         woken || staged >= floor || stale
     }
 
