@@ -535,6 +535,134 @@ impl CacheSpec for CountrySpec {
     }
 }
 
+/// One staged import batch: all four row families a parse produced, under one
+/// monotonic sequence number.
+///
+/// The identity is the BATCH, not the row: an import window is atomic in one
+/// transaction, and a row-level key would let a later batch overwrite a
+/// still-pending earlier one (whose rows would then never be written). Callers
+/// mint `seq` from an `AtomicU64`, so every staged batch is its own pending
+/// entry and nothing is lost.
+#[derive(Debug, Clone)]
+pub struct SourceBatch {
+    /// Monotonic batch id — the pending-map key.
+    pub seq: u64,
+    /// `endpoints` rows parsed from this batch.
+    pub endpoints: Vec<crate::models_toasty::Endpoint>,
+    /// `protocols` rows parsed from this batch.
+    pub protocols: Vec<crate::models_toasty::Protocol>,
+    /// `profile_stats` rows parsed from this batch.
+    pub links: Vec<crate::models_toasty::ProfileStats>,
+    /// `endpoint_groups` rows parsed from this batch.
+    pub group_links: Vec<crate::models_toasty::EndpointGroup>,
+}
+
+/// The write side of an import batch: 1:1 with [`SourceBatch`], so the patch IS
+/// the row.
+///
+/// Same split as [`CountryPatch`], for the same reason (the driver hands the
+/// write path a patch slice and the failure path the row).
+#[derive(Debug, Clone)]
+pub struct SourcePatch {
+    /// Monotonic batch id.
+    pub seq: u64,
+    /// `endpoints` rows to upsert.
+    pub endpoints: Vec<crate::models_toasty::Endpoint>,
+    /// `protocols` rows to upsert.
+    pub protocols: Vec<crate::models_toasty::Protocol>,
+    /// `profile_stats` rows to upsert.
+    pub links: Vec<crate::models_toasty::ProfileStats>,
+    /// `endpoint_groups` rows to upsert.
+    pub group_links: Vec<crate::models_toasty::EndpointGroup>,
+}
+
+impl From<&SourceBatch> for SourcePatch {
+    fn from(batch: &SourceBatch) -> Self {
+        Self {
+            seq: batch.seq,
+            endpoints: batch.endpoints.clone(),
+            protocols: batch.protocols.clone(),
+            links: batch.links.clone(),
+            group_links: batch.group_links.clone(),
+        }
+    }
+}
+
+/// The write-behind spec for the subscription/import bulk path.
+///
+/// ONE driver, not four: today's persist issues
+/// `upsert_endpoints_bulk` / `upsert_protocols_bulk` / `upsert_links_bulk` /
+/// `upsert_endpoint_group_links_bulk` in a SINGLE transaction, and this
+/// driver's `write_window` runs all four in the transaction IT opened. So a
+/// committed window never contains an endpoint without its link — the
+/// linkless-endpoint state a per-table driver would produce is only ever the
+/// one the input batch itself contains.
+pub struct SourceSpec;
+
+impl CacheSpec for SourceSpec {
+    type Key = u64;
+    type Row = SourceBatch;
+    type Patch = SourcePatch;
+
+    fn key_of(row: &Self::Row) -> Self::Key {
+        row.seq
+    }
+
+    fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
+        // Identity: every batch carries its own unique `seq`, so nothing is
+        // merged and drain order is preserved.
+        rows.into_iter()
+            .map(|row| {
+                let key = row.seq;
+                let patch = SourcePatch::from(&row);
+                Coalesced { key, row, patch }
+            })
+            .collect()
+    }
+
+    /// Write every family in the window on the driver's transaction, and
+    /// report the LINK rows written — the count the import outcome reports.
+    async fn write_window<'a>(
+        tx: &'a mut impl toasty::Executor,
+        patches: &'a [Self::Patch],
+    ) -> crate::Result<usize> {
+        if patches.is_empty() {
+            return Ok(0);
+        }
+        let mut endpoints = Vec::new();
+        let mut protocols = Vec::new();
+        let mut links = Vec::new();
+        let mut group_links = Vec::new();
+        for patch in patches {
+            endpoints.extend_from_slice(&patch.endpoints);
+            protocols.extend_from_slice(&patch.protocols);
+            links.extend_from_slice(&patch.links);
+            group_links.extend_from_slice(&patch.group_links);
+        }
+        let stored_links = links.len();
+        crate::database::upsert_endpoints_bulk(tx, &endpoints).await?;
+        crate::database::upsert_protocols_bulk(tx, &protocols).await?;
+        crate::database::upsert_links_bulk(tx, &links).await?;
+        crate::database::upsert_endpoint_group_links_bulk(tx, &group_links).await?;
+        Ok(stored_links)
+    }
+
+    /// Nothing to do: `upsert_links_bulk` already calls `endpoint_rank::refresh`
+    /// for the endpoints it touched, inside this same transaction — so the rank
+    /// keys are already atomic with the write, and a second refresh here would
+    /// double the import's per-window cost for the same result.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "trait-mandated async signature"
+    )]
+    async fn refresh<'a>(
+        _tx: &'a mut impl toasty::Executor,
+        _patches: &'a [Self::Patch],
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -912,5 +1040,225 @@ mod tests {
             .expect("endpoint 1 survived");
         assert_eq!(one.patch.iso, "DE");
         assert_eq!(one.row.iso, "DE");
+    }
+
+    // ── SourceSpec (import bulk path) ────────────────────────────────────
+
+    use super::{SourceBatch, SourceSpec};
+    use crate::models_toasty::{
+        ConfigType, Endpoint, HostType, ProfileStats, Protocol, ProtocolId, Security, TrafficStats,
+        Transport,
+    };
+    use toasty::{Deferred, Json};
+    use xray_tui_proto::proto_spec::common::TransportConfig;
+    use xray_tui_proto::proto_spec::{
+        CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+        VlessConfig,
+    };
+
+    /// A protocol row with its JSON columns LOADED — `upsert_protocols_bulk`
+    /// rejects a deferred one.
+    fn loaded_protocol(id: i64) -> Protocol {
+        Protocol {
+            id: ProtocolId::new(id),
+            sig: id,
+            proto_kind: ProtocolKind::Vless,
+            transport: Transport {
+                r#type: TransportType::Tcp,
+                data: Deferred::from(Json(TransportConfig::Tcp)),
+            },
+            security: Security {
+                r#type: SecurityType::None,
+                sni: None,
+                fp: None,
+                insecure: None,
+                data: Deferred::from(Json(SecurityConfig::default())),
+            },
+            config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
+                uuid: "00000000-0000-0000-0000-000000000000".to_owned(),
+                uuid_origin: None,
+                security: SecurityConfig::default(),
+                transport: TransportConfig::Tcp,
+                encryption: None,
+                flow: None,
+                path: None,
+                splice: None,
+                remarks: None,
+                mux: None,
+            }))),
+            created_at: 0,
+            links: Deferred::default(),
+        }
+    }
+
+    fn endpoint_row(id: i64) -> Endpoint {
+        Endpoint {
+            id: EndpointId::new(id),
+            host: format!("host{id}.example"),
+            host_type: HostType::Dns,
+            port: 443,
+            ports: Vec::new(),
+            last_source: None,
+            manual_protocol_override: None,
+            resolved_at: None,
+            created_at: 0,
+            links: Deferred::default(),
+            group_links: Deferred::default(),
+        }
+    }
+
+    fn link_row(endpoint_id: i64) -> ProfileStats {
+        ProfileStats {
+            protocol_id: ProtocolId::new(1),
+            endpoint_id: EndpointId::new(endpoint_id),
+            core_type: CoreType::Xray,
+            config_type: ConfigType::ShareUrl,
+            last_used_at: None,
+            last_seen_at: 0,
+            latency: None,
+            speed_bps: None,
+            error: None,
+            purge_reason: None,
+            traffic: TrafficStats {
+                today_up: 0,
+                today_down: 0,
+                total_up: 0,
+                total_down: 0,
+            },
+            created_at: 0,
+            updated_at: 0,
+            version: 1,
+            protocol: Deferred::default(),
+            endpoint: Deferred::default(),
+        }
+    }
+
+    /// A batch of `endpoints` endpoint rows whose FIRST `links` of them carry
+    /// a link. `links < endpoints` therefore builds an orphan endpoint on
+    /// purpose — the state the brief's probe measures.
+    fn source_batch(seq: u64, endpoints: usize, links: usize) -> SourceBatch {
+        let ids: Vec<i64> = (1..=i64::try_from(endpoints).expect("small count")).collect();
+        SourceBatch {
+            seq,
+            endpoints: ids.iter().copied().map(endpoint_row).collect(),
+            protocols: vec![loaded_protocol(1)],
+            links: ids.iter().copied().take(links).map(link_row).collect(),
+            group_links: Vec::new(),
+        }
+    }
+
+    /// Endpoints with no link row at all.
+    async fn linkless_endpoint_count(db: &crate::Database) -> usize {
+        let mut conn = db.connection().await.expect("conn");
+        let rows = toasty::sql::query(
+            "SELECT COUNT(*) FROM endpoints e \
+             WHERE NOT EXISTS (SELECT 1 FROM profile_stats p WHERE p.endpoint_id = e.id)",
+        )
+        .exec(&mut conn)
+        .await
+        .expect("count linkless endpoints");
+        rows.first()
+            .and_then(|row| match row {
+                toasty::stmt::Value::Record(record) => match record.fields.first() {
+                    Some(toasty::stmt::Value::I64(n)) => usize::try_from(*n).ok(),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("count is a row")
+    }
+
+    /// The accepted state after a coordinated flush: orphans come only from the
+    /// INPUT batch, never from a split commit. One driver writes all four
+    /// families in one transaction, so the endpoint a window wrote without a
+    /// link is exactly one the caller handed it.
+    #[tokio::test]
+    async fn import_flush_leaves_only_the_input_batchs_own_orphans() {
+        let db = Arc::new(crate::Database::in_memory().await.expect("db"));
+        let driver =
+            WriteBehind::<SourceSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
+
+        driver.push(source_batch(1, 3, 2)); // 3 endpoints, 2 links
+        assert_eq!(driver.flush().await.expect("flush"), 2, "link rows written");
+
+        assert_eq!(
+            linkless_endpoint_count(&db).await,
+            1,
+            "the orphan is the batch's own third endpoint, not a split commit"
+        );
+    }
+
+    /// A well-formed batch leaves NO orphans: the endpoint and its link commit
+    /// together.
+    #[tokio::test]
+    async fn import_flush_leaves_no_linkless_endpoints() {
+        let db = Arc::new(crate::Database::in_memory().await.expect("db"));
+        let driver =
+            WriteBehind::<SourceSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
+
+        driver.push(source_batch(1, 3, 3));
+        assert_eq!(driver.flush().await.expect("flush"), 3);
+
+        assert_eq!(linkless_endpoint_count(&db).await, 0);
+    }
+
+    /// The batch id is the staging identity, so two staged batches are TWO
+    /// pending entries and both are written — a content-derived or constant key
+    /// would silently drop one.
+    #[tokio::test]
+    async fn source_batches_stage_under_their_own_ids() {
+        let db = Arc::new(crate::Database::in_memory().await.expect("db"));
+        let driver =
+            WriteBehind::<SourceSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
+
+        driver.push(source_batch(1, 2, 2));
+        driver.push(source_batch(2, 4, 4));
+        assert_eq!(driver.staged_len(), 2, "one pending entry per batch id");
+        assert_eq!(
+            driver.flush().await.expect("flush"),
+            6,
+            "links of both batches"
+        );
+
+        assert_eq!(linkless_endpoint_count(&db).await, 0);
+    }
+
+    /// Every staged entry is drained even when the window spans several
+    /// batches: `flush` reports the sum of the per-window link counts.
+    #[tokio::test]
+    async fn source_flush_sums_across_windows() {
+        let db = Arc::new(crate::Database::in_memory().await.expect("db"));
+        // flush_rows = 1 → one transaction per batch.
+        let driver = WriteBehind::<SourceSpec>::new(Arc::clone(&db), 1, Duration::from_millis(200));
+
+        driver.push(source_batch(1, 2, 2));
+        driver.push(source_batch(2, 3, 3));
+        assert_eq!(driver.flush().await.expect("flush"), 5);
+        assert_eq!(driver.staged_len(), 0, "everything drained");
+    }
+
+    /// A poisoned batch fails the window, and the rows are RE-STAGED so the
+    /// next flush writes them — the driver's failure contract, on the real
+    /// four-family write.
+    #[tokio::test]
+    async fn a_failed_source_flush_restages_the_window() {
+        let db = Arc::new(crate::Database::in_memory().await.expect("db"));
+        let driver =
+            WriteBehind::<SourceSpec>::new(Arc::clone(&db), 512, Duration::from_millis(200));
+
+        // A protocol row with an UNLOADED config: `upsert_protocols_bulk`
+        // rejects it outright, which is a deterministic NON-busy error, so
+        // `retry_on_busy` does not spin on it.
+        driver.push(source_batch(1, 2, 2));
+        let mut poisoned = source_batch(2, 1, 1);
+        poisoned.protocols[0].config = Deferred::default();
+        driver.push(poisoned);
+
+        assert!(driver.flush().await.is_err(), "the window must fail");
+        assert_eq!(
+            driver.staged_len(),
+            2,
+            "the failed window is re-staged, not dropped"
+        );
     }
 }

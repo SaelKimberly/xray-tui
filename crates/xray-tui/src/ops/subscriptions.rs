@@ -490,21 +490,24 @@ async fn record_import_result(db: &Arc<Database>, group_id: &str, outcome: &Impo
     }
 }
 
-/// URLs per parse+persist batch (one DB transaction per batch).
+/// URLs per parse+stage batch. The batch is staged on the write-behind driver,
+/// which commits several of them per transaction
+/// ([`crate::ops::stream_import::IMPORT_FLUSH_BATCHES`]).
 pub const PERSIST_CHUNK: usize = 500;
 
 /// Parse URLs in bounded batches and persist each batch's rows with the
 /// db-crate bulk upserts.
 ///
-/// One transaction per batch instead of one autocommit per row — a 7000-URL
-/// feed previously issued ~28k implicit commits, pegging the `NVMe` and
-/// starving the UI. Rows are deduped across the WHOLE import via deterministic
-/// ids before the bulk calls, so repeated protocol configs and duplicate
-/// (host, port) lines upsert once per run.
+/// One write-behind WINDOW per transaction instead of one autocommit per row —
+/// a 7000-URL feed previously issued ~28k implicit commits, pegging the `NVMe`
+/// and starving the UI. Rows are deduped across the WHOLE import via
+/// deterministic ids before the bulk calls, so repeated protocol configs and
+/// duplicate (host, port) lines upsert once per run.
 ///
-/// Batch failures are logged with the URL index range and skipped — same
-/// log-and-continue semantics the old per-profile loop had, coarser.
-/// Returns `(links persisted, whole-run summary)`.
+/// The writes are DEFERRED: each chunk is staged on
+/// [`xray_tui_db::WriteBehind`] and the run ends with a coordinated flush, so
+/// the returned count is what was STORED (see [`ImportOutcome`]'s `links`).
+/// Returns `(links stored, whole-run summary)`.
 pub async fn persist_parsed_urls(
     db: &Arc<Database>,
     urls: &[String],
@@ -515,7 +518,12 @@ pub async fn persist_parsed_urls(
     let total = urls.len();
 
     let mut summary = ValidationSummary::default();
-    let mut count = 0usize;
+    // Parsed-link total, reconciled against the final flush's `stored`.
+    let mut staged_count = 0usize;
+    // Monotonic per-chunk staging ids: two chunks pending at once must be two
+    // pending-map entries.
+    let mut next_seq = 0u64;
+    let driver = crate::ops::stream_import::import_driver(db);
     // Deterministic-id dedup sets: a protocol row is shared across endpoints
     // (identity excludes host/port), so subscription feeds that repeat one
     // protocol config over hundreds of server URLs collapse to one upsert.
@@ -523,7 +531,7 @@ pub async fn persist_parsed_urls(
     let mut seen_endpoints = std::collections::HashSet::new();
     let mut seen_links = std::collections::HashSet::new();
 
-    for (chunk_idx, chunk) in urls.chunks(PERSIST_CHUNK).enumerate() {
+    for chunk in urls.chunks(PERSIST_CHUNK) {
         let (profiles, batch_summary) =
             xray_tui_config::subscription::parse_url_batch(chunk, validation);
         summary.merge(&batch_summary);
@@ -532,7 +540,6 @@ pub async fn persist_parsed_urls(
         let mut protocols: Vec<xray_tui_db::models::Protocol> = Vec::new();
         let mut links: Vec<xray_tui_db::models::ProfileStats> = Vec::new();
         let mut group_links: Vec<xray_tui_db::models::EndpointGroup> = Vec::new();
-        let mut chunk_links = 0usize;
 
         for profile in &profiles {
             let parsed = &profile.parsed;
@@ -561,59 +568,41 @@ pub async fn persist_parsed_urls(
                             group: toasty::Deferred::default(),
                         });
                     }
-                    chunk_links += 1;
                 }
             }
         }
 
-        let url_range = (
-            chunk_idx * PERSIST_CHUNK,
-            chunk_idx * PERSIST_CHUNK + chunk.len(),
-        );
-        // One transaction for the WHOLE chunk: the four bulk families share
-        // one commit, and a busy error retries the whole chunk. Row Vecs are
-        // moved into Arc slices so each retry attempt clones the Arc
-        // (refcount bump) instead of deep-copying the chunk contents.
-        let endpoints = Arc::from(endpoints);
-        let protocols = Arc::from(protocols);
-        let links = Arc::from(links);
-        let group_links = Arc::from(group_links);
-        let persist = || {
-            let (endpoints, protocols, links, group_links) = (
-                Arc::clone(&endpoints),
-                Arc::clone(&protocols),
-                Arc::clone(&links),
-                Arc::clone(&group_links),
-            );
-            async move {
-                let mut conn = db.connection().await?;
-                let mut tx = conn.transaction().await?;
-                xray_tui_db::upsert_endpoints_bulk(&mut tx, &endpoints).await?;
-                xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await?;
-                xray_tui_db::upsert_links_bulk(&mut tx, &links).await?;
-                xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &group_links).await?;
-                tx.commit().await?;
-                Ok(())
-            }
-        };
-        if let Err(e) = xray_tui_db::retry_on_busy(persist, 5).await {
-            tracing::error!(
-                target: "tui::ops::subscriptions",
-                "bulk persist failed for URLs [{}..{}): {e}",
-                url_range.0,
-                url_range.1,
-            );
-        } else {
-            count += chunk_links;
-        }
+        let chunk_links = links.len();
+        staged_count += chunk_links;
+        driver.push(xray_tui_db::SourceBatch {
+            seq: next_seq,
+            endpoints,
+            protocols,
+            links,
+            group_links,
+        });
+        next_seq += 1;
 
-        if count != 0 && count / PROGRESS_EVERY != (count - chunk_links) / PROGRESS_EVERY {
-            tracing::info!(target: "tui::ops::subscriptions", "Imported {count}/{total} links from subscription");
+        if staged_count / PROGRESS_EVERY != (staged_count - chunk_links) / PROGRESS_EVERY {
+            tracing::info!(target: "tui::ops::subscriptions", "Imported {staged_count}/{total} links from subscription");
         }
         tokio::task::yield_now().await;
     }
 
-    (count, summary)
+    // Coordinated end-of-run flush: the staged rows are written now, so the
+    // returned count is what was STORED.
+    let flushed = crate::ops::stream_import::flush_import(&driver).await;
+    let flush_dropped = staged_count.saturating_sub(flushed.stored);
+    if flush_dropped > 0 {
+        tracing::error!(
+            target: "tui::ops::subscriptions",
+            "{flush_dropped} parsed link(s) from this subscription were NOT stored: \
+             every flush attempt failed ({} batch(es) still staged)",
+            flushed.staged_left,
+        );
+    }
+
+    (flushed.stored, summary)
 }
 
 pub fn update_all_subscriptions(state: &mut AppState) {

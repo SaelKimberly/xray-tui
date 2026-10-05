@@ -46,6 +46,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Default)]
 #[must_use]
 pub struct ImportOutcome {
+    /// Links STORED. Writes are deferred to the write-behind driver, so this
+    /// is what the end-of-import flush reported, NOT the parsed count — the
+    /// "only what was STORED" invariant.
     pub links: usize,
     pub summary: ValidationSummary,
     pub ended_early: Option<String>,
@@ -189,7 +192,15 @@ where
     let mut feed_bytes = 0usize;
     let mut batcher = UrlBatcher::new(batch_size);
     let mut summary = ValidationSummary::default();
-    let mut count = 0usize;
+    // Parsed-link total: what the run STAGED, which is what `on_progress`
+    // reports (parsed, not yet necessarily stored). Reconciled against the
+    // final flush's `stored` below.
+    let mut staged_count = 0usize;
+    // Mint of the per-batch staging ids. Monotonic and unique: two batches
+    // pending at once must be two pending-map entries, or the later one
+    // overwrites the earlier and its rows are never written.
+    let mut next_seq = 0u64;
+    let driver = import_driver(db);
     // Set by every non-natural end of the stream (stall, source error,
     // undecodable bytes): the loop still drains what it has, but the caller
     // learns the run was cut short.
@@ -260,52 +271,72 @@ where
                 tracing::debug!(target: "tui::ops::subscriptions", "Finalize had undecodable trailing bytes: {e}");
             }
             while let Some(tail) = batcher.take_batch() {
-                let (n, dropped, s) = persist_batch(
-                    db,
+                let (rows, s) = parse_batch(
+                    next_seq,
                     &tail,
                     group_id,
                     validation,
                     &mut seen_protocols,
                     &mut seen_endpoints,
                     &mut seen_links,
-                )
-                .await;
-                count += n;
-                dropped_total += dropped;
+                );
+                next_seq += 1;
+                staged_count += rows.links.len();
+                driver.push(rows);
                 summary.merge(&s);
                 if let Some(cb) = on_progress {
-                    cb(count);
+                    cb(staged_count);
                 }
             }
             break;
         };
 
-        let (n, dropped, s) = persist_batch(
-            db,
+        let (rows, s) = parse_batch(
+            next_seq,
             &batch,
             group_id,
             validation,
             &mut seen_protocols,
             &mut seen_endpoints,
             &mut seen_links,
-        )
-        .await;
-        count += n;
-        dropped_total += dropped;
+        );
+        next_seq += 1;
+        staged_count += rows.links.len();
+        driver.push(rows);
         summary.merge(&s);
         if let Some(cb) = on_progress {
-            cb(count);
+            cb(staged_count);
         }
-        if count > max_feed_links {
+        if staged_count > max_feed_links {
             tracing::warn!(
                 target: "tui::ops::subscriptions",
-                "Feed exceeded the {max_feed_links}-link budget ({count} links) — stopping with partial results"
+                "Feed exceeded the {max_feed_links}-link budget ({staged_count} links) — stopping with partial results"
             );
             ended_early = Some(format!("feed over the {max_feed_links}-link budget"));
             break;
         }
         tokio::task::yield_now().await;
     }
+
+    // End of import: the coordinated flush. Persist-time failures surface HERE
+    // (not per batch) and are attributed to the run as a whole — still
+    // reported, never swallowed.
+    let flushed = flush_import(&driver).await;
+    let staged_left = flushed.staged_left;
+    // A driver re-stages a window it could not write, so the shortfall is what
+    // the caller loses. `saturating_sub` because a link written by an EARLIER
+    // window counts in both totals only once; the reconciliation is exact
+    // because every staged link is written by at most one window.
+    let flush_dropped = staged_count.saturating_sub(flushed.stored);
+    if flush_dropped > 0 || staged_left > 0 {
+        tracing::error!(
+            target: "tui::ops::subscriptions",
+            "{flush_dropped} parsed link(s) were NOT stored ({} batch(es) still staged): \
+             every flush attempt failed",
+            staged_left,
+        );
+    }
+    dropped_total += flush_dropped;
 
     if dropped_total > 0 {
         tracing::error!(
@@ -319,24 +350,31 @@ where
     }
 
     ImportOutcome {
-        links: count,
+        // STORED, not staged: the "only what was STORED" invariant the
+        // `links` doc comment names.
+        links: flushed.stored,
         summary,
         ended_early,
     }
 }
 
-/// Parse one URL batch and persist it via the bulk upserts (the exact body of
-/// one chunk iteration from `persist_parsed_urls`, reused so both paths share
-/// dedup + error semantics).
-async fn persist_batch(
-    db: &Arc<Database>,
+/// Parse one URL batch into the four row families the bulk upserts take, with
+/// NO database access (the exact body of one chunk iteration from
+/// `persist_parsed_urls`, so both paths share dedup semantics).
+///
+/// The parse half is deliberately separate from the write: the write goes
+/// through [`xray_tui_db::WriteBehind`] (which owns the transaction), so
+/// everything here is CPU plus the caller's dedup sets. `batch_links` is the
+/// staged batch's own link count — the run's `staged_count`.
+fn parse_batch(
+    seq: u64,
     batch: &[String],
     group_id: Option<&str>,
     validation: &ValidationSettings,
     seen_protocols: &mut std::collections::HashSet<i64>,
     seen_endpoints: &mut std::collections::HashSet<i64>,
     seen_links: &mut std::collections::HashSet<(i64, i64)>,
-) -> (usize, usize, ValidationSummary) {
+) -> (xray_tui_db::SourceBatch, ValidationSummary) {
     let (profiles, batch_summary) =
         xray_tui_config::subscription::parse_url_batch(batch, validation);
 
@@ -344,7 +382,6 @@ async fn persist_batch(
     let mut protocols: Vec<xray_tui_db::models::Protocol> = Vec::new();
     let mut links: Vec<xray_tui_db::models::ProfileStats> = Vec::new();
     let mut group_links: Vec<xray_tui_db::models::EndpointGroup> = Vec::new();
-    let mut batch_links = 0usize;
 
     for profile in &profiles {
         let parsed = &profile.parsed;
@@ -373,50 +410,94 @@ async fn persist_batch(
                         group: toasty::Deferred::default(),
                     });
                 }
-                batch_links += 1;
             }
         }
     }
 
-    // One transaction for the WHOLE batch: a crash mid-batch never leaves
-    // half a batch stored, and the four bulk families share one commit.
-    // Move the row Vecs into Arc slices: each retry attempt clones the Arc
-    // (refcount bump) instead of deep-copying the batch contents.
-    let endpoints = Arc::from(endpoints);
-    let protocols = Arc::from(protocols);
-    let links = Arc::from(links);
-    let group_links = Arc::from(group_links);
-    let persist = || {
-        let (endpoints, protocols, links, group_links) = (
-            Arc::clone(&endpoints),
-            Arc::clone(&protocols),
-            Arc::clone(&links),
-            Arc::clone(&group_links),
+    (
+        xray_tui_db::SourceBatch {
+            seq,
+            endpoints,
+            protocols,
+            links,
+            group_links,
+        },
+        batch_summary,
+    )
+}
+
+/// Batches per driver window on the import path.
+///
+/// The driver's `flush_rows` counts staged BATCHES (each carries up to
+/// `PERSIST_CHUNK` links), so this is the transaction width in link terms:
+/// eight 500-URL batches ≈ 4,000 links, close to what the old per-batch
+/// transactions moved and far below the point where one transaction's WAL
+/// growth stalls the UI.
+pub const IMPORT_FLUSH_BATCHES: usize = 8;
+
+/// Flush interval of the import driver's timer path.
+const IMPORT_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Attempts for the import's end-of-run flush. Copied from the ping batch's
+/// `FINAL_FLUSH_ATTEMPTS`: contention with a concurrent writer is transient
+/// and the driver already waits `busy_timeout` inside each attempt, so this is
+/// a short bounded retry, not a stacked backoff.
+const FINAL_FLUSH_ATTEMPTS: u32 = 3;
+
+/// Build the import's write-behind driver over `db`.
+#[must_use]
+pub fn import_driver(db: &Arc<Database>) -> Arc<xray_tui_db::WriteBehind<xray_tui_db::SourceSpec>> {
+    xray_tui_db::WriteBehind::new(Arc::clone(db), IMPORT_FLUSH_BATCHES, IMPORT_FLUSH_INTERVAL)
+}
+
+/// The result of the end-of-import coordinated flush: links actually STORED,
+/// and staged entries still pending afterwards (non-zero only when every
+/// attempt failed).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FinalFlush {
+    pub(crate) stored: usize,
+    pub(crate) staged_left: usize,
+}
+
+/// Write everything the run staged, with a bounded retry, and report what
+/// landed.
+///
+/// Whatever did not reach the database is the caller's `dropped_total` (see
+/// [`run_streaming_import`]), which reconciles against `staged_count`.
+pub(crate) async fn flush_import(
+    driver: &xray_tui_db::WriteBehind<xray_tui_db::SourceSpec>,
+) -> FinalFlush {
+    let mut stored = 0usize;
+    let mut last_error = None;
+    for attempt in 0..FINAL_FLUSH_ATTEMPTS {
+        match driver.flush().await {
+            Ok(written) => {
+                stored += written;
+                last_error = None;
+                break;
+            }
+            Err(error) => {
+                // A failed flush re-stages the unwritten remainder, so the
+                // next attempt writes all of it.
+                tracing::warn!(
+                    target: "tui::ops::subscriptions",
+                    "import flush attempt {} failed: {error}",
+                    attempt + 1,
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(50u64 << attempt.min(3))).await;
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        tracing::error!(
+            target: "tui::ops::subscriptions",
+            "import flush failed after {FINAL_FLUSH_ATTEMPTS} attempts: {error}",
         );
-        async move {
-            let mut conn = db.connection().await?;
-            let mut tx = conn.transaction().await?;
-            xray_tui_db::upsert_endpoints_bulk(&mut tx, &endpoints).await?;
-            xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await?;
-            xray_tui_db::upsert_links_bulk(&mut tx, &links).await?;
-            xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &group_links).await?;
-            tx.commit().await?;
-            Ok(())
-        }
-    };
-    match xray_tui_db::retry_on_busy(persist, 5).await {
-        Err(e) => {
-            tracing::error!(
-                target: "tui::ops::subscriptions",
-                "bulk persist failed for a {}-URL batch: {e}",
-                batch.len(),
-            );
-            // The batch's URLs are NOT counted, and its loss must reach the
-            // caller: returning `(0, …)` is why a dropped batch used to report a
-            // clean success. The middle value is how many URLs went missing.
-            (0, batch.len(), batch_summary)
-        }
-        Ok(()) => (batch_links, 0, batch_summary),
+    }
+    FinalFlush {
+        stored,
+        staged_left: driver.staged_len(),
     }
 }
 
