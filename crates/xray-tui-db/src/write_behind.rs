@@ -156,6 +156,15 @@ pub struct WriteBehind<S: CacheSpec> {
     wake: tokio::sync::Notify,
     /// Transactions performed (diagnostics and tests).
     flushes: AtomicU64,
+    /// Rows committed by every `flush` this driver has ever run, including the
+    /// windows of a flush that later FAILED.
+    ///
+    /// A flush that commits windows 1..k and fails on k+1 returns `Err` and
+    /// re-stages k+1.. — so the `Ok` count it would have returned is lost, and
+    /// a caller retrying sees only the remainder. Reading the DELTA of this
+    /// counter across a whole retry sequence recovers every committed row
+    /// exactly once: a row is only ever counted when its transaction commits.
+    committed_total: AtomicU64,
     /// Ties the spec's types to the driver without storing a value.
     _spec: std::marker::PhantomData<S>,
 }
@@ -203,6 +212,7 @@ impl<S: CacheSpec> WriteBehind<S> {
             gate: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
             flushes: AtomicU64::new(0),
+            committed_total: AtomicU64::new(0),
             _spec: std::marker::PhantomData,
         })
     }
@@ -293,6 +303,11 @@ impl<S: CacheSpec> WriteBehind<S> {
             match result {
                 Ok(n) => {
                     written += n;
+                    // Recorded HERE, not on the success return, so the windows
+                    // a later failure discards are still counted — see
+                    // [`Self::committed_total`].
+                    self.committed_total
+                        .fetch_add(usize_to_u64(n), Ordering::Relaxed);
                     self.flushes.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
@@ -337,6 +352,28 @@ impl<S: CacheSpec> WriteBehind<S> {
     #[must_use]
     pub fn flush_count(&self) -> u64 {
         self.flushes.load(Ordering::Relaxed)
+    }
+
+    /// Rows this driver has committed, counting the windows of a flush that
+    /// went on to fail.
+    ///
+    /// [`Self::flush`] returns `Err` for a flush that committed some windows
+    /// and then failed, and its retry writes only the re-staged remainder — so
+    /// neither the `Err` nor the retry's `Ok` accounts for the windows in
+    /// between. A caller that must report an exact stored count takes the DELTA
+    /// of this counter across its whole flush sequence instead:
+    ///
+    /// ```ignore
+    /// let before = driver.committed_total();
+    /// let _ = driver.flush().await;             // Err, or Ok
+    /// let stored = driver.committed_total() - before;
+    /// ```
+    ///
+    /// A row is counted only when its transaction commits, so the delta never
+    /// double-counts a window a retry re-writes.
+    #[must_use]
+    pub fn committed_total(&self) -> u64 {
+        self.committed_total.load(Ordering::Relaxed)
     }
 
     /// Wake the flush task so it writes on its next loop iteration.
@@ -428,6 +465,13 @@ impl<S: CacheSpec> WriteBehind<S> {
         let driver = Arc::clone(self);
         tokio::spawn(driver.run())
     }
+}
+
+/// A row count as the counter's width. A count that does not fit is a bug, not
+/// a runtime condition, so the counter saturates rather than wrapping — a wrap
+/// would report a negative delta to the caller taking it.
+fn usize_to_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// One staged country write: the endpoint, the address its country belongs to,
@@ -667,6 +711,7 @@ impl CacheSpec for SourceSpec {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::{CacheSpec, Coalesced, WriteBehind};
@@ -759,6 +804,134 @@ mod tests {
         ) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    /// How many `write_window` calls [`FailingWindowSpec`] has seen.
+    ///
+    /// The spec hooks are associated functions — the driver holds only a
+    /// `PhantomData` — so the ordinal cannot live in the spec VALUE and lives
+    /// in a test-local static instead.
+    static WINDOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// The ordinal [`FailingWindowSpec`] fails on.
+    static FAIL_AT: AtomicUsize = AtomicUsize::new(1);
+
+    /// A spec whose Nth `write_window` call fails, so the windows AROUND a
+    /// mid-flush failure are deterministic: the failure is keyed to the window
+    /// ordinal, not to row contents (whose drain order is not a contract).
+    ///
+    /// The error is a plain `Generic`, so `retry_on_busy` returns it at once and
+    /// the window ordinal advances exactly once per flush attempt.
+    struct FailingWindowSpec;
+
+    #[derive(Debug, Clone)]
+    struct WindowPatch {
+        key: i64,
+    }
+
+    impl CacheSpec for FailingWindowSpec {
+        type Key = i64;
+        type Row = i64;
+        type Patch = WindowPatch;
+
+        fn key_of(row: &Self::Row) -> Self::Key {
+            *row
+        }
+
+        fn coalesce(rows: Vec<Self::Row>) -> Vec<Coalesced<Self::Key, Self::Row, Self::Patch>> {
+            rows.into_iter()
+                .map(|key| Coalesced {
+                    key,
+                    row: key,
+                    patch: WindowPatch { key },
+                })
+                .collect()
+        }
+
+        async fn write_window<'a>(
+            tx: &'a mut impl toasty::Executor,
+            patches: &'a [Self::Patch],
+        ) -> crate::Result<usize> {
+            let ordinal = WINDOW_CALLS.fetch_add(1, Ordering::Relaxed);
+            if ordinal == FAIL_AT.load(Ordering::Relaxed) {
+                return Err(crate::DatabaseError::Generic(format!(
+                    "injected failure on window {ordinal}"
+                )));
+            }
+            for patch in patches {
+                toasty::sql::query(format!(
+                    "INSERT INTO fake_state(key, value) VALUES ({}, 1) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    patch.key
+                ))
+                .exec(&mut *tx)
+                .await?;
+            }
+            Ok(patches.len())
+        }
+
+        // The trait mandates a future; this spec derives nothing to await.
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "trait-mandated async signature"
+        )]
+        async fn refresh<'a>(
+            _tx: &'a mut impl toasty::Executor,
+            _patches: &'a [Self::Patch],
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A flush that commits windows 1..k and fails on k+1 returns `Err`, and the
+    /// committed count is NOT in that error — so a caller reconciling
+    /// "parsed vs stored" from the `Ok` values alone counts the stored rows as
+    /// lost. `committed_total` is what carries them across the failure.
+    #[tokio::test]
+    async fn committed_total_keeps_the_windows_a_failed_flush_discards() {
+        WINDOW_CALLS.store(0, Ordering::Relaxed);
+        FAIL_AT.store(1, Ordering::Relaxed);
+
+        let db = fake_db().await;
+        // flush_rows = 2, so six staged rows are three windows.
+        let driver: Arc<WriteBehind<FailingWindowSpec>> = WriteBehind::new_with_deadline(
+            Arc::clone(&db),
+            2,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+        for key in 1..=6 {
+            driver.push(key);
+        }
+
+        assert_eq!(driver.staged_len(), 6);
+        assert_eq!(
+            driver.committed_total(),
+            0,
+            "nothing is committed before the first flush"
+        );
+
+        assert!(
+            driver.flush().await.is_err(),
+            "the second window fails, so the flush must report Err"
+        );
+        assert_eq!(
+            driver.committed_total(),
+            2,
+            "the FIRST window committed, and the Err must not hide it"
+        );
+        assert_eq!(
+            driver.staged_len(),
+            4,
+            "the failing window and every later one are re-staged"
+        );
+
+        // The retry drains the re-staged remainder, so both remaining windows
+        // write: the counter moves by exactly what that attempt committed.
+        let before_retry = driver.committed_total();
+        assert_eq!(driver.flush().await.expect("retry writes the remainder"), 4);
+        assert_eq!(driver.committed_total(), 6);
+        assert_eq!(driver.committed_total() - before_retry, 4);
+        assert_eq!(driver.staged_len(), 0, "the remainder is drained");
     }
 
     fn row(key: i64, value: i64) -> FakeRow {

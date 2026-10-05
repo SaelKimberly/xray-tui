@@ -467,12 +467,16 @@ pub(crate) struct FinalFlush {
 pub(crate) async fn flush_import(
     driver: &xray_tui_db::WriteBehind<xray_tui_db::SourceSpec>,
 ) -> FinalFlush {
-    let mut stored = 0usize;
+    // `flush` returns `Err` for a flush that committed some windows and then
+    // failed, and the next attempt writes only the re-staged remainder — so
+    // neither the `Err` nor the retry's `Ok` accounts for the windows in
+    // between. The DELTA of the driver's cumulative counter does, and a row is
+    // counted only when its transaction commits, so no window is counted twice.
+    let before = driver.committed_total();
     let mut last_error = None;
     for attempt in 0..FINAL_FLUSH_ATTEMPTS {
         match driver.flush().await {
-            Ok(written) => {
-                stored += written;
+            Ok(_) => {
                 last_error = None;
                 break;
             }
@@ -495,6 +499,8 @@ pub(crate) async fn flush_import(
             "import flush failed after {FINAL_FLUSH_ATTEMPTS} attempts: {error}",
         );
     }
+    let stored =
+        usize::try_from(driver.committed_total().saturating_sub(before)).unwrap_or(usize::MAX);
     FinalFlush {
         stored,
         staged_left: driver.staged_len(),
