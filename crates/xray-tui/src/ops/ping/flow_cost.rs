@@ -1889,9 +1889,10 @@ fn split_batches(slice: &ImportBatch, n: usize, per_tx: usize) -> Vec<ImportBatc
 ///   3.   **fan-in** — import and geo writers OVERLAPPING. Every other row in this
 ///        module is sequential, and only this shape reproduces the `snapshot is
 ///        stale` aborts; without it there is no contention to measure.
-///        **As of 2026-10-05 the IMPORT half is unusable** — see the
-///        AFTER-NUMBERS block above; the geo arms carry the measurement until the
-///        slice is rebuilt with protocol `config` loaded.
+///        **As of 2026-10-05 the IMPORT half is unusable** — the AFTER-NUMBERS
+///        block further down inside this function explains why; the geo arms and
+///        the trickle row carry the measurement until the slice is rebuilt with
+///        protocol `config` loaded.
 ///   4.   **flush trickle** — the link writer driven on a wall-clock ARRIVAL
 ///        schedule, reporting `flush_count()`. Rows-per-flush is set by arrival
 ///        rate, not row count: staging 4,028 rows in a tight loop trips the
@@ -2231,12 +2232,23 @@ async fn flow_cost_contention() {
     //   fan-in geo PER-ADDRESS / 16 writers          3,576,034 ns    5 samples, 0/100 writes failed
     //   flush trickle WALL (4028 rows @ 12/s)  -> 32 flushes = 125.9 rows/flush, 0 staged left
     //
-    // **What the migration changed: the commit COUNT, and the failures.**
-    //   - `snapshot is stale` / `database is locked`: **zero** in this run. The
-    //     2026-10-01 production run recorded 88 `snapshot is stale` aborts and
-    //     10 `busy_timeout` drops against ~1,000 overlapping single-row write
-    //     transactions; the fan-in arm below is the shape that reproduces them,
-    //     and it now runs clean at the same 16-writer concurrency.
+    // **What the migration changed: the commit COUNT.** Read the arms apart, because
+    // only some of them exercise the driver:
+    //   - Arm 2c, "fan-in geo PER-ADDRESS / 16 writers" (ABOVE this block, the row
+    //     `fan-in geo PER-ADDRESS / {geo_fanin} writers (pre-fix)`), ran 16
+    //     concurrent writers with **0/100 writes failed and zero `snapshot is
+    //     stale` / `database is locked`**, against the 2026-10-01 production run's
+    //     88 `snapshot is stale` aborts and 10 `busy_timeout` drops against ~1,000
+    //     overlapping single-row write transactions. **Be careful what that
+    //     proves**: arm 2c calls `db.set_endpoint_ip_country`, the PER-ADDRESS
+    //     writer this plan does NOT touch — it is deliberately kept as the
+    //     pre-fix control, so a clean run there is evidence that the ENGINE is no
+    //     longer losing writes under this feed's concurrency, NOT evidence that
+    //     `WriteBehind<CountrySpec>` fixed anything. The driver's own evidence is
+    //     the commit count in the next bullet, measured through the driver.
+    //   - The arm physically below (block 3, `fan-in: import and geo writers
+    //     OVERLAPPING`) is the mixed import+geo shape, and it is unusable — see
+    //     its own paragraph at the end of this block.
     //   - flush commits for the link writer: 32 commits for 4,028 arrivals
     //     (125.9 rows/commit) at the production trickle rate, versus the ~8 the
     //     512-row size trigger alone would give for the same 4,028 rows staged
@@ -2249,13 +2261,16 @@ async fn flow_cost_contention() {
     //
     // **The retired per-row writer, for the A/B.** `apply_link_patches` used to
     // be one existence probe + one `UPDATE` per row (turso has no
-    // `UPDATE ... FROM (VALUES ...)`, database.rs:1120). Measured over the
-    // reference feed on a 512-patch window: **29.0 ms -> 10.6 ms** once it became
-    // one multi-row upsert per 400-row chunk. That number is per-WINDOW and
-    // predates the driver; the driver's contribution is the commit count above,
-    // not the statement cost.
+    // `UPDATE ... FROM (VALUES ...)`, database.rs:1122). Measured over the
+    // reference feed on a 512-patch window including the rank refresh:
+    // **29.0 ms -> 10.0 ms** once it became one multi-row upsert per 400-row
+    // chunk (ADR 0002 amendment 4; `docs/aegis/specs/2026-09-16-db-claim-verification.md:25`).
+    // The neighbouring 11.1 / 10.6 / 10.6 ms figures are the STATEMENT-WIDTH
+    // probe at 400 / 1,000 / 2,000 rows per statement, not this window. That
+    // number is per-WINDOW and predates the driver; the driver's contribution is
+    // the commit count above, not the statement cost.
     //
-    // **The import half of arm 3 could NOT be measured — see the guard below.**
+    // **The import half of the mixed fan-in arm below could NOT be measured.**
     // `write_import_once` calls `upsert_protocols_bulk`, which rejects a
     // `Protocol` whose deferred `config` was not loaded ("deferred config not
     // loaded"). The slice is built from `load_page_rows`, which stopped
@@ -2265,9 +2280,11 @@ async fn flow_cost_contention() {
     // nothing on that path (the diff touches no `upsert_*_bulk`). Every import
     // transaction therefore errors deterministically, `ArmFailures` correctly
     // DISCARDs both import rows, and the 680 `write failures` this run prints are
-    // all that one cause. Arm 3 as a whole is unusable until the slice loads
-    // protocols with their config; until then the geo arms above carry the
-    // contention measurement.
+    // all that one cause. **The mixed fan-in arm produces NO row**, so this is
+    // NOT the contention evidence: the geo arms (arm 2c above, arm 2) and the
+    // driver-backed trickle row below carry the measurement instead. The mixed
+    // arm stays unusable until the slice is rebuilt with protocol `config`
+    // loaded.
 
     // 3. fan-in: import and geo writers OVERLAPPING, the production shape.
     // `batches` is shared, not moved: the closure captures it by reference, so a

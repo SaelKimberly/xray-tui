@@ -275,10 +275,20 @@ reader diffing the file does not mistake a relocated statement for a new excepti
 
 **The transaction count is the thing that changed, so it is the thing to measure.** §3's numbers
 are per-statement costs and are unaffected; what the migration removes is the *number of
-transactions* around them. The counter-evidence for that claim lives in
-`crates/xray-tui/src/ops/ping/flow_cost.rs` (`flow_cost_contention`, the ADR-0008 perf lab): the
-fan-in arm runs overlapping import + geo writers against the same file, and its rows are recorded
-there with the before/after comment.
+transactions* around them. The measurement lives in
+`crates/xray-tui/src/ops/ping/flow_cost.rs` (`flow_cost_contention`, the ADR-0008 perf lab), in
+the AFTER-NUMBERS block inside that function: the **driver-backed trickle row** is the direct
+evidence (32 commits for 4,028 arrivals, 125.9 rows/flush, against the ~8 a bare size trigger
+gives and 1,167 pre-driver).
+
+**Its mixed import+geo fan-in arm is currently unusable and proves nothing.** Every import
+transaction in that arm fails deterministically — `upsert_protocols_bulk` rejects a `Protocol`
+whose deferred `config` was not loaded, because the lab builds its slice from `load_page_rows`
+and `fcf2a5f` ("no toasty .include() on the profiles read path") stopped issuing `.include()`
+there. `fcf2a5f` is an ancestor of this migration's base, the diff touches no `upsert_*_bulk`,
+and `ArmFailures` correctly DISCARDs both import rows, so **the arm emits no row at all** — read
+the geo arms and the trickle row instead, and do not read a before/after into a number that was
+never recorded.
 
 **No `db_method` span on the tx-scoped pair.** `apply_link_patches_tx` and
 `set_endpoint_ip_countries_once` deliberately carry no `#[tracing::instrument(target =
