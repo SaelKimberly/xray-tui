@@ -1,39 +1,42 @@
 # Checkpoint — DB rewamp
 
 ## Snapshot
-- root `/home/user/oss/xray-tui`; branch `native-core-stub`; HEAD `5bd2d64`.
-- Upstream `origin/native-core-stub`. Single worktree.
-- Preexisting dirty: `docs/aegis/INDEX.md` (M), spec+plan (untracked). Preserved.
+- root `/home/user/oss/xray-tui`; branch `native-core-stub`; HEAD `c41e63f`.
+- Tree **clean**; last 4 commits are this workstream (S1 → … → ConfigType).
+
+## Commits landed (each green: nextest + workspace check)
+| commit | slice |
+| --- | --- |
+| `544d441` | S1 — spec rev.2, plan, baseline, harness guard, turso planner gate |
+| `068bbb6` | drop write-only `transport_data`/`security_data` (−13.6% file) |
+| `80111de` | drop `core_type` (per-pair + group) + the form override (D3) |
+| `c41e63f` | drop `ConfigType` from identity + schema (D9), `IDENTITY_VERSION` 2→3, golden re-pinned; `rank_config` removed with it |
 
 ## Todo map
-- S1: T0 baseline · T1 harness · T2 turso gate
-- S2 (one non-green window): T3 psl2+meta · T4 identity/host · T5 validation · T6 core_type · T7 ConfigType+JSON · T8 binned law+index · T9 page/search · T10 sort-UI · T11 wipe · T12 FK
-- S3: T13 long-lived reader · S4: T14 gated WR · S5: T15 docs/ADR/AGENTS
+- **Done:** T0 baseline · T1 harness guard · T2 turso gate · T6 core_type · T7-part[a: JSON]
+- **Remaining:** T3 psl2 helper+meta · T4 identity/host model · T5 validation ·
+  T7-part[b: ConfigType — DONE] · T8 binned law+index · T9 page order/search ·
+  T10 sort UI · T11 tag-15 wipe · T12 FK cascade · T13 direct reader ·
+  T14 gated WITHOUT ROWID · T15 docs/ADR/AGENTS
 
-## Active
-T0/T2 — results being collected (`bg_4` → `/tmp/rewamp_t0t2.txt`).
-
-## Completed / evidence
-- **T0 (partial):** HEAD index inventory + size captured: 11 raw/secondary
-  indexes + 10 PK autoindexes; `user_version=14`; 74,723 endpoints / 146,744
-  links / 77,395 protocols / 7,721 addresses; file 121.8 MB (with WAL).
-- **T1 (done):** `PageSort::Id` and `profiles_walk_page` have NO production
-  caller (grep: lab `flow_cost.rs` + its integration test only). The lab port is
-  folded into the T10 slice (porting now targets an API about to change).
-- **T2 (written):** `crates/xray-tui-db/tests/turso_planner.rs` — ignored gate
-  seeding the proposed `endpoint_rank` shape at 74,723 rows on a direct turso
-  connection and printing `EXPLAIN QUERY PLAN` for Active/Purgatory/All/scope/reband.
-- **Advisory rejected:** a claimed workspace/hakari self-cycle — `cargo metadata`
-  RC=0 and `cargo check -p xray-tui-db` RC=0; false.
-
-## Execution refinement (deviation from plan wording, not scope)
-S2 executes as **sequential green sub-slices** (each drops a column AND its
-readers in the same commit) instead of one non-green window: the plan's
-atomicity argument is per-file-list, and every sub-slice keeps the crate
-green + testable. Same total change; safer verification. Recorded here.
+## Verification at this HEAD
+- `cargo check --workspace --all-targets` → 0 errors.
+- `cargo nextest`: proto/config/core **732**, db **170**, tui **261** — all green.
 
 ## Blockers
-(none)
+- none technical. **Budget**: the remaining slices (psl2 identity, binned law,
+  page/search, sort UI, wipe, FK, reader, docs) are each large; the session did
+  not have room to finish them.
 
-## Next step
-Collect T2/T0 output; run T2 gate; then S2 first sub-slice.
+## Next step (exact resume point)
+1. **T10 (smallest):** delete the sort UI — `types::SortColumn`, the `s` cycle in
+   `ui/mod.rs`, `ops/profiles.rs::page_sort`/`set_sort`, `AppState.sort_column`/
+   `sort_ascending`, `ui/profiles.rs`'s sort-column match. Keep `PageSort` for the
+   perf lab. Green + commit.
+2. **T3/T4/T5:** add `psl2`, the one split helper, `domain`/`sub_domain` on
+   `endpoints`, derived host-kind, all-addresses-in-`endpoint_ip`, uniform
+   validation + counted skip, the three `host_type→HostKind` reconstruction sites.
+3. **T8/T9:** binned law `(bin, ⌐weight, domain, sub, addr, endpoint_id)`,
+   `endpoint_rank` reshape + the one covering index; page order/view/search.
+4. **T11** tag 15 wipe, **T12** FK cascade, **T13** direct reader,
+   **T14** gated WR, **T15** docs/ADR/AGENTS.

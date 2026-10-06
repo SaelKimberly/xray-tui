@@ -9,7 +9,7 @@ use crate::AppState;
 use crate::state::{
     endpoint_from_essentials, load_protocol_with_config, persist_parsed, protocol_from_parsed,
 };
-use crate::types::{AppMode, BatchImportItem, SortColumn};
+use crate::types::{AppMode, BatchImportItem};
 use crate::{common_field_defaults, get_field, profile_to_fields};
 use xray_tui_db::Database;
 use xray_tui_db::DatabaseError;
@@ -100,8 +100,8 @@ impl From<&AppState> for ProfilesLoad {
             purgatory_ttl_secs: s.purgatory_ttl_secs,
             error_ttl_hours: s.config.speed_test.error_ttl_hours,
             search: (!s.search_query.is_empty()).then(|| s.search_query.clone()),
-            sort: page_sort(s.sort_column),
-            ascending: s.sort_ascending,
+            sort: PageSort::Test,
+            ascending: true,
             offset: s.page_offset,
             limit: PROFILES_PAGE_SIZE,
             group_id: None,
@@ -411,19 +411,6 @@ pub const fn filtered_len(state: &AppState) -> usize {
 
 /// The page size.
 pub(crate) const PROFILES_PAGE_SIZE: usize = 200;
-
-/// Map the UI sort column onto the query's sort enum.
-pub(crate) const fn page_sort(column: SortColumn) -> PageSort {
-    match column {
-        SortColumn::Address => PageSort::Address,
-        SortColumn::Port => PageSort::Port,
-        SortColumn::Test => PageSort::Test,
-        SortColumn::Speed => PageSort::Speed,
-        SortColumn::Traffic => PageSort::Traffic,
-        SortColumn::LastSeen => PageSort::LastSeen,
-        SortColumn::Ip => PageSort::Ip,
-    }
-}
 
 /// Whether the endpoint's DNS host is currently unresolved (no known IPs).
 ///
@@ -1996,41 +1983,6 @@ mod view_window_tests {
 }
 
 #[cfg(test)]
-mod sort_tests {
-    use super::{AppState, PageSort, SortColumn, page_sort};
-
-    /// The tab no longer sorts in memory: it asks the query for the order. What
-    /// the UI owns is the mapping from its column enum to the query's sort enum,
-    /// and the order parity is pinned against the Rust oracle in the db crate
-    /// (`profiles_query::tests`).
-    #[test]
-    fn sort_columns_map_onto_the_query_sorts() {
-        assert_eq!(page_sort(SortColumn::Test), PageSort::Test);
-        assert_eq!(page_sort(SortColumn::Address), PageSort::Address);
-        assert_eq!(page_sort(SortColumn::Port), PageSort::Port);
-        assert_eq!(page_sort(SortColumn::LastSeen), PageSort::LastSeen);
-        assert_eq!(page_sort(SortColumn::Speed), PageSort::Speed);
-        assert_eq!(page_sort(SortColumn::Traffic), PageSort::Traffic);
-    }
-
-    /// Changing the sort restarts from the first page: a page offset from the
-    /// old order is meaningless in the new one.
-    #[tokio::test]
-    async fn sort_change_resets_the_page_offset() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = std::sync::Arc::new(
-            xray_tui_db::Database::open(dir.path().join("t.db"))
-                .await
-                .unwrap(),
-        );
-        let mut state = AppState::new(db, xray_tui_config::AppConfig::default()).await;
-        state.page_offset = 400;
-        state.selected_index = 3;
-        state.set_sort(SortColumn::Test);
-        assert_eq!(state.page_offset, 0, "offset reset");
-        assert_eq!(state.selected_index, 0, "selection returns to the top");
-    }
-}
 
 #[cfg(test)]
 mod ttl_tests {

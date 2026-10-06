@@ -6,7 +6,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use xray_tui_core::speed_test::TestType;
 
-use crate::SortColumn;
 use crate::ui::render_confirmation_overlay;
 use crate::ui::theme::ThemeStyles;
 use crate::ui::widgets::data_table::{
@@ -967,16 +966,8 @@ fn render_data_grid(
         .title_style(ThemeStyles::container_title(palette));
 
     // Map sort state to DataTable column indices
-    let sort_column = match state.sort_column {
-        SortColumn::Address | SortColumn::Port | SortColumn::Ip => Some(5),
-        SortColumn::Test => Some(11),
-        SortColumn::LastSeen | SortColumn::Speed | SortColumn::Traffic => None,
-    };
-    let sort_direction = if state.sort_ascending {
-        SortDirection::Ascending
-    } else {
-        SortDirection::Descending
-    };
+    let sort_column = Some(11);
+    let sort_direction = SortDirection::Ascending;
 
     // 16 fixed columns (118 cells total); headers carry only descriptive
     // names (decorative separator cells have empty headers).

@@ -26,7 +26,7 @@ use crate::BackendUpdateStatus;
 use crate::ops::{connect, events, ping, profiles, scheduler, settings, subscriptions, updates};
 use crate::types::{
     AppMode, ConfirmAction, CoreEvent, EndpointInfo, EndpointRow, LogLine, NativeActivityLog,
-    SettingsSection, SortColumn, SplitRightPane, Tab,
+    SettingsSection, SplitRightPane, Tab,
 };
 
 /// Global UI/connection state.
@@ -88,8 +88,6 @@ pub struct AppState {
     /// Anchor for multi-line selection in logs tab (offset from bottom).
     /// `None` = no active selection.
     pub log_select_anchor: Option<usize>,
-    pub sort_column: SortColumn,
-    pub sort_ascending: bool,
     pub search_query: String,
     pub search_focused: bool,
     pub connected_core: Option<CoreType>,
@@ -344,7 +342,6 @@ pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
 /// already-computed protocol id (no `uid()` rehash per endpoint).
 #[must_use]
 pub fn link_from_parsed_with_id(
-    parsed: &ParsedProto,
     protocol_id: ProtocolId,
     endpoint_id: EndpointId,
 ) -> ProfileStats {
@@ -403,7 +400,7 @@ pub async fn persist_parsed(
     let mut group_links = Vec::with_capacity(parsed.endpoints.len());
     for ep in &parsed.endpoints {
         let endpoint = endpoint_from_essentials(ep);
-        let link = link_from_parsed_with_id(parsed, protocol.id, endpoint.id);
+        let link = link_from_parsed_with_id(protocol.id, endpoint.id);
         if let Some(gid) = group_id {
             group_links.push(EndpointGroup {
                 endpoint_id: endpoint.id,
@@ -541,8 +538,6 @@ impl AppState {
             selected_index: 0,
             log_scroll: 0,
             log_select_anchor: None,
-            sort_column: SortColumn::Address,
-            sort_ascending: true,
             search_query: String::new(),
             search_focused: false,
             log_cache: VecDeque::new(),
@@ -699,17 +694,6 @@ impl AppState {
         profiles::reload_routing_rules(self).await;
     }
 
-    /// Set the Profiles sort column. The page restarts from the top: an offset
-    /// taken in the previous order is meaningless in the new one, and the
-    /// ordering itself is applied by the query, not in memory.
-    pub fn set_sort(&mut self, column: SortColumn) {
-        self.sort_column = column;
-        self.sort_ascending = true;
-        self.page_offset = 0;
-        self.selected_index = 0;
-        self.selected_sub = None;
-        self.filter_cache_valid.set(false);
-    }
 
     /// The filtered total across all pages (the page holds one window of it).
     #[must_use]

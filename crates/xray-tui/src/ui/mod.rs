@@ -10,7 +10,7 @@ pub mod statistics;
 pub mod status_bar;
 pub mod theme;
 pub mod widgets;
-use crate::{AppMode, AppState, ConfirmAction, SortColumn, Tab};
+use crate::{AppMode, AppState, ConfirmAction, Tab};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -540,11 +540,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     10 => {
                         state.start_batch_then_real_ping_scoped(PlanScope::Failed);
                     }
-                    11 => {
-                        state.sort_column = SortColumn::Test;
-                        state.sort_ascending = true;
-                        state.filter_cache_valid.set(false);
-                    }
                     12 => {
                         state.remove_failed_servers().await;
                     }
@@ -786,26 +781,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
         {
             state.stop_speed_test();
             state.log_trace("info", "tui::ui", "Speed test stopped by user");
-        }
-        // Cycle sort column — preserve selection by profile ID
-        KeyCode::Char('o' | 'O') if state.current_tab == Tab::Profiles => {
-            let selected_id = state.selected_profile_id();
-            let all = &[
-                SortColumn::Address,
-                SortColumn::Port,
-                SortColumn::Test,
-                SortColumn::Speed,
-                SortColumn::Traffic,
-                SortColumn::LastSeen,
-                SortColumn::Ip,
-            ];
-            let current_idx = all
-                .iter()
-                .position(|c| *c == state.sort_column)
-                .unwrap_or(0);
-            let next_idx = (current_idx + 1) % all.len();
-            let _ = selected_id;
-            state.set_sort(all[next_idx]);
         }
         // CRUD shortcuts (profiles tab)
         KeyCode::Char('a' | 'A') if state.current_tab == Tab::Profiles => {

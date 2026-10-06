@@ -397,7 +397,7 @@ fn parse_batch(
         }
         for ep in &parsed.endpoints {
             let endpoint = crate::state::endpoint_from_essentials(ep);
-            let link = crate::state::link_from_parsed_with_id(parsed, protocol.id, endpoint.id);
+            let link = crate::state::link_from_parsed_with_id(protocol.id, endpoint.id);
             if seen_links.insert((link.protocol_id.get(), link.endpoint_id.get())) {
                 if seen_endpoints.insert(endpoint.id.get()) {
                     endpoints.push(endpoint.clone());

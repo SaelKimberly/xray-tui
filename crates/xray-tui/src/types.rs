@@ -224,18 +224,6 @@ impl Tab {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortColumn {
-    Address,
-    Port,
-    Test,
-    Speed,
-    Traffic,
-    LastSeen,
-    /// The endpoint's lowest resolved address (`endpoint_ip`).
-    Ip,
-}
-
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub level: String,
