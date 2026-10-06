@@ -4468,6 +4468,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl2"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "120a0434955904d58c598a99ea42be2018c813b5f08f89c18ac66aba70546e0f"
+dependencies = [
+ "idna",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7983,6 +7992,7 @@ dependencies = [
  "escape8259",
  "humantime",
  "memchr",
+ "psl2",
  "ratatui-themes",
  "serde",
  "serde_json",

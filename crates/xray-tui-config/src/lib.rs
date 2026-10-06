@@ -1,5 +1,6 @@
 pub mod app_config;
 pub mod base64_util;
+pub mod domain;
 pub mod duration_or_secs;
 pub mod fast_perc;
 pub mod forms;
