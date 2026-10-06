@@ -2453,7 +2453,7 @@ async fn flow_cost_seed_measure_db() {
 #[ignore = "perf lab: run explicitly with --ignored"]
 async fn flow_cost_protocol_writer_cost() {
     let n = env_usize("XRAY_TUI_MEASURE_SEED_PROTOS", 200);
-    let mut state = test_state(Vec::new()).await;
+    let state = test_state(Vec::new()).await;
     let rows = synth_rows(n, n);
     let protocols: Vec<xray_tui_db::models::Protocol> = rows
         .iter()

@@ -428,6 +428,12 @@ pub(crate) const fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow
 ///
 /// The per-pair `link.core_type` override is gone (db-rewamp D3); the core is
 /// derived from the kind, the config override and the Shadowsocks method.
+///
+/// LIMITATION: this reads a page `EndpointRow` whose `protocol.config` is
+/// UNLOADED, so `shadowsocks_method` returns `None` — a legacy-cipher SS row
+/// shows the xray default here. The connect path resolves the core from the
+/// LOADED protocol instead (`ops::connect`), which is authoritative; this
+/// label is cosmetic. Same for the UI's core column.
 pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
     let Some((_link, protocol)) = row.active_protocol() else {
         return CoreType::Auto;

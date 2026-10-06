@@ -126,7 +126,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         return;
     }
 
-    let (endpoint, _link, protocol, protocol_id, proto_kind) = {
+    let (endpoint, protocol_id, proto_kind) = {
         let Some(row) = state
             .endpoints
             .iter()
@@ -148,40 +148,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             );
             return;
         };
-        (
-            row.endpoint.clone(),
-            link.clone(),
-            protocol.clone(),
-            link.protocol_id,
-            protocol.proto_kind,
-        )
-    };
-
-    // The subprocess core is derived from the protocol kind, the config-level
-    // override and the Shadowsocks method (the per-pair `core_type` column is
-    // gone, db-rewamp D3): `protocol_core_overrides` wins, then
-    // `core_mapping::resolve_core`'s kind/method default. Whether the in-process
-    // native core serves this connect instead is decided in the task (0.5),
-    // where the loaded config can face the capability gate.
-    let core_override = state
-        .config
-        .core
-        .protocol_core_overrides
-        .get(&proto_kind.to_string())
-        .and_then(|s| s.parse::<CoreType>().ok());
-    let forced = match core_override {
-        Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
-        Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
-        Some(CoreType::Native | CoreType::Auto) => None,
-        None => None,
-    };
-    let link_core = match xray_tui_proto::proto_spec::core_mapping::resolve_core(
-        proto_kind,
-        forced,
-        xray_tui_core::config_builder::shadowsocks_method(&protocol).as_deref(),
-    ) {
-        ProtoCoreType::Xray => CoreType::Xray,
-        ProtoCoreType::SingBox => CoreType::SingBox,
+        (row.endpoint.clone(), link.protocol_id, protocol.proto_kind)
     };
 
     // If already connected/disconnecting, send stop signal first
@@ -342,13 +309,27 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             },
         };
 
-        // 0.5. Runtime core. The link stamp is concrete and nothing native is
-        // persisted: native preference is decided here, per connect, because
-        // only here is the deferred config loaded and only here can the
-        // capability gate run.
+        // 0.5. Runtime core. The core is DERIVED (the per-pair stamp is gone,
+        //     db-rewamp D3) from the LOADED protocol — `shadowsocks_method`
+        //     needs the real config, and the page row's is unloaded, so a
+        //     legacy-cipher SS row would otherwise default to xray-core and
+        //     fail at build. Native preference is decided here too, because
+        //     only here can the capability gate run.
         let forced = param_core_overrides
             .get(&proto_kind.to_string())
             .and_then(|s| s.parse::<CoreType>().ok());
+        let link_core = match xray_tui_proto::proto_spec::core_mapping::resolve_core(
+            proto_kind,
+            match forced {
+                Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
+                Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
+                Some(CoreType::Native | CoreType::Auto) | None => None,
+            },
+            xray_tui_core::config_builder::shadowsocks_method(&protocol).as_deref(),
+        ) {
+            ProtoCoreType::Xray => CoreType::Xray,
+            ProtoCoreType::SingBox => CoreType::SingBox,
+        };
         // The native core is proxy-all — no routing engine, no DNS server — so
         // a profile with routing rules or non-default DNS keeps the subprocess
         // core. Decided before the capability gate so the `BuildParams` api

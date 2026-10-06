@@ -69,7 +69,16 @@ use crate::retry_on_busy;
 // simply be a stale uid with no config behind it, so the file is wiped
 // for the clean re-import. The user accepted the wipe (pre-alpha,
 // 2026-09-30).
-pub const SCHEMA_VERSION: i64 = 14;
+//
+// 15 = the DB-rewamp column drops + identity re-key: `protocols`
+// loses `transport_data`/`security_data`, `profile_stats` loses
+// `core_type`/`config_type` and `endpoint_rank` loses `rank_config`,
+// and `IDENTITY_VERSION` 2 → 3 (the `config_type` term left the
+// identity). A v14 file keeps the dropped columns as NOT NULL while the
+// model no longer has them — every import INSERT would fail — so the
+// file is wiped for the clean re-import. Subsequent rewamp slices
+// (the host/identity model, the binned law) bump again.
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does). A named alias because the signature
