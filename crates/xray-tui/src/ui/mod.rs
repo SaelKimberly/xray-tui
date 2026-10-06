@@ -89,6 +89,31 @@ pub async fn run(state: &mut AppState) -> anyhow::Result<()> {
     // transaction inside the resolution task (T7).
     crate::ops::enrich::spawn_geo_drain(state.db.clone(), state.shutdown_token.clone());
 
+    // PSL-version guard (db-rewamp D2): the DNS-name split, and therefore every
+    // endpoint's identity, is a function of the `psl2` Public Suffix List the
+    // build embedded. A `cargo update` that moves it can re-key or reject hosts
+    // with no code change, so a mismatch is surfaced (re-import) rather than
+    // allowed to shift silently.
+    let psl = xray_tui_config::domain::psl_version();
+    match state.db.meta_get("psl_version").await {
+        Ok(Some(stored)) if stored != psl => {
+            state.log_trace(
+                "warn",
+                "tui::state",
+                &format!(
+                    "public-suffix list changed ({stored} -> {psl}); stored endpoint \
+                     identities may be stale — re-import the feed"
+                ),
+            );
+        }
+        Ok(_) => {
+            if let Err(e) = state.db.meta_set("psl_version", psl).await {
+                tracing::warn!(target: "tui::state", "psl_version stamp failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!(target: "tui::state", "psl_version read failed: {e}"),
+    }
+
     tokio::task::spawn_blocking(move || {
         /// Idle poll slice: the quit path waits at most this long for the reader.
         const IDLE_POLL: Duration = Duration::from_millis(200);

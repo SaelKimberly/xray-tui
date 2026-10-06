@@ -348,6 +348,18 @@ impl Database {
         if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
             tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
+        // The generic key/value meta table (db-rewamp D2): stamps that guard the
+        // STORED identity against a change in a build-time input. The first is
+        // the `psl2` Public Suffix List version — a change re-keys endpoints, so
+        // the app surfaces a mismatch instead of silently shifting.
+        if let Err(e) = toasty::sql::query(
+            "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .exec(&mut conn)
+        .await
+        {
+            tracing::warn!(target: "xray_tui_db", "app_meta: {e}");
+        }
         Ok(Self {
             db,
             concurrent_writes,
@@ -480,6 +492,18 @@ impl Database {
         // single-column, and the sort wants `(ip_key, endpoint_id)` together.
         if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
             tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
+        }
+        // The generic key/value meta table (db-rewamp D2): stamps that guard the
+        // STORED identity against a change in a build-time input. The first is
+        // the `psl2` Public Suffix List version — a change re-keys endpoints, so
+        // the app surfaces a mismatch instead of silently shifting.
+        if let Err(e) = toasty::sql::query(
+            "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .exec(&mut conn)
+        .await
+        {
+            tracing::warn!(target: "xray_tui_db", "app_meta: {e}");
         }
         Ok(Self {
             db,
@@ -714,6 +738,44 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
 }
 
 /// Extract the first INTEGER column of the first row (used for PRAGMA reads).
+impl Database {
+/// Read a value from the generic `app_meta` key/value table, `None` when the
+/// key is absent. Raw SQL: a single-row point read, and the table is created
+/// at open (it is not a toasty model — a new model would need a schema tag).
+#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+pub async fn meta_get(&self, key: &str) -> Result<Option<String>> {
+    let mut conn = self.conn().await?;
+    let rows = toasty::sql::query(format!(
+        "SELECT value FROM app_meta WHERE key = {}",
+        sql_lit(key)
+    ))
+    .exec(&mut conn)
+    .await?;
+    Ok(rows.first().and_then(|row| match row {
+        Value::Record(record) => record.fields.first().cloned(),
+        _ => None,
+    }).and_then(|v| match v {
+        Value::String(s) => Some(s),
+        _ => None,
+    }))
+}
+
+/// Upsert a value into `app_meta`. Raw SQL for the same reason `meta_get` is.
+#[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
+pub async fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+    let mut conn = self.conn().await?;
+    toasty::sql::query(format!(
+        "INSERT INTO app_meta (key, value) VALUES ({}, {}) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        sql_lit(key),
+        sql_lit(value)
+    ))
+    .exec(&mut conn)
+    .await?;
+    Ok(())
+}
+}
+
 fn first_i64(rows: &[Value]) -> Option<i64> {
     rows.first().and_then(|v| {
         if let Value::Record(fields) = v {
@@ -2002,6 +2064,27 @@ mod tests {
     use crate::models_toasty::{Latency, Security, TrafficStats, Transport};
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
+
+    /// The generic `app_meta` store: point read, upsert, absent key.
+    #[tokio::test]
+    async fn app_meta_round_trips_and_upserts() {
+        let db = Database::in_memory().await.expect("db");
+        assert_eq!(db.meta_get("missing").await.expect("get"), None);
+        db.meta_set("psl_version", "2026-01-01T00:00:00Z")
+            .await
+            .expect("set");
+        assert_eq!(
+            db.meta_get("psl_version").await.expect("get"),
+            Some("2026-01-01T00:00:00Z".to_string())
+        );
+        db.meta_set("psl_version", "2027-02-02T00:00:00Z")
+            .await
+            .expect("upsert");
+        assert_eq!(
+            db.meta_get("psl_version").await.expect("get"),
+            Some("2027-02-02T00:00:00Z".to_string())
+        );
+    }
     use xray_tui_proto::proto_spec::{
 ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         VlessConfig,
