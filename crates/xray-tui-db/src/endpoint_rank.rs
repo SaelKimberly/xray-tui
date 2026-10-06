@@ -34,8 +34,6 @@ pub const NO_SEEN: i64 = i64::MIN;
 /// Sentinel for "no measured display link", matching the retired
 /// `COALESCE(<speed>, -1)`.
 pub const NO_SPEED: i64 = -1;
-/// Sentinel for "unknown config type", matching the retired `COALESCE(…, 2)`.
-
 /// Process-wide Active-view TTL (seconds). `band` is materialized against
 /// `now − this` at write and sweep time, so the DB layer needs the same ttl
 /// the page uses. Set once at startup (and on settings save) from the config;

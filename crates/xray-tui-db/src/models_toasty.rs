@@ -223,18 +223,22 @@ pub struct TrafficStats {
     pub total_down: i64,
 }
 
-/// Transport-layer kind — the scalar projection the page reads without
-/// touching the JSON. The full transport config lives inside
-/// `Protocol.config` (the single owner); a second `data` JSON column was a
-/// write-only duplicate and is dropped (db-rewamp D8).
+/// Transport-layer kind.
+///
+/// The scalar projection the page reads without touching the JSON. The full
+/// transport config lives inside `Protocol.config` (the single owner); a
+/// second `data` JSON column was a write-only duplicate and is dropped
+/// (db-rewamp D8).
 #[derive(Debug, Clone, toasty::Embed)]
 pub struct Transport {
     pub r#type: TransportType,
 }
 
-/// Security (TLS/REALITY) scalar projection the page reads without the JSON.
-/// The full security config lives inside `Protocol.config` (the single owner);
-/// the write-only `data` JSON duplicate is dropped (db-rewamp D8).
+/// Security (TLS/REALITY) scalar projection.
+///
+/// The page reads these without the JSON. The full security config lives
+/// inside `Protocol.config` (the single owner); the write-only `data` JSON
+/// duplicate is dropped (db-rewamp D8).
 #[derive(Debug, Clone, toasty::Embed)]
 pub struct Security {
     pub r#type: SecurityType,
