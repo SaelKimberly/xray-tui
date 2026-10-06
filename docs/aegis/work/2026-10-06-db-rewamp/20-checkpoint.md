@@ -50,9 +50,27 @@
      `endpoint_ip`), so its signature must take them/`EndpointRow`.
    - `xray-tui`: `state.rs::endpoint_from_essentials`, `ops/native_connect.rs`
      (its own `endpoint_essentials` copy + `:85`), `ops/ping_native.rs:224`,
-     `ui/mod.rs:902`, `ui/profiles.rs` (Address column), `ops/export.rs:136`.
+     `ui/mod.rs:902`, `ui/profiles.rs` (Address column **and** the three
+     `host_type == Dns` checks at `:459`/`:732`/`:799`), `ops/export.rs:136`.
+   - **`host_type` consumers that read the derived kind** (semantic, not just
+     compile noise — each replaces `host_type` with the derived predicate):
+     `ops/enrich.rs` (`:290`, `:344-345`, `:403-404` the
+     `Ipv4|Ipv6 => host.parse(), _ => resolve` branch that decides in-place vs
+     resolver — the derived-kind replacement MUST preserve it — and `:633`),
+     `ops/events.rs:646` (`== HostType::Dns`), `ops/ping.rs:1735`/`:1742`
+     (`plan.endpoint.host_type`).
    - validation: `import_export::validate_host` DNS branch calls `domain::split`
      and STOPS normalizing via `url::Host` (one normalizer).
+   - **IP literal → `endpoint_ip` at import (named sub-step).** Today the ONLY
+     writer of `endpoint_ip` is `Database::update_endpoint_resolution` (the DNS
+     event path); NO import writer touches it, and `spawn_enrich_ip_hosts`
+     synthesizes an IP host's address in memory without persisting (its gate is
+     `resolved_at_secs.is_some()`, which is None for IP hosts). So the moment
+     `endpoints.host` drops, an IP endpoint (74% of the feed) has its literal in
+     NEITHER place — dial host, `addr` rank term, and the page address column all
+     go empty. T4 MUST add the literal write at EVERY import entry point:
+     `state::persist_parsed`, `ops/stream_import.rs`, `ops/subscriptions.rs`.
+     Invariant test: an imported IP endpoint has exactly one address row.
    - The **parse boundary** `xray-tui-proto::EndpointEssentials.host/host_type`
      STAYS (the split is the DB layer's job).
    Bump `SCHEMA_VERSION` to 16 again (the model changes).
