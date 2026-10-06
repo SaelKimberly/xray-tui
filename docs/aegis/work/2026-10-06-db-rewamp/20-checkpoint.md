@@ -1,8 +1,8 @@
 # Checkpoint — DB rewamp
 
 ## Snapshot
-- root `/home/user/oss/xray-tui`; branch `native-core-stub`; HEAD `c41e63f`.
-- Tree **clean**; last 4 commits are this workstream (S1 → … → ConfigType).
+- root `/home/user/oss/xray-tui`; branch `native-core-stub`; HEAD `8097cb9`.
+- Tree **clean**; the workstream is the last 5 commits.
 
 ## Commits landed (each green: nextest + workspace check)
 | commit | slice |
@@ -10,14 +10,17 @@
 | `544d441` | S1 — spec rev.2, plan, baseline, harness guard, turso planner gate |
 | `068bbb6` | drop write-only `transport_data`/`security_data` (−13.6% file) |
 | `80111de` | drop `core_type` (per-pair + group) + the form override (D3) |
-| `c41e63f` | drop `ConfigType` from identity + schema (D9), `IDENTITY_VERSION` 2→3, golden re-pinned; `rank_config` removed with it |
+| `c41e63f` | drop `ConfigType` from identity + schema (D9), `IDENTITY_VERSION` 2→3, golden re-pinned; `rank_config` removed |
+| `1f89de5` | lock the Profiles order — delete the sort UI (D1) |
+| `8097cb9` | `psl2` dep + `xray_tui_config::domain::split` (the DNS-split owner, D2/D6) |
 
 ## Todo map
-- **Done:** T0 baseline · T1 harness guard · T2 turso gate · T6 core_type · T7-part[a: JSON]
-- **Remaining:** T3 psl2 helper+meta · T4 identity/host model · T5 validation ·
-  T7-part[b: ConfigType — DONE] · T8 binned law+index · T9 page order/search ·
-  T10 sort UI · T11 tag-15 wipe · T12 FK cascade · T13 direct reader ·
-  T14 gated WITHOUT ROWID · T15 docs/ADR/AGENTS
+- **Done:** T0 baseline · T1 harness guard · T2 turso gate · T3 psl2 helper
+  (meta row still to wire) · T6 core_type · T7 ConfigType+JSON · T10 sort UI
+- **Remaining:** T3-meta (PSL version row) · T4 identity/host model ·
+  T5 validation + counted skip · T8 binned law + one index · T9 page order/search ·
+  T11 tag-15 wipe · T12 FK cascade · T13 direct reader · T14 gated WITHOUT ROWID ·
+  T15 docs/ADR/AGENTS
 
 ## Verification at this HEAD
 - `cargo check --workspace --all-targets` → 0 errors.
