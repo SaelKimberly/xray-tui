@@ -1387,14 +1387,12 @@ pub(crate) mod xray_tui_db_helper {
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: SecurityType::None,
                 sni: None,
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
                 uuid: format!("00000000-0000-0000-0000-{id:012}"),
@@ -1419,7 +1417,6 @@ mod uid_fixed_point_tests {
     use super::test_support::test_state;
     use toasty::{Deferred, Json};
     use xray_tui_db::models::{Protocol, ProtocolId, Security, Transport};
-    use xray_tui_proto::proto_spec::common::{SecurityConfig, TransportConfig};
     use xray_tui_proto::proto_spec::{
         EndpointEssentials, ProtocolConfig, ProtocolKind, SecurityType, TransportType,
     };
@@ -1460,14 +1457,12 @@ mod uid_fixed_point_tests {
                 proto_kind: ProtocolKind::Shadowsocks,
                 transport: Transport {
                     r#type: TransportType::Tcp,
-                    data: Deferred::from(Json(TransportConfig::Tcp)),
                 },
                 security: Security {
                     r#type: SecurityType::None,
                     sni: None,
                     fp: None,
                     insecure: None,
-                    data: Deferred::from(Json(SecurityConfig::default())),
                 },
                 config: Deferred::from(Json(stored_config.clone())),
                 created_at: 0,

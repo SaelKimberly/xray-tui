@@ -250,10 +250,7 @@ fn transport_embed(config: &ProtocolConfig) -> Transport {
         .type_str()
         .parse::<xray_tui_proto::proto_spec::TransportType>()
         .unwrap_or(xray_tui_proto::proto_spec::TransportType::Tcp);
-    Transport {
-        r#type,
-        data: Deferred::from(Json(transport)),
-    }
+    Transport { r#type }
 }
 
 /// Derive the typed [`Security`] embed from a protocol config: the security
@@ -274,7 +271,6 @@ fn security_embed(config: &ProtocolConfig) -> Security {
         sni: security.sni().map(str::to_string),
         fp: security.fp().map(str::to_string),
         insecure: security.insecure(),
-        data: Deferred::from(Json(security)),
     }
 }
 
@@ -302,9 +298,8 @@ pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
     }
 }
 
-/// Build a typed `Protocol` row from a parse result, with deferred
-/// `config`/`transport.data`/`security.data` JSON loaded so it is ready for
-/// `Database::upsert_protocol`.
+/// Build a typed `Protocol` row from a parse result, with the deferred
+/// `config` JSON loaded so it is ready for `Database::upsert_protocol`.
 ///
 /// Identity: id = `uid()`, computed from ONE canonical serialization
 /// (`identity_once`) — the three separate `sig()`/`cred_hash()`/`uid()` calls
@@ -456,8 +451,7 @@ pub const fn link_is_failed(link: &ProfileStats) -> bool {
     link.error.is_some()
 }
 
-/// Load a `Protocol` row with its deferred `config`/`transport.data`/
-/// `security.data` JSON included.
+/// Load a `Protocol` row with its deferred `config` JSON included.
 ///
 /// Default read paths exclude deferred columns (the `EndpointRow` list ships
 /// unloaded `Protocol`s); `ConfigBuilder::build` and
@@ -470,8 +464,6 @@ pub async fn load_protocol_with_config(
     let mut conn = db.connection().await?;
     let protocol = Protocol::filter_by_id(id)
         .include(Protocol::fields().config())
-        .include(Protocol::fields().transport().data())
-        .include(Protocol::fields().security().data())
         .first()
         .exec(&mut conn)
         .await?;
@@ -1217,10 +1209,10 @@ mod tests {
             protocol_from_parsed(&canonical_input).id,
             "the owner must canonicalize before hashing"
         );
-        let stored = serde_json::to_string(&row.transport.data).expect("serialize transport");
+        let stored = serde_json::to_string(&row.config.get().0).expect("serialize config");
         assert!(
             stored.contains("/trTelegram%20x"),
-            "stored transport carries the canonical path: {stored}"
+            "stored config carries the canonical transport path: {stored}"
         );
     }
 

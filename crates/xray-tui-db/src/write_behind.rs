@@ -1494,14 +1494,12 @@ mod tests {
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: SecurityType::None,
                 sni: None,
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
                 uuid: "00000000-0000-0000-0000-000000000000".to_owned(),

@@ -459,14 +459,12 @@ mod tests {
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: xray_tui_proto::proto_spec::TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: xray_tui_proto::proto_spec::SecurityType::None,
                 sni: None,
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
                 uuid: "00000000-0000-0000-0000-000000000001".into(),
@@ -661,14 +659,12 @@ mod tests {
             proto_kind: ProtocolKind::Shadowsocks2022,
             transport: Transport {
                 r#type: xray_tui_proto::proto_spec::TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: xray_tui_proto::proto_spec::SecurityType::None,
                 sni: None,
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(config)),
             created_at: 0,

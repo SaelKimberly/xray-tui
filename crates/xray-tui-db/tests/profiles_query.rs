@@ -12,10 +12,7 @@ use xray_tui_db::models::{
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_db::{LinkGroups, LinkPatch};
-use xray_tui_proto::proto_spec::common::{
-    GrpcConfig, HttpConfig, HttpUpgradeConfig, KcpConfig, TransportConfig, WebSocketConfig,
-    XHttpConfig,
-};
+use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
     CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
     VlessConfig,
@@ -85,22 +82,6 @@ async fn seed_endpoint(
     }
 }
 
-/// The carrier matching a transport's type, so a fixture row never contradicts
-/// itself (nothing on the page/rank paths reads it, but a generic helper that
-/// can lie is a trap for its next user).
-fn transport_config(transport: TransportType) -> TransportConfig {
-    match transport {
-        TransportType::Tcp => TransportConfig::Tcp,
-        TransportType::Ws => TransportConfig::Ws(WebSocketConfig::default()),
-        TransportType::Grpc => TransportConfig::Grpc(GrpcConfig::default()),
-        TransportType::Http => TransportConfig::Http(HttpConfig::default()),
-        TransportType::Quic => TransportConfig::Quic,
-        TransportType::Kcp => TransportConfig::Kcp(KcpConfig::default()),
-        TransportType::HttpUpgrade => TransportConfig::HttpUpgrade(HttpUpgradeConfig::default()),
-        TransportType::XHttp => TransportConfig::XHttp(XHttpConfig::default()),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn seed_link_with(
     conn: &mut toasty::Connection,
@@ -121,14 +102,12 @@ async fn seed_link_with(
             // Match the type: a row claiming `x_http` while its own config says
             // `tcp` is an inconsistency that only matters because every page and
             // rank path reads `type` and leaves this deferred carrier unloaded.
-            data: Deferred::from(Json(transport_config(transport))),
         },
         security: Security {
             r#type: SecurityType::None,
             sni: None,
             fp: None,
             insecure: None,
-            data: Deferred::from(Json(SecurityConfig::default())),
         },
         config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
             uuid: "00000000-0000-0000-0000-000000000000".to_string(),
@@ -1049,14 +1028,14 @@ async fn seed_projection_fixture() -> Database {
         "INSERT INTO endpoint_ip (endpoint_id, ip_key) VALUES \
          (2, x'04' || x'cb007107')",
         // Protocols: ws+tls with every optional pinned, and tcp+reality bare.
-        "INSERT INTO protocols (id, sig, proto_kind, transport_type, transport_data, \
-         security_type, security_sni, security_fp, security_insecure, security_data, config, \
-         created_at) VALUES (11, 111, 'vless', 'ws', 'null', 'tls', 'sni.example', 'chrome', \
-         1, 'null', 'null', 1788220803)",
-        "INSERT INTO protocols (id, sig, proto_kind, transport_type, transport_data, \
-         security_type, security_sni, security_fp, security_insecure, security_data, config, \
-         created_at) VALUES (13, 333, 'shadowsocks2022', 'tcp', 'null', 'reality', \
-         'steal.example', NULL, NULL, 'null', 'null', 1788220804)",
+        "INSERT INTO protocols (id, sig, proto_kind, transport_type, \
+         security_type, security_sni, security_fp, security_insecure, config, \
+         created_at) VALUES (11, 111, 'vless', 'ws', 'tls', 'sni.example', 'chrome', \
+         1, 'null', 1788220803)",
+        "INSERT INTO protocols (id, sig, proto_kind, transport_type, \
+         security_type, security_sni, security_fp, security_insecure, config, \
+         created_at) VALUES (13, 333, 'shadowsocks2022', 'tcp', 'reality', \
+         'steal.example', NULL, NULL, 'null', 1788220804)",
         // A transport whose STORED label differs from its wire spelling:
         // toasty's embed writes the snake_case ident `x_http` where the wire
         // form (and every share URL) says `xhttp`. A reader that parses this
@@ -1064,10 +1043,10 @@ async fn seed_projection_fixture() -> Database {
         // ordering law is a silently persisted ZERO weight, and a stored page
         // order that disagrees with the in-memory panel. Found in review on a
         // real feed (145 `http_upgrade` + 169 `x_http` rows).
-        "INSERT INTO protocols (id, sig, proto_kind, transport_type, transport_data, \
-         security_type, security_sni, security_fp, security_insecure, security_data, config, \
-         created_at) VALUES (14, 444, 'vless', 'x_http', 'null', 'reality', \
-         'steal.example', NULL, NULL, 'null', 'null', 1788220812)",
+        "INSERT INTO protocols (id, sig, proto_kind, transport_type, \
+         security_type, security_sni, security_fp, security_insecure, config, \
+         created_at) VALUES (14, 444, 'vless', 'x_http', 'reality', \
+         'steal.example', NULL, NULL, 'null', 1788220812)",
         // e1/link A: real ping with an exit IP, speed, traffic, a task slot.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
@@ -1325,14 +1304,6 @@ async fn page_projection_matches_the_orm_rows() {
                 projected_protocol.config.is_unloaded(),
                 "{ctx}: the projection must not load `protocols.config`"
             );
-            assert!(
-                projected_protocol.transport.data.is_unloaded(),
-                "{ctx}: the projection must not load `transport_data`"
-            );
-            assert!(
-                projected_protocol.security.data.is_unloaded(),
-                "{ctx}: the projection must not load `security_data`"
-            );
         }
     }
 
@@ -1588,14 +1559,12 @@ async fn a_stale_weight_version_is_recomputed_at_open() {
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: SecurityType::Reality,
                 sni: Some("steal.example".to_string()),
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(ProtocolConfig::Vless(VlessConfig {
                 uuid: "00000000-0000-0000-0000-000000000000".to_string(),

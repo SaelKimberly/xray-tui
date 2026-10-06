@@ -248,7 +248,6 @@ mod tests {
     pub(super) fn tcp_transport() -> Transport {
         Transport {
             r#type: TransportType::Tcp,
-            data: Deferred::from(Json(TransportConfig::Tcp)),
         }
     }
 
@@ -258,7 +257,6 @@ mod tests {
             sni: None,
             fp: None,
             insecure: None,
-            data: Deferred::from(Json(SecurityConfig::default())),
         }
     }
 

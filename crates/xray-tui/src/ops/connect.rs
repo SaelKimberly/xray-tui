@@ -725,14 +725,12 @@ mod tests {
             proto_kind: ProtocolKind::Redirect,
             transport: Transport {
                 r#type: TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: SecurityType::None,
                 sni: None,
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(ProtocolConfig::Redirect(PlaceholderConfig::new(
                 "redirect".to_string(),

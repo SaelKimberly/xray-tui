@@ -1027,19 +1027,17 @@ impl Database {
 
     /// Insert or update one protocol row by id.
     ///
-    /// The `config`, `transport.data`, and `security.data` deferred JSON
-    /// columns are read via `.get()`, which panics when unloaded — a default
-    /// read path (including the crate's own `load_endpoint_rows`, which never
-    /// includes deferred data) yields an unloaded `Protocol`. Callers must
-    /// pass a freshly-built struct or one loaded with the deferred data
-    /// included; an unloaded struct is rejected with an error instead of
-    /// panicking.
+    /// The `config` deferred JSON column is read via `.get()`, which panics when
+    /// unloaded — a default read path (including the crate's own
+    /// `load_endpoint_rows`, which never includes deferred data) yields an
+    /// unloaded `Protocol`. Callers must pass a freshly-built struct or one
+    /// loaded with the deferred data included; an unloaded struct is rejected
+    /// with an error instead of panicking.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn upsert_protocol(&self, p: &Protocol) -> Result<()> {
-        if p.config.is_unloaded() || p.transport.data.is_unloaded() || p.security.data.is_unloaded()
-        {
+        if p.config.is_unloaded() {
             return Err(DatabaseError::Generic(
-                "upsert_protocol: deferred config not loaded (rebuild the Protocol or load it with config/transport/security data included)"
+                "upsert_protocol: deferred config not loaded (rebuild the Protocol or load it with config included)"
                     .into(),
             ));
         }
@@ -1888,10 +1886,9 @@ fn blob_lit(ports: &[u16]) -> String {
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> Result<()> {
     for p in ps {
-        if p.config.is_unloaded() || p.transport.data.is_unloaded() || p.security.data.is_unloaded()
-        {
+        if p.config.is_unloaded() {
             return Err(DatabaseError::Generic(
-                "upsert_protocols_bulk: deferred config not loaded (rebuild the Protocol or load it with config/transport/security data included)"
+                "upsert_protocols_bulk: deferred config not loaded (rebuild the Protocol or load it with config included)"
                     .into(),
             ));
         }
@@ -2288,7 +2285,6 @@ mod tests {
     fn tcp_transport() -> Transport {
         Transport {
             r#type: TransportType::Tcp,
-            data: Deferred::from(Json(TransportConfig::Tcp)),
         }
     }
 
@@ -2298,7 +2294,6 @@ mod tests {
             sni: None,
             fp: None,
             insecure: None,
-            data: Deferred::from(Json(SecurityConfig::default())),
         }
     }
 

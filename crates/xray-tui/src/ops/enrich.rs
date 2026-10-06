@@ -1154,16 +1154,12 @@ mod tests {
                 proto_kind: xray_tui_proto::proto_spec::ProtocolKind::Shadowsocks,
                 transport: xray_tui_db::models::Transport {
                     r#type: xray_tui_proto::proto_spec::TransportType::Tcp,
-                    data: toasty::Deferred::from(toasty::Json(
-                        xray_tui_proto::proto_spec::common::TransportConfig::Tcp,
-                    )),
                 },
                 security: xray_tui_db::models::Security {
                     r#type: xray_tui_proto::proto_spec::SecurityType::None,
                     sni: None,
                     fp: None,
                     insecure: None,
-                    data: toasty::Deferred::from(toasty::Json(SecurityConfig::default())),
                 },
                 config: toasty::Deferred::from(toasty::Json(config)),
                 created_at: 0,

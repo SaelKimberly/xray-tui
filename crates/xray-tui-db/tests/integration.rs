@@ -91,7 +91,6 @@ const fn ts(secs: i64) -> i64 {
 fn tcp_transport() -> Transport {
     Transport {
         r#type: TransportType::Tcp,
-        data: Deferred::from(Json(TransportConfig::Tcp)),
     }
 }
 
@@ -101,7 +100,6 @@ fn no_security() -> Security {
         sni: None,
         fp: None,
         insecure: None,
-        data: Deferred::from(Json(SecurityConfig::default())),
     }
 }
 

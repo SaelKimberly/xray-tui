@@ -929,14 +929,12 @@ fn decode_projected_protocol(p: &mut Projection<'_>) -> Result<Option<Protocol>>
         proto_kind,
         transport: Transport {
             r#type: transport_type,
-            data: Deferred::default(),
         },
         security: Security {
             r#type: security_type,
             sni,
             fp,
             insecure,
-            data: Deferred::default(),
         },
         config: Deferred::default(),
         created_at,
@@ -958,10 +956,9 @@ impl Database {
     /// only display columns, so no deferred JSON is decoded.
     ///
     /// `ids` are page ids (they all have at least one link — the page source
-    /// requires it), returned in the order given. The three deferred JSON
-    /// carriers on `Protocol` (`transport.data`, `security.data`, `config`)
-    /// come back unloaded: reading one is a bug, not a fallback, because the
-    /// connect path re-reads its protocol through
+    /// requires it), returned in the order given. The deferred `config` JSON
+    /// carrier on `Protocol` comes back unloaded: reading it is a bug, not a
+    /// fallback, because the connect path re-reads its protocol through
     /// [`Database::load_protocol_with_config`].
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn load_page_projection(

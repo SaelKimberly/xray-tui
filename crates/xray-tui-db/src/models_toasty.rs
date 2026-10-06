@@ -22,9 +22,8 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 use toasty::{Deferred, Json};
-use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
-    CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+    CoreType, ProtocolConfig, ProtocolKind, SecurityType, TransportType,
 };
 
 // ── Typed embed types ───────────────────────────────────────────────────
@@ -239,23 +238,24 @@ pub struct TrafficStats {
     pub total_down: i64,
 }
 
-/// Transport-layer config. `data` is deferred + opaque JSON (not queryable).
+/// Transport-layer kind — the scalar projection the page reads without
+/// touching the JSON. The full transport config lives inside
+/// `Protocol.config` (the single owner); a second `data` JSON column was a
+/// write-only duplicate and is dropped (db-rewamp D8).
 #[derive(Debug, Clone, toasty::Embed)]
 pub struct Transport {
     pub r#type: TransportType,
-    #[column(type = text)]
-    pub data: Deferred<Json<TransportConfig>>,
 }
 
-/// Security (TLS/Reality) config. `data` is deferred + opaque JSON.
+/// Security (TLS/REALITY) scalar projection the page reads without the JSON.
+/// The full security config lives inside `Protocol.config` (the single owner);
+/// the write-only `data` JSON duplicate is dropped (db-rewamp D8).
 #[derive(Debug, Clone, toasty::Embed)]
 pub struct Security {
     pub r#type: SecurityType,
     pub sni: Option<String>,
     pub fp: Option<String>,
     pub insecure: Option<bool>,
-    #[column(type = text)]
-    pub data: Deferred<Json<SecurityConfig>>,
 }
 
 /// Latency of one probe, real or fast. Both variants share the `delay`
@@ -362,8 +362,8 @@ pub struct Protocol {
     pub id: ProtocolId, // = uid (protocol essentials only)
     pub sig: i64, // the non-credential half of the uid (grouping key)
     pub proto_kind: ProtocolKind,
-    pub transport: Transport, // embed (T7): type + Deferred<Json<TransportConfig>>
-    pub security: Security,   // embed (T7): type/sni/fp/insecure + Deferred<Json<SecurityConfig>>
+    pub transport: Transport, // embed (T7): transport kind (display projection)
+    pub security: Security,   // embed (T7): security type/sni/fp/insecure
     /// Full exact definition, sans host/port.
     #[column(type = text)]
     pub config: Deferred<Json<ProtocolConfig>>,
@@ -749,6 +749,8 @@ pub enum PurgatoryView {
 mod tests {
     use super::*;
     use toasty::Deferred;
+    use xray_tui_proto::proto_spec::SecurityConfig;
+    use xray_tui_proto::proto_spec::common::TransportConfig;
 
     /// Endpoint with links `(protocol_id, last_seen_at_secs, latency, error)`.
     fn row(links: &[(i64, i64, Option<Latency>, Option<ErrorInfo>)]) -> EndpointRow {
@@ -1040,14 +1042,12 @@ mod tests {
             proto_kind: ProtocolKind::Vless,
             transport: Transport {
                 r#type: TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: SecurityType::None,
                 sni: None,
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(vless_config())),
             created_at: 0,
@@ -1079,9 +1079,6 @@ mod tests {
     // These tests pin the embed behavior (shared columns, deferred JSON,
     // enum/struct round-trips, newtype key columns) in an in-memory DB.
 
-    use xray_tui_proto::proto_spec::common::WebSocketConfig;
-    use xray_tui_proto::proto_spec::{TlsConfig, TlsOpts};
-
     #[derive(Debug, toasty::Model)]
     struct ScratchEmbedProbe {
         #[key]
@@ -1110,7 +1107,6 @@ mod tests {
     fn tcp_transport() -> Transport {
         Transport {
             r#type: TransportType::Tcp,
-            data: Deferred::from(Json(TransportConfig::Tcp)),
         }
     }
 
@@ -1120,7 +1116,6 @@ mod tests {
             sni: None,
             fp: None,
             insecure: None,
-            data: Deferred::from(Json(SecurityConfig::default())),
         }
     }
 
@@ -1191,37 +1186,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_security_json_roundtrip() {
+    async fn transport_security_scalar_roundtrip() {
         let mut db = probe_db().await;
-
-        let ws = TransportConfig::Ws(WebSocketConfig {
-            host: Some("x".into()),
-            path: Some("/p".into()),
-            headers: None,
-            ..Default::default()
-        });
-        let tls = SecurityConfig {
-            tls: Some(TlsConfig::Tls(TlsOpts {
-                sni: Some("example.com".into()),
-                alpn: None,
-                fp: Some("chrome".into()),
-                insecure: Some(true),
-                ..Default::default()
-            })),
-            enc: None,
-        };
 
         let created = toasty::create!(ScratchEmbedProbe {
             transport: Transport {
                 r#type: TransportType::Ws,
-                data: Deferred::from(Json(ws.clone())),
             },
             security: Security {
                 r#type: SecurityType::Tls,
                 sni: Some("example.com".to_string()),
                 fp: Some("chrome".to_string()),
                 insecure: Some(true),
-                data: Deferred::from(Json(tls.clone())),
             },
             traffic: zero_traffic(),
             kind: TaskKind::SpeedTest,
@@ -1230,26 +1206,11 @@ mod tests {
         .await
         .expect("create");
 
-        // INSERT ... RETURNING echoes the supplied values — deferred JSON
-        // arrives loaded.
-        assert!(!created.transport.data.is_unloaded());
-        assert_eq!(&ws, &created.transport.data.get().0);
-        assert!(!created.security.data.is_unloaded());
-        assert_eq!(&tls, &created.security.data.get().0);
-
-        // A default read leaves the deferred JSON unloaded; `.include()`
-        // loads the same query.
         let read = ScratchEmbedProbe::filter_by_id(created.id)
-            .include(ScratchEmbedProbe::fields().transport().data())
-            .include(ScratchEmbedProbe::fields().security().data())
             .get(&mut db)
             .await
             .expect("read back");
-        assert!(!read.transport.data.is_unloaded());
-        assert_eq!(&ws, &read.transport.data.get().0);
         assert_eq!(read.transport.r#type, TransportType::Ws);
-        assert!(!read.security.data.is_unloaded());
-        assert_eq!(&tls, &read.security.data.get().0);
         assert_eq!(read.security.r#type, SecurityType::Tls);
         assert_eq!(read.security.sni.as_deref(), Some("example.com"));
         assert_eq!(read.security.fp.as_deref(), Some("chrome"));

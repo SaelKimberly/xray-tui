@@ -3133,7 +3133,7 @@ mod tests {
     fn plugin_row(id: i64, host: &str, opts: &str) -> EndpointRow {
         use toasty::{Deferred, Json};
         use xray_tui_db::models::{Protocol, Security, Transport};
-        use xray_tui_proto::proto_spec::common::{SecurityConfig, TransportConfig};
+        use xray_tui_proto::proto_spec::common::SecurityConfig;
         use xray_tui_proto::proto_spec::{
             PluginSpec, ProtocolConfig, ProtocolKind, SecurityType, SsConfig, TransportType,
         };
@@ -3146,14 +3146,12 @@ mod tests {
             proto_kind: ProtocolKind::Shadowsocks,
             transport: Transport {
                 r#type: TransportType::Tcp,
-                data: Deferred::from(Json(TransportConfig::Tcp)),
             },
             security: Security {
                 r#type: SecurityType::None,
                 sni: None,
                 fp: None,
                 insecure: None,
-                data: Deferred::from(Json(SecurityConfig::default())),
             },
             config: Deferred::from(Json(ProtocolConfig::Ss(SsConfig {
                 method: "aes-256-gcm".into(),
