@@ -14,7 +14,7 @@ use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_db::{LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
-    CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
     VlessConfig,
 };
 
@@ -131,7 +131,6 @@ async fn seed_link_with(
         updated_at: 0,
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(last_seen),
         traffic: TrafficStats {
@@ -207,7 +206,6 @@ fn link_value(
     ProfileStats {
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_used_at: None,
         last_seen_at: ts(last_seen),
@@ -1048,63 +1046,63 @@ async fn seed_projection_fixture() -> Database {
          created_at) VALUES (14, 444, 'vless', 'x_http', 'reality', \
          'steal.example', NULL, NULL, 'null', 1788220812)",
         // e1/link A: real ping with an exit IP, speed, traffic, a task slot.
-        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version) VALUES \
-         (11, 1, 'xray', 'share_url', 1789034400, \
+         (11, 1, 'share_url', 1789034400, \
           1789038000, 'real', 42, '198.51.100.9', 1234567, \
           NULL, NULL, NULL, 11, 22, 33, 44, 1788220805, \
           1789038000, 3)",
         // e1/link B: fast ping, a fast failure, form config.
-        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version) VALUES \
-         (13, 1, 'sing_box', 'form', NULL, 1789041600, \
+         (13, 1, 'form', NULL, 1789041600, \
           'fast', 8, NULL, NULL, 1, 'fast', 'fast probe', 0, 0, 0, 0, \
           1788220806, 1789041600, 1)",
         // e1/link C: the x_http protocol row above, measured — so the raw-column
         // read that computes its weight is on the page path the parity golden
         // checks, not only on a synthetic parser test.
-        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version) VALUES \
-         (14, 1, 'xray', 'share_url', NULL, 1789043400, \
+         (14, 1, 'share_url', NULL, 1789043400, \
           'real', 77, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
           1788220812, 1789043400, 1)",
         // e2: name-resolution failure, no measurement.
-        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version) VALUES \
-         (11, 2, 'xray', 'share_url', NULL, 1789045200, NULL, \
+         (11, 2, 'share_url', NULL, 1789045200, NULL, \
           NULL, NULL, NULL, 1, 'name', 'name probe', 0, 0, 0, 0, \
           1788220807, 1789045200, 2)",
         // e2's second link: the only PURGED one, so the purge filter's two
         // policies produce different pages from this fixture.
-        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
          traffic_total_up, traffic_total_down, created_at, updated_at, version) VALUES \
-         (13, 2, 'xray', 'share_url', NULL, 1789047000, NULL, \
+         (13, 2, 'share_url', NULL, 1789047000, NULL, \
           NULL, NULL, NULL, 1, 'real', 'reality error', 'reality_fallback', 0, 0, 0, 0, \
           1788220810, 1789047000, 1)",
         // e3: a measured success AND a real failure on one endpoint, plus a
         // link whose protocol row does not exist (LEFT JOIN -> no entry).
-        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version) VALUES \
-         (13, 3, 'sing_box', 'share_url', NULL, 1789048800, \
+         (13, 3, 'share_url', NULL, 1789048800, \
           'real', 5, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
           1788220808, 1789048800, 1)",
-        "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, config_type, last_used_at, \
+        "INSERT INTO profile_stats (protocol_id, endpoint_id, config_type, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
          traffic_total_down, created_at, updated_at, version) VALUES \
-         (99, 3, 'xray', 'form', NULL, 1789052400, NULL, \
+         (99, 3, 'form', NULL, 1789052400, NULL, \
           NULL, NULL, NULL, 1, 'real', 'real probe', 0, 0, 0, 0, \
           1788220809, 1789052400, 1)",
     ] {
@@ -1129,7 +1127,6 @@ fn assert_same_link(typed: &ProfileStats, projected: &ProfileStats, ctx: &str) {
         typed.endpoint_id, projected.endpoint_id,
         "{ctx}: endpoint_id"
     );
-    assert_eq!(typed.core_type, projected.core_type, "{ctx}: core_type");
     assert_eq!(
         typed.config_type, projected.config_type,
         "{ctx}: config_type"

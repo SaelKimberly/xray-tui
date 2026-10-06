@@ -126,7 +126,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         return;
     }
 
-    let (endpoint, link, protocol_id, proto_kind) = {
+    let (endpoint, _link, protocol, protocol_id, proto_kind) = {
         let Some(row) = state
             .endpoints
             .iter()
@@ -151,17 +151,35 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         (
             row.endpoint.clone(),
             link.clone(),
+            protocol.clone(),
             link.protocol_id,
             protocol.proto_kind,
         )
     };
 
-    // The link's `core_type` is the persisted per-pair stamp, always concrete
-    // (`Xray`/`SingBox`), and it is also the only core the subprocess path may
-    // run (`ConfigBuilder::build` dispatches on it). Whether the in-process
+    // The subprocess core is derived from the protocol kind, the config-level
+    // override and the Shadowsocks method (the per-pair `core_type` column is
+    // gone, db-rewamp D3): `protocol_core_overrides` wins, then
+    // `core_mapping::resolve_core`'s kind/method default. Whether the in-process
     // native core serves this connect instead is decided in the task (0.5),
     // where the loaded config can face the capability gate.
-    let link_core = match link.core_type {
+    let core_override = state
+        .config
+        .core
+        .protocol_core_overrides
+        .get(&proto_kind.to_string())
+        .and_then(|s| s.parse::<CoreType>().ok());
+    let forced = match core_override {
+        Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
+        Some(CoreType::SingBox) => Some(ProtoCoreType::SingBox),
+        Some(CoreType::Native | CoreType::Auto) => None,
+        None => None,
+    };
+    let link_core = match xray_tui_proto::proto_spec::core_mapping::resolve_core(
+        proto_kind,
+        forced,
+        xray_tui_core::config_builder::shadowsocks_method(&protocol).as_deref(),
+    ) {
         ProtoCoreType::Xray => CoreType::Xray,
         ProtoCoreType::SingBox => CoreType::SingBox,
     };
@@ -398,8 +416,25 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         }
 
         // 1. Build config
-        let backend_config =
-            match ConfigBuilder::build(&endpoint, &link, &protocol, &params, &routing, &dns) {
+        let backend_config = match ConfigBuilder::build(
+            &endpoint,
+            &protocol,
+            match runtime_core {
+                CoreType::Xray => ProtoCoreType::Xray,
+                CoreType::SingBox => ProtoCoreType::SingBox,
+                CoreType::Auto | CoreType::Native => {
+                    try_send_or_warn(
+                        &tx,
+                        CoreEvent::Error("internal: non-subprocess core reached the builder".into()),
+                        "config_build_error",
+                    );
+                    return;
+                }
+            },
+            &params,
+            &routing,
+            &dns,
+        ) {
                 Ok(c) => c,
                 Err(e) => {
                     try_send_or_warn(

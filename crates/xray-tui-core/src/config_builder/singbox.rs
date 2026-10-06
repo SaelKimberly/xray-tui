@@ -110,6 +110,7 @@ impl SingBoxConfigBuilder {
     /// Build a multi-inbound config for batch real ping.
     pub fn build_multi(
         items: &[MultiInboundItem],
+        core_type: CoreType,
         base_params: &BuildParams,
         dns: &DnsSetting,
     ) -> Result<SingBoxConfig, BuildError> {
@@ -132,7 +133,7 @@ impl SingBoxConfigBuilder {
             let mut outbound = build_proxy_outbound(
                 item.endpoint,
                 item.protocol,
-                item.link.core_type,
+                core_type,
                 base_params,
             )?;
             if let Some(obj) = outbound.as_object_mut() {
@@ -322,7 +323,7 @@ mod tests {
     use xray_tui_db::models::RoutingRule;
     use xray_tui_proto::proto_spec::ProtocolKind;
     use xray_tui_proto::proto_spec::common::SecurityConfig;
-    use xray_tui_proto::proto_spec::{CoreType as ProtoCoreType, ProtocolConfig};
+    use xray_tui_proto::proto_spec::ProtocolConfig;
 
     fn assert_singbox_top_level(json: &Value) {
         assert!(json.get("log").is_some(), "missing log");
@@ -344,8 +345,7 @@ mod tests {
             remarks: None,
         });
         let protocol = super::super::tests::protocol(ProtocolKind::Tuic, tuic);
-        let link = super::super::tests::link(ProtoCoreType::SingBox);
-        (endpoint, protocol, link)
+        (endpoint, protocol, super::super::tests::link())
     }
 
     fn domain_rule() -> RoutingRule {
@@ -374,12 +374,12 @@ mod tests {
     fn singbox_build_tuic_full_config() {
         // Real inject_to (T15) now builds the full tuic outbound; assert the
         // complete config, not an error.
-        let (endpoint, protocol, link) = test_endpoint_protocol_link();
+        let (endpoint, protocol, _link) = test_endpoint_protocol_link();
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
-            link.core_type,
+            CoreType::SingBox,
             &params,
             &rules,
             &dns,
@@ -407,13 +407,13 @@ mod tests {
     #[test]
     fn singbox_build_unloaded_config_returns_error() {
         use toasty::Deferred;
-        let (endpoint, mut protocol, link) = test_endpoint_protocol_link();
+        let (endpoint, mut protocol, _link) = test_endpoint_protocol_link();
         protocol.config = Deferred::default();
         let (params, rules, dns) = super::super::tests::default_params();
         let err = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
-            link.core_type,
+            CoreType::SingBox,
             &params,
             &rules,
             &dns,
@@ -434,12 +434,11 @@ mod tests {
             ProtocolKind::Shadowsocks,
             super::super::tests::ss_config("salsa20"),
         );
-        let link = super::super::tests::link(ProtoCoreType::SingBox);
         let (params, rules, dns) = super::super::tests::default_params();
         let err = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
-            link.core_type,
+            CoreType::SingBox,
             &params,
             &rules,
             &dns,
@@ -460,12 +459,11 @@ mod tests {
             ProtocolKind::Shadowsocks,
             super::super::tests::ss_config("aes-256-cfb"),
         );
-        let link = super::super::tests::link(ProtoCoreType::SingBox);
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
-            link.core_type,
+            CoreType::SingBox,
             &params,
             &rules,
             &dns,
@@ -489,12 +487,11 @@ mod tests {
             ProtocolKind::Shadowsocks2022,
             super::super::tests::ss_config("2022-blake3-aes-128-gcm"),
         );
-        let link = super::super::tests::link(ProtoCoreType::SingBox);
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
-            link.core_type,
+            CoreType::SingBox,
             &params,
             &rules,
             &dns,
@@ -521,12 +518,11 @@ mod tests {
             ProtocolKind::WireGuard,
             super::super::tests::wg_config(),
         );
-        let link = super::super::tests::link(ProtoCoreType::SingBox);
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
-            link.core_type,
+            CoreType::SingBox,
             &params,
             &rules,
             &dns,
@@ -556,12 +552,11 @@ mod tests {
             ProtocolKind::Hysteria2,
             super::super::tests::hy2_config(),
         );
-        let link = super::super::tests::link(ProtoCoreType::SingBox);
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
             &protocol,
-            link.core_type,
+            CoreType::SingBox,
             &params,
             &rules,
             &dns,

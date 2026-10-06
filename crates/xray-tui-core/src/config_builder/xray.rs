@@ -122,6 +122,7 @@ impl XrayConfigBuilder {
     /// connecting each inbound to its matching outbound.
     pub fn build_multi(
         items: &[MultiInboundItem],
+        core_type: CoreType,
         base_params: &BuildParams,
         dns: &DnsSetting,
     ) -> Result<XrayConfig, BuildError> {
@@ -152,7 +153,7 @@ impl XrayConfigBuilder {
             let mut outbound = build_proxy_outbound(
                 item.endpoint,
                 item.protocol,
-                item.link.core_type,
+                core_type,
                 base_params.skip_cert_verify,
             )?;
             outbound.tag = tag.clone();
@@ -412,7 +413,6 @@ fn build_dns(dns: &DnsSetting) -> DnsConfig {
 mod tests {
     use super::*;
     use xray_tui_db::models::RoutingRule;
-    use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
     use xray_tui_proto::proto_spec::ProtocolKind;
 
     fn assert_xray_top_level(json: &Value) {
@@ -430,8 +430,7 @@ mod tests {
         let endpoint = super::super::tests::endpoint("example.com", 443);
         let protocol =
             super::super::tests::protocol(ProtocolKind::Vless, super::super::tests::vless_config());
-        let link = super::super::tests::link(ProtoCoreType::Xray);
-        (endpoint, protocol, link)
+        (endpoint, protocol, super::super::tests::link())
     }
 
     fn domain_rule() -> RoutingRule {
@@ -460,10 +459,10 @@ mod tests {
     fn xray_build_vless_full_config() {
         // Real inject_to (T14) now builds the full vless outbound; assert the
         // complete config, not an error.
-        let (endpoint, protocol, link) = test_endpoint_protocol_link();
+        let (endpoint, protocol, _link) = test_endpoint_protocol_link();
         let (params, rules, dns) = super::super::tests::default_params();
         let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect("vless xray build must succeed");
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
@@ -488,11 +487,11 @@ mod tests {
     #[test]
     fn xray_build_unloaded_config_returns_error() {
         use toasty::Deferred;
-        let (endpoint, mut protocol, link) = test_endpoint_protocol_link();
+        let (endpoint, mut protocol, _link) = test_endpoint_protocol_link();
         protocol.config = Deferred::default();
         let (params, rules, dns) = super::super::tests::default_params();
         let err =
-            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect_err("unloaded config must be rejected");
         assert!(
             err.to_string().contains("not loaded"),
@@ -511,10 +510,9 @@ mod tests {
             ProtocolKind::Vless,
             super::super::tests::vless_reality_without_key_config(),
         );
-        let link = super::super::tests::link(ProtoCoreType::Xray);
         let (params, rules, dns) = super::super::tests::default_params();
         let err =
-            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect_err("reality without publicKey must be rejected");
         assert!(
             err.to_string().contains("reality"),
@@ -535,10 +533,9 @@ mod tests {
             ProtocolKind::Shadowsocks,
             super::super::tests::ss_config("aes-256-cfb"),
         );
-        let link = super::super::tests::link(ProtoCoreType::Xray);
         let (params, rules, dns) = super::super::tests::default_params();
         let err =
-            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect_err("xray-core cannot build aes-256-cfb");
         assert!(
             err.to_string().contains("aes-256-cfb"),
@@ -554,10 +551,9 @@ mod tests {
             ProtocolKind::Shadowsocks2022,
             super::super::tests::ss_config("2022-blake3-aes-128-gcm"),
         );
-        let link = super::super::tests::link(ProtoCoreType::Xray);
         let (params, rules, dns) = super::super::tests::default_params();
         let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect("ss-2022 xray build must succeed");
         let json = serde_json::to_value(&config).unwrap();
         let proxy = json["outbounds"]
@@ -584,10 +580,9 @@ mod tests {
             ProtocolKind::Hysteria2,
             super::super::tests::hy2_config(),
         );
-        let link = super::super::tests::link(ProtoCoreType::Xray);
         let (params, rules, dns) = super::super::tests::default_params();
         let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, link.core_type, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect("hy2 xray build must succeed");
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);

@@ -274,7 +274,6 @@ mod tests {
             link: ProfileStats {
                 protocol_id: ProtocolId::new(1),
                 endpoint_id: EndpointId::new(1),
-                core_type: xray_tui_proto::proto_spec::CoreType::SingBox,
                 config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: 0,

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use turso::Value;
 use xray_tui_proto::proto_spec::{
-    CoreType, EndpointEssentials, HostKind, ProtocolConfig, ProtocolKind,
+EndpointEssentials, HostKind, ProtocolConfig, ProtocolKind,
 };
 
 use crate::error::{DatabaseError, Result};
@@ -209,7 +209,7 @@ fn projection_sql(scope: ExportScope) -> String {
     format!(
         "SELECT e.host, e.host_type, e.port, e.ports, \
          pr.proto_kind, pr.transport_type, pr.security_type, pr.config, \
-         ps.protocol_id, ps.endpoint_id, ps.core_type, ps.config_type, \
+         ps.protocol_id, ps.endpoint_id, ps.config_type, \
          ps.last_used_at, ps.last_seen_at, ps.latency, ps.latency_delay, ps.latency_ip, \
          ps.speed_bps, ps.error, ps.error_kind, ps.error_text, ps.purge_reason, \
          ps.traffic_today_up, ps.traffic_today_down, ps.traffic_total_up, ps.traffic_total_down, \
@@ -244,25 +244,22 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         .map_err(|e| DatabaseError::Generic(format!("export protocol config: {e}")))?;
     let protocol_id = ProtocolId::new(integer(row, 8)?);
     let endpoint_id = EndpointId::new(integer(row, 9)?);
-    let core_type = text(row, 10)?
-        .parse::<CoreType>()
-        .map_err(|e| DatabaseError::Generic(format!("export core type: {e:?}")))?;
-    let config_type = config_type(&text(row, 11)?)?;
+    let config_type = config_type(&text(row, 10)?)?;
     let latency = match (
-        optional_text(row, 14)?.as_deref(),
-        optional_integer(row, 15)?.and_then(|value| i32::try_from(value).ok()),
+        optional_text(row, 13)?.as_deref(),
+        optional_integer(row, 14)?.and_then(|value| i32::try_from(value).ok()),
     ) {
         (Some("real"), Some(delay)) => Some(Latency::Real {
             delay,
-            ip: optional_text(row, 16)?,
+            ip: optional_text(row, 15)?,
         }),
         (Some("fast"), Some(delay)) => Some(Latency::Fast { delay }),
         _ => None,
     };
-    let error = match (optional_bool(row, 18)?, optional_text(row, 19)?) {
+    let error = match (optional_bool(row, 17)?, optional_text(row, 18)?) {
         (Some(true), Some(kind)) => Some(ErrorInfo {
             kind: profile_err(&kind)?,
-            text: optional_text(row, 20)?.unwrap_or_default(),
+            text: optional_text(row, 19)?.unwrap_or_default(),
         }),
         (Some(true), None) => {
             return Err(DatabaseError::Generic(
@@ -271,33 +268,32 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         }
         _ => None,
     };
-    let purge_reason = optional_text(row, 21)?
+    let purge_reason = optional_text(row, 20)?
         .map(|value| purge_reason(&value))
         .transpose()?;
     let link = ProfileStats {
         protocol_id,
         endpoint_id,
-        core_type,
         config_type,
-        last_used_at: optional_integer(row, 12)?,
-        last_seen_at: integer(row, 13)?,
+        last_used_at: optional_integer(row, 11)?,
+        last_seen_at: integer(row, 12)?,
         latency,
-        speed_bps: optional_integer(row, 17)?,
+        speed_bps: optional_integer(row, 16)?,
         error,
         purge_reason,
         traffic: TrafficStats {
-            today_up: integer(row, 22)?,
-            today_down: integer(row, 23)?,
-            total_up: integer(row, 24)?,
-            total_down: integer(row, 25)?,
+            today_up: integer(row, 21)?,
+            today_down: integer(row, 22)?,
+            total_up: integer(row, 23)?,
+            total_down: integer(row, 24)?,
         },
-        created_at: integer(row, 26)?,
-        updated_at: integer(row, 27)?,
-        version: u64::try_from(integer(row, 28)?).unwrap_or_default(),
+        created_at: integer(row, 25)?,
+        updated_at: integer(row, 26)?,
+        version: u64::try_from(integer(row, 27)?).unwrap_or_default(),
         protocol: toasty::Deferred::default(),
         endpoint: toasty::Deferred::default(),
     };
-    let ip_key = optional_blob(row, 29)?.unwrap_or_default();
+    let ip_key = optional_blob(row, 28)?.unwrap_or_default();
     let resolved_ip = endpoint_ip::ip_of(&ip_key);
     let endpoint = EndpointEssentials {
         host,
@@ -433,7 +429,7 @@ mod tests {
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
-        CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
+ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
     };
 
     fn endpoint(id: i64, host: &str, host_type: HostType) -> Endpoint {
@@ -492,7 +488,6 @@ mod tests {
         ProfileStats {
             protocol_id: ProtocolId::new(protocol_id),
             endpoint_id: EndpointId::new(endpoint_id),
-            core_type: CoreType::Xray,
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: 1,

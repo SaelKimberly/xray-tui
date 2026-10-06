@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use jiff::Timestamp;
 use toasty::{Deferred, Json};
 use xray_tui_proto::proto_spec::{
-    CoreType, ProtocolConfig, ProtocolKind, SecurityType, TransportType,
+    ProtocolConfig, ProtocolKind, SecurityType, TransportType,
 };
 
 // ── Typed embed types ───────────────────────────────────────────────────
@@ -170,14 +170,6 @@ pub enum GroupStatus {
     Ok,
     Error,
     Never,
-}
-
-/// Group core type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
-pub enum GroupCoreType {
-    Auto,
-    Xray,
-    SingBox,
 }
 
 /// IP selection strategy.
@@ -383,7 +375,6 @@ pub struct ProfileStats {
     pub protocol_id: ProtocolId,
     #[index]
     pub endpoint_id: EndpointId,
-    pub core_type: CoreType, // per-pair override (resolved at parse, overridable)
     pub config_type: ConfigType,
     pub last_used_at: Option<i64>, // epoch seconds
     /// Per-link staleness tracking (epoch seconds). Indexed: the retention
@@ -450,7 +441,6 @@ pub struct Group {
     pub enabled: bool,
     pub user_agent: Option<String>,
     pub convert_target: Option<ConvertTarget>,
-    pub core_type: Option<GroupCoreType>, // form allows "auto"
     pub sort_order: Option<i32>,
     pub last_refreshed: Option<i64>, // epoch seconds
     pub status: Option<GroupStatus>,
@@ -778,7 +768,6 @@ mod tests {
             row.links.push(ProfileStats {
                 protocol_id: ProtocolId::new(*pid),
                 endpoint_id: EndpointId::new(1),
-                core_type: CoreType::Xray,
                 config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: *last_seen,

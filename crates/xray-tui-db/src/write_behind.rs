@@ -1481,7 +1481,7 @@ mod tests {
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
-        CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         VlessConfig,
     };
 
@@ -1538,7 +1538,6 @@ mod tests {
         ProfileStats {
             protocol_id: ProtocolId::new(1),
             endpoint_id: EndpointId::new(endpoint_id),
-            core_type: CoreType::Xray,
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: 0,

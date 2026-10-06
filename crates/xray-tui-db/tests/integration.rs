@@ -16,7 +16,7 @@ use xray_tui_db::models::{
 use xray_tui_db::{Database, LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
-    CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
     VlessConfig,
 };
 
@@ -176,7 +176,6 @@ async fn seed_link(
         updated_at: 0,
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(last_seen),
         traffic: zero_traffic(),
@@ -212,7 +211,6 @@ async fn seed_purged_link(
         updated_at: 0,
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(last_seen),
         purge_reason: Some(reason),
@@ -1004,7 +1002,6 @@ async fn seed_link_latency(
         updated_at: 0,
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(last_seen),
         latency,
@@ -1054,7 +1051,6 @@ async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
         updated_at: 0,
         protocol_id: ProtocolId::new(1002),
         endpoint_id: EndpointId::new(3),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(1600),
         traffic: zero_traffic(),
@@ -1163,7 +1159,6 @@ async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
         updated_at: 0,
         protocol_id: ProtocolId::new(1002),
         endpoint_id: EndpointId::new(2),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_seen_at: ts(30),
         traffic: zero_traffic(),
@@ -1327,7 +1322,7 @@ async fn occ_rejects_a_stale_link_stage() {
 
     // Writer A wins via an instance update.
     toasty::update!(h1 {
-        core_type: CoreType::SingBox,
+        speed_bps: Some(777),
     })
     .exec(&mut conn)
     .await
@@ -1335,7 +1330,7 @@ async fn occ_rejects_a_stale_link_stage() {
 
     // Writer B from the same stale snapshot is rejected by the #[version] guard.
     let err = toasty::update!(h2 {
-        core_type: CoreType::Xray,
+        speed_bps: Some(888),
     })
     .exec(&mut conn)
     .await
@@ -1351,7 +1346,7 @@ async fn occ_rejects_a_stale_link_stage() {
     .await
     .expect("read")
     .expect("link");
-    assert_eq!(link.core_type, CoreType::SingBox, "writer A's value stands");
+    assert_eq!(link.speed_bps, Some(777), "writer A's value stands");
 }
 
 #[tokio::test]
@@ -1384,7 +1379,6 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
     let link = |last_seen: i64, latency: Option<Latency>| ProfileStats {
         protocol_id: ProtocolId::new(1001),
         endpoint_id: EndpointId::new(1),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_used_at: Some(ts(10)),
         last_seen_at: ts(last_seen),
@@ -1541,7 +1535,6 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     let link = ProfileStats {
         protocol_id: ProtocolId::new(1001),
         endpoint_id: EndpointId::new(1),
-        core_type: CoreType::Xray,
         config_type: ConfigType::ShareUrl,
         last_used_at: None,
         last_seen_at: now,
@@ -1901,9 +1894,9 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     assert_eq!(traffic_row.traffic.total_up, 33);
     assert_eq!(traffic_row.traffic.total_down, 44);
     assert_eq!(
-        traffic_row.core_type,
-        CoreType::Xray,
-        "untouched columns keep their values"
+        traffic_row.config_type,
+        ConfigType::ShareUrl,
+        "columns outside the patched groups keep their values"
     );
 }
 

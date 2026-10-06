@@ -7,7 +7,7 @@ use std::time::Duration;
 use dashmap::DashSet;
 use xray_tui_config::import_export::{ValidationSettings, ValidationSummary};
 use xray_tui_db::Database;
-use xray_tui_db::models::{Group, GroupCoreType, GroupStatus};
+use xray_tui_db::models::{Group, GroupStatus};
 
 use crate::AppState;
 use crate::ops::stream_import::ImportOutcome;
@@ -15,36 +15,12 @@ use crate::ops::stream_import::ImportOutcome;
 use crate::types::{CoreEvent, SplitRightPane};
 use crate::{get_field, try_send_or_warn};
 
-/// Map the typed group core enum to the form's select values.
-const fn group_core_to_str(c: GroupCoreType) -> &'static str {
-    match c {
-        GroupCoreType::Auto => "auto",
-        GroupCoreType::Xray => "Xray",
-        GroupCoreType::SingBox => "SingBox",
-    }
-}
-
-/// Map the form's select value to the typed group core (auto → `None`, the
-/// model's "unset" state).
-fn group_core_from_str(s: &str) -> Option<GroupCoreType> {
-    match s {
-        // Accept the select's capitalized values ("Xray"/"SingBox") in
-        // addition to the legacy lowercase spellings — the group form writes
-        // the capitalized strings, so rejecting them silently reset every
-        // explicit override to auto.
-        "xray" | "Xray" => Some(GroupCoreType::Xray),
-        "sing-box" | "singbox" | "SingBox" => Some(GroupCoreType::SingBox),
-        _ => None,
-    }
-}
-
 pub fn start_add_group(state: &mut AppState) {
     let fields = vec![
         ("name".into(), String::new()),
         ("subscription_url".into(), String::new()),
         ("user_agent".into(), String::new()),
         ("update_interval".into(), "1h".into()),
-        ("core_type".into(), "auto".into()),
     ];
     if let crate::AppMode::Settings {
         mode: crate::SettingsMode::Split { right, .. },
@@ -83,13 +59,6 @@ pub fn start_edit_group(state: &mut AppState, group_id: &str) {
             group.user_agent.clone().unwrap_or_default(),
         ),
         ("update_interval".into(), update_interval_value),
-        (
-            "core_type".into(),
-            group
-                .core_type
-                .map_or("auto", group_core_to_str)
-                .to_string(),
-        ),
     ];
     if let crate::AppMode::Settings {
         mode: crate::SettingsMode::Split { right, .. },
@@ -125,9 +94,6 @@ pub async fn confirm_add_group(state: &mut AppState) {
         enabled: true,
         user_agent: get_field(&fields, "user_agent"),
         convert_target: None,
-        core_type: get_field(&fields, "core_type")
-            .as_deref()
-            .and_then(group_core_from_str),
         sort_order: Some((state.groups.len() + 1) as i32),
         refresh_interval: Some(interval),
         last_refreshed: None,
@@ -185,9 +151,6 @@ pub async fn confirm_edit_group(state: &mut AppState) {
     group.name = get_field(&fields, "name");
     group.url = get_field(&fields, "subscription_url");
     group.user_agent = get_field(&fields, "user_agent");
-    group.core_type = get_field(&fields, "core_type")
-        .as_deref()
-        .and_then(group_core_from_str);
     let interval: i64 = get_field(&fields, "update_interval")
         .and_then(|v| humantime::parse_duration(&v).ok())
         .map_or(60, |d| (d.as_secs() / 60) as i64);
@@ -740,46 +703,6 @@ pub fn spawn_auto_update(state: &mut AppState) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn group_core_select_round_trip() {
-        // The group form's Core Type select (ui/settings.rs OPTIONS) offers
-        // "Auto"/"Xray"/"SingBox". Every option must parse to the right core
-        // instead of silently degrading to auto (F1: the capitalized values
-        // were rejected, so explicit Xray/SingBox overrides reset to auto on
-        // save — and editing such a group showed the override as lost).
-        for (select, expected) in [
-            ("Auto", None),
-            ("Xray", Some(GroupCoreType::Xray)),
-            ("SingBox", Some(GroupCoreType::SingBox)),
-        ] {
-            assert_eq!(
-                group_core_from_str(select),
-                expected,
-                "from_str({select:?})"
-            );
-        }
-        // Emitter output must parse back to the same core. Auto's emitter
-        // spelling is "auto", which maps to the model's unset state (None).
-        for (core, expected) in [
-            (GroupCoreType::Auto, None),
-            (GroupCoreType::Xray, Some(GroupCoreType::Xray)),
-            (GroupCoreType::SingBox, Some(GroupCoreType::SingBox)),
-        ] {
-            assert_eq!(
-                group_core_from_str(group_core_to_str(core)),
-                expected,
-                "round-trip {core:?}"
-            );
-        }
-        // Legacy lowercase spellings remain accepted.
-        assert_eq!(group_core_from_str("xray"), Some(GroupCoreType::Xray));
-        assert_eq!(
-            group_core_from_str("sing-box"),
-            Some(GroupCoreType::SingBox)
-        );
-        assert_eq!(group_core_from_str("singbox"), Some(GroupCoreType::SingBox));
-    }
-
     fn valid_vmess_url(host: &str) -> String {
         let qr = serde_json::json!({
             "v": "2", "ps": "test", "add": host, "port": "443",
@@ -840,7 +763,6 @@ mod tests {
             enabled: true,
             user_agent: None,
             convert_target: None,
-            core_type: None,
             sort_order: None,
             refresh_interval: Some(60),
             last_refreshed: None,

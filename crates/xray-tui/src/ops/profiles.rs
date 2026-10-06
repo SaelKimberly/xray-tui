@@ -437,11 +437,13 @@ pub(crate) const fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow
 }
 
 /// Resolve which core a profile row should use, considering (in order):
-///   1. Per-profile override (`link.core_type`)
-///   2. Per-protocol config override (`config.core.protocol_core_overrides`)
-///   3. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
+///   1. Per-protocol config override (`config.core.protocol_core_overrides`)
+///   2. Hardcoded auto-detection (`core_for_protocol` via `resolve_core`)
+///
+/// The per-pair `link.core_type` override is gone (db-rewamp D3); the core is
+/// derived from the kind, the config override and the Shadowsocks method.
 pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
-    let Some((link, protocol)) = row.active_protocol() else {
+    let Some((_link, protocol)) = row.active_protocol() else {
         return CoreType::Auto;
     };
     let config_override = state
@@ -450,10 +452,7 @@ pub fn resolved_core(state: &AppState, row: &EndpointRow) -> CoreType {
         .protocol_core_overrides
         .get(&protocol.proto_kind.to_string())
         .and_then(|s| s.parse::<CoreType>().ok());
-    let override_ = match config_override.or(match link.core_type {
-        ProtoCoreType::Xray => Some(CoreType::Xray),
-        ProtoCoreType::SingBox => Some(CoreType::SingBox),
-    }) {
+    let override_ = match config_override {
         Some(CoreType::Auto) | None => None,
         Some(CoreType::Native) => return CoreType::Native,
         Some(CoreType::Xray) => Some(ProtoCoreType::Xray),
@@ -528,7 +527,7 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
     // The edit form is populated from the ACTIVE protocol's typed config
     // (loaded with `config` included — `profile_to_fields` and the config
     // builders require it).
-    let Some((link, protocol)) = row.active_protocol() else {
+    let Some((_link, protocol)) = row.active_protocol() else {
         state.log_trace(
             "error",
             "tui::ops::profiles",
@@ -555,10 +554,7 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
             return;
         }
     };
-    let mut fields = profile_to_fields(&protocol, &row.endpoint);
-    // The per-pair core override is a link column, not a config field —
-    // `profile_to_fields` leaves the default; set the actual override.
-    set_core_field(&mut fields, link.core_type);
+    let fields = profile_to_fields(&protocol, &row.endpoint);
     state.mode = AppMode::EditServer {
         protocol_id: endpoint_id,
         proto_kind: protocol.proto_kind,
@@ -566,14 +562,6 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
         focus_index: 0,
         form_errors: HashMap::new(),
     };
-}
-
-/// Set the `core_type` form field to the link's per-pair override (the
-/// producer reads it back into `link.core_type` on save).
-fn set_core_field(fields: &mut [(String, String)], core_type: ProtoCoreType) {
-    if let Some((_, v)) = fields.iter_mut().find(|(k, _)| k == "core_type") {
-        *v = core_type.as_str().to_string();
-    }
 }
 
 pub fn selected_profile_id(state: &AppState) -> Option<i64> {
@@ -638,7 +626,7 @@ pub fn collapse_expand(state: &mut AppState) {
 pub fn fields_to_parsed(
     kind: ProtocolKind,
     fields: &[(String, String)],
-) -> Result<(ParsedProto, Option<ProtoCoreType>), String> {
+) -> Result<ParsedProto, String> {
     let address = get_field(fields, "address").unwrap_or_default();
     let port = get_field(fields, "port")
         .and_then(|p| p.parse::<u16>().ok())
@@ -650,7 +638,6 @@ pub fn fields_to_parsed(
     let mut proto_map = serde_json::Map::new();
     let mut stream_map = serde_json::Map::new();
     let mut user_id: Option<String> = None;
-    let mut core_type = "auto".to_string();
 
     for (key, value) in fields {
         if value.is_empty() {
@@ -681,8 +668,7 @@ pub fn fields_to_parsed(
             }
             // Profile-column / edit-form plumbing fields — never in the
             // settings JSON (vmess encryption defaults to auto).
-            "address" | "port" | "security" | "network" | "config_type" => {}
-            "core_type" => core_type.clone_from(value),
+            "address" | "port" | "security" | "network" | "config_type" | "core_type" => {}
             // F6: tuic's `password` is a protocol_setting credential (its
             // `uuid` owns the top-level `user_id` slot); every other
             // protocol's `user_id`/`password`/`uuid` key routes to the
@@ -727,12 +713,7 @@ pub fn fields_to_parsed(
     }
 
     let parsed = build_typed_config(kind, &address, port, &serde_json::Value::Object(settings))?;
-    let core_override = match core_type.as_str() {
-        "xray" => Some(ProtoCoreType::Xray),
-        "sing-box" | "singbox" => Some(ProtoCoreType::SingBox),
-        _ => None,
-    };
-    Ok((parsed, core_override))
+    Ok(parsed)
 }
 
 /// Validation shared by add/edit: address/port presence and required
@@ -831,10 +812,9 @@ pub async fn confirm_add_server(state: &mut AppState) {
     } else {
         Some(group_id.as_str())
     };
-    match persist_parsed(&state.db, &parsed.0, group, parsed.1).await {
+    match persist_parsed(&state.db, &parsed, group).await {
         Ok(_) => {
             let addr = parsed
-                .0
                 .first_endpoint()
                 .map_or_else(|| "?".into(), |e| format!("{}:{}", e.host, e.port));
             state.log_trace(
@@ -933,10 +913,9 @@ pub async fn confirm_edit_server(state: &mut AppState) {
     } else {
         Some(group_id.as_str())
     };
-    match persist_parsed(&state.db, &parsed.0, group, parsed.1).await {
+    match persist_parsed(&state.db, &parsed, group).await {
         Ok(_) => {
             let addr = parsed
-                .0
                 .first_endpoint()
                 .map_or_else(|| "?".into(), |e| format!("{}:{}", e.host, e.port));
             state.log_trace(
@@ -1014,8 +993,7 @@ fn form_from_parsed(state: &mut AppState, parsed: &ParsedProfile) {
     };
     let endpoint = endpoint_from_essentials(&first);
     let protocol = protocol_from_parsed(&parsed.parsed);
-    let mut fields = profile_to_fields(&protocol, &endpoint);
-    set_core_field(&mut fields, parsed.parsed.protocol.core_type);
+    let fields = profile_to_fields(&protocol, &endpoint);
     let core_protocol = parsed.parsed.protocol.proto_kind;
     state.mode = AppMode::AddServer {
         protocol: Some(core_protocol),
@@ -1076,7 +1054,7 @@ pub async fn confirm_batch_import(state: &mut AppState) {
     };
     for item in items {
         if let Some(parsed) = item.profile {
-            match persist_parsed(&state.db, &parsed.parsed, group, None).await {
+            match persist_parsed(&state.db, &parsed.parsed, group).await {
                 Ok(_) => imported += 1,
                 Err(_) => errors += 1,
             }
@@ -1286,7 +1264,6 @@ pub(crate) mod test_support {
         ConfigType, Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId,
         TrafficStats,
     };
-    use xray_tui_proto::proto_spec::CoreType as ProtoCoreType;
 
     /// Epoch seconds — the storage unit of every timestamp column.
     pub fn ts(secs: i64) -> i64 {
@@ -1313,7 +1290,6 @@ pub(crate) mod test_support {
             .map(|i| ProfileStats {
                 protocol_id: ProtocolId::new(id * 100 + i as i64),
                 endpoint_id: EndpointId::new(id),
-                core_type: ProtoCoreType::Xray,
                 config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: ts(0),
@@ -1704,7 +1680,6 @@ mod edit_tests {
             ProfileStats {
                 protocol_id: protocol.id,
                 endpoint_id: endpoint.id,
-                core_type: xray_tui_proto::proto_spec::CoreType::Xray,
                 config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: super::test_support::ts(0),

@@ -352,7 +352,6 @@ pub fn link_from_parsed_with_id(
     ProfileStats {
         protocol_id,
         endpoint_id,
-        core_type: parsed.protocol.core_type,
         config_type: match parsed.protocol.config_type {
             ConfigKind::ShareUrl => ConfigType::ShareUrl,
             ConfigKind::Form => ConfigType::Form,
@@ -394,7 +393,6 @@ pub async fn persist_parsed(
     db: &Database,
     parsed: &ParsedProto,
     group_id: Option<&str>,
-    core_override: Option<xray_tui_proto::proto_spec::CoreType>,
 ) -> Result<usize, xray_tui_db::DatabaseError> {
     // Build the whole batch, then write it in ONE transaction — the shape
     // `ops::stream_import` already uses for a subscription body. Per-row
@@ -409,10 +407,7 @@ pub async fn persist_parsed(
     let mut group_links = Vec::with_capacity(parsed.endpoints.len());
     for ep in &parsed.endpoints {
         let endpoint = endpoint_from_essentials(ep);
-        let mut link = link_from_parsed_with_id(parsed, protocol.id, endpoint.id);
-        if let Some(core) = core_override {
-            link.core_type = core;
-        }
+        let link = link_from_parsed_with_id(parsed, protocol.id, endpoint.id);
         if let Some(gid) = group_id {
             group_links.push(EndpointGroup {
                 endpoint_id: endpoint.id,

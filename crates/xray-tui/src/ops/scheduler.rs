@@ -438,7 +438,6 @@ mod tests {
     use xray_tui_db::models::{
         ConfigType, EndpointId, ProfileStats, ProtocolId, TaskKind, TrafficStats,
     };
-    use xray_tui_proto::proto_spec::CoreType;
 
     use super::MIN_DNS_DEFER_SECS;
 
@@ -453,7 +452,6 @@ mod tests {
         ProfileStats {
             protocol_id: ProtocolId::new(pid),
             endpoint_id: EndpointId::new(eid),
-            core_type: CoreType::Xray,
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(0),

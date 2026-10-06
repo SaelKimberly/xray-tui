@@ -30,7 +30,7 @@ use crate::models_toasty::{
 use toasty::Deferred;
 use toasty::schema::Load;
 use toasty_core::stmt::Value;
-use xray_tui_proto::proto_spec::{CoreType, ProtocolKind, SecurityType, TransportType};
+use xray_tui_proto::proto_spec::{ProtocolKind, SecurityType, TransportType};
 
 /// Default rows per page.
 pub const DEFAULT_PAGE_SIZE: usize = 200;
@@ -611,7 +611,6 @@ const PAGE_PROJECTION: &[&str] = &[
     // profile_stats (23)
     "ps.protocol_id",
     "ps.endpoint_id",
-    "ps.core_type",
     "ps.config_type",
     "ps.last_used_at",
     "ps.last_seen_at",
@@ -821,7 +820,6 @@ fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<Ip
 fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     let protocol_id = p.next_protocol_id()?;
     let endpoint_id = p.next_endpoint_id()?;
-    let core_type: CoreType = p.next()?;
     let config_type: ConfigType = p.next()?;
     let last_used_at = p.next_opt_ts()?;
     let last_seen_at = p.next_ts()?;
@@ -872,7 +870,6 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     Ok(ProfileStats {
         protocol_id,
         endpoint_id,
-        core_type,
         config_type,
         last_used_at,
         last_seen_at,

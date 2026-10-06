@@ -148,86 +148,71 @@ pub enum BuildError {
 pub struct ConfigBuilder;
 
 impl ConfigBuilder {
-    /// Build a backend config for one profile.
-    ///
-    /// The core is taken from `link.core_type` — the per-pair override,
-    /// resolved at parse time (never `Auto`). The outbound block is produced
-    /// by `protocol.config.inject_to(...)`, which until Tasks 14/15 errors
-    /// with [`SupportError::UnsupportedProtocol`] (surfaced as
-    /// [`BuildError::Support`]).
-    pub fn build(
-        endpoint: &Endpoint,
-        link: &ProfileStats,
-        protocol: &Protocol,
-        params: &BuildParams,
-        routing: &[RoutingRule],
-        dns: &DnsSetting,
-    ) -> Result<BackendConfig, BuildError> {
-        match link.core_type {
-            ProtoCoreType::Xray => {
-                let config = xray::XrayConfigBuilder::build(
-                    endpoint,
-                    protocol,
-                    link.core_type,
-                    params,
-                    routing,
-                    dns,
-                )?;
-                Ok(BackendConfig::Xray(config))
-            }
-            ProtoCoreType::SingBox => {
-                let config = singbox::SingBoxConfigBuilder::build(
-                    endpoint,
-                    protocol,
-                    link.core_type,
-                    params,
-                    routing,
-                    dns,
-                )?;
-                Ok(BackendConfig::SingBox(config))
-            }
+/// Build a backend config for one profile.
+///
+/// The core is supplied by the caller (the connect path resolves it via
+/// `core_mapping::resolve_core` from the protocol kind, the config-level
+/// override and the Shadowsocks method — the per-pair `core_type` column was
+/// dropped, db-rewamp D3). The outbound block is produced by
+/// `protocol.config.inject_to(...)`; an unsupported pair surfaces as
+/// [`SupportError::UnsupportedProtocol`] → [`BuildError::Support`].
+pub fn build(
+    endpoint: &Endpoint,
+    protocol: &Protocol,
+    core_type: ProtoCoreType,
+    params: &BuildParams,
+    routing: &[RoutingRule],
+    dns: &DnsSetting,
+) -> Result<BackendConfig, BuildError> {
+    match core_type {
+        ProtoCoreType::Xray => {
+            let config =
+                xray::XrayConfigBuilder::build(endpoint, protocol, core_type, params, routing, dns)?;
+            Ok(BackendConfig::Xray(config))
+        }
+        ProtoCoreType::SingBox => {
+            let config = singbox::SingBoxConfigBuilder::build(
+                endpoint, protocol, core_type, params, routing, dns,
+            )?;
+            Ok(BackendConfig::SingBox(config))
         }
     }
+}
 
-    /// Build a multi-inbound config for batch real ping.
-    ///
-    /// Creates N SOCKS5 inbounds (one per profile on its `assigned_port`),
-    /// N proxy outbounds, plus standard dns-out/direct/block outbounds.
-    /// Routing rules direct traffic from each inbound to its matching outbound.
-    ///
-    /// Pattern from v2rayN's `LoadCoreConfigSpeedtest(List<ServerTestItem>)` —
-    /// one core serves an entire batch page instead of spawning one core per profile.
-    ///
-    /// All items must share one `link.core_type` (a batch page runs on a
-    /// single core); the dispatch derives the core from the items.
-    pub fn build_multi(
-        items: &[MultiInboundItem],
-        base_params: &BuildParams,
-        dns: &DnsSetting,
-    ) -> Result<BackendConfig, BuildError> {
-        let core_type = items
-            .first()
-            .map(|item| item.link.core_type)
-            .ok_or_else(|| {
-                BuildError::InvalidProfile("build_multi: empty item list".to_string())
-            })?;
-        if let Some(mismatch) = items.iter().find(|item| item.link.core_type != core_type) {
-            return Err(BuildError::InvalidProfile(format!(
-                "build_multi: mixed core types in one batch ({core_type} vs {})",
-                mismatch.link.core_type
-            )));
+/// Build a multi-inbound config for batch real ping.
+///
+/// Creates N SOCKS5 inbounds (one per profile on its `assigned_port`),
+/// N proxy outbounds, plus standard dns-out/direct/block outbounds.
+/// Routing rules direct traffic from each inbound to its matching outbound.
+///
+/// Pattern from v2rayN's `LoadCoreConfigSpeedtest(List<ServerTestItem>)` —
+/// one core serves an entire batch page instead of spawning one core per profile.
+///
+/// The caller supplies the single core the batch runs on (the per-pair
+/// `core_type` column is gone, db-rewamp D3).
+pub fn build_multi(
+    items: &[MultiInboundItem],
+    core_type: ProtoCoreType,
+    base_params: &BuildParams,
+    dns: &DnsSetting,
+) -> Result<BackendConfig, BuildError> {
+    if items.is_empty() {
+        return Err(BuildError::InvalidProfile(
+            "build_multi: empty item list".to_string(),
+        ));
+    }
+    match core_type {
+        ProtoCoreType::Xray => {
+            let config = xray::XrayConfigBuilder::build_multi(items, core_type, base_params, dns)?;
+            Ok(BackendConfig::Xray(config))
         }
-        match core_type {
-            ProtoCoreType::Xray => {
-                let config = xray::XrayConfigBuilder::build_multi(items, base_params, dns)?;
-                Ok(BackendConfig::Xray(config))
-            }
-            ProtoCoreType::SingBox => {
-                let config = singbox::SingBoxConfigBuilder::build_multi(items, base_params, dns)?;
-                Ok(BackendConfig::SingBox(config))
-            }
+        ProtoCoreType::SingBox => {
+            let config =
+                singbox::SingBoxConfigBuilder::build_multi(items, core_type, base_params, dns)?;
+            Ok(BackendConfig::SingBox(config))
         }
     }
+}
 }
 
 #[cfg(test)]
@@ -304,11 +289,10 @@ mod tests {
         }
     }
 
-    pub(super) fn link(core_type: ProtoCoreType) -> ProfileStats {
+    pub(super) fn link() -> ProfileStats {
         ProfileStats {
             protocol_id: xray_tui_db::models::ProtocolId::new(1),
             endpoint_id: xray_tui_db::models::EndpointId::new(1),
-            core_type,
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(0),
@@ -473,10 +457,9 @@ mod tests {
     fn build_xray_via_dispatch() {
         let endpoint = endpoint("example.com", 443);
         let protocol = protocol(ProtocolKind::Vless, vless_config());
-        let link = link(ProtoCoreType::Xray);
-        let (params, rules, dns) = default_params();
+                let (params, rules, dns) = default_params();
         let json = assert_ok_dispatch(
-            ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns),
+            ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::Xray, &params, &rules, &dns),
             ProtoCoreType::Xray,
             "vless",
             "protocol",
@@ -507,10 +490,9 @@ mod tests {
             remarks: None,
         });
         let protocol = protocol(ProtocolKind::Tuic, tuic);
-        let link = link(ProtoCoreType::SingBox);
-        let (params, rules, dns) = default_params();
+                let (params, rules, dns) = default_params();
         let json = assert_ok_dispatch(
-            ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns),
+            ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::SingBox, &params, &rules, &dns),
             ProtoCoreType::SingBox,
             "tuic",
             "type",
@@ -549,10 +531,9 @@ mod tests {
         });
         let config = ProtocolConfig::Vless(vless);
         let protocol = protocol(ProtocolKind::Vless, config);
-        let xray_link = link(ProtoCoreType::Xray);
-        let (params, rules, dns) = default_params();
+                let (params, rules, dns) = default_params();
 
-        let err = ConfigBuilder::build(&endpoint, &xray_link, &protocol, &params, &rules, &dns)
+        let err = ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::Xray, &params, &rules, &dns)
             .expect_err("xray-core removed the http transport, so the build must refuse it");
         assert!(matches!(err, BuildError::Support(_)), "{err:?}");
         assert!(
@@ -562,8 +543,7 @@ mod tests {
 
         // The refusal is scoped to the core that removed it: the SAME config
         // still builds for sing-box, which implements the transport.
-        let singbox_link = link(ProtoCoreType::SingBox);
-        ConfigBuilder::build(&endpoint, &singbox_link, &protocol, &params, &rules, &dns)
+                ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::SingBox, &params, &rules, &dns)
             .expect("sing-box still implements the http transport");
     }
 
@@ -574,9 +554,8 @@ mod tests {
         let endpoint = endpoint("example.com", 443);
         let mut protocol = protocol(ProtocolKind::Vless, vless_config());
         protocol.config = Deferred::default();
-        let link = link(ProtoCoreType::Xray);
-        let (params, rules, dns) = default_params();
-        let err = ConfigBuilder::build(&endpoint, &link, &protocol, &params, &rules, &dns)
+                let (params, rules, dns) = default_params();
+        let err = ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::Xray, &params, &rules, &dns)
             .expect_err("unloaded config must be rejected");
         assert!(
             err.to_string().contains("not loaded"),

@@ -536,7 +536,7 @@ const LINK_COMPARE_KEYS: &str = "protocol_id, endpoint_id";
 /// The `INSERT … VALUES (…),(…)` prefix both link writers share; a caller
 /// appends its tuples and then the `ON CONFLICT` action. The column order IS
 /// the order [`link_values_sql`] emits.
-const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, core_type, \
+const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, \
      config_type, last_used_at, last_seen_at, latency, latency_delay, latency_ip, speed_bps, \
      error, error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
      traffic_total_up, traffic_total_down, created_at, updated_at, version) VALUES ";
@@ -552,10 +552,9 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
     let mut sql = String::with_capacity(160);
     let _ = write!(
         sql,
-        "({}, {}, '{}', '{}', NULL, {}, ",
+        "({}, {}, '{}', NULL, {}, ",
         link.protocol_id.get(),
         link.endpoint_id.get(),
-        core_type_str(link.core_type),
         config_type_str(link.config_type),
         link.last_seen_at
     );
@@ -652,7 +651,7 @@ fn link_patch_conflict_sql(has_result: bool, has_traffic: bool, has_purge: bool)
 /// every fast latency it had just written). `last_used_at` is likewise never
 /// touched here (its owner is [`Database::update_last_used`]).
 const LINK_SOURCE_CONFLICT_SQL: &str = " ON CONFLICT(protocol_id, endpoint_id) DO UPDATE SET \
-     core_type = excluded.core_type, config_type = excluded.config_type, \
+     config_type = excluded.config_type, \
      last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at";
 
 /// One multi-row upsert statement for a set of rows whose conflict action is
@@ -704,14 +703,6 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
         PurgeReason::ConfigInvalid => "config_invalid",
         PurgeReason::TransportRejected => "transport_rejected",
         PurgeReason::OriginUnreachable => "origin_unreachable",
-    }
-}
-
-/// The `CHECK`-constrained storage text of a [`CoreType`] column value.
-const fn core_type_str(core: xray_tui_proto::proto_spec::CoreType) -> &'static str {
-    match core {
-        xray_tui_proto::proto_spec::CoreType::Xray => "xray",
-        xray_tui_proto::proto_spec::CoreType::SingBox => "sing_box",
     }
 }
 
@@ -1086,7 +1077,6 @@ impl Database {
                         link.protocol_id,
                         link.endpoint_id,
                     )
-                    .core_type(link.core_type)
                     .config_type(link.config_type)
                     .last_seen_at(link.last_seen_at)
                     .latency(link.latency.clone())
@@ -1257,7 +1247,6 @@ impl Database {
                         .enabled(group.enabled)
                         .user_agent(group.user_agent.clone())
                         .convert_target(group.convert_target)
-                        .core_type(group.core_type)
                         .sort_order(group.sort_order)
                         .last_refreshed(group.last_refreshed)
                         .status(group.status)
@@ -2016,7 +2005,7 @@ mod tests {
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
-        CoreType, ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
+ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         VlessConfig,
     };
 
@@ -2407,7 +2396,6 @@ mod tests {
             updated_at: 0,
             protocol_id: ProtocolId::new(protocol_id),
             endpoint_id: EndpointId::new(endpoint_id),
-            core_type: CoreType::Xray,
             config_type: ConfigType::ShareUrl,
             last_seen_at: ts(last_seen),
             traffic: zero_traffic(),
@@ -2591,7 +2579,6 @@ mod tests {
                 updated_at: 0,
                 protocol_id: ProtocolId::new(pid),
                 endpoint_id: EndpointId::new(1),
-                core_type: CoreType::Xray,
                 config_type: ConfigType::ShareUrl,
                 last_seen_at: ts(last_seen),
                 latency: Some(Latency::Real {
@@ -3008,7 +2995,6 @@ mod tests {
         ProfileStats {
             protocol_id: ProtocolId::new(protocol_id),
             endpoint_id: EndpointId::new(endpoint_id),
-            core_type: CoreType::Xray,
             config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(last_seen),
@@ -3123,9 +3109,9 @@ mod tests {
 
         // A subscription refresh re-persists the link from a fresh parse: its
         // snapshot carries no measurement and zeroed counters, and one SOURCE
-        // column (the per-pair core override) genuinely changed.
+        // column (the config type) genuinely changed.
         let mut fresh = link_struct(1001, 1, 200);
-        fresh.core_type = CoreType::SingBox;
+        fresh.config_type = ConfigType::Form;
         let mut tx = conn.transaction().await.expect("tx");
         upsert_links_bulk(&mut tx, std::slice::from_ref(&fresh))
             .await
@@ -3162,9 +3148,9 @@ mod tests {
         );
         assert_eq!(stored.last_seen_at, ts(200), "source column updates");
         assert_eq!(
-            stored.core_type,
-            CoreType::SingBox,
-            "the per-pair core override still updates"
+            stored.config_type,
+            ConfigType::Form,
+            "the config type still updates on a source refresh"
         );
     }
 
@@ -3642,7 +3628,6 @@ mod tests {
             enabled: true,
             user_agent: None,
             convert_target: None,
-            core_type: None,
             sort_order: Some(0),
             last_refreshed: None,
             status: None,
@@ -3707,7 +3692,6 @@ mod tests {
             enabled: true,
             user_agent: None,
             convert_target: None,
-            core_type: None,
             sort_order: None,
             last_refreshed: None,
             status: None,

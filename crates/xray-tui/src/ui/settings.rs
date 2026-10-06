@@ -607,7 +607,6 @@ fn form_field_defs_for_section(
             ("subscription_url", "Subscription URL", "Url"),
             ("user_agent", "User Agent", "Text"),
             ("update_interval", "Update Interval", "Duration"),
-            ("core_type", "Core Type", "Select:Auto,Xray,SingBox"),
         ],
         SettingsSection::Updates | SettingsSection::Routing => &[],
         SettingsSection::RouteProbes => &[("probes", "Probes (comma-sep)", "Text")],
@@ -2019,21 +2018,8 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                 if *focus_index >= fields.len() {
                     return;
                 }
-                // core_type field: cycle on any char (toggle mode)
-                let key_name = match *focus_index {
-                    4 => "core_type",
-                    _ => "",
-                };
-                if key_name == "core_type" {
-                    const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
-                    let (_, ref mut val) = fields[*focus_index];
-                    let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
-                    val.clear();
-                    val.push_str(OPTIONS[(idx + 1) % OPTIONS.len()]);
-                } else {
-                    let (_, ref mut val) = fields[*focus_index];
-                    val.push(c);
-                }
+                let (_, ref mut val) = fields[*focus_index];
+                val.push(c);
             }
         }
         KeyCode::Backspace => {
@@ -2055,37 +2041,7 @@ async fn handle_group_form_key(state: &mut AppState, key: &KeyEvent) {
                 val.pop();
             }
         }
-        KeyCode::Right | KeyCode::Left => {
-            // core_type field: cycle through options on Left/Right
-            if let AppMode::Settings {
-                mode:
-                    SettingsMode::Split {
-                        right:
-                            SplitRightPane::GroupForm {
-                                ref mut fields,
-                                ref mut focus_index,
-                                ..
-                            },
-                        ..
-                    },
-            } = state.mode
-                && *focus_index == 4
-                && *focus_index < fields.len()
-            {
-                const OPTIONS: &[&str] = &["Auto", "Xray", "SingBox"];
-                let (_, ref mut val) = fields[*focus_index];
-                let idx = OPTIONS.iter().position(|o| *o == val.as_str()).unwrap_or(0);
-                let next = OPTIONS[if key.code == KeyCode::Right {
-                    (idx + 1) % OPTIONS.len()
-                } else if idx == 0 {
-                    OPTIONS.len() - 1
-                } else {
-                    idx - 1
-                }];
-                val.clear();
-                val.push_str(next);
-            }
-        }
+        KeyCode::Right | KeyCode::Left => {}
         _ => {}
     }
 }
