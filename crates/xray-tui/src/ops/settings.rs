@@ -42,14 +42,6 @@ pub async fn build_settings_fields(
                     "sing_box_path".into(),
                     state.config.core.sing_box_path.clone().unwrap_or_default(),
                 ),
-                (
-                    "default_core".into(),
-                    state
-                        .config
-                        .core
-                        .core_type
-                        .map_or_else(|| "Auto".into(), |c| c.to_string()),
-                ),
                 ("log_level".into(), state.config.core.log_level.clone()),
                 (
                     "skip_cert_verify".into(),
@@ -389,12 +381,6 @@ fn apply_settings_fields(
         Core => {
             state.config.core.xray_path = get_opt("xray_path");
             state.config.core.sing_box_path = get_opt("sing_box_path");
-            let core_str = get_str("default_core");
-            state.config.core.core_type = if core_str.is_empty() || core_str == "Auto" {
-                None
-            } else {
-                core_str.parse::<xray_tui_core::CoreType>().ok()
-            };
             if !get_str("log_level").is_empty() {
                 state.config.core.log_level = get("log_level");
             }

@@ -508,7 +508,6 @@ fn form_field_defs_for_section(
         SettingsSection::Core => &[
             ("xray_path", "Xray Path", "Text"),
             ("sing_box_path", "Sing-Box Path", "Text"),
-            ("default_core", "Default Core", "Select:Auto,Xray,SingBox"),
             ("log_level", "Log Level", "Select:debug,info,warning,error"),
             ("skip_cert_verify", "Skip Cert Verify", "Boolean"),
             ("clash_mixin", "Clash Mixin (JSON/YAML)", "Text"),

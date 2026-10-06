@@ -1,7 +1,6 @@
 use ratatui_themes::ThemeName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use xray_tui_core::CoreType;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -110,7 +109,6 @@ impl Default for PurgatoryConfig {
 pub struct CoreConfig {
     pub xray_path: Option<String>,
     pub sing_box_path: Option<String>,
-    pub core_type: Option<CoreType>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default)]
@@ -124,7 +122,6 @@ impl Default for CoreConfig {
         Self {
             xray_path: None,
             sing_box_path: None,
-            core_type: None,
             log_level: default_log_level(),
             protocol_core_overrides: std::collections::HashMap::new(),
             skip_cert_verify: false,
@@ -446,19 +443,6 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.speed_test.task_queue_limit, 0);
         assert_eq!(config.speed_test.dns_failure_defer_secs, 0);
-    }
-
-    #[test]
-    fn core_type_field_accepts_null() {
-        // When core_type is absent in JSON, it should become None
-        let json = r#"{"core":{},"gui":{},"inbound":{}}"#;
-        let config: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(config.core.core_type.is_none());
-
-        // When present and valid, it should parse
-        let json = r#"{"core":{"core_type":"xray"},"gui":{},"inbound":{}}"#;
-        let config: AppConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.core.core_type, Some(CoreType::Xray));
     }
 
     #[test]
