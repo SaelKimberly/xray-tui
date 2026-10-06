@@ -315,33 +315,29 @@ impl<S> tracing_subscriber::Layer<S> for DbMonitorLayer
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
-    /// Never cache a callsite verdict — see the note.
-    ///
-    /// `tracing` decides ONCE per `#[instrument]` callsite whether the span
-    /// will ever be enabled, and that decision is PROCESS-GLOBAL: it is taken
-    /// the first time the instrumented function runs, on whatever thread
-    /// happens to get there first. Return `never` (the default when no
-    /// subscriber is current, which is every thread but the instrumented
-    /// caller's) and the span is a no-op for the rest of the process — no
-    /// `on_new_span`, no registry row, statements unattributed, however correct
-    /// the code is. The write-behind flush hit exactly this: its span is
-    /// reached from many threads (the geo drain task, the import barrier, ping
-    /// batches), so under the parallel test runner a subscriber-less thread
-    /// would win the race and poison the cache.
-    ///
-    /// `sometimes` makes `enabled` run per creation instead, so the verdict is
-    /// always taken against the dispatcher actually current at the call. The
-    /// default `enabled` is a constant `true`, so this costs one predictable
-    /// branch per span/event and buys immunity to the cache. The monitor is
-    /// already always-on (bounded ~1.3 MiB); a branch is not the thing to
-    /// optimize here.
-    fn register_callsite(
-        &self,
-        _metadata: &tracing::Metadata<'_>,
-    ) -> tracing::subscriber::Interest {
-        tracing::subscriber::Interest::sometimes()
-    }
-
+    // NOTE (no `register_callsite` override): an earlier revision overrode it
+    // to return `Interest::always()`. That was reverted — it buys nothing and
+    // the rationale was wrong:
+    //
+    // * In production it is inert. `main.rs` wraps this layer in
+    //   `.with_filter(EnvFilter::…)`; `Filtered::register_callsite`
+    //   (tracing-subscriber `filter/layer_filters/mod.rs`) calls the inner
+    //   layer only for side effects and DISCARDS its `Interest`, returning
+    //   `Interest::always()` itself — so the override could not change
+    //   production behavior either way.
+    // * The premise ("`never` is the default") was also wrong: `Layer::
+    //   register_callsite` defaults to `Interest::always()` when `enabled()`
+    //   is true (tracing-subscriber `layer/mod.rs`), and `enabled` defaults
+    //   true. The `never` a test can observe comes from tracing-core's
+    //   no-subscriber path, not from this layer.
+    //
+    // What actually protects the span is the DISPATCHER, not this layer's
+    // interest: production installs the global subscriber before any callsite
+    // is evaluated, so the verdict is always taken against the real filter
+    // stack. A test that installs a thread-local subscriber AFTER the callsite
+    // was first seen must re-arm the process-global interest cache with
+    // `tracing::callsite::rebuild_interest_cache()` — see the attribution test
+    // below.
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
         if attrs.metadata().target() != METHOD_TARGET {
             return;
@@ -563,8 +559,11 @@ mod tests {
         let monitor = DbMonitor::new();
         let subscriber = tracing_subscriber::registry().with(DbMonitorLayer::new(monitor.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
-        // Re-arm the global interest cache before every attempt. See
-        // `DbMonitorLayer::register_callsite` for why it can go stale.
+        // Re-arm the global interest cache before every attempt. The
+        // `write_behind_flush` callsite's interest verdict is cached
+        // process-globally and `DbMonitorLayer` no longer overrides
+        // `register_callsite`; this thread-local subscriber must be the one the
+        // next `Span::new` decides against.
         tracing::callsite::rebuild_interest_cache();
 
         // An endpoint to hang the resolved address off: `endpoint_ip` rows

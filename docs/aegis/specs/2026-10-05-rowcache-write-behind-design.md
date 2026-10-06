@@ -154,13 +154,17 @@ same commit (clean cutover, decision: no parallel write paths).
   the last window, recovered by next refresh.
 - Cross-table atomicity loss (import): today one tx commits endpoints +
   protocols + links + group_links (`stream_import.rs:397-403`), so 0 linkless
-  endpoints exist. Per-table drivers split this into independent commits; a
-  crash between the endpoints window and the links window leaves endpoint rows
-  with no links — a NEW state. Accepted tradeoff: end-of-import performs a
-  coordinated flush (all four drivers, endpoints-first order) and reports
-  staged-left per driver; orphan endpoints (no links after flush) are repaired
-  by the next refresh re-adding their links, or swept by `purge_expired` when
-  older than retention. A linkless-endpoint count probe joins the §5 suite.
+  endpoints exist. The import uses ONE `SourceSpec` driver (not four): every
+  window's `write_window` runs all four bulk upserts on the driver's single
+  transaction, so the four families stay atomic per committed window. The
+  accepted tradeoff is CROSS-WINDOW: a crash between two committed windows
+  leaves an endpoint row whose links live in a later, unwritten window — a
+  state the old whole-feed-per-batch shape also had (each 500-URL batch was
+  its own tx), so it is not new. Mitigation: end-of-import runs a coordinated
+  flush (the one driver) and reports staged-left; orphan endpoints (no links
+  after the final flush) are repaired by the next refresh re-adding their
+  links, or swept by `purge_expired` when older than retention. A
+  linkless-endpoint count probe joins the §5 suite.
 - Generic driver over `DashMap` per table: N maps, N tasks — same as today,
   no regression, but no cross-table scheduling either (approach C rejected;
   revisit only if cross-table contention persists after migration).
