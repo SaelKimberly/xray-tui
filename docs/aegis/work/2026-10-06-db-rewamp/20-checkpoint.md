@@ -32,14 +32,38 @@
   not have room to finish them.
 
 ## Next step (exact resume point)
-1. **T10 (smallest):** delete the sort UI — `types::SortColumn`, the `s` cycle in
-   `ui/mod.rs`, `ops/profiles.rs::page_sort`/`set_sort`, `AppState.sort_column`/
-   `sort_ascending`, `ui/profiles.rs`'s sort-column match. Keep `PageSort` for the
-   perf lab. Green + commit.
-2. **T3/T4/T5:** add `psl2`, the one split helper, `domain`/`sub_domain` on
-   `endpoints`, derived host-kind, all-addresses-in-`endpoint_ip`, uniform
-   validation + counted skip, the three `host_type→HostKind` reconstruction sites.
-3. **T8/T9:** binned law `(bin, ⌐weight, domain, sub, addr, endpoint_id)`,
-   `endpoint_rank` reshape + the one covering index; page order/view/search.
-4. **T11** tag 15 wipe, **T12** FK cascade, **T13** direct reader,
-   **T14** gated WR, **T15** docs/ADR/AGENTS.
+1. **T4 — endpoint identity/host model.** Drop `endpoints.host`/`host_type`; add
+   `domain`/`sub_domain`; identity = `stable_hash(ascii_name, port)` using
+   `xray_tui_config::domain::split(host).ascii` for dns, the literal for ip,
+   `("undefined", config_uid)` for exotic; write an IP host's literal as its
+   `endpoint_ip` row; derive host-kind (`domain` non-empty → dns; address row →
+   ip; else undefined).
+   **Consumer surface (must all move in ONE commit — it cannot compile until
+   done):**
+   - `xray-tui-db`: `models_toasty::Endpoint`, `database.rs`
+     (`upsert_endpoints_bulk` SQL + seeds), `profiles_query.rs`
+     (`PAGE_PROJECTION` `e.host`/`e.host_type`, search predicate),
+     `export.rs` (SELECT + decode), `endpoint_rank.rs`
+     (`dns_unresolved_endpoint`, `weight_from_discriminators`, `rank_host`).
+   - `xray-tui-core`: `config_builder/mod.rs::endpoint_essentials(&Endpoint)`
+     — **needs the addresses** (an IP host's dial host now lives only in
+     `endpoint_ip`), so its signature must take them/`EndpointRow`.
+   - `xray-tui`: `state.rs::endpoint_from_essentials`, `ops/native_connect.rs`
+     (its own `endpoint_essentials` copy + `:85`), `ops/ping_native.rs:224`,
+     `ui/mod.rs:902`, `ui/profiles.rs` (Address column), `ops/export.rs:136`.
+   - validation: `import_export::validate_host` DNS branch calls `domain::split`
+     and STOPS normalizing via `url::Host` (one normalizer).
+   - The **parse boundary** `xray-tui-proto::EndpointEssentials.host/host_type`
+     STAYS (the split is the DB layer's job).
+   Bump `SCHEMA_VERSION` to 16 again (the model changes).
+2. **T5** validation counted-skip (form == import) · **T8/T9** binned law + one
+   index + page order/search (needs T4's `domain`/`sub_domain`/`addr`) ·
+   **T12** FK cascade · **T13** direct reader · **T14** gated WR ·
+   **T15** docs/ADR/AGENTS.
+
+## Verification at this HEAD
+- `cargo check --workspace --all-targets` → 0 errors (2 pre-existing native doc warnings).
+- nextest: proto/config/core **732**, db **170**, tui **259** — all green.
+- Clippy: MY files clean; the workspace gate is red from PRE-EXISTING lints on
+  this WIP branch (native/context.rs, tls/spec, route/compiler, proto mod.rs
+  len_zero) — untouched by this work.
