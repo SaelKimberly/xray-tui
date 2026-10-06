@@ -968,7 +968,6 @@ fn render_data_grid(
 
     // Map sort state to DataTable column indices
     let sort_column = match state.sort_column {
-        SortColumn::ConfigType => Some(9),
         SortColumn::Address | SortColumn::Port | SortColumn::Ip => Some(5),
         SortColumn::Test => Some(11),
         SortColumn::LastSeen | SortColumn::Speed | SortColumn::Traffic => None,

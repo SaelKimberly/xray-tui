@@ -44,7 +44,7 @@ use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
     ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashSocks5};
@@ -136,7 +136,6 @@ impl Socks5Config {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Socks,
-                config_type: ConfigKind::ShareUrl,
                 core_type: core_mapping::resolve_core(ProtocolKind::Socks, None, None),
                 config: ProtocolConfig::Socks(config),
             },
@@ -216,7 +215,6 @@ impl Socks5Config {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Socks,
-                        config_type: ConfigKind::ShareUrl,
                         core_type: core_mapping::resolve_core(ProtocolKind::Socks, None, None),
                         config: ProtocolConfig::Socks(config),
                     },
@@ -410,7 +408,7 @@ impl Socks5Config {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+        CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
     };
     use super::Socks5Config;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -468,7 +466,6 @@ mod tests {
         assert_eq!(ep.port, 1080);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Socks);
-        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let cfg = config(parsed);
         assert_eq!(cfg.username.as_deref(), Some("user"));

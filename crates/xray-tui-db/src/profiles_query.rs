@@ -23,7 +23,7 @@ use std::net::IpAddr;
 use crate::Database;
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    ConfigType, Endpoint, EndpointId, EndpointRow, ErrorInfo, HostType, Latency, ProfileErr,
+    Endpoint, EndpointId, EndpointRow, ErrorInfo, HostType, Latency, ProfileErr,
     ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats,
     Transport,
 };
@@ -52,7 +52,6 @@ pub enum PageSort {
     LastSeen,
     Speed,
     Traffic,
-    ConfigType,
     /// The endpoint's lowest resolved address (`endpoint_ip.ip_key`). The
     /// addresses are the only IP fact stored per endpoint, so this is the one
     /// sort the JSON-array column could not express at all.
@@ -255,10 +254,6 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
         ],
         PageSort::Traffic => vec![
             term(rank_col("rank_traffic"), true),
-            term("k.endpoint_id".to_string(), true),
-        ],
-        PageSort::ConfigType => vec![
-            term(rank_col("rank_config"), true),
             term("k.endpoint_id".to_string(), true),
         ],
         PageSort::Address => vec![
@@ -611,7 +606,6 @@ const PAGE_PROJECTION: &[&str] = &[
     // profile_stats (23)
     "ps.protocol_id",
     "ps.endpoint_id",
-    "ps.config_type",
     "ps.last_used_at",
     "ps.last_seen_at",
     "ps.latency",
@@ -820,7 +814,6 @@ fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<Ip
 fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     let protocol_id = p.next_protocol_id()?;
     let endpoint_id = p.next_endpoint_id()?;
-    let config_type: ConfigType = p.next()?;
     let last_used_at = p.next_opt_ts()?;
     let last_seen_at = p.next_ts()?;
     let latency_kind: Option<String> = p.next()?;
@@ -870,7 +863,6 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     Ok(ProfileStats {
         protocol_id,
         endpoint_id,
-        config_type,
         last_used_at,
         last_seen_at,
         latency,

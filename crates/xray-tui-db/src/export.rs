@@ -9,7 +9,7 @@ EndpointEssentials, HostKind, ProtocolConfig, ProtocolKind,
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    ConfigType, EndpointId, ErrorInfo, HostType, Latency, ProfileErr, ProfileStats, ProtocolId,
+    EndpointId, ErrorInfo, HostType, Latency, ProfileErr, ProfileStats, ProtocolId,
     PurgeReason, TrafficStats,
 };
 use crate::{Database, endpoint_ip};
@@ -209,7 +209,7 @@ fn projection_sql(scope: ExportScope) -> String {
     format!(
         "SELECT e.host, e.host_type, e.port, e.ports, \
          pr.proto_kind, pr.transport_type, pr.security_type, pr.config, \
-         ps.protocol_id, ps.endpoint_id, ps.config_type, \
+         ps.protocol_id, ps.endpoint_id, \
          ps.last_used_at, ps.last_seen_at, ps.latency, ps.latency_delay, ps.latency_ip, \
          ps.speed_bps, ps.error, ps.error_kind, ps.error_text, ps.purge_reason, \
          ps.traffic_today_up, ps.traffic_today_down, ps.traffic_total_up, ps.traffic_total_down, \
@@ -244,22 +244,21 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         .map_err(|e| DatabaseError::Generic(format!("export protocol config: {e}")))?;
     let protocol_id = ProtocolId::new(integer(row, 8)?);
     let endpoint_id = EndpointId::new(integer(row, 9)?);
-    let config_type = config_type(&text(row, 10)?)?;
     let latency = match (
-        optional_text(row, 13)?.as_deref(),
-        optional_integer(row, 14)?.and_then(|value| i32::try_from(value).ok()),
+        optional_text(row, 12)?.as_deref(),
+        optional_integer(row, 13)?.and_then(|value| i32::try_from(value).ok()),
     ) {
         (Some("real"), Some(delay)) => Some(Latency::Real {
             delay,
-            ip: optional_text(row, 15)?,
+            ip: optional_text(row, 14)?,
         }),
         (Some("fast"), Some(delay)) => Some(Latency::Fast { delay }),
         _ => None,
     };
-    let error = match (optional_bool(row, 17)?, optional_text(row, 18)?) {
+    let error = match (optional_bool(row, 16)?, optional_text(row, 17)?) {
         (Some(true), Some(kind)) => Some(ErrorInfo {
             kind: profile_err(&kind)?,
-            text: optional_text(row, 19)?.unwrap_or_default(),
+            text: optional_text(row, 18)?.unwrap_or_default(),
         }),
         (Some(true), None) => {
             return Err(DatabaseError::Generic(
@@ -268,32 +267,31 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         }
         _ => None,
     };
-    let purge_reason = optional_text(row, 20)?
+    let purge_reason = optional_text(row, 19)?
         .map(|value| purge_reason(&value))
         .transpose()?;
     let link = ProfileStats {
         protocol_id,
         endpoint_id,
-        config_type,
-        last_used_at: optional_integer(row, 11)?,
-        last_seen_at: integer(row, 12)?,
+        last_used_at: optional_integer(row, 10)?,
+        last_seen_at: integer(row, 11)?,
         latency,
-        speed_bps: optional_integer(row, 16)?,
+        speed_bps: optional_integer(row, 15)?,
         error,
         purge_reason,
         traffic: TrafficStats {
-            today_up: integer(row, 21)?,
-            today_down: integer(row, 22)?,
-            total_up: integer(row, 23)?,
-            total_down: integer(row, 24)?,
+            today_up: integer(row, 20)?,
+            today_down: integer(row, 21)?,
+            total_up: integer(row, 22)?,
+            total_down: integer(row, 23)?,
         },
-        created_at: integer(row, 25)?,
-        updated_at: integer(row, 26)?,
-        version: u64::try_from(integer(row, 27)?).unwrap_or_default(),
+        created_at: integer(row, 24)?,
+        updated_at: integer(row, 25)?,
+        version: u64::try_from(integer(row, 26)?).unwrap_or_default(),
         protocol: toasty::Deferred::default(),
         endpoint: toasty::Deferred::default(),
     };
-    let ip_key = optional_blob(row, 28)?.unwrap_or_default();
+    let ip_key = optional_blob(row, 27)?.unwrap_or_default();
     let resolved_ip = endpoint_ip::ip_of(&ip_key);
     let endpoint = EndpointEssentials {
         host,
@@ -376,15 +374,6 @@ fn host_type(value: &str) -> Result<HostType> {
         other => Err(DatabaseError::Generic(format!("unknown host type {other}"))),
     }
 }
-fn config_type(value: &str) -> Result<ConfigType> {
-    match value {
-        "share_url" | "shareurl" => Ok(ConfigType::ShareUrl),
-        "form" => Ok(ConfigType::Form),
-        other => Err(DatabaseError::Generic(format!(
-            "unknown config type {other}"
-        ))),
-    }
-}
 fn profile_err(value: &str) -> Result<ProfileErr> {
     match value {
         "real" => Ok(ProfileErr::Real),
@@ -423,7 +412,7 @@ fn turso_error(error: turso::Error) -> DatabaseError {
 mod tests {
     use super::*;
     use crate::models_toasty::{
-        ConfigType, Endpoint, EndpointId, HostType, Protocol, Security, Transport,
+        Endpoint, EndpointId, HostType, Protocol, Security, Transport,
     };
     use tempfile::tempdir;
     use toasty::{Deferred, Json};
@@ -488,7 +477,6 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
         ProfileStats {
             protocol_id: ProtocolId::new(protocol_id),
             endpoint_id: EndpointId::new(endpoint_id),
-            config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: 1,
             latency,

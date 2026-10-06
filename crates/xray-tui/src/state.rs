@@ -14,12 +14,12 @@ use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
 use xray_tui_db::hash::stable_hash;
 use xray_tui_db::models::{
-    ConfigType, Endpoint, EndpointGroup, EndpointId, Group, HostType, ProfileStats, Protocol,
+Endpoint, EndpointGroup, EndpointId, Group, HostType, ProfileStats, Protocol,
     ProtocolId, PurgatoryView, RoutingRule, Security, TrafficStats, Transport,
 };
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
-    ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtoSpec, ProtocolConfig,
+EndpointEssentials, HostKind, ParsedProto, ProtoSpec, ProtocolConfig,
 };
 
 use crate::BackendUpdateStatus;
@@ -352,10 +352,6 @@ pub fn link_from_parsed_with_id(
     ProfileStats {
         protocol_id,
         endpoint_id,
-        config_type: match parsed.protocol.config_type {
-            ConfigKind::ShareUrl => ConfigType::ShareUrl,
-            ConfigKind::Form => ConfigType::Form,
-        },
         last_used_at: None,
         last_seen_at: now,
         latency: None,

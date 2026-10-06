@@ -43,7 +43,7 @@ pub use common::{
     HttpUpgradeConfig, RealityOpts, SecurityConfig, TlsConfig, TlsOpts, XHttpConfig, curve_id,
     parse_curve_names,
 };
-pub use endpoint::{ConfigKind, EndpointEssentials, HostKind, ParsedProto, ProtocolEssentials};
+pub use endpoint::{EndpointEssentials, HostKind, ParsedProto, ProtocolEssentials};
 pub use error::SupportError;
 pub use http_client::HttpClientConfig;
 pub use hysteria1::Hysteria1Config;
@@ -724,7 +724,6 @@ impl PlaceholderConfig {
             endpoints: vec![],
             protocol: ProtocolEssentials {
                 proto_kind,
-                config_type: ConfigKind::ShareUrl,
                 core_type: core_mapping::resolve_core(proto_kind, None, None),
                 config,
             },
@@ -818,7 +817,6 @@ mod tests {
         let parsed = redirect.try_parse_proto();
         assert!(parsed.endpoints.is_empty(), "orphan protocol: no endpoint");
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Redirect);
-        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
         assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         assert_eq!(
             parsed.protocol.config,
@@ -914,7 +912,6 @@ mod tests {
             endpoints: vec![],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Shadowsocks,
-                config_type: ConfigKind::ShareUrl,
                 core_type: CoreType::Xray,
                 config,
             },

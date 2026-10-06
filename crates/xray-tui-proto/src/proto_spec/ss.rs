@@ -61,7 +61,7 @@ use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
     ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashProxy, ClashSS};
@@ -174,7 +174,6 @@ impl SsConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind,
-                config_type: ConfigKind::ShareUrl,
                 core_type: core_mapping::resolve_core(proto_kind, None, Some(method)),
                 config: ProtocolConfig::Ss(config),
             },
@@ -277,7 +276,6 @@ impl SsConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind,
-                        config_type: ConfigKind::ShareUrl,
                         core_type: core_mapping::resolve_core(proto_kind, None, Some(&c.cipher)),
                         config: ProtocolConfig::Ss(config),
                     },
@@ -613,7 +611,7 @@ mod tests {
     use base64::Engine as _;
 
     use super::super::{
-        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+        CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
         SecurityConfig, TlsConfig, TlsOpts,
     };
     use super::SsConfig;
@@ -675,7 +673,6 @@ mod tests {
         assert_eq!(ep.ports, vec![8080]);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Shadowsocks);
-        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let cfg = config(parsed);
         assert_eq!(cfg.method, "aes-256-gcm");

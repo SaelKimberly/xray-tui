@@ -415,7 +415,6 @@ pub(crate) const PROFILES_PAGE_SIZE: usize = 200;
 /// Map the UI sort column onto the query's sort enum.
 pub(crate) const fn page_sort(column: SortColumn) -> PageSort {
     match column {
-        SortColumn::ConfigType => PageSort::ConfigType,
         SortColumn::Address => PageSort::Address,
         SortColumn::Port => PageSort::Port,
         SortColumn::Test => PageSort::Test,
@@ -1261,7 +1260,7 @@ pub(crate) mod test_support {
     use toasty::Deferred;
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{
-        ConfigType, Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId,
+        Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId,
         TrafficStats,
     };
 
@@ -1290,7 +1289,6 @@ pub(crate) mod test_support {
             .map(|i| ProfileStats {
                 protocol_id: ProtocolId::new(id * 100 + i as i64),
                 endpoint_id: EndpointId::new(id),
-                config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: ts(0),
                 latency: None,
@@ -1676,11 +1674,10 @@ mod edit_tests {
         let endpoint = super::test_support::fake_row(42, "never-seen.example", 1).endpoint;
         let protocol = super::xray_tui_db_helper::vless_protocol(4200);
         let link = {
-            use xray_tui_db::models::{ConfigType, ProfileStats, TrafficStats};
+            use xray_tui_db::models::{ProfileStats, TrafficStats};
             ProfileStats {
                 protocol_id: protocol.id,
                 endpoint_id: endpoint.id,
-                config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: super::test_support::ts(0),
                 latency: None,
@@ -2014,7 +2011,6 @@ mod sort_tests {
         assert_eq!(page_sort(SortColumn::LastSeen), PageSort::LastSeen);
         assert_eq!(page_sort(SortColumn::Speed), PageSort::Speed);
         assert_eq!(page_sort(SortColumn::Traffic), PageSort::Traffic);
-        assert_eq!(page_sort(SortColumn::ConfigType), PageSort::ConfigType);
     }
 
     /// Changing the sort restarts from the first page: a page offset from the

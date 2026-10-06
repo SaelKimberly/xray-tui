@@ -20,7 +20,7 @@ use toasty_core::driver::operation::TransactionMode;
 use toasty_core::stmt::Value;
 
 use crate::models_toasty::{
-    ConfigType, Endpoint, EndpointId, EndpointRank, EndpointRow, HostType, Latency, ProfileErr,
+    Endpoint, EndpointId, EndpointRank, EndpointRow, HostType, Latency, ProfileErr,
     ProfileStats, Protocol, ProtocolId,
 };
 use xray_tui_proto::proto_spec::{
@@ -35,7 +35,6 @@ pub const NO_SEEN: i64 = i64::MIN;
 /// `COALESCE(<speed>, -1)`.
 pub const NO_SPEED: i64 = -1;
 /// Sentinel for "unknown config type", matching the retired `COALESCE(…, 2)`.
-pub const CONFIG_OTHER: i64 = 2;
 
 /// Process-wide Active-view TTL (seconds). `band` is materialized against
 /// `now − this` at write and sweep time, so the DB layer needs the same ttl
@@ -63,7 +62,6 @@ pub struct RankLink {
     pub seen_secs: i64,
     pub speed: Option<i64>,
     pub traffic: i64,
-    pub config: ConfigType,
     /// The link carries a purge verdict (spec `2026-09-17-purge-reason`). It can
     /// no longer represent the endpoint while a live link exists.
     pub purged: bool,
@@ -107,7 +105,6 @@ impl RankLink {
                 .traffic
                 .total_up
                 .saturating_add(link.traffic.total_down),
-            config: link.config_type,
             purged: link.purge_reason.is_some(),
             weight,
         }
@@ -226,13 +223,6 @@ pub fn display_link_index(links: &[RankLink], override_protocol: Option<i64>) ->
         .map(|(i, _, _, _)| i)
 }
 
-const fn config_rank(config: ConfigType) -> i64 {
-    match config {
-        ConfigType::Form => 0,
-        ConfigType::ShareUrl => 1,
-    }
-}
-
 /// A rank row plus the one key that is NOT a model field.
 ///
 /// `rank_weight` is a RAW column (added with `ALTER TABLE ADD COLUMN` beside
@@ -327,7 +317,6 @@ pub fn compute_rank(
             display_seen: display.map_or(NO_SEEN, |l| l.seen_secs),
             speed: display.map_or(NO_SPEED, |l| l.speed.unwrap_or(NO_SPEED)),
             traffic: display.map_or(0, |l| l.traffic),
-            config: display.map_or(CONFIG_OTHER, |l| config_rank(l.config)),
             newest_seen,
         },
         weight,
@@ -391,7 +380,7 @@ const RANK_CHUNK: usize = 400;
 /// into a comparison.
 const RANK_COLUMNS: &str = "endpoint_id, rank_dns, rank_tier, rank_weight, \
      rank_latency, rank_seen, rank_protocol, rank_display_seen, rank_speed, \
-     rank_traffic, rank_config, rank_newest_seen";
+     rank_traffic, rank_newest_seen";
 
 /// The weight column: an 8-byte big-endian blob, `NOT NULL` so an un-refreshed
 /// row is still a legal ordering term.
@@ -600,7 +589,7 @@ pub(crate) async fn write(
             .map(|row| {
                 let r = &row.rank;
                 format!(
-                    "({},{},{},{},{},{},{},{},{},{},{},{})",
+                    "({},{},{},{},{},{},{},{},{},{},{})",
                     r.endpoint_id.get(),
                     r.dns,
                     r.tier,
@@ -611,7 +600,6 @@ pub(crate) async fn write(
                     r.display_seen,
                     r.speed,
                     r.traffic,
-                    r.config,
                     r.newest_seen
                 )
             })
@@ -909,7 +897,7 @@ pub(crate) async fn refresh(
     let rows = toasty::sql::query(format!(
         "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, ps.latency, ps.latency_delay, \
          ps.last_seen_at, ps.speed_bps, ps.traffic_total_up, ps.traffic_total_down, \
-         ps.config_type, ps.purge_reason, \
+         ps.purge_reason, \
          pr.transport_type, pr.security_type, pr.security_sni, pr.security_fp \
          FROM profile_stats ps LEFT JOIN protocols pr ON pr.id = ps.protocol_id \
          WHERE ps.endpoint_id IN ({id_list})"
@@ -941,21 +929,17 @@ pub(crate) async fn refresh(
             speed: field(6).and_then(as_i64),
             traffic: field(7).and_then(as_i64).unwrap_or(0)
                 + field(8).and_then(as_i64).unwrap_or(0),
-            config: match field(9).and_then(as_text).as_deref() {
-                Some("form") => ConfigType::Form,
-                _ => ConfigType::ShareUrl,
-            },
             // A NULL column is a live link; any stored spelling is a verdict
             // (the value itself is the page's business, not the rank law's).
-            purged: field(10).and_then(as_text).is_some(),
+            purged: field(9).and_then(as_text).is_some(),
             // A link whose protocol row is absent (the join is LEFT) has no
             // known stack, so it sorts as "worst" — the same value an
             // un-refreshed endpoint carries, never a silent average.
             weight: weight_from_discriminators(
+                field(10).and_then(as_text).as_deref(),
                 field(11).and_then(as_text).as_deref(),
                 field(12).and_then(as_text).as_deref(),
                 field(13).and_then(as_text).as_deref(),
-                field(14).and_then(as_text).as_deref(),
             ),
         });
     }
@@ -1048,7 +1032,6 @@ mod tests {
             seen_secs: seen,
             speed: None,
             traffic: 0,
-            config: ConfigType::ShareUrl,
             purged: false,
             weight: ZERO_WEIGHT,
         }

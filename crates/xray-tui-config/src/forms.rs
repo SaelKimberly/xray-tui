@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 use xray_tui_proto::proto_spec::common::{GrpcConfig, TransportConfig, WebSocketConfig};
 use xray_tui_proto::proto_spec::core_mapping;
 use xray_tui_proto::proto_spec::{
-    AnyTlsConfig, ConfigKind, EndpointEssentials, HostKind, HttpClientConfig, Hysteria1Config,
+    AnyTlsConfig, EndpointEssentials, HostKind, HttpClientConfig, Hysteria1Config,
     Hysteria2Config, NaiveConfig, ParsedProto, PlaceholderConfig, PluginSpec, ProtocolConfig,
     ProtocolEssentials, ProtocolKind, SecurityConfig, ShadowTlsConfig, Socks5Config, SsConfig,
     SshConfig, SsrConfig, TailscaleConfig, TlsConfig, TlsOpts, TorConfig, TrojanConfig, TuicConfig,
@@ -1372,7 +1372,6 @@ pub fn build_typed_config(
                 endpoints: vec![endpoint_from(address, port)],
                 protocol: ProtocolEssentials {
                     proto_kind: kind,
-                    config_type: ConfigKind::Form,
                     core_type: core_mapping::resolve_core(kind, None, Some(cfg.method.as_str())),
                     config: ProtocolConfig::Ss(cfg),
                 },
@@ -1427,7 +1426,6 @@ pub fn build_typed_config(
         endpoints: vec![endpoint],
         protocol: ProtocolEssentials {
             proto_kind,
-            config_type: ConfigKind::Form,
             core_type: core_mapping::resolve_core(proto_kind, None, None),
             config,
         },
@@ -1706,7 +1704,6 @@ fn placeholder_parsed(
         endpoints: vec![endpoint_from(address, port)],
         protocol: ProtocolEssentials {
             proto_kind,
-            config_type: ConfigKind::Form,
             core_type: core_mapping::resolve_core(proto_kind, None, None),
             config,
         },
@@ -2610,7 +2607,6 @@ mod tests {
             ]),
         );
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Vless);
-        assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let ProtocolConfig::Vless(c) = &parsed.protocol.config else {
             panic!("expected Vless config");
@@ -3321,7 +3317,6 @@ mod tests {
             let raw = producer_settings(&[("network", "tcp"), ("doko_address", "10.0.0.1")]);
             let parsed = built(kind, &raw);
             assert_eq!(parsed.protocol.proto_kind, kind);
-            assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
             let ProtocolConfig::Mixed(p) = &parsed.protocol.config else {
                 panic!("{kind:?} must be a Mixed placeholder");
             };
@@ -3345,7 +3340,6 @@ mod tests {
             let raw = producer_settings(&[]);
             let parsed = built(kind, &raw);
             assert_eq!(parsed.protocol.proto_kind, kind);
-            assert_eq!(parsed.protocol.config_type, ConfigKind::Form);
             let config = &parsed.protocol.config;
             let variant = match config {
                 ProtocolConfig::Redirect(_) => "Redirect",

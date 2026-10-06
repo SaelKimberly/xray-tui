@@ -246,7 +246,7 @@ pub fn default_export_path(scope: ExportScope) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use xray_tui_db::models::{ConfigType, EndpointId, ProfileStats, ProtocolId};
+    use xray_tui_db::models::{EndpointId, ProfileStats, ProtocolId};
     use xray_tui_proto::proto_spec::{
         EndpointEssentials, PlaceholderConfig, ProtocolConfig, ProtocolKind,
     };
@@ -274,7 +274,6 @@ mod tests {
             link: ProfileStats {
                 protocol_id: ProtocolId::new(1),
                 endpoint_id: EndpointId::new(1),
-                config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: 0,
                 latency: None,

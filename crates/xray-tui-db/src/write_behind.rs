@@ -1475,7 +1475,7 @@ mod tests {
 
     use super::{SourceBatch, SourceSpec};
     use crate::models_toasty::{
-        ConfigType, Endpoint, HostType, ProfileStats, Protocol, ProtocolId, Security, TrafficStats,
+        Endpoint, HostType, ProfileStats, Protocol, ProtocolId, Security, TrafficStats,
         Transport,
     };
     use toasty::{Deferred, Json};
@@ -1538,7 +1538,6 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         ProfileStats {
             protocol_id: ProtocolId::new(1),
             endpoint_id: EndpointId::new(endpoint_id),
-            config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: 0,
             latency: None,

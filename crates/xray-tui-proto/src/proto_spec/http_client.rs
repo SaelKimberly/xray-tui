@@ -40,7 +40,7 @@ use super::core_mapping;
 use super::identity::IdentityWriter;
 use super::utils;
 use super::{
-    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
     ParsedProto, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind, SupportError,
 };
 use crate::clash::{ClashHttp, ClashProxy};
@@ -150,7 +150,6 @@ impl HttpClientConfig {
             endpoints: vec![endpoint],
             protocol: ProtocolEssentials {
                 proto_kind: ProtocolKind::Http,
-                config_type: ConfigKind::ShareUrl,
                 core_type: core_mapping::resolve_core(ProtocolKind::Http, None, None),
                 config: ProtocolConfig::Http(config),
             },
@@ -257,7 +256,6 @@ impl HttpClientConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Http,
-                        config_type: ConfigKind::ShareUrl,
                         core_type: core_mapping::resolve_core(ProtocolKind::Http, None, None),
                         config: ProtocolConfig::Http(config),
                     },
@@ -464,7 +462,7 @@ impl HttpClientConfig {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ConfigKind, CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
+        CoreType, HostKind, ParsedProto, ProtoSpec, ProtocolConfig, ProtocolKind,
     };
     use super::HttpClientConfig;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -522,7 +520,6 @@ mod tests {
         assert_eq!(ep.port, 8080);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Http);
-        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
         assert_eq!(parsed.protocol.core_type, CoreType::Xray);
         let cfg = config(parsed);
         assert_eq!(cfg.username.as_deref(), Some("user"));

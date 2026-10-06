@@ -108,7 +108,7 @@ impl LinkGroups {
     ///
     /// Every group can change a STORED ORDERING KEY — the rank columns derive
     /// from a link's `error`/`latency`/`last_seen_at`/`speed_bps`/`traffic`/
-    /// `config_type`/`purge_reason` — so every patch refreshes its endpoint's
+    /// `purge_reason` — so every patch refreshes its endpoint's
     /// keys. (The scheduler's task state used to be a third group; it is
     /// runtime-only now and never reaches this table.)
     pub const ALL: Self = Self(0b111);
@@ -537,7 +537,7 @@ const LINK_COMPARE_KEYS: &str = "protocol_id, endpoint_id";
 /// appends its tuples and then the `ON CONFLICT` action. The column order IS
 /// the order [`link_values_sql`] emits.
 const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, \
-     config_type, last_used_at, last_seen_at, latency, latency_delay, latency_ip, speed_bps, \
+     last_used_at, last_seen_at, latency, latency_delay, latency_ip, speed_bps, \
      error, error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
      traffic_total_up, traffic_total_down, created_at, updated_at, version) VALUES ";
 
@@ -552,10 +552,9 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
     let mut sql = String::with_capacity(160);
     let _ = write!(
         sql,
-        "({}, {}, '{}', NULL, {}, ",
+        "({}, {}, NULL, {}, ",
         link.protocol_id.get(),
         link.endpoint_id.get(),
-        config_type_str(link.config_type),
         link.last_seen_at
     );
     match &link.latency {
@@ -651,7 +650,6 @@ fn link_patch_conflict_sql(has_result: bool, has_traffic: bool, has_purge: bool)
 /// every fast latency it had just written). `last_used_at` is likewise never
 /// touched here (its owner is [`Database::update_last_used`]).
 const LINK_SOURCE_CONFLICT_SQL: &str = " ON CONFLICT(protocol_id, endpoint_id) DO UPDATE SET \
-     config_type = excluded.config_type, \
      last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at";
 
 /// One multi-row upsert statement for a set of rows whose conflict action is
@@ -703,14 +701,6 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
         PurgeReason::ConfigInvalid => "config_invalid",
         PurgeReason::TransportRejected => "transport_rejected",
         PurgeReason::OriginUnreachable => "origin_unreachable",
-    }
-}
-
-/// The `CHECK`-constrained storage text of a [`ConfigType`] column value.
-const fn config_type_str(config: crate::models_toasty::ConfigType) -> &'static str {
-    match config {
-        crate::models_toasty::ConfigType::ShareUrl => "share_url",
-        crate::models_toasty::ConfigType::Form => "form",
     }
 }
 
@@ -1060,7 +1050,7 @@ impl Database {
     /// `(protocol_id, endpoint_id)`.
     ///
     /// Replaces the link's source- and result-state fields (`core_type`,
-    /// `config_type`, `last_seen_at`, `latency`, `speed_bps`, `error`,
+    /// `last_seen_at`, `latency`, `speed_bps`, `error`,
     /// `traffic`). The activity timestamp (`last_used_at`) is owned by
     /// [`Self::update_last_used`] and is preserved on update.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
@@ -1077,7 +1067,6 @@ impl Database {
                         link.protocol_id,
                         link.endpoint_id,
                     )
-                    .config_type(link.config_type)
                     .last_seen_at(link.last_seen_at)
                     .latency(link.latency.clone())
                     .speed_bps(link.speed_bps)
@@ -1901,7 +1890,7 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
 /// columns.
 ///
 /// Empty slice is a no-op. An **update** writes identity/config provenance only
-/// (`core_type`, `config_type`, `last_seen_at`, `updated_at`); the RESULT
+/// (`last_seen_at`, `updated_at`); the RESULT
 /// columns (`latency*`, `speed_bps`, `error*`) and the TRAFFIC counters are
 /// written **on create only** (they ride the `VALUES` tuple, which a conflicting
 /// row's `DO UPDATE` never reads). The caller's snapshot comes from a fresh
@@ -2001,7 +1990,7 @@ mod tests {
     use super::*;
     use crate::is_busy_error;
     use crate::models_toasty::HostType;
-    use crate::models_toasty::{ConfigType, Latency, Security, TrafficStats, Transport};
+    use crate::models_toasty::{Latency, Security, TrafficStats, Transport};
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
@@ -2396,7 +2385,6 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
             updated_at: 0,
             protocol_id: ProtocolId::new(protocol_id),
             endpoint_id: EndpointId::new(endpoint_id),
-            config_type: ConfigType::ShareUrl,
             last_seen_at: ts(last_seen),
             traffic: zero_traffic(),
         })
@@ -2579,7 +2567,6 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
                 updated_at: 0,
                 protocol_id: ProtocolId::new(pid),
                 endpoint_id: EndpointId::new(1),
-                config_type: ConfigType::ShareUrl,
                 last_seen_at: ts(last_seen),
                 latency: Some(Latency::Real {
                     delay: 10,
@@ -2995,7 +2982,6 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         ProfileStats {
             protocol_id: ProtocolId::new(protocol_id),
             endpoint_id: EndpointId::new(endpoint_id),
-            config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(last_seen),
             latency: None,
@@ -3108,10 +3094,9 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         db.upsert_link(&probed).await.expect("probed link");
 
         // A subscription refresh re-persists the link from a fresh parse: its
-        // snapshot carries no measurement and zeroed counters, and one SOURCE
-        // column (the config type) genuinely changed.
-        let mut fresh = link_struct(1001, 1, 200);
-        fresh.config_type = ConfigType::Form;
+        // snapshot carries no measurement and zeroed counters. The refresh only
+        // touches `last_seen_at` among the SOURCE columns now.
+        let fresh = link_struct(1001, 1, 200);
         let mut tx = conn.transaction().await.expect("tx");
         upsert_links_bulk(&mut tx, std::slice::from_ref(&fresh))
             .await
@@ -3147,11 +3132,6 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
             "traffic counters survive an import refresh"
         );
         assert_eq!(stored.last_seen_at, ts(200), "source column updates");
-        assert_eq!(
-            stored.config_type,
-            ConfigType::Form,
-            "the config type still updates on a source refresh"
-        );
     }
 
     #[tokio::test]

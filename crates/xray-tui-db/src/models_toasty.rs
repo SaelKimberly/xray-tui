@@ -139,13 +139,6 @@ impl HostType {
     }
 }
 
-/// How a protocol row was configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
-pub enum ConfigType {
-    ShareUrl,
-    Form,
-}
-
 /// Kind of latency/ping task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, toasty::Embed)]
 pub enum TaskKind {
@@ -375,7 +368,6 @@ pub struct ProfileStats {
     pub protocol_id: ProtocolId,
     #[index]
     pub endpoint_id: EndpointId,
-    pub config_type: ConfigType,
     pub last_used_at: Option<i64>, // epoch seconds
     /// Per-link staleness tracking (epoch seconds). Indexed: the retention
     /// purge's cutoff and the staleness windows scan on it.
@@ -537,9 +529,6 @@ pub struct EndpointRank {
     /// Display link's total traffic (up + down), 0 when none.
     #[column("rank_traffic")]
     pub traffic: i64,
-    /// Display link's config-type rank (`form` 0, `share_url` 1, other 2).
-    #[column("rank_config")]
-    pub config: i64,
     /// Newest `last_seen_at` across the endpoint's links (epoch seconds): the
     /// view windows ask whether any link falls in the band, which is the same
     /// question as whether the newest one does — and reading it here keeps the
@@ -768,7 +757,6 @@ mod tests {
             row.links.push(ProfileStats {
                 protocol_id: ProtocolId::new(*pid),
                 endpoint_id: EndpointId::new(1),
-                config_type: ConfigType::ShareUrl,
                 last_used_at: None,
                 last_seen_at: *last_seen,
                 latency: latency.clone(),

@@ -44,12 +44,14 @@ use smallvec::SmallVec;
 /// Identity format version, written first into both streams. A bump is a
 /// deliberate, global re-key.
 ///
-/// **2** — the SIP003 plugin field became a typed, lossless `PluginSpec`: the
-/// `plugin` + `plugin_opts` pair is replaced by per-field writes, so every
-/// stored uid changes and the schema tag moves with it (`SCHEMA_VERSION` 13 →
-/// 14, which recreates the database — the accepted pre-alpha cost,
-/// `AGENTS.md` decision 4/11).
-pub const IDENTITY_VERSION: u8 = 2;
+/// **3** — the `config_type` (`ShareUrl` vs `Form`) discriminator left the
+/// identity (db-rewamp D9): the origin of a config does not change what it is,
+/// so a form config and an identical share URL now share one `Protocol` row.
+/// Every stored uid changes, so the schema tag moves with it (a wipe, the
+/// accepted pre-alpha cost, `AGENTS.md` decision 4/11).
+///
+/// **2** — the SIP003 plugin field became a typed, lossless `PluginSpec`.
+pub const IDENTITY_VERSION: u8 = 3;
 
 /// Domain separator for the credential stream: credential bytes are hashed
 /// with a different prefix than sig bytes, so a byte slice moved between the
@@ -60,7 +62,7 @@ const CRED_DOMAIN: &[u8] = b"\x00cred\x00";
 /// Reserved tags for shared structural fields (never used by per-kind fields).
 pub mod tag {
     pub const PROTO_KIND: u8 = 0x01;
-    pub const CONFIG_TYPE: u8 = 0x02;
+    // 0x02 was CONFIG_TYPE, dropped with IDENTITY_VERSION 3 (db-rewamp D9).
     pub const CORE_TYPE: u8 = 0x03;
 
     // ── SecurityConfig ──

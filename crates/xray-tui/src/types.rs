@@ -226,7 +226,6 @@ impl Tab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
-    ConfigType,
     Address,
     Port,
     Test,

@@ -49,13 +49,6 @@ impl EndpointEssentials {
     }
 }
 
-/// Where a profile's configuration came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ConfigKind {
-    ShareUrl,
-    Form,
-}
-
 /// The parse-boundary protocol identity: kind, config shape, core, and the
 /// exact serializable protocol definition (sans host/port).
 ///
@@ -70,7 +63,6 @@ pub enum ConfigKind {
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct ProtocolEssentials {
     pub proto_kind: ProtocolKind,
-    pub config_type: ConfigKind,
     pub core_type: CoreType,
     /// The exact serializable protocol definition (config struct sans
     /// host/port). This is the identity-hashed payload.
@@ -92,18 +84,11 @@ impl ProtocolEssentials {
     ///
     /// `proto_kind` is load-bearing beyond the config enum: `Redirect`, `TProxy`
     /// and `Mixed` share one `PlaceholderConfig` type, so the variant is only
-    /// distinguishable here. `config_type` (`ShareUrl` vs `Form`) and `core_type`
-    /// are part of the legacy identity too and stay in — dropping them is a
-    /// deliberate future re-key, not an accident.
+    /// distinguishable here. `core_type` stays in the identity for now.
+    /// `config_type` (`ShareUrl` vs `Form`) was dropped (db-rewamp D9): the
+    /// origin of a config does not change what it is.
     pub(crate) fn write_identity(&self, w: &mut IdentityWriter) {
         w.str(tag::PROTO_KIND, self.proto_kind.as_str());
-        w.str(
-            tag::CONFIG_TYPE,
-            match self.config_type {
-                ConfigKind::ShareUrl => "share_url",
-                ConfigKind::Form => "form",
-            },
-        );
         w.str(tag::CORE_TYPE, self.core_type.as_str());
         self.config.write_identity(w);
     }
@@ -179,7 +164,6 @@ mod tests {
     fn proto(kind: ProtocolKind, config: ProtocolConfig) -> ProtocolEssentials {
         ProtocolEssentials {
             proto_kind: kind,
-            config_type: ConfigKind::ShareUrl,
             core_type: CoreType::Xray,
             config,
         }
@@ -479,10 +463,6 @@ mod tests {
     fn parse_boundary_discriminators_are_in_identity() {
         let config = || config_from(VLESS_WS_URL);
         let base = parsed(vec![], proto(ProtocolKind::Vless, config()));
-        let mut form = base.protocol.clone();
-        form.config_type = ConfigKind::Form;
-        let form = parsed(vec![], form);
-        assert_ne!(base.uid(), form.uid(), "config_type is part of identity");
 
         let mut singbox = base.protocol.clone();
         singbox.core_type = CoreType::SingBox;
@@ -637,153 +617,153 @@ mod tests {
                 // rides the same unshipped re-key as the plugin field — HEAD is
                 // `IDENTITY_VERSION` 1 / `SCHEMA_VERSION` 13, so no second reset.
                 "vless-ws-mux",
-                6_100_996_762_037_578_388,
-                -2_881_299_096_322_983_884,
-                -8_311_241_895_891_348_832,
+                5437349299491384277,
+                7237829249111972841,
+                3388034286164078652,
             ),
             (
                 "vless-ws-tls",
-                -2_987_501_478_761_108_211,
-                -8_648_203_761_523_865_159,
-                5_868_519_360_654_550_196,
+                -4160182401465950656,
+                9038095373623525140,
+                -4960200424530108076,
             ),
             (
                 "vless-reality",
-                7_586_882_427_335_041_889,
-                -2_881_299_096_322_983_884,
-                -5_671_838_556_340_429_995,
+                -5370045905108754040,
+                7237829249111972841,
+                -3384405737303967135,
             ),
             (
                 "vmess-ws-tls",
-                -6_621_712_334_016_049_155,
-                -5_682_137_933_843_125_753,
-                1_530_676_388_030_621_178,
+                3755779837625638772,
+                4711179184087460576,
+                8466289410407626132,
             ),
             (
                 "trojan-ws-tls",
-                1_110_930_071_339_878_723,
-                2_217_139_339_919_472_518,
-                1_273_970_553_739_476_677,
+                -6243832246565909625,
+                8846474750042557826,
+                -3198243698111379963,
             ),
             (
                 "shadowsocks",
-                -4_223_963_570_859_138_411,
-                3_712_452_513_656_381_612,
-                -656_346_425_419_988_423,
+                -4695531493070296767,
+                7259515508699914486,
+                -2708664381270537801,
             ),
             (
                 "shadowsocks-obfs-tls",
-                -1_493_242_037_559_569_978,
-                -6_283_624_933_558_780_081,
-                4_866_953_231_380_786_825,
+                6853842879246446139,
+                -4197501671529492512,
+                -7304056082489187877,
             ),
             (
                 "shadowsocks-v2ray-ws-tls",
-                -4_393_811_348_014_923_786,
-                -6_283_624_933_558_780_081,
-                7_767_055_354_605_437_113,
+                8639150827753531647,
+                -4197501671529492512,
+                -5594852136968706273,
             ),
             (
                 "shadowsocks-2022",
-                -5_052_182_658_192_366_269,
-                -731_170_168_199_595_435,
-                5_492_516_022_430_179_094,
+                6238586135178953044,
+                -1909586701634914587,
+                -5481971416994056271,
             ),
             (
                 "ssr",
-                3_732_417_951_653_507_641,
-                -7_455_351_073_667_229_630,
-                -6_105_346_276_144_584_069,
+                -7867750124614314782,
+                3784699572302144416,
+                -6461021939863357630,
             ),
             (
                 "socks5",
-                2_148_343_094_798_232_189,
-                3_769_031_800_111_600_542,
-                2_998_896_912_806_001_123,
+                -7562594893736803364,
+                -424673764407062844,
+                7860757675300375832,
             ),
             (
                 "http",
-                703_668_104_136_773_639,
-                -2_160_453_482_225_164_808,
-                -1_457_080_055_863_783_937,
+                -5973881477475438080,
+                -8559188781230601923,
+                2607343754494327613,
             ),
             (
                 "naive",
-                -8_197_153_169_158_428_550,
-                -396_819_802_707_063_948,
-                8_377_797_990_724_018_958,
+                173886074361586563,
+                -3188151586708707941,
+                -3339228424503523816,
             ),
             (
                 "anytls",
-                -618_035_370_469_477_871,
-                -6_595_596_079_923_051_150,
-                5_988_644_379_708_913_507,
+                5799290887954844030,
+                4910103980576211782,
+                1467902827296672312,
             ),
             (
                 "shadowtls",
-                5_400_691_160_941_814_834,
-                -9_152_733_024_816_515_344,
-                -3_888_314_906_649_013_566,
+                -9188312548884254956,
+                -5235536646410682589,
+                3975320864426807351,
             ),
             (
                 "hysteria2",
-                -8_320_861_569_228_382_501,
-                8_951_996_896_343_825_614,
-                -1_099_514_091_878_727_147,
+                -4216711160721665791,
+                -9009215055611302259,
+                5153223161439682444,
             ),
             (
                 "hysteria1",
-                4_544_686_737_536_129_086,
+                9119102330889832543,
                 0,
-                4_544_686_737_536_129_086,
+                9119102330889832543,
             ),
             (
                 "tuic",
-                4_994_625_897_588_583_353,
-                5_293_549_237_599_699_230,
-                875_403_905_386_703_527,
+                5129408308793111597,
+                -7508355781878442882,
+                -3394685403026005933,
             ),
             (
                 "wireguard",
-                4_777_282_356_650_029_985,
-                -4_262_256_458_443_101_561,
-                -8_749_019_994_362_226_394,
+                -7515075866274409979,
+                5577658325956710591,
+                -2678862349368294726,
             ),
             (
                 "tor",
-                5_032_754_759_538_517_879,
+                -7833141363582691002,
                 0,
-                5_032_754_759_538_517_879,
+                -7833141363582691002,
             ),
             (
                 "ssh",
-                -3_882_198_215_788_675_992,
-                1_963_920_763_125_183_063,
-                -3_360_082_460_509_106_625,
+                -6521917483108332113,
+                8087748422698527689,
+                -3080450271763962266,
             ),
             (
                 "tailscale",
-                -6_293_511_426_757_686_755,
-                4_272_073_220_656_860_472,
-                -7_790_797_145_228_376_283,
+                -4230922949655668576,
+                -4841268782563381559,
+                8762006302573917801,
             ),
             (
                 "redirect",
-                1_481_944_893_350_502_286,
+                226407323748179428,
                 0,
-                1_481_944_893_350_502_286,
+                226407323748179428,
             ),
             (
                 "tproxy",
-                7_624_819_788_728_944_176,
+                -2967083918553066919,
                 0,
-                7_624_819_788_728_944_176,
+                -2967083918553066919,
             ),
             (
                 "mixed",
-                -5_934_232_811_321_823_966,
+                -8517797057979171685,
                 0,
-                -5_934_232_811_321_823_966,
+                -8517797057979171685,
             ),
         ];
         let goldens = identity_goldens();

@@ -796,7 +796,6 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                 SortColumn::Test,
                 SortColumn::Speed,
                 SortColumn::Traffic,
-                SortColumn::ConfigType,
                 SortColumn::LastSeen,
                 SortColumn::Ip,
             ];

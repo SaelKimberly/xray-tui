@@ -26,7 +26,7 @@ use crate::proto_spec::common::SecurityConfig;
 use crate::proto_spec::common::clash_to_endpoint;
 use crate::proto_spec::core_mapping;
 use crate::proto_spec::{
-    ConfigKind, CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
+    CoreType, EndpointEssentials, InjectOptions, InjectToCoreConf, ParseError,
     ParsedProto, ProtoIdentity, ProtoSpec, ProtocolConfig, ProtocolEssentials, ProtocolKind,
     SupportError,
 };
@@ -101,7 +101,6 @@ impl TorConfig {
                     endpoints: vec![clash_to_endpoint(&c.server, c.port)],
                     protocol: ProtocolEssentials {
                         proto_kind: ProtocolKind::Tor,
-                        config_type: ConfigKind::ShareUrl,
                         core_type: core_mapping::resolve_core(ProtocolKind::Tor, None, None),
                         config: ProtocolConfig::Tor(config),
                     },
@@ -241,7 +240,7 @@ impl InjectToCoreConf for TorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ConfigKind, CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
+    use super::super::{CoreType, HostKind, ProtoSpec, ProtocolConfig, ProtocolKind};
     use super::TorConfig;
     use crate::proto_spec::common::SecurityConfig;
     use crate::urlx::{RawUrlX, SchemeX};
@@ -270,7 +269,6 @@ mod tests {
         assert_eq!(parsed.endpoints[0].port, 9050);
 
         assert_eq!(parsed.protocol.proto_kind, ProtocolKind::Tor);
-        assert_eq!(parsed.protocol.config_type, ConfigKind::ShareUrl);
         assert_eq!(parsed.protocol.core_type, CoreType::SingBox);
         let cfg = match &parsed.protocol.config {
             ProtocolConfig::Tor(c) => c,

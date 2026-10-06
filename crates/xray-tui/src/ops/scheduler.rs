@@ -436,7 +436,7 @@ mod tests {
 
     use toasty::Deferred;
     use xray_tui_db::models::{
-        ConfigType, EndpointId, ProfileStats, ProtocolId, TaskKind, TrafficStats,
+        EndpointId, ProfileStats, ProtocolId, TaskKind, TrafficStats,
     };
 
     use super::MIN_DNS_DEFER_SECS;
@@ -452,7 +452,6 @@ mod tests {
         ProfileStats {
             protocol_id: ProtocolId::new(pid),
             endpoint_id: EndpointId::new(eid),
-            config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(0),
             latency: None,

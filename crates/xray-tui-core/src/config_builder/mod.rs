@@ -219,7 +219,7 @@ pub fn build_multi(
 mod tests {
     use super::*;
     use toasty::{Deferred, Json};
-    use xray_tui_db::models::{ConfigType, TrafficStats, Transport};
+    use xray_tui_db::models::{TrafficStats, Transport};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
         CoreType as ProtoCoreType, ProtocolKind, SecurityConfig, SecurityType, TransportType,
@@ -293,7 +293,6 @@ mod tests {
         ProfileStats {
             protocol_id: xray_tui_db::models::ProtocolId::new(1),
             endpoint_id: xray_tui_db::models::EndpointId::new(1),
-            config_type: ConfigType::ShareUrl,
             last_used_at: None,
             last_seen_at: ts(0),
             latency: None,
