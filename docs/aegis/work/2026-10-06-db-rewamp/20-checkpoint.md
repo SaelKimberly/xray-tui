@@ -40,6 +40,18 @@ and the DNS-predicate readers migrated onto them (`ui/profiles` ×3, `ops/ping`,
 reverted this turn. Measured remaining shape after the model change
 (`Endpoint`: drop `host`/`host_type`, add `domain`/`sub_domain`):
 
+**The crux (why this is a multi-file, multi-session change):**
+`endpoint_essentials(e: &Endpoint)` (config_builder/mod.rs:64, and a copy in
+`ops/native_connect.rs:188`) builds the dial host from `e.host`. Once `host` is
+gone, an IP host's literal lives only in `endpoint_ip`, so the function must take
+the ADDRESSES: `endpoint_essentials(e, &[IpAddr])`, using `e.dns_name()` for a
+DNS host and `addresses[0]` for an IP host. That cascades through its five
+callers — `build_proxy_outbound` (xray.rs:296, singbox.rs:221), `build`
+(connect.rs:418), `run_native_session`/`NativeConnectParams.server`
+(native_connect.rs:85), `ping_native.rs:224`, `ui/mod.rs:927` — each of which
+must be handed the endpoint's addresses (available as `EndpointRow::resolved_ips`
+at the page/connect layer, but the `&Endpoint`-only signatures must change).
+
 - `dns_unresolved_endpoint(host_type, has_address)` → `(domain: &str, has_address)`
   — callers `dns_unresolved(row)` (`&row.endpoint.domain`), `load_raw_endpoints`
   (SELECT `e.domain`), `compute_rank`'s caller (`&endpoint.domain`), and the page
