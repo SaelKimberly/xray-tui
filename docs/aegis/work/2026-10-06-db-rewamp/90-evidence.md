@@ -66,16 +66,14 @@ probe (`crates/xray-tui-db/tests/zz_fk_probe.rs`, throwaway, removed). Result:
    dumps every table without a single FK clause (verified by dumping
    `sqlite_master.sql` after a real `Database::open`). The plan's "fresh-schema
    DDL rebuild hook" would have to synthesize the FK DDL itself.
-2. **turso 0.7.2 refuses FKs on WITHOUT ROWID tables** — and the physical
-   index T8 already ships (`endpoint_rank_key`) IS a physical
-   `CREATE TABLE … WITHOUT ROWID`:
+2. **turso 0.7.2 refuses FKs on WITHOUT ROWID tables** (probe):
    > `Parse error: foreign keys on WITHOUT ROWID tables are not supported`
    A `REFERENCES` clause is accepted in the `CREATE TABLE` text but rejected at
-   INSERT: `Parse error: foreign keys on WITHOUT ROWID tables are not supported`
-   / `Constraint("foreign key mismatch …")`. So T12 and T14 are **mutually
-   exclusive on the same table** by design, and T12's four candidate child
-   tables (`endpoint_groups`, `profile_stats`, `endpoint_ip`, `endpoint_rank`)
-   all have `WITHOUT ROWID` parents or are themselves the WR table.
+   INSERT. This only binds if T14 is adopted (it cannot be, see below): the
+   CURRENT schema is all rowid tables (`grep WITHOUT ROWID crates/` → none), so
+   today's blocker for T12 is (1) alone. The conflict is recorded because the
+   plan intends T12 and T14 as a pair on the same tables, and they cannot both
+   hold: a `WITHOUT ROWID` table cannot carry a `REFERENCES`.
 
 ### T14 (WITHOUT ROWID) — BLOCKED: turso 0.7.2 cannot write WR tables
 

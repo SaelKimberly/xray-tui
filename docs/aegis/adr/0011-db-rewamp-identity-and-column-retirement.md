@@ -73,13 +73,14 @@ Both remaining plan slices were probed directly against the vendored
 `docs/aegis/work/2026-10-06-db-rewamp/90-evidence.md`, "T12/T14 probed and
 BLOCKED"):
 
-- **T12 (FK cascade) — blocked twice.** (a) toasty 0.11's `push_schema()` emits
-  no `REFERENCES` clause at all, so the DDL would have to be hand-owned
-  (`docs/database-manual-sql.md` §5 rejected that for STRICT). (b) turso rejects
-  foreign keys on `WITHOUT ROWID` tables
-  (`Parse error: foreign keys on WITHOUT ROWID tables are not supported`), and
-  the physical index T8 ships (`endpoint_rank_key`) IS on a `WITHOUT ROWID`
-  `endpoint_rank`. So T12 and T14 cannot both apply to the same table.
+- **T12 (FK cascade) — blocked.** toasty 0.11's `push_schema()` emits no
+  `REFERENCES` clause at all (verified by dumping `sqlite_master.sql`), so the
+  DDL would have to be hand-owned (`docs/database-manual-sql.md` §5 rejected
+  that for STRICT). Separately, turso rejects foreign keys on `WITHOUT ROWID`
+  tables (`Parse error: foreign keys on WITHOUT ROWID tables are not
+  supported`), so T12 and T14 can never both apply to the same table — the
+  current all-rowid schema is unaffected by that second point, but the pair the
+  plan intends cannot hold.
 - **T14 (WITHOUT ROWID) — blocked.** turso's WR support is insert-only: it
   raises `Parse error: DELETE from WITHOUT ROWID tables is not supported`,
   `…UPDATE of WITHOUT ROWID tables…`, and `CREATE INDEX on WITHOUT ROWID
