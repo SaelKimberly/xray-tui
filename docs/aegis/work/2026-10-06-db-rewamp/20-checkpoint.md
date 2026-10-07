@@ -31,6 +31,36 @@
   page/search, sort UI, wipe, FK, reader, docs) are each large; the session did
   not have room to finish them.
 
+## Phase 1 DONE (committed 4318c11) — Phase 2 (the swap) remains
+**Phase 1 (green):** `Endpoint::is_dns()`/`is_ip()`/`display_host()` accessors,
+and the DNS-predicate readers migrated onto them (`ui/profiles` ×3, `ops/ping`,
+`ops/events`, `ops/enrich`, `endpoint_rank::dns_unresolved`). Behavior identical.
+
+**Phase 2 (the model swap) — do it by hand, NOT by bulk regex.** Attempted and
+reverted this turn. Measured remaining shape after the model change
+(`Endpoint`: drop `host`/`host_type`, add `domain`/`sub_domain`):
+
+- `dns_unresolved_endpoint(host_type, has_address)` → `(domain: &str, has_address)`
+  — callers `dns_unresolved(row)` (`&row.endpoint.domain`), `load_raw_endpoints`
+  (SELECT `e.domain`), `compute_rank`'s caller (`&endpoint.domain`), and the page
+  projection decode. Exotic stays out of tier 5: `!domain.is_empty()` is false
+  for it.
+- Raw SQL sites: `upsert_endpoints_bulk` (done in the model edit), the typed
+  `upsert_endpoint` builder (`.domain`/`.sub_domain`), `rank_host`'s
+  `SELECT host FROM endpoints` → reconstruct `subdomain.domain`, the page
+  `PAGE_PROJECTION` (`e.host`/`e.host_type` → `e.domain`/`e.sub_domain`) + its
+  decode, `export.rs` SELECT + decode + **`ExportScope::predicate()`** (semantic:
+  `e.host_type != 'dns'` → `domain != ''`, `IN ('ipv4','ipv6')` → `domain = ''
+  AND EXISTS(endpoint_ip)`), and the `endpoint_essentials(&Endpoint)` dial host
+  (2 copies) which now needs the ADDRESSES.
+- ~37 `Endpoint { … }` fixtures across 14 files, PLUS test helper *signatures*
+  that take `host`/`host_type` params.
+- **HAZARD (cost me a revert):** a bulk regex for `host: X,\n host_type: Y,`
+  ALSO rewrites `host: &str,\n host_type: HostType,` in FN SIGNATURES and
+  `host`/`host_type` shorthand in `toasty::create!`. Edit literals individually;
+  never regex the pair.
+- Bump `SCHEMA_VERSION` to 17.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of
