@@ -868,7 +868,7 @@ fn min_address_key(row: &xray_tui_db::models::EndpointRow) -> Vec<u8> {
 /// SQL reads the stored pack DESCENDING. Comparing the negated form here is
 /// what pins that the two directions are the same order — a flip between them
 /// fails THIS test, not the field.
-type OracleKey = (i64, u64, String, String, Vec<u8>, i64);
+type OracleKey = (i64, i64, u64, String, String, Vec<u8>, i64);
 
 fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleKey {
     match sort {
@@ -889,11 +889,25 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
             } else {
                 xray_tui_db::endpoint_ip::key_of_str(&row.endpoint.host).unwrap_or_default()
             };
-            (i64::from(bin), neg_weight, domain, sub_domain, addr, row.endpoint.id.get())
+            // band = "has a live link" (threshold ts(0)); NO_SEEN-only -> 1.
+            let band = if row.links.iter().any(|l| l.purge_reason.is_none()) {
+                0
+            } else {
+                1
+            };
+            (
+                band,
+                i64::from(bin),
+                neg_weight,
+                domain,
+                sub_domain,
+                addr,
+                row.endpoint.id.get(),
+            )
         }
-        PageSort::Address | PageSort::Ip => (0, 0, String::new(), String::new(), Vec::new(), row.endpoint.id.get()),
-        PageSort::Id => (row.endpoint.id.get(), 0, String::new(), String::new(), Vec::new(), 0),
-        PageSort::Port => (i64::from(row.endpoint.port), 0, String::new(), String::new(), Vec::new(), 0),
+        PageSort::Address | PageSort::Ip => (0, 0, 0, String::new(), String::new(), Vec::new(), row.endpoint.id.get()),
+        PageSort::Id => (0, row.endpoint.id.get(), 0, String::new(), String::new(), Vec::new(), 0),
+        PageSort::Port => (0, i64::from(row.endpoint.port), 0, String::new(), String::new(), Vec::new(), 0),
     }
 }
 

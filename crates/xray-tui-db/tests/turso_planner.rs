@@ -29,7 +29,7 @@ const KEY_INDEX: &str = "CREATE INDEX endpoint_rank_key ON endpoint_rank(\
 
 /// The ORDER BY term list (the binned law), band-less so the same text serves
 /// the Active/Purgatory seek and the All `(band, key)` scan.
-const KEY: &str = "rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id";
+const KEY: &str = "band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id";
 
 fn value_row(i: usize) -> String {
     let band = i64::from(i % 10 != 0);
@@ -115,7 +115,7 @@ async fn turso_planner_gate() {
         ),
         (
             "All ORDER band,key (wanted)",
-            format!("SELECT endpoint_id FROM endpoint_rank WHERE 1=1 ORDER BY band, {KEY} LIMIT 200 OFFSET 5000"),
+            format!("SELECT endpoint_id FROM endpoint_rank WHERE 1=1 ORDER BY {KEY} LIMIT 200 OFFSET 5000"),
         ),
         (
             "All band IN (0,1) key (trap)",
@@ -123,7 +123,7 @@ async fn turso_planner_gate() {
         ),
         (
             "scope rank_bin IN (13,14,15)",
-            format!("SELECT endpoint_id FROM endpoint_rank WHERE rank_bin IN (13,14,15) ORDER BY band, {KEY} LIMIT 200"),
+            format!("SELECT endpoint_id FROM endpoint_rank WHERE rank_bin IN (13,14,15) ORDER BY {KEY} LIMIT 200"),
         ),
     ];
 

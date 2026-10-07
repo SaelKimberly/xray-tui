@@ -296,6 +296,11 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
         // order. Flipping this term to ASC inverts the page against the
         // comparator — the parity test fails, not the field.
         PageSort::Test => vec![
+            // band FIRST: the covering index leads with it, so `ORDER BY band,
+            // …` is the index order for BOTH the Active/Purgatory seek (`band =
+            // ?`, constant) and the All/batch scan (mixed bands) — without it
+            // the All view would filesort (turso `USE SORTER`).
+            term(rank_col("band"), true),
             term(rank_col("rank_bin"), true),
             term(rank_col("rank_weight"), false),
             term(rank_col("rank_domain"), true),
