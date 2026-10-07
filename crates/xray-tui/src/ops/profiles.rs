@@ -705,6 +705,15 @@ pub fn fields_to_parsed(
     }
 
     let parsed = build_typed_config(kind, &address, port, &serde_json::Value::Object(settings))?;
+    // The SAME host policy the URL path applies (db-rewamp T5: one rule for
+    // every import path) — a form-built host with no registrable domain is
+    // rejected here exactly as an imported one is. `allow_private_ips` is off
+    // for the form: a single-label/private host cannot key an endpoint.
+    xray_tui_config::import_export::validate_host(
+        &parsed,
+        &xray_tui_config::import_export::ValidationSettings::default(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(parsed)
 }
 

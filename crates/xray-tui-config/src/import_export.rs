@@ -635,7 +635,7 @@ fn is_valid_hostname(host: &str) -> bool {
 ///
 /// Hostnames are validated against RFC-compliant DNS labels — underscores,
 /// non-ASCII, and other invalid characters are rejected.
-fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<(), ImportError> {
+pub fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<(), ImportError> {
     let Some(endpoint) = parsed.endpoints.first() else {
         return Ok(()); // no address to validate
     };
@@ -683,6 +683,26 @@ fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<
         }
     }
 
+    // DNS-name rules run BEFORE the private-IP gate: a DNS name is not an IP,
+    // so `allow_private_ips` must not skip them. db-rewamp T5 adds the
+    // registrable-domain rule — a name the psl2 split cannot map to a domain
+    // cannot key an endpoint, so it is rejected (per-profile; the import skips
+    // and counts it).
+    if parsed_ip.is_none() {
+        let lower = normalized.to_lowercase();
+        if lower == "localhost" || lower.ends_with(".localhost") {
+            return Err(ImportError::Validation("localhost hostname".into()));
+        }
+        if !is_valid_hostname(&normalized) {
+            return Err(ImportError::Validation("invalid hostname".into()));
+        }
+        if xray_tui_proto::domain::split(&normalized).is_none() {
+            return Err(ImportError::Validation(
+                "host has no registrable domain".into(),
+            ));
+        }
+    }
+
     if settings.allow_private_ips {
         return Ok(());
     }
@@ -711,18 +731,7 @@ fn validate_host(parsed: &ParsedProto, settings: &ValidationSettings) -> Result<
                 return Err(ImportError::Validation("link-local IP address".into()));
             }
         }
-        None => {
-            // DNS name — reject localhost and names with invalid
-            // characters (underscores, non-ASCII, etc.) that are
-            // not valid server hostnames.
-            let lower = normalized.to_lowercase();
-            if lower == "localhost" || lower.ends_with(".localhost") {
-                return Err(ImportError::Validation("localhost hostname".into()));
-            }
-            if !is_valid_hostname(&normalized) {
-                return Err(ImportError::Validation("invalid hostname".into()));
-            }
-        }
+        None => {} // validated above
     }
 
     Ok(())
@@ -1097,27 +1106,59 @@ mod tests {
 
     #[test]
     fn reject_localhost_hostname() {
-        // "localhost" and "*.localhost" (RFC 6761 special-use domains) parse
-        // fine at the typed boundary and are rejected by the config-layer
-        // host policy when the gate is closed; admitted when it is open.
+        // "localhost" and "*.localhost" (RFC 6761 special-use domains) have no
+        // registrable domain, so the psl2 split (db-rewamp D2/T5) rejects them
+        // at the config layer — unconditionally, because the private-IP gate
+        // does not apply to a DNS name and the endpoint model cannot key a
+        // domainless host.
         for host in ["localhost", "foo.localhost"] {
             let url =
                 format!("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@{host}:443?type=tcp#test");
-            let settings = ValidationSettings {
-                allow_private_ips: false,
-                reject_insecure: false,
-            };
-            assert!(matches!(
-                parse_share_url(&url, &settings),
-                Err(ImportError::Validation(_))
-            ));
-            let settings = ValidationSettings {
-                allow_private_ips: true,
-                reject_insecure: false,
-            };
-            let p = parse_share_url(&url, &settings).unwrap();
-            assert_eq!(p.parsed.endpoints[0].host, host);
+            for allow_private_ips in [false, true] {
+                let settings = ValidationSettings {
+                    allow_private_ips,
+                    reject_insecure: false,
+                };
+                assert!(
+                    matches!(
+                        parse_share_url(&url, &settings),
+                        Err(ImportError::Validation(_))
+                    ),
+                    "{host} must be rejected (allow_private_ips={allow_private_ips})"
+                );
+            }
         }
+    }
+
+    /// A DNS name with no registrable domain (a single label, or a bare public
+    /// suffix) is rejected for BOTH gate settings — the psl2 split cannot map it
+    /// to `domain`/`sub_domain` (db-rewamp D2/T5).
+    #[test]
+    fn reject_dns_name_without_registrable_domain() {
+        for host in ["myproxyserver", "co.uk", "github.io"] {
+            let url =
+                format!("vless://6202b230-417c-4d8e-b624-0f71afa9c75d@{host}:443?type=tcp#test");
+            for allow_private_ips in [false, true] {
+                let settings = ValidationSettings {
+                    allow_private_ips,
+                    reject_insecure: false,
+                };
+                assert!(
+                    matches!(
+                        parse_share_url(&url, &settings),
+                        Err(ImportError::Validation(_))
+                    ),
+                    "{host} has no registrable domain and must be rejected"
+                );
+            }
+        }
+        // A registrable name (including one under a private suffix) is admitted.
+        let ok = "vless://6202b230-417c-4d8e-b624-0f71afa9c75d@foo.github.io:443?type=tcp#x";
+        let settings = ValidationSettings {
+            allow_private_ips: false,
+            reject_insecure: false,
+        };
+        assert!(parse_share_url(ok, &settings).is_ok(), "foo.github.io is registrable");
     }
 
     /// The documented `parsing.reject_insecure` gate must actually reject a
