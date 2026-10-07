@@ -97,13 +97,13 @@ pub enum PlanScope {
 }
 
 impl PlanScope {
-    /// The `rank_bin` values this scope selects (db-rewamp D11: bins replace
-    /// tiers). Empty means "no predicate".
+    /// The `rank_bin` values this scope selects (db-rewamp D11). Empty means
+    /// "no predicate".
     ///
     /// Successful = any real success (`0..=5`); New = untested (`12`);
     /// Failed = real-err/fast-err/dns-err (`13..=15`).
     #[must_use]
-    pub const fn tiers(self) -> &'static [i64] {
+    pub const fn bins(self) -> &'static [i64] {
         match self {
             Self::All => &[],
             Self::Successful => &[0, 1, 2, 3, 4, 5],
@@ -383,11 +383,17 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
     if let Some(search) = &req.search
         && !search.is_empty()
     {
-        // The indexed prefix search (db-rewamp D6): the materialized `rank_domain`
-        // / `rank_sub_domain` (lowercased) are matched by a byte RANGE (`>= term
-        // AND < term||0x10ffff`) rather than `LIKE '%term%'`, so a keystroke is
-        // an index seek, not a full scan. An IP/CIDR term ranges over the packed
-        // `rank_addr`; the port keeps its substring match.
+        // The indexed PREFIX search (db-rewamp D6): the materialized
+        // `rank_domain` / `rank_sub_domain` (lowercased) are matched by a byte
+        // RANGE (`>= term AND < term||U+10FFFF`) rather than `LIKE '%term%'`,
+        // so a keystroke is an index seek, not a full scan.
+        //
+        // CONTRACT (deliberate, per D6): the match is a PREFIX of the domain or
+        // of the sub-domain — never a substring, a suffix, or the assembled
+        // full host. `exa` finds `example.com`; `www` finds the `www` label;
+        // but typing the whole `www.example.com`, or a mid-name `ample`, matches
+        // nothing (the pre-D6 `LIKE '%…%'` did). An IP/CIDR term ranges over the
+        // packed `rank_addr`; the port keeps its substring match.
         let term = search.to_lowercase();
         let escaped = escape_like(&term);
         let port_pat = sql.bind(format!("%{escaped}%"));
@@ -412,10 +418,10 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
     // so the scoped batch variants are an index range. Bound (never inlined)
     // like every other predicate, and shared with the count so the footer
     // cannot drift.
-    let tiers = req.scope.tiers();
-    if !tiers.is_empty() {
-        let binds: Vec<String> = tiers.iter().map(|t| sql.bind(*t)).collect();
-        sql.push(&format!(" AND k.rank_bin IN ({})", binds.join(", ")));
+    let bins = req.scope.bins();
+    if !bins.is_empty() {
+        let placeholders: Vec<String> = bins.iter().map(|b| sql.bind(*b)).collect();
+        sql.push(&format!(" AND k.rank_bin IN ({})", placeholders.join(", ")));
     }
 }
 

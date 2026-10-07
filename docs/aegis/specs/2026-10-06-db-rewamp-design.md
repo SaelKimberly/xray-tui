@@ -188,7 +188,9 @@ reader exists (`ConfigBuilder::protocol_config` reads `config`). Drop both colum
 model and identity; the AddServer form's `config_type` field goes.
 
 ### 3.8 Search
-`PageRequest.search` becomes a prefix predicate over three index-servable columns: lowercased
+`PageRequest.search` becomes a prefix predicate over three index-servable columns
+(**contract: prefix of `domain` or `sub_domain` — not a substring, suffix, or the
+assembled full host**): lowercased
 `domain`, lowercased `sub_domain` (range `>= x AND < x||'\xff'`), and — when the term parses
 as an IP or CIDR — a byte-range on the packed `endpoint_ip.ip_key` (family byte + octets; no
 text column is added — two spellings of one address is the rejected shape). Exact

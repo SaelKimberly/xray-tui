@@ -31,9 +31,6 @@ use xray_tui_proto::proto_spec::{
 /// Sentinel for "no display link": sorts before any real timestamp, matching
 /// the retired SQL `COALESCE(<seen>, '')` (empty text sorts first ascending).
 pub const NO_SEEN: i64 = i64::MIN;
-/// Sentinel for "no measured display link", matching the retired
-/// `COALESCE(<speed>, -1)`.
-pub const NO_SPEED: i64 = -1;
 /// Process-wide Active-view TTL (seconds). `band` is materialized against
 /// `now − this` at write and sweep time, so the DB layer needs the same ttl
 /// the page uses. Set once at startup (and on settings save) from the config;
@@ -316,11 +313,9 @@ pub fn compute_rank(
     host: &str,
     host_type: HostType,
     dns_unresolved: bool,
-    override_protocol: Option<i64>,
     links: &[RankLink],
 ) -> Option<RankRow> {
     let (bin, neg_weight, _, _) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
-    let display = display_link_index(links, override_protocol).map(|i| links[i]);
     // The view windows ask whether any LIVE link falls in the band. A
     // purged-only endpoint therefore reports `NO_SEEN`, which is below every
     // window bound — that is exactly "it belongs to Purgatory" (spec §5), and it
@@ -332,7 +327,6 @@ pub fn compute_rank(
         .max()
         .unwrap_or(NO_SEEN);
     // The minimum key's weight term is `u64::MAX - weight`; invert it back.
-    let _ = display;
     let weight = ConfigWeight::from_be_bytes((u64::MAX - neg_weight).to_be_bytes());
     // domain/sub_domain from the split (empty for an IP/exotic host); the addr
     // term is the IP literal's packed key (empty for a DNS host), so a bin+weight
@@ -380,7 +374,6 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<RankRow> {
         &row.endpoint.host,
         row.endpoint.host_type,
         dns_unresolved(row),
-        row.endpoint.manual_protocol_override.map(ProtocolId::get),
         &links,
     )
 }
@@ -666,7 +659,6 @@ struct RawEndpoint {
     host: String,
     host_type: HostType,
     dns_unresolved: bool,
-    override_protocol: Option<i64>,
 }
 
 impl crate::Database {
@@ -827,7 +819,6 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
                 &endpoint.host,
                 endpoint.host_type,
                 dns_unresolved_endpoint(endpoint.host_type, resolved.contains(&endpoint.id.get())),
-                endpoint.manual_protocol_override.map(ProtocolId::get),
                 &links,
             )
         })
@@ -985,7 +976,6 @@ pub(crate) async fn refresh(
                 &endpoint.host,
                 endpoint.host_type,
                 endpoint.dns_unresolved,
-                endpoint.override_protocol,
                 endpoint_links,
             )
         })
@@ -1003,8 +993,8 @@ async fn load_raw_endpoints(
     // round trip.
     let rows = toasty::sql::query(format!(
         "SELECT e.id, e.host, e.host_type, \
-         EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id), \
-         e.manual_protocol_override FROM endpoints e WHERE e.id IN ({id_list})"
+         EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id) \
+         FROM endpoints e WHERE e.id IN ({id_list})"
     ))
     .exec(conn)
     .await?;
@@ -1029,7 +1019,6 @@ async fn load_raw_endpoints(
                 host,
                 host_type,
                 dns_unresolved: matches!(host_type, HostType::Dns) && !has_address,
-                override_protocol: field(4).and_then(as_i64),
             },
         );
     }
@@ -1157,7 +1146,6 @@ mod tests {
             "h.example",
             HostType::Dns,
             false,
-            None,
             &[weak, strong],
         )
         .expect("rank");
@@ -1264,7 +1252,6 @@ mod tests {
             "h.example",
             HostType::Dns,
             false,
-            None,
             &links,
         )
         .expect("rank");
@@ -1283,7 +1270,6 @@ mod tests {
             "h.example",
             HostType::Dns,
             false,
-            None,
             &all_purged,
         )
         .expect("rank");

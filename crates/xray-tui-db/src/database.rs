@@ -527,7 +527,7 @@ const LINK_STATEMENT_ROWS: usize = 400;
 /// A SQL TEXT literal: single quotes doubled, so a stored error message can
 /// never terminate the literal. The values come from our own rows, never from
 /// user input at this layer.
-pub(crate) fn sql_lit(s: &str) -> String {
+pub fn sql_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {
