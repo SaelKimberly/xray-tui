@@ -32,6 +32,16 @@
   not have room to finish them.
 
 ## Next step (exact resume point)
+0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
+   `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of
+   it — `profiles_query` (search/order by `e.host`), `endpoint_rank`
+   (`dns_unresolved_endpoint(host_type, …)`, the rank `bin`), `export`
+   (host/host_type), `config_builder`/`native_connect`/`ping_native`
+   (`endpoint_essentials` dial host), `ui/profiles` (Address column + `== Dns`
+   flags), `enrich`/`events`/`ping` all move. Doing T4 alone leaves the tree
+   broken; the correct unit is T4+T8+T9 (host model + binned law + page/search).
+   Budget: the largest slice in the plan. The T4 attempt was reverted — HEAD is
+   green and committed; nothing is half-done.
 1. **T4 — endpoint identity/host model.** Drop `endpoints.host`/`host_type`; add
    `domain`/`sub_domain`; identity = `stable_hash(ascii_name, port)` using
    `xray_tui_config::domain::split(host).ascii` for dns, the literal for ip,
