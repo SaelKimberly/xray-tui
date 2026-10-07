@@ -189,6 +189,65 @@ impl Sql {
     }
 }
 
+/// The packed-key half-open range `[lo, hi)` an IP search term selects, or
+/// `None` for a name term. A full address, a CIDR, and a three-octet partial
+/// (the /24 range) are all understood.
+fn ip_range_bounds(term: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    use std::net::IpAddr;
+    if let Some((addr, bits)) = term.split_once('/') {
+        let ip = addr.trim().parse::<IpAddr>().ok()?;
+        return cidr_bounds(ip, bits.trim().parse().ok()?);
+    }
+    if let Ok(ip) = term.parse::<IpAddr>() {
+        let lo = crate::endpoint_ip::key_of(ip);
+        return Some((lo.clone(), next_key(lo)));
+    }
+    let octets: Vec<&str> = term.split('.').collect();
+    if octets.len() == 3 && octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+        let ip: IpAddr = format!("{term}.0").parse().ok()?;
+        return cidr_bounds(ip, 24);
+    }
+    None
+}
+
+/// The packed-key half-open range of a CIDR block.
+fn cidr_bounds(ip: std::net::IpAddr, bits: u8) -> Option<(Vec<u8>, Vec<u8>)> {
+    let octets = match ip {
+        std::net::IpAddr::V4(_) => 4,
+        std::net::IpAddr::V6(_) => 16,
+    };
+    if usize::from(bits) > octets * 8 {
+        return None;
+    }
+    let mut lo = crate::endpoint_ip::key_of(ip);
+    let full = usize::from(bits / 8);
+    let rem = bits % 8;
+    for b in (full + 1)..=octets {
+        lo[b] = 0;
+    }
+    if rem != 0 {
+        lo[full + 1] &= 0xff << (8 - rem);
+    }
+    let mut hi = lo.clone();
+    for b in (full + 1)..=octets {
+        hi[b] = 0xff;
+    }
+    Some((lo, next_key(hi)))
+}
+
+/// The next packed key (big-endian successor): the exclusive upper bound.
+fn next_key(mut k: Vec<u8>) -> Vec<u8> {
+    for b in k.iter_mut().rev() {
+        if *b == 0xff {
+            *b = 0;
+        } else {
+            *b += 1;
+            return k;
+        }
+    }
+    k
+}
+
 /// Escape LIKE metacharacters for an `ESCAPE '\'` clause.
 fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
@@ -319,11 +378,30 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
     if let Some(search) = &req.search
         && !search.is_empty()
     {
-        let pattern = sql.bind(format!("%{}%", escape_like(&search.to_lowercase())));
-        sql.push(&format!(
-            " AND (lower(e.host) LIKE {pattern} ESCAPE '\\' \
-             OR CAST(e.port AS TEXT) LIKE {pattern} ESCAPE '\\')"
-        ));
+        // The indexed prefix search (db-rewamp D6): the materialized `rank_domain`
+        // / `rank_sub_domain` (lowercased) are matched by a byte RANGE (`>= term
+        // AND < term||0x10ffff`) rather than `LIKE '%term%'`, so a keystroke is
+        // an index seek, not a full scan. An IP/CIDR term ranges over the packed
+        // `rank_addr`; the port keeps its substring match.
+        let term = search.to_lowercase();
+        let escaped = escape_like(&term);
+        let port_pat = sql.bind(format!("%{escaped}%"));
+        let mut clauses = vec![format!(
+            "CAST(e.port AS TEXT) LIKE {port_pat} ESCAPE '\\'"
+        )];
+        if let Some((lo, hi)) = ip_range_bounds(&term) {
+            let l = sql.bind(Value::Bytes(lo));
+            let h = sql.bind(Value::Bytes(hi));
+            clauses.push(format!("(k.rank_addr >= {l} AND k.rank_addr < {h})"));
+        } else {
+            let l = sql.bind(term.clone());
+            let h = sql.bind(format!("{term}\u{10ffff}"));
+            clauses.push(format!("(k.rank_domain >= {l} AND k.rank_domain < {h})"));
+            let l2 = sql.bind(term.clone());
+            let h2 = sql.bind(format!("{term}\u{10ffff}"));
+            clauses.push(format!("(k.rank_sub_domain >= {l2} AND k.rank_sub_domain < {h2})"));
+        }
+        sql.push(&format!(" AND ({})", clauses.join(" OR ")));
     }
     // The plan scope reads the endpoint's materialized BIN (db-rewamp D11),
     // so the scoped batch variants are an index range. Bound (never inlined)

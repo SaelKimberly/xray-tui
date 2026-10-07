@@ -236,17 +236,17 @@ async fn seed_fixture() -> Database {
     let mut conn = db.connection().await.expect("conn");
 
     // e1: real 30 + fast-error sibling
-    seed_endpoint(&mut conn, 1, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 1, HostType::Dns, &["10.0.0.1"]).await;
     seed_link(&mut conn, 1, 101, Some(30), None, 100).await;
     seed_link(&mut conn, 1, 102, None, Some("fast"), 200).await;
     // e2: real 10
-    seed_endpoint(&mut conn, 2, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 2, HostType::Dns, &["10.0.0.2"]).await;
     seed_link(&mut conn, 2, 103, Some(10), None, 150).await;
     // e3: untested
-    seed_endpoint(&mut conn, 3, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 3, HostType::Dns, &["10.0.0.3"]).await;
     seed_link(&mut conn, 3, 104, None, None, 50).await;
     // e4: manual override away from the minimum-weight link
-    seed_endpoint(&mut conn, 4, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 4, HostType::Dns, &["10.0.0.4"]).await;
     seed_link(&mut conn, 4, 105, Some(90), None, 120).await;
     seed_link(&mut conn, 4, 106, Some(500), None, 130).await;
     toasty::sql::statement("UPDATE endpoints SET manual_protocol_override = ?1 WHERE id = ?2")
@@ -256,7 +256,7 @@ async fn seed_fixture() -> Database {
         .await
         .expect("set override");
     // e5: measured link WITH an error marker beside an untested sibling
-    seed_endpoint(&mut conn, 5, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 5, HostType::Dns, &["10.0.0.5"]).await;
     seed_link(&mut conn, 5, 107, Some(40), Some("fast"), 140).await;
     seed_link(&mut conn, 5, 108, None, None, 160).await;
     // e6: dns host, unresolved (persisted) despite a stored measurement.
@@ -514,8 +514,8 @@ async fn descending_order_is_the_reverse_of_ascending_for_every_sort() {
 async fn link_writes_keep_the_stored_keys_current() {
     let db = Database::in_memory().await.expect("db");
     let mut conn = db.connection().await.expect("conn");
-    seed_endpoint(&mut conn, 1, HostType::Ipv4, &[]).await;
-    seed_endpoint(&mut conn, 2, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 1, HostType::Dns, &["10.0.0.1"]).await;
+    seed_endpoint(&mut conn, 2, HostType::Dns, &["10.0.0.2"]).await;
     drop(conn);
 
     let page = || async {
@@ -606,7 +606,7 @@ async fn resolving_a_dns_host_moves_its_stored_key() {
 async fn a_result_patch_that_inserts_a_link_still_moves_the_key() {
     let db = Database::in_memory().await.expect("db");
     let mut conn = db.connection().await.expect("conn");
-    seed_endpoint(&mut conn, 1, HostType::Ipv4, &[]).await;
+    seed_endpoint(&mut conn, 1, HostType::Dns, &["10.0.0.1"]).await;
     drop(conn);
 
     let page = db

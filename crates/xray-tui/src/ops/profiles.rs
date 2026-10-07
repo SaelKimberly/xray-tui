@@ -1273,10 +1273,23 @@ pub(crate) mod test_support {
     /// Minimal typed `EndpointRow` with `n` links (protocol ids
     /// `id*100 .. id*100+n`).
     pub fn fake_row(id: i64, host: &str, n_protos: usize) -> EndpointRow {
+        let host_type = match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(_)) => HostType::Ipv4,
+            Ok(std::net::IpAddr::V6(_)) => HostType::Ipv6,
+            Err(_) => HostType::Dns,
+        };
+        // A named fixture host is a RESOLVED DNS endpoint (a synthetic
+        // address), so it is live rather than dns-unresolved — the state the
+        // real import writes for a host that resolves.
+        let resolved_ips = if matches!(host_type, HostType::Dns) {
+            vec!["10.0.0.1".parse().expect("addr")]
+        } else {
+            Vec::new()
+        };
         let endpoint = Endpoint {
             id: EndpointId::new(id),
             host: host.to_string(),
-            host_type: HostType::Ipv4,
+            host_type,
             port: 443,
             ports: Vec::new(),
             last_source: None,
@@ -1322,7 +1335,7 @@ pub(crate) mod test_support {
             endpoint,
             links,
             protocols,
-            resolved_ips: Vec::new(),
+            resolved_ips,
             selected_protocol: 0,
             expanded: false,
         }

@@ -2533,6 +2533,7 @@ mod tests {
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
         set_delay(&mut row, 7, 50, true); // real-ok
         row.endpoint.host_type = HostType::Dns;
+        row.resolved_ips.clear(); // a DNS host with no resolved address
         state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
         state.selected_index = 0;
         state.selected_sub = None;
@@ -2612,6 +2613,7 @@ mod tests {
         set_delay(&mut row, 7, 50, false); // fast-ok
         set_delay(&mut row, 8, 10, true); // real-ok
         row.endpoint.host_type = HostType::Dns;
+        row.resolved_ips.clear(); // a DNS host with no resolved address
         state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
         state.selected_index = 0;
         state.selected_sub = None;
