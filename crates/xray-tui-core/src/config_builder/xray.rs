@@ -353,7 +353,7 @@ mod tests {
         assert!(json.get("policy").is_some(), "missing policy");
     }
 
-    fn test_endpoint_protocol_link() -> (Endpoint, Protocol, crate::config_builder::ProfileStats) {
+    fn test_endpoint_protocol_link() -> (Endpoint, Protocol, xray_tui_db::models::ProfileStats) {
         let endpoint = super::super::tests::endpoint("example.com", 443);
         let protocol =
             super::super::tests::protocol(ProtocolKind::Vless, super::super::tests::vless_config());

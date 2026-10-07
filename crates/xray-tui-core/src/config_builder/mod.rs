@@ -5,7 +5,7 @@ pub mod clash_mixin;
 use crate::core_type::CoreType;
 use serde::Serialize;
 use serde_json::{Value, json};
-use xray_tui_db::models::{DnsSetting, Endpoint, HostType, ProfileStats, Protocol, RoutingRule};
+use xray_tui_db::models::{DnsSetting, Endpoint, HostType, Protocol, RoutingRule};
 use xray_tui_proto::proto_spec::{
     CoreType as ProtoCoreType, EndpointEssentials, HostKind, ProtocolConfig, SupportError,
 };
@@ -175,7 +175,7 @@ pub fn build(
 mod tests {
     use super::*;
     use toasty::{Deferred, Json};
-    use xray_tui_db::models::{TrafficStats, Transport};
+    use xray_tui_db::models::{ProfileStats, TrafficStats, Transport};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
         CoreType as ProtoCoreType, ProtocolKind, SecurityConfig, SecurityType, TransportType,

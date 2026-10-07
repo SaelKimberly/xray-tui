@@ -193,6 +193,15 @@ Purgatory `SEARCH USING INDEX endpoint_rank_key (band=?)`, All `SCAN USING
 COVERING INDEX`, no sorter; the `band IN (0,1)` trap sorts. db 171, tui 259,
 core/proto/config 740 green.
 
+## T13 DONE (commit f43617b) — measured
+The page's id+count read through a long-lived direct turso connection (bypasses
+toasty's exec layer). `the_direct_page_matches_the_toasty_page` pins it to the
+toasty oracle for every sort/direction/view. Measured (`measure_page_scale`,
+XRAY_TUI_SCALE=…,50000, file db → direct active, engine turso):
+`Active Test(index)` offset 0/12516/24832 = **1.52 / 2.34 / 2.87 ms**;
+`band=0 seek` = 0.059 ms. T0 baseline (74k real feed, TOASTY path) was 108 ms —
+so the binned index + direct reader take the page to low-millisecond.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of

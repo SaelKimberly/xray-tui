@@ -273,7 +273,7 @@ mod tests {
         assert!(json.get("experimental").is_some(), "missing experimental");
     }
 
-    fn test_endpoint_protocol_link() -> (Endpoint, Protocol, crate::config_builder::ProfileStats) {
+    fn test_endpoint_protocol_link() -> (Endpoint, Protocol, xray_tui_db::models::ProfileStats) {
         let endpoint = super::super::tests::endpoint("example.com", 443);
         let tuic = ProtocolConfig::Tuic(xray_tui_proto::proto_spec::TuicConfig {
             uuid: "00000000-0000-0000-0000-000000000000".to_string(),
