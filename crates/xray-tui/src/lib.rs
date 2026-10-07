@@ -59,6 +59,7 @@ fn common_field_defaults() -> Vec<(String, String)> {
 pub(crate) fn profile_to_fields(
     protocol: &xray_tui_db::models::Protocol,
     endpoint: &xray_tui_db::models::Endpoint,
+    addresses: &[std::net::IpAddr],
 ) -> Vec<(String, String)> {
     let mut fields = common_field_defaults();
     if !protocol.config.is_unloaded() {
@@ -84,7 +85,10 @@ pub(crate) fn profile_to_fields(
             flatten_json_to_fields(ss, &mut fields);
         }
     }
-    let address = endpoint.dns_name();
+    // The `address` field is the DIAL host, not the DNS name: an IP-literal
+    // endpoint's `dns_name()` is empty, so the form would open blank and its
+    // re-submit would fail validation (~75% of a real feed).
+    let address = endpoint.display_host(addresses);
     if !address.is_empty() {
         set_field(&mut fields, "address", &address);
     }

@@ -25,9 +25,8 @@ const fn ts(secs: i64) -> i64 {
 
 const ALL_ENDPOINTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
 
-const ALL_SORTS: [PageSort; 5] = [
+const ALL_SORTS: [PageSort; 4] = [
     PageSort::Test,
-    PageSort::Address,
     PageSort::Port,
     PageSort::Ip,
     PageSort::Id,
@@ -960,7 +959,7 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
                 row.endpoint.id.get(),
             )
         }
-        PageSort::Address | PageSort::Ip => (0, 0, 0, String::new(), String::new(), Vec::new(), row.endpoint.id.get()),
+        PageSort::Ip => (0, 0, 0, String::new(), String::new(), Vec::new(), row.endpoint.id.get()),
         PageSort::Id => (0, row.endpoint.id.get(), 0, String::new(), String::new(), Vec::new(), 0),
         PageSort::Port => (0, i64::from(row.endpoint.port), 0, String::new(), String::new(), Vec::new(), 0),
     }
@@ -978,16 +977,9 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
 
     for sort in ALL_SORTS {
         for ascending in [true, false] {
-            // Address compares host text, which the numeric key cannot carry;
-            // every other sort uses the oracle tuple.
-            let mut expected: Vec<i64> = if sort == PageSort::Address {
-                let mut v: Vec<(String, i64)> = rows
-                    .iter()
-                    .map(|r| (r.endpoint.dns_name(), r.endpoint.id.get()))
-                    .collect();
-                v.sort_unstable();
-                v.into_iter().map(|(_, id)| id).collect()
-            } else if sort == PageSort::Ip {
+            // Every sort uses the oracle tuple; the `Ip` arm derives its key
+            // from the row through the production codec.
+            let mut expected: Vec<i64> = if sort == PageSort::Ip {
                 // The address key, derived from the row's own values through
                 // the production codec: `min` over the keys is what the SQL's
                 // `min(ip_key)` reads, an endpoint with no address takes the

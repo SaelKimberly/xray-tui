@@ -725,7 +725,7 @@ fn build_display_rows(
             .and_then(|i| i.country.as_deref())
             .map_or_else(|| "\u{1F3F4}".to_string(), iso_to_flag);
         let address_port_str =
-            truncate_pad(&format!(" {}:{}", row.endpoint.dns_name(), row.endpoint.port), 34);
+            truncate_pad(&format!(" {}:{}", row.endpoint.display_host(&row.resolved_ips), row.endpoint.port), 34);
         // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
         // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
         let ip_feature =
@@ -1182,11 +1182,8 @@ fn render_footer(
         |row| {
             let core = state.resolved_core(row);
 
-            let addr = if row.endpoint.dns_name().is_empty() {
-                "-"
-            } else {
-                &row.endpoint.dns_name()
-            };
+            let host = row.endpoint.display_host(&row.resolved_ips);
+            let addr = if host.is_empty() { "-".to_string() } else { host };
             let port = row.endpoint.port.to_string();
             Line::from(vec![
                 Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
@@ -1253,7 +1250,7 @@ fn render_confirmation_overlays(
             let profile_name = rows
                 .iter()
                 .find(|r| r.endpoint.id.get() == *delete_id)
-                .map(|r| format!("{}:{}", r.endpoint.dns_name(), r.endpoint.port))
+                .map(|r| format!("{}:{}", r.endpoint.display_host(&r.resolved_ips), r.endpoint.port))
                 .unwrap_or_default();
             render_confirmation_overlay(
                 frame,
@@ -1434,7 +1431,8 @@ mod page_window_tests {
             after[0].address_port_str.trim(),
             format!(
                 "{}:{}",
-                state.endpoints[0].endpoint.dns_name(), state.endpoints[0].endpoint.port
+                state.endpoints[0].endpoint.display_host(&state.endpoints[0].resolved_ips),
+                state.endpoints[0].endpoint.port
             )
         );
     }

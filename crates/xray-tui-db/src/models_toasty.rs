@@ -329,6 +329,22 @@ impl Endpoint {
         if self.sub_domain.is_empty() { self.domain.clone() } else { format!("{}.{}", self.sub_domain, self.domain) }
     }
 
+    /// The endpoint's host as text for DISPLAY and dialing (db-rewamp D10): the
+    /// reconstructed DNS name, else the first address literal. `dns_name()` is
+    /// empty for an IP-literal host, so a bare `dns_name()` renders "" for ~75%
+    /// of a real feed — this is the ONE accessor every display/edit/dial site
+    /// reads (the dial sites were `ping::dial_host` before it moved here).
+    #[must_use]
+    pub fn display_host(&self, addresses: &[std::net::IpAddr]) -> String {
+        if self.is_dns() {
+            self.dns_name()
+        } else {
+            addresses
+                .first()
+                .map_or_else(String::new, ToString::to_string)
+        }
+    }
+
     /// True for a DNS-name host (`domain` non-empty). The DERIVED kind (D10).
     #[must_use]
     pub const fn is_dns(&self) -> bool { !self.domain.is_empty() }
@@ -410,9 +426,12 @@ pub struct Protocol {
 #[table = "profile_stats"]
 #[key(protocol_id, endpoint_id)]
 pub struct ProfileStats {
-    // Indexed so the `Endpoint::links` / `Protocol::links` has_many relations
-    // (and the batched `endpoint_id IN (...)` read) can use them.
-    #[index]
+    // `protocol_id` is the FIRST column of the composite PK, and the PK
+    // autoindex already serves a prefix seek, so it carries no `#[index]`
+    // (db-rewamp §3.2 — a redundant secondary index costs every write).
+    // `endpoint_id` is the SECOND PK column, so IT does need one: the
+    // `endpoint_id IN (...)` page read and `Endpoint::links` seek that prefix,
+    // which the PK autoindex cannot serve.
     pub protocol_id: ProtocolId,
     #[index]
     pub endpoint_id: EndpointId,
@@ -456,9 +475,10 @@ pub struct ProfileStats {
 #[table = "endpoint_groups"]
 #[key(endpoint_id, group_id)]
 pub struct EndpointGroup {
-    // Indexed so `Endpoint::group_links` is queryable and the per-group
-    // membership filter can use it.
-    #[index]
+    // `endpoint_id` is the FIRST column of the composite PK
+    // `(endpoint_id, group_id)`, so a prefix seek uses the PK autoindex — no
+    // `#[index]` (db-rewamp §3.2). `group_id` is the SECOND column and the
+    // per-group membership filter seeks it, so it keeps one.
     pub endpoint_id: EndpointId,
     #[index]
     pub group_id: String,

@@ -741,9 +741,7 @@ impl CacheSpec for SourceSpec {
         crate::database::upsert_protocols_bulk(tx, &protocols).await?;
         crate::database::upsert_links_bulk(tx, &links).await?;
         crate::database::upsert_endpoint_group_links_bulk(tx, &group_links).await?;
-        for (id, ip) in &ip_literals {
-            crate::endpoint_ip::replace(tx, *id, std::slice::from_ref(ip)).await?;
-        }
+        crate::endpoint_ip::insert_literals_bulk(tx, &ip_literals).await?;
         Ok(stored_links)
     }
 

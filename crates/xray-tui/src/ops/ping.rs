@@ -3093,7 +3093,7 @@ mod tests {
             scope: PlanScope::Failed,
             search: None,
             group_id: None,
-            sort: PageSort::Address,
+            sort: PageSort::Port,
             ascending: true,
             offset: 0,
             limit: 10,

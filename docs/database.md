@@ -257,12 +257,10 @@ ERROR, not a mis-sort.
 | *(PK autoindex)* | `endpoint_ip(endpoint_id, ip_key)` | the address set of an endpoint (prefix seek), PK uniqueness |
 | `endpoint_ip_by_key` *(raw)* | `endpoint_ip(ip_key, endpoint_id)` | address-ordered scans, `min(ip_key)` per endpoint, range lookups by address |
 | *(PK autoindex)* | `profile_stats(protocol_id, endpoint_id)` | pair lookups, the link upserts' `ON CONFLICT` target |
-| `index_profile_stats_by_protocol_id` | `profile_stats(protocol_id)` | per-protocol reads |
-| `index_profile_stats_by_endpoint_id` | `profile_stats(endpoint_id)` | the page's per-endpoint link reads |
+| `index_profile_stats_by_endpoint_id` | `profile_stats(endpoint_id)` | the page's per-endpoint link reads. (`protocol_id` — the FIRST PK column — deliberately carries NO secondary index: the PK autoindex serves its prefix seek, and a redundant index costs every write, db-rewamp §3.2) |
 | `index_profile_stats_by_last_seen_at` | `profile_stats(last_seen_at)` | retention cutoff, staleness windows |
-| *(PK autoindex)* | `endpoint_groups(endpoint_id, group_id)` | membership lookups |
-| `index_endpoint_groups_by_endpoint_id` | `endpoint_groups(endpoint_id)` | an endpoint's groups |
-| `index_endpoint_groups_by_group_id` | `endpoint_groups(group_id)` | a group's endpoints (the query) |
+| *(PK autoindex)* | `endpoint_groups(endpoint_id, group_id)` | membership lookups AND an endpoint's groups (`endpoint_id` is the PK prefix, db-rewamp §3.2) |
+| `index_endpoint_groups_by_group_id` | `endpoint_groups(group_id)` | a group's endpoints (the query; `group_id` is the second PK column, so the autoindex cannot serve it) |
 | *(PK autoindex)* | `endpoint_rank(endpoint_id)` | rank-row writes/lookups |
 | `endpoint_rank_key` *(raw)* | `endpoint_rank(band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)` | the default page order — a covering index, so the page is an index scan (~8.6 ms at 7,672 endpoints, ADR 0003). **A NEW NAME, never an edit in place**: `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on an existing database, which would drop the page back to the ~240 ms filesort |
 | `rank_weight_meta` *(raw)* | `rank_weight_meta(id, weight_version)` | one row: the version of the compiled weight tables that produced the stored weights. A mismatch at open recomputes every key — the ONLY trigger that can replace the all-zero default `ADD COLUMN` materialized for pre-existing rows |

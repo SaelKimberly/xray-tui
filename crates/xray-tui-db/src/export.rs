@@ -42,7 +42,10 @@ impl ExportScope {
                  AND (e.domain = '' OR EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id))"
             }
             Self::Resolved => {
-                "(e.domain = '' OR EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id))"
+                // "has a dialable address" — the address row IS the condition.
+                // `e.domain = ''` would also admit an exotic/Undefined host
+                // (empty domain, NO address row), which must not be emitted.
+                "EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id)"
             }
             Self::Active => "er.band = 0 AND ps.purge_reason IS NULL",
             Self::Full => "ps.purge_reason IS NULL",
@@ -214,7 +217,7 @@ fn projection_sql(scope: ExportScope) -> String {
          ps.speed_bps, ps.error, ps.error_kind, ps.error_text, ps.purge_reason, \
          ps.traffic_today_up, ps.traffic_today_down, ps.traffic_total_up, ps.traffic_total_down, \
          ps.created_at, ps.updated_at, ps.version, {address_key} AS ip_key, \
-         CASE WHEN e.domain = '' THEN 1 \
+         CASE WHEN e.domain = '' AND EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id) THEN 1 \
               WHEN EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id) THEN 0 \
               ELSE 2 END AS address_rank \
          FROM profile_stats ps \

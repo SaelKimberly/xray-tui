@@ -858,7 +858,7 @@ async fn handle_key(key: &KeyEvent, state: &mut AppState) {
                     .endpoints
                     .iter()
                     .find(|r| r.endpoint.id.get() == ep_id)
-                    .map(|r| r.endpoint.dns_name())
+                    .map(|r| r.endpoint.display_host(&r.resolved_ips))
                     .unwrap_or_default();
                 crate::ops::enrich::spawn_dns_resolve(state, ep_id, true);
                 state.log_trace("info", "tui::ui", &format!("Resolving {host} …"));

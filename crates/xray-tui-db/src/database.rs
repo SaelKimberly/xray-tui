@@ -3608,6 +3608,48 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         );
     }
 
+    /// The import path's bulk literal writer (db-rewamp D10): an IP literal's
+    /// row is written once, and a re-import of the SAME literal must NOT erase
+    /// the country the geo step stored — `ON CONFLICT DO NOTHING`, not a
+    /// re-insert. A duplicated literal in one batch must not raise either.
+    #[tokio::test]
+    async fn import_literal_bulk_writes_once_and_keeps_the_country() {
+        let db = Database::in_memory().await.expect("in-memory db");
+        let mut conn = db.connection().await.expect("connection");
+
+        crate::endpoint_ip::insert_literals_bulk(
+            &mut conn,
+            &[
+                (EndpointId::new(1), ip("198.51.100.7")),
+                (EndpointId::new(1), ip("198.51.100.7")), // duplicate in-batch
+                (EndpointId::new(2), ip("2001:db8::1")),
+            ],
+        )
+        .await
+        .expect("bulk literals");
+        db.set_endpoint_ip_country(EndpointId::new(1), ip("198.51.100.7"), "FR")
+            .await
+            .expect("country");
+
+        // A second import of the same literal keeps the row and its country.
+        crate::endpoint_ip::insert_literals_bulk(
+            &mut conn,
+            &[(EndpointId::new(1), ip("198.51.100.7"))],
+        )
+        .await
+        .expect("re-import");
+        assert_eq!(
+            db.endpoint_resolutions(&[EndpointId::new(1)])
+                .await
+                .expect("read")
+                .get(&EndpointId::new(1))
+                .cloned()
+                .unwrap_or_default(),
+            vec![(ip("198.51.100.7"), Some("FR".to_string()))],
+            "one row, country intact, no duplicate",
+        );
+    }
+
     #[tokio::test]
     async fn country_batch_creates_missing_address_rows() {
         let db = Database::in_memory().await.expect("in-memory db");

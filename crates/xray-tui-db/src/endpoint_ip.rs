@@ -161,6 +161,68 @@ pub async fn replace(
     Ok(())
 }
 
+/// Bulk-insert IP-literal address rows — the IMPORT hot path (db-rewamp D10).
+///
+/// An IP literal's address set is immutable and its row is written once, at
+/// import, so this is a single multi-row `INSERT … ON CONFLICT DO NOTHING` per
+/// 400 rows — NO per-endpoint read or delete. `replace` (delete-then-insert
+/// plus a `countries_of` read) is the RESOLUTION path, where the set is what
+/// the resolver just returned; reusing it here cost 3 statements × ~56k
+/// IP-literal endpoints, reintroducing the per-row import shape ADR 0008
+/// measured at 360 ms/2k links vs 44.3 ms bulk.
+///
+/// `DO NOTHING` is semantically exact: the row already exists only when the
+/// same literal was imported before, and then its `country` (written by the
+/// geo step) MUST survive — an insert that overwrote it would erase a lookup.
+pub async fn insert_literals_bulk(
+    conn: &mut impl toasty::Executor,
+    rows: &[(EndpointId, IpAddr)],
+) -> Result<()> {
+    use std::fmt::Write as _;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // Dedup by (endpoint, key): the PK is the pair, and a duplicated literal
+    // must not be a constraint violation.
+    let mut seen: std::collections::HashSet<(i64, Vec<u8>)> =
+        std::collections::HashSet::with_capacity(rows.len());
+    let mut pairs: Vec<(i64, Vec<u8>)> = Vec::with_capacity(rows.len());
+    for (id, ip) in rows {
+        let key = key_of(*ip);
+        if seen.insert((id.get(), key.clone())) {
+            pairs.push((id.get(), key));
+        }
+    }
+    for chunk in pairs.chunks(LITERAL_BULK_ROWS) {
+        let mut sql = String::with_capacity(chunk.len() * 48 + 96);
+        sql.push_str("INSERT INTO \"endpoint_ip\" (\"endpoint_id\", \"ip_key\") VALUES ");
+        for (i, (id, key)) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            let _ = write!(sql, "({id}, x'{}')", hex_lit(key));
+        }
+        sql.push_str(" ON CONFLICT(\"endpoint_id\", \"ip_key\") DO NOTHING");
+        toasty::sql::statement(sql).exec(conn).await?;
+    }
+    Ok(())
+}
+
+/// Rows per bulk statement — the same 400 the other import bulk writers use
+/// (`database::IMPORT_STATEMENT_ROWS`); kept local because that constant is
+/// private to its module.
+const LITERAL_BULK_ROWS: usize = 400;
+
+/// Lowercase hex of a key, for a `x'…'` blob literal.
+fn hex_lit(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// The persisted countries of `ids`, keyed by endpoint and address key.
 ///
 /// One statement for the whole set, ids inlined for the same reason [`load`]

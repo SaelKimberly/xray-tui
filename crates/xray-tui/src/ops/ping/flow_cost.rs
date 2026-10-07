@@ -677,7 +677,7 @@ async fn flow_cost_report() {
                     scope: PlanScope::All,
                     search: None,
                     group_id: None,
-                    sort: PageSort::Address,
+                    sort: PageSort::Port,
                     ascending: true,
                     offset: 0,
                     limit: PROFILES_PAGE_SIZE,
@@ -705,7 +705,7 @@ async fn flow_cost_report() {
                     (PurgatoryView::All, "All"),
                     (PurgatoryView::Active, "Active"),
                 ] {
-                    for (sort, tag) in [(PageSort::Address, "Address"), (PageSort::Test, "Test")] {
+                    for (sort, tag) in [(PageSort::Port, "Port"), (PageSort::Test, "Test")] {
                         let head = PageRequest {
                             view,
                             active_threshold: 0,
@@ -824,8 +824,6 @@ async fn flow_cost_report() {
                 for (sort, ascending) in [
                     (PageSort::Test, true),
                     (PageSort::Test, false),
-                    (PageSort::Address, true),
-                    (PageSort::Address, false),
                 ] {
                     let request = PageRequest {
                         view: PurgatoryView::Active,
@@ -1193,7 +1191,6 @@ async fn measure_page_scale() {
             active_total.saturating_sub(PROFILES_PAGE_SIZE),
         ];
         for (sort, tag) in [
-            (PageSort::Address, "Address(filesort)"),
             (PageSort::Port, "Port(filesort)"),
             (PageSort::Test, "Test(index)"),
         ] {

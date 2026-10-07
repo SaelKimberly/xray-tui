@@ -437,9 +437,7 @@ pub async fn persist_parsed(
         xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await?;
         xray_tui_db::upsert_links_bulk(&mut tx, &links).await?;
         xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &group_links).await?;
-        for (id, ip) in &ip_literals {
-            xray_tui_db::endpoint_ip::replace(&mut tx, *id, std::slice::from_ref(ip)).await?;
-        }
+        xray_tui_db::endpoint_ip::insert_literals_bulk(&mut tx, &ip_literals).await?;
         tx.commit().await?;
         Ok(())
     };

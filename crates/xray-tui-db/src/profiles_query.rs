@@ -47,7 +47,6 @@ const PROJ_ID: &str = "k.endpoint_id";
 pub enum PageSort {
     /// Decision-16 test priority, ordered by the representative link.
     Test,
-    Address,
     Port,
     /// The endpoint's lowest resolved address (`endpoint_ip.ip_key`). The
     /// addresses are the only IP fact stored per endpoint, so this is the one
@@ -55,11 +54,10 @@ pub enum PageSort {
     Ip,
     /// The endpoint id — the batch's feed walk.
     ///
-    /// Ids never change, so the order is as stable under a running batch as
-    /// `Address` is, and it is 3.2× cheaper (measured on the 7,486-endpoint
-    /// reference feed: 3.6 ms per page against 11.6 ms for the host order,
-    /// both through the app's own driver). `Address` was chosen for stability,
-    /// not for meaning: nothing displays this order.
+    /// Ids never change, so the order is stable under a running batch, and it
+    /// is 3.2× cheaper than a host-text order (measured on the 7,486-endpoint
+    /// reference feed: 3.6 ms per page against 11.6 ms, both through the app's
+    /// own driver). Nothing displays this order; it exists for the lab.
     Id,
 }
 
@@ -335,10 +333,6 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
             term(rank_col("rank_addr"), true),
             term("k.endpoint_id".to_string(), true),
         ],
-        PageSort::Address => vec![
-            term(rank_col("rank_host"), true),
-            term("k.endpoint_id".to_string(), true),
-        ],
         PageSort::Port => vec![
             term("e.port".to_string(), true),
             term("k.endpoint_id".to_string(), true),
@@ -480,7 +474,7 @@ fn base_select(sql: &mut Sql, req: &PageRequest, projection: &str, join_endpoint
 }
 
 /// Whether a query needs the `endpoints` row: the search predicate reads the
-/// host/port, and the Address/Port sorts order by them.
+/// host/port, and the Port sort orders by it.
 fn needs_endpoints(req: &PageRequest) -> bool {
     req.search.as_ref().is_some_and(|s| !s.is_empty()) || matches!(req.sort, PageSort::Port)
 }
@@ -667,8 +661,8 @@ impl Database {
             .join(", ");
         let mut key_sql = Sql::new();
         key_sql.push(&format!("SELECT {key_projection}"));
-        // The Address/Port sorts read endpoint columns, so their key query
-        // needs the join the page query also takes for them.
+        // The Port sort reads an endpoint column, so its key query needs the
+        // join the page query also takes for it.
         key_sql.push(" FROM endpoint_rank k");
         if needs_endpoints(req) {
             key_sql.push(" JOIN endpoints e ON e.id = k.endpoint_id");

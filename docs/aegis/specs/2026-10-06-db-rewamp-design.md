@@ -119,10 +119,13 @@ Access paths (all measured SQLite, §9.2 — re-verify on turso):
   bin predicate applied inline (verified, §9.2) — so `endpoint_rank_test_v2` is not needed.
 - The reband sweep keeps `(band, rank_newest_seen)`.
 
-Dropped indexes: `endpoint_rank_test`, `endpoint_rank_test_v2`, `endpoint_rank_band_host`,
-`endpoint_rank_window`. **`endpoint_ip_by_key` STAYS** — it served the retired Ip sort *and*
-now serves the IP/CIDR search range (§3.8). Model drops: `profile_stats.protocol_id` and
-`endpoint_groups.endpoint_id` (PK-prefix redundant).
+Dropped indexes (**shipped 2026-10-07**): `endpoint_rank_test`, `endpoint_rank_test_v2`,
+`endpoint_rank_band_host`, `endpoint_rank_window`. **`endpoint_ip_by_key` STAYS** — it served
+the retired Ip sort *and* now serves the IP/CIDR search range (§3.8). Model drops (**shipped**):
+`profile_stats.protocol_id` and `endpoint_groups.endpoint_id` (both are the FIRST column of
+their composite PK, so the PK autoindex already serves the prefix seek). `PageSort::Address`
+and the `rank_host` raw column + its `band_host` index retired with it (no production caller;
+Address ordering is the Test key's `rank_domain`/`rank_sub_domain`/`rank_addr` tail).
 
 ### 3.3 Sort contract
 

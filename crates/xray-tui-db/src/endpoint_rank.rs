@@ -262,7 +262,7 @@ pub fn display_link_index(links: &[RankLink], override_protocol: Option<i64>) ->
 /// A rank row plus the one key that is NOT a model field.
 ///
 /// `rank_weight` is a RAW column (added with `ALTER TABLE ADD COLUMN` beside
-/// `band`/`rank_host`), and the toasty model has no seat for a raw column —
+/// `band`), and the toasty model has no seat for a raw column —
 /// declaring it on `EndpointRank` instead would need schema tag 15, which
 /// decision 4 defines as a full database wipe. So the write path carries this
 /// plain row instead of the model.
@@ -435,12 +435,6 @@ const WEIGHT_COLUMN: &str = "ALTER TABLE endpoint_rank ADD COLUMN rank_weight BL
 const WEIGHT_META_TABLE: &str = "CREATE TABLE IF NOT EXISTS rank_weight_meta \
      (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)";
 
-/// The Active-view Address page: `WHERE band = 0 ORDER BY rank_host` is an
-/// index seek + ordered scan, no temp b-tree (the range-vs-order filesort the
-/// `(rank_newest_seen, host)` shape could not avoid — host lives on `endpoints`).
-const BAND_HOST_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_band_host \
-     ON endpoint_rank(band, rank_host, endpoint_id)";
-
 /// The directional reband sweep seeks `band = 0 AND rank_newest_seen < ?`.
 const BAND_WINDOW_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_band_window \
      ON endpoint_rank(band, rank_newest_seen)";
@@ -468,14 +462,13 @@ pub(crate) async fn ensure(conn: &mut toasty::Connection) -> crate::Result<()> {
 }
 
 async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
-    // `band` + `rank_host` are RAW columns on this derived table (NOT toasty
-    // model fields), so the page's Active membership is a stored `band = 0` and
-    // the Address order is an index seek on `rank_host` — no schema-tag bump,
-    // no file wipe. ADD COLUMN is attempted every open; the duplicate-column
-    // error on an already-migrated database is expected and ignored.
+    // `band` is a RAW column on this derived table (NOT a toasty model field),
+    // so the page's Active membership is a stored `band = 0` — no schema-tag
+    // bump, no file wipe. ADD COLUMN is attempted every open; the
+    // duplicate-column error on an already-migrated database is expected and
+    // ignored. (`rank_host` died with `PageSort::Address` — db-rewamp §3.2.)
     for alter in [
         "ALTER TABLE endpoint_rank ADD COLUMN band INTEGER",
-        "ALTER TABLE endpoint_rank ADD COLUMN rank_host TEXT",
         WEIGHT_COLUMN,
     ] {
         let _ = toasty::sql::query(alter).exec(conn).await;
@@ -487,7 +480,6 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     // time) so a rollback still has one.
     for ddl in [
         COVERING_INDEX,
-        BAND_HOST_INDEX,
         BAND_WINDOW_INDEX,
         WEIGHT_META_TABLE,
     ] {
@@ -513,7 +505,7 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         // path existed, or by a path that bypassed one) heals here rather than
         // hiding rows from the page.
         repair_missing(conn).await?;
-        // One-time band/rank_host backfill for rows that predate the columns:
+        // One-time band backfill for rows that predate the column:
         // `repair_missing` fills only ABSENT rows, so an existing rank row
         // carries a NULL band until it is next refreshed. Fill them once here.
         backfill_bands(conn).await?;
@@ -545,9 +537,9 @@ async fn stamp_weight_version(conn: &mut impl toasty::Executor) -> crate::Result
     Ok(())
 }
 
-/// Fill `band`/`rank_host` for rows that predate the columns (`band IS NULL`) —
-/// the non-destructive upgrade's one-time cost. Same derivation as `write`'s
-/// follow-up: `band` from the ttl membership, `rank_host` from the endpoint host.
+/// Fill `band` for rows that predate the column (`band IS NULL`) — the
+/// non-destructive upgrade's one-time cost. Same derivation as `write`'s
+/// follow-up: the ttl membership.
 async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     if scalar_i64(
         conn,
@@ -562,8 +554,7 @@ async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
         - ACTIVE_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed);
     toasty::sql::query(format!(
         "UPDATE endpoint_rank SET \
-         band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END, \
-         rank_host = (SELECT CASE WHEN e.sub_domain = '' THEN e.domain ELSE e.sub_domain || '.' || e.domain END FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
+         band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END \
          WHERE band IS NULL"
     ))
     .exec(conn)
@@ -625,11 +616,9 @@ pub(crate) async fn write(
         ))
         .exec(conn)
         .await?;
-        // `band`/`rank_host` are RAW columns (not in the toasty model): INSERT
-        // OR REPLACE re-inserts the row and nulls them, so re-set them for this
-        // chunk. band is the ttl membership from the just-written
-        // rank_newest_seen; rank_host mirrors the endpoint host so the
-        // Active-Address page is an index seek, not a cross-table sort.
+        // `band` is a RAW column (not in the toasty model): INSERT OR REPLACE
+        // re-inserts the row and nulls it, so re-set it for this chunk — the
+        // ttl membership from the just-written rank_newest_seen.
         //
         // `rank_weight` is NOT re-set here: it is Rust-computed, so it went
         // into the INSERT's values tuple above and needs no second statement.
@@ -640,8 +629,7 @@ pub(crate) async fn write(
             .join(",");
         toasty::sql::query(format!(
             "UPDATE endpoint_rank SET \
-             band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END, \
-             rank_host = (SELECT CASE WHEN e.sub_domain = '' THEN e.domain ELSE e.sub_domain || '.' || e.domain END FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
+             band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END \
              WHERE endpoint_id IN ({ids})"
         ))
         .exec(conn)

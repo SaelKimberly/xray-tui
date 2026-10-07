@@ -546,7 +546,7 @@ pub async fn start_edit_profile(state: &mut AppState, id: &str) {
             return;
         }
     };
-    let fields = profile_to_fields(&protocol, &row.endpoint);
+    let fields = profile_to_fields(&protocol, &row.endpoint, &row.resolved_ips);
     state.mode = AppMode::EditServer {
         protocol_id: endpoint_id,
         proto_kind: protocol.proto_kind,
@@ -993,7 +993,15 @@ fn form_from_parsed(state: &mut AppState, parsed: &ParsedProfile) {
     };
     let endpoint = endpoint_from_essentials(&first);
     let protocol = protocol_from_parsed(&parsed.parsed);
-    let fields = profile_to_fields(&protocol, &endpoint);
+    // An IP-literal share URL's address is not in `dns_name()`; hand the form
+    // the parse-boundary literal so the `address` field is populated.
+    let literal: Vec<std::net::IpAddr> = first
+        .host
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .into_iter()
+        .collect();
+    let fields = profile_to_fields(&protocol, &endpoint, &literal);
     let core_protocol = parsed.parsed.protocol.proto_kind;
     state.mode = AppMode::AddServer {
         protocol: Some(core_protocol),
@@ -1668,6 +1676,32 @@ mod edit_tests {
                     .iter()
                     .any(|(k, v)| k == "address" && v == "visible.example"),
                 "edit form must carry the endpoint address"
+            );
+        } else {
+            panic!("expected EditServer");
+        }
+    }
+
+    /// An IP-literal endpoint's `dns_name()` is empty and its address lives in
+    /// `endpoint_ip`, so the edit form must read the DIAL host (`display_host`)
+    /// — a bare `dns_name()` opened the form blank and its re-submit would fail
+    /// validation for ~75% of a real feed. The DNS case above is the control.
+    #[tokio::test]
+    async fn edit_form_shows_an_ip_literal_address() {
+        let mut state = test_state(vec![fake_row(7, "203.0.113.7", 1)]).await;
+        let row = state.endpoints[0].clone();
+        state.db.upsert_endpoint(&row.endpoint).await.unwrap();
+        let proto = super::xray_tui_db_helper::vless_protocol(700);
+        state.db.upsert_protocol(&proto).await.unwrap();
+        state.db.upsert_link(&row.links[0]).await.unwrap();
+        start_edit_profile(&mut state, "7").await;
+        assert!(matches_edit_mode(&state, 7));
+        if let AppMode::EditServer { fields, .. } = &state.mode {
+            assert!(
+                fields
+                    .iter()
+                    .any(|(k, v)| k == "address" && v == "203.0.113.7"),
+                "the edit form must carry an IP-literal endpoint's address, got {fields:?}"
             );
         } else {
             panic!("expected EditServer");

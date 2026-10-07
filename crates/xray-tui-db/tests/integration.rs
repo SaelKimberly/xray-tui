@@ -675,23 +675,21 @@ async fn backfill_bands_fills_null_band_rows_on_reopen() {
         let mut conn = db.connection().await.expect("connection");
         seed_endpoint(&mut conn, 1, 1001, "1.1.1.1", HostType::Ipv4, 443, now).await;
         db.repair_endpoint_ranks().await.expect("ranks");
-        // A pre-columns rank row: band + rank_host NULL — the state every
-        // upgrading user's rows are in before the first reopen.
-        toasty::sql::query(
-            "UPDATE endpoint_rank SET band = NULL, rank_host = NULL WHERE endpoint_id = 1",
-        )
+        // A pre-columns rank row: band NULL — the state every upgrading
+        // user's rows are in before the first reopen.
+        toasty::sql::query("UPDATE endpoint_rank SET band = NULL WHERE endpoint_id = 1")
         .exec(&mut conn)
         .await
         .expect("null the band");
     }
     // Reopen: ensure_in sees COUNT > 0 and runs backfill_bands over the NULL
-    // rows, setting band AND rank_host in one statement.
+    // rows, setting band.
     let db = Database::open(&path).await.expect("reopen");
     let active = page_req(PurgatoryView::Active, ts(now - 7 * 86_400), None);
     assert_eq!(
         page_ids(&db, &active).await,
         vec![1],
-        "the one-time backfill filled band (and rank_host, same statement)"
+        "the one-time backfill filled band"
     );
 }
 
@@ -1630,15 +1628,15 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
          AND name IN ('endpoints', 'protocols', 'profile_stats', \
                        'endpoint_groups', 'groups', 'routing_rules', 'dns_settings', \
-                       'route_probes', 'endpoint_rank', 'endpoint_ip')",
+                       'route_probes', 'endpoint_rank', 'endpoint_ip', 'app_meta')",
     )
     .exec(&mut conn)
     .await
     .expect("count tables");
     assert_eq!(
         first_i64(&rows),
-        Some(10),
-        "the typed schema (10 tables) is created"
+        Some(11),
+        "the typed schema (11 tables) is created"
     );
 
     // Seed data, then reopen: the tag preserves both schema and data.
