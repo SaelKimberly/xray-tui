@@ -103,7 +103,7 @@ impl PlanScope {
     /// Successful = any real success (`0..=5`); New = untested (`12`);
     /// Failed = real-err/fast-err/dns-err (`13..=15`).
     #[must_use]
-    pub fn tiers(self) -> &'static [i64] {
+    pub const fn tiers(self) -> &'static [i64] {
         match self {
             Self::All => &[],
             Self::Successful => &[0, 1, 2, 3, 4, 5],
@@ -222,15 +222,15 @@ fn cidr_bounds(ip: std::net::IpAddr, bits: u8) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut lo = crate::endpoint_ip::key_of(ip);
     let full = usize::from(bits / 8);
     let rem = bits % 8;
-    for b in (full + 1)..=octets {
-        lo[b] = 0;
+    for byte in lo.iter_mut().skip(full + 1) {
+        *byte = 0;
     }
     if rem != 0 {
         lo[full + 1] &= 0xff << (8 - rem);
     }
     let mut hi = lo.clone();
-    for b in (full + 1)..=octets {
-        hi[b] = 0xff;
+    for byte in hi.iter_mut().skip(full + 1) {
+        *byte = 0xff;
     }
     Some((lo, next_key(hi)))
 }

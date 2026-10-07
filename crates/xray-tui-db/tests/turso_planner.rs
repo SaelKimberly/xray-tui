@@ -18,6 +18,8 @@
 //! cargo test -p xray-tui-db --release --test turso_planner -- --ignored --nocapture
 //! ```
 
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#![allow(clippy::items_after_statements, clippy::needless_pass_by_value, clippy::significant_drop_tightening, clippy::used_underscore_binding)]
 use turso::Builder;
 
 /// Reference-feed scale (the 2026-10-06 `data.db` endpoint count).
@@ -32,7 +34,7 @@ const KEY_INDEX: &str = "CREATE INDEX endpoint_rank_key ON endpoint_rank(\
 const KEY: &str = "band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id";
 
 fn value_row(i: usize) -> String {
-    let band = i64::from(i % 10 != 0);
+    let band = i64::from(!(i % 10).is_multiple_of(10));
     let bin = (i % 18) as i64;
     // A descending 8-byte BE blob, the real column's shape.
     let weight = format!("x'{:016x}'", u64::MAX - (i as u64 % 1000));

@@ -184,6 +184,14 @@ refresh ALREADY reads `endpoints.host` — so T8/T9 needs NO T4. Approach:
    `rank_domain`/`rank_sub_domain` + the addr range (or `endpoints.domain` later).
 5. Re-pin the profiles_query oracle + rank unit tests.
 
+## T8/T9/D6 DONE (commits 68fcf9d, 7cb34f1, 280bdad, + clippy)
+The binned law + one covering index + band-first order + indexed search all land
+WITHOUT T4 (the split is materialized on `endpoint_rank` at refresh; `endpoints`
+keeps `host`/`host_type`). `SCHEMA_VERSION` 17. Verified on turso: Active/
+Purgatory `SEARCH USING INDEX endpoint_rank_key (band=?)`, All `SCAN USING
+COVERING INDEX`, no sorter; the `band IN (0,1)` trap sorts. db 171, tui 259,
+core/proto/config 740 green.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of

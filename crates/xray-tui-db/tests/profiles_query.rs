@@ -824,27 +824,6 @@ fn dns_unresolved(row: &xray_tui_db::models::EndpointRow) -> bool {
 /// Not `EndpointRow::active_link()`: that falls back to `links[selected_protocol]`
 /// — the untested link when nothing is measured — while the ordering rule is
 /// "no measured link, no value" (the SQL's `COALESCE(..., sentinel)`).
-fn display_link(
-    row: &xray_tui_db::models::EndpointRow,
-) -> Option<&xray_tui_db::models::ProfileStats> {
-    if let Some(pid) = row.endpoint.manual_protocol_override
-        && let Some(link) = row.links.iter().find(|l| l.protocol_id == pid)
-    {
-        return Some(link);
-    }
-    row.links
-        .iter()
-        .filter(|l| l.latency.is_some())
-        .min_by_key(|l| {
-            let (rank, delay) = match l.latency {
-                Some(xray_tui_db::models::Latency::Real { delay, .. }) => (0i32, delay),
-                Some(xray_tui_db::models::Latency::Fast { delay }) => (1, delay),
-                None => (2, i32::MAX),
-            };
-            (rank, delay, l.protocol_id.get())
-        })
-}
-
 /// Ascending sort key per endpoint, mirroring `order_terms`.
 ///
 /// A tuple, not a packed integer: the Test key is the FULL decision-16 tuple
@@ -890,11 +869,7 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
                 xray_tui_db::endpoint_ip::key_of_str(&row.endpoint.host).unwrap_or_default()
             };
             // band = "has a live link" (threshold ts(0)); NO_SEEN-only -> 1.
-            let band = if row.links.iter().any(|l| l.purge_reason.is_none()) {
-                0
-            } else {
-                1
-            };
+            let band = i64::from(row.links.iter().all(|l| l.purge_reason.is_some()));
             (
                 band,
                 i64::from(bin),

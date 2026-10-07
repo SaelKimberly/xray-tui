@@ -1,8 +1,7 @@
 //! The ONE DNS-name split (db-rewamp D2/D6).
 //!
-//! A DNS host is split into its registrable `domain` (eTLD+1, from the Public
-//! Suffix List) and its `sub_domain` (the labels left of it). This module is
-//! the SINGLE owner of that split — validation (`import_export::validate_host`),
+//! A DNS host splits into a registrable `domain` and a `sub_domain`. This
+//! module is the SINGLE owner of that split — validation (`import_export::validate_host`),
 //! the row-build owner (`state::endpoint_from_essentials`) and the prefix-search
 //! predicate all read it, so the accepted name, the stored name and the
 //! identity cannot drift.
@@ -32,9 +31,11 @@ pub struct DomainSplit {
     pub sub_domain: String,
 }
 
-/// Split a DNS host into `(domain, sub_domain)`, or `None` when the host has no
-/// registrable domain — a single label (`localhost`, `pl`) or a bare public
-/// suffix (`co.uk`, `github.io`). The caller rejects (validation) or skips.
+/// Split a DNS host into `(domain, sub_domain)`, or `None`.
+///
+/// `None` when the host has no registrable domain — a single label
+/// (`localhost`, `pl`) or a bare public suffix (`co.uk`, `github.io`). The
+/// caller rejects (validation) or skips.
 ///
 /// The PRIVATE section of the list is honoured: `github.io`/`blogspot.com`/
 /// `pages.dev` are public suffixes (so a bare one yields `None`), while
@@ -119,6 +120,6 @@ mod tests {
 
     #[test]
     fn the_psl_version_is_nonempty() {
-        assert!(!psl_version().is_empty());
+        assert_ne!(psl_version(), "");
     }
 }

@@ -206,7 +206,7 @@ pub const fn dns_unresolved_endpoint(host_type: HostType, has_address: bool) -> 
 
 /// True for an [`EndpointRow`].
 #[must_use]
-pub fn dns_unresolved(row: &EndpointRow) -> bool {
+pub const fn dns_unresolved(row: &EndpointRow) -> bool {
     row.endpoint.is_dns() && row.resolved_ips.is_empty()
 }
 
