@@ -233,6 +233,13 @@ fn link_value(
 /// a measured link with an error marker beside an untested sibling.
 async fn seed_fixture() -> Database {
     let db = Database::in_memory().await.expect("in-memory db");
+    seed_into(&db).await;
+    db
+}
+
+/// Seed the standard fixture into an EXISTING database (so a file-backed one
+/// can exercise the direct reader path the in-memory tests fall back past).
+async fn seed_into(db: &Database) {
     let mut conn = db.connection().await.expect("conn");
 
     // e1: real 30 + fast-error sibling
@@ -285,7 +292,42 @@ async fn seed_fixture() -> Database {
     // Establish the same invariant they do, explicitly.
     let ids: Vec<EndpointId> = (1..=7).map(EndpointId::new).collect();
     db.refresh_endpoint_ranks(&ids).await.expect("seed ranks");
-    db
+}
+
+/// The direct turso reader must return the SAME page the toasty path does —
+/// every sort, both directions, all three views. The file db takes the direct
+/// path; the in-memory one falls back to toasty.
+#[tokio::test]
+async fn the_direct_page_matches_the_toasty_page() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_db = Database::open(dir.path().join("direct.db"))
+        .await
+        .expect("file db");
+    assert!(file_db.uses_direct_reader(), "a file db has a direct reader");
+    seed_into(&file_db).await;
+    let mem_db = seed_fixture().await;
+
+    for sort in ALL_SORTS {
+        for ascending in [true, false] {
+            for view in [
+                PurgatoryView::All,
+                PurgatoryView::Active,
+                PurgatoryView::Purgatory,
+            ] {
+                let req = PageRequest {
+                    view,
+                    ..request(sort, ascending, 0, 100)
+                };
+                let direct = file_db.profiles_page(&req).await.expect("direct page");
+                let toasty = mem_db.profiles_page(&req).await.expect("toasty page");
+                assert_eq!(
+                    direct.ids, toasty.ids,
+                    "direct vs toasty {sort:?} asc={ascending} view={view:?}"
+                );
+                assert_eq!(direct.total, toasty.total, "total {sort:?} {view:?}");
+            }
+        }
+    }
 }
 
 #[tokio::test]

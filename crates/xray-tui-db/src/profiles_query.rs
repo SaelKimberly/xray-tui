@@ -187,6 +187,33 @@ impl Sql {
         }
         Ok(query.exec(conn).await?)
     }
+
+    /// Run the statement on the LONG-LIVED direct turso connection (T13) and
+    /// return the ids/count as `Value::I64` — the page's id and count queries
+    /// each select one INTEGER column. `self.params` (toasty `Value`s) are
+    /// converted to turso values.
+    async fn exec_direct(&self, conn: &mut turso::Connection) -> Result<Vec<Value>> {
+        let params: Vec<turso::Value> = self.params.iter().map(to_turso_value).collect();
+        let mut rows = conn
+            .query(self.text.clone(), turso::params_from_iter(params))
+            .await
+            .map_err(crate::export::turso_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(crate::export::turso_error)? {
+            out.push(Value::I64(row.get::<i64>(0).unwrap_or(0)));
+        }
+        Ok(out)
+    }
+}
+
+/// toasty `Value` → turso `Value` (only the page's bind kinds: ints, text, blobs).
+fn to_turso_value(v: &Value) -> turso::Value {
+    match v {
+        Value::I64(n) => turso::Value::Integer(*n),
+        Value::String(s) => turso::Value::Text(s.clone()),
+        Value::Bytes(b) => turso::Value::Blob(b.clone()),
+        _ => turso::Value::Null,
+    }
 }
 
 /// The packed-key half-open range `[lo, hi)` an IP search term selects, or
@@ -494,6 +521,10 @@ impl Database {
     /// One page of endpoint ids in display order, plus the filtered total.
     #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
     pub async fn profiles_page(&self, req: &PageRequest) -> Result<PageMeta> {
+        if let Some(direct) = &self.direct {
+            let mut conn = direct.lock().await;
+            return Self::page_ids_direct(&mut conn, req).await;
+        }
         let mut conn = self.connection().await?;
         let total = self.profiles_count_with(&mut conn, req).await?;
         let offset = req.offset.min(usize::try_from(total).unwrap_or(usize::MAX));
@@ -552,6 +583,47 @@ impl Database {
         let rows = sql.exec(&mut conn).await?;
         let ids = rows.iter().map(decode_id).collect::<Result<Vec<_>>>()?;
         Ok((ids, total))
+    }
+
+    /// The page's ids + total over the long-lived direct connection (T13) —
+    /// no toasty execution layer, which is the measured 80× gap.
+    async fn page_ids_direct(conn: &mut turso::Connection, req: &PageRequest) -> Result<PageMeta> {
+        let mut count_sql = Sql::new();
+        count_sql.push("SELECT COUNT(*)");
+        base_from_where(
+            &mut count_sql,
+            req,
+            req.search.as_ref().is_some_and(|s| !s.is_empty()),
+        );
+        let total = count_sql
+            .exec_direct(conn)
+            .await?
+            .first()
+            .and_then(|v| match v {
+                Value::I64(n) => u64::try_from(*n).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let offset = req.offset.min(usize::try_from(total).unwrap_or(usize::MAX));
+
+        let mut sql = Sql::new();
+        base_select(&mut sql, req, PROJ_ID, needs_endpoints(req));
+        order_by(&mut sql, &req.order_terms());
+        let limit = sql.bind(i64::try_from(req.limit).unwrap_or(i64::MAX));
+        let offset_bind = sql.bind(i64::try_from(offset).unwrap_or(i64::MAX));
+        sql.push(&format!(" LIMIT {limit} OFFSET {offset_bind}"));
+        let rows = sql.exec_direct(conn).await?;
+        // `exec_direct` already reduced each row to its integer column.
+        let ids = rows
+            .iter()
+            .map(|v| match v {
+                Value::I64(n) => Ok(EndpointId::new(*n)),
+                other => Err(DatabaseError::Generic(format!(
+                    "profiles_page (direct): unexpected id {other:?}"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PageMeta { ids, total, offset })
     }
 
     async fn profiles_count_with(

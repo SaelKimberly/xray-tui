@@ -98,6 +98,12 @@ pub struct Database {
     concurrent_writes: bool,
     path: Option<PathBuf>,
     export_lock: Arc<tokio::sync::Mutex<()>>,
+    /// A LONG-LIVED direct turso connection (db-rewamp T13), created ONCE at
+    /// open and used for the page's id+count reads, which bypass toasty's
+    /// execution layer (~108 ms → ~1 ms on the 74k feed). `None` for an
+    /// in-memory database, where the toasty path is used. The export reader
+    /// opens its own per-call connection instead: it is a one-off.
+    pub(crate) direct: Option<Arc<tokio::sync::Mutex<turso::Connection>>>,
 }
 
 /// Which mutable column groups a [`LinkPatch`] writes.
@@ -193,6 +199,21 @@ fn should_use_mvcc(path: &Path, requested_mvcc: bool) -> Result<bool> {
         Some(_) => Ok(false),
         None => Ok(requested_mvcc),
     }
+}
+
+/// Open the long-lived direct reader connection (db-rewamp T13). Mirrors the
+/// driver's journal mode so a WAL/MVCC file is read consistently.
+async fn open_direct_conn(path: &str, concurrent_writes: bool) -> Result<turso::Connection> {
+    let db = turso::Builder::new_local(path)
+        .build()
+        .await
+        .map_err(crate::export::turso_error)?;
+    let conn = db.connect().map_err(crate::export::turso_error)?;
+    let journal = if concurrent_writes { "mvcc" } else { "wal" };
+    let _ = conn
+        .pragma_update("journal_mode", format!("'{journal}'"))
+        .await;
+    Ok(conn)
 }
 
 fn file_driver(path: &str, concurrent_writes: bool) -> toasty_driver_turso::Turso {
@@ -356,12 +377,28 @@ impl Database {
         if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
             tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
+        let direct = match open_direct_conn(path_str, concurrent_writes).await {
+            Ok(c) => Some(Arc::new(tokio::sync::Mutex::new(c))),
+            Err(e) => {
+                tracing::warn!(target: "xray_tui_db", "direct reader unavailable: {e}");
+                None
+            }
+        };
         Ok(Self {
             db,
             concurrent_writes,
             path: Some(PathBuf::from(path_str)),
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
+            direct,
         })
+    }
+
+    /// True when this handle reads the page through the long-lived direct
+    /// turso connection (T13) — a file-backed database. False for an in-memory
+    /// one, which uses the toasty execution path.
+    #[must_use]
+    pub fn uses_direct_reader(&self) -> bool {
+        self.direct.is_some()
     }
 
     /// Open a toasty DB by constructing builder. Separate for recovery logic.
@@ -496,6 +533,7 @@ impl Database {
             concurrent_writes: false,
             path: None,
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
+            direct: None,
         })
     }
 

@@ -403,7 +403,7 @@ fn path_str(path: &Path) -> Result<&str> {
         .ok_or_else(|| DatabaseError::Generic("database path is not valid UTF-8".into()))
 }
 #[allow(clippy::needless_pass_by_value)]
-fn turso_error(error: turso::Error) -> DatabaseError {
+pub(crate) fn turso_error(error: turso::Error) -> DatabaseError {
     DatabaseError::Generic(format!("turso export: {error}"))
 }
 
