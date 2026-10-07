@@ -494,6 +494,20 @@ pub struct RouteProbes {
     pub hosts: Vec<String>,
 }
 
+/// A generic key/value stamp (db-rewamp D2).
+///
+/// Guards the STORED identity against a change in a build-time input: the first
+/// key is `psl_version`, the `psl2` Public Suffix List version, whose change can
+/// re-key endpoints. A typed model (not raw DDL) so `push_schema` owns the
+/// table and the raw-SQL inventory stays clean.
+#[derive(Debug, Clone, toasty::Model)]
+#[table = "app_meta"]
+pub struct AppMeta {
+    #[key]
+    pub key: String,
+    pub value: String,
+}
+
 /// Materialized per-endpoint ordering keys (ADR 0003).
 ///
 /// Derived state of the decision-16 law, computed in Rust by

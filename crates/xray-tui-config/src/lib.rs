@@ -1,6 +1,10 @@
 pub mod app_config;
+
+/// Re-exported from `xray-tui-proto` (db-rewamp D2/D6): the split is the ONE
+/// owner of a DNS name's `domain`/`sub_domain`, and `xray-tui-db` needs it too
+/// (the rank keys materialize the split), so it lives in the crate both depend on.
+pub use xray_tui_proto::domain;
 pub mod base64_util;
-pub mod domain;
 pub mod duration_or_secs;
 pub mod fast_perc;
 pub mod forms;

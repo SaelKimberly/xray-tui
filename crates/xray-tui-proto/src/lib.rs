@@ -1,4 +1,5 @@
 pub mod clash;
+pub mod domain;
 pub mod proto_spec;
 pub mod urlx;
 pub mod utils;

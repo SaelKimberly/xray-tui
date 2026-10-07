@@ -25,9 +25,6 @@ urlencoding.workspace = true
 simdutf8 = "0.1.5"
 url.workspace = true
 
-# ============ Public-suffix split (db-rewamp D2/D6) ============
-psl2 = "0.1.31"
-
 # ============ Enum Utilities ============
 strum = { version = "0.28.0", default-features = false, features = ["derive"] }
 

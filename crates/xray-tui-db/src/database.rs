@@ -10,7 +10,8 @@ use toasty_core::stmt::Value;
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointIp, EndpointRank, EndpointRow, Group,
+    AppMeta, DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointIp, EndpointRank, EndpointRow,
+    Group,
     ProfileStats, Protocol, ProtocolId, RouteProbes, RoutingRule, TrafficStats, now_epoch,
 };
 use crate::retry_on_busy;
@@ -78,7 +79,10 @@ use crate::retry_on_busy;
 // model no longer has them — every import INSERT would fail — so the
 // file is wiped for the clean re-import. Subsequent rewamp slices
 // (the host/identity model, the binned law) bump again.
-pub const SCHEMA_VERSION: i64 = 15;
+//
+// 16 = `app_meta(key, value)` added as a typed toasty model (the PSL-version
+// stamp). Toasty's `push_schema` owns it, so the raw-DDL inventory stays clean.
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does). A named alias because the signature
@@ -348,18 +352,6 @@ impl Database {
         if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
             tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
-        // The generic key/value meta table (db-rewamp D2): stamps that guard the
-        // STORED identity against a change in a build-time input. The first is
-        // the `psl2` Public Suffix List version — a change re-keys endpoints, so
-        // the app surfaces a mismatch instead of silently shifting.
-        if let Err(e) = toasty::sql::query(
-            "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )
-        .exec(&mut conn)
-        .await
-        {
-            tracing::warn!(target: "xray_tui_db", "app_meta: {e}");
-        }
         Ok(Self {
             db,
             concurrent_writes,
@@ -387,6 +379,7 @@ impl Database {
                 RoutingRule,
                 DnsSetting,
                 RouteProbes,
+                AppMeta,
                 EndpointRank,
                 EndpointIp
             ))
@@ -453,6 +446,7 @@ impl Database {
                 RoutingRule,
                 DnsSetting,
                 RouteProbes,
+                AppMeta,
                 EndpointRank,
                 EndpointIp
             ))
@@ -492,18 +486,6 @@ impl Database {
         // single-column, and the sort wants `(ip_key, endpoint_id)` together.
         if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
             tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
-        }
-        // The generic key/value meta table (db-rewamp D2): stamps that guard the
-        // STORED identity against a change in a build-time input. The first is
-        // the `psl2` Public Suffix List version — a change re-keys endpoints, so
-        // the app surfaces a mismatch instead of silently shifting.
-        if let Err(e) = toasty::sql::query(
-            "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        )
-        .exec(&mut conn)
-        .await
-        {
-            tracing::warn!(target: "xray_tui_db", "app_meta: {e}");
         }
         Ok(Self {
             db,
@@ -739,39 +721,26 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
 
 /// Extract the first INTEGER column of the first row (used for PRAGMA reads).
 impl Database {
-/// Read a value from the generic `app_meta` key/value table, `None` when the
-/// key is absent. Raw SQL: a single-row point read, and the table is created
-/// at open (it is not a toasty model — a new model would need a schema tag).
+/// Read a value from the typed `app_meta` key/value table, `None` when the key
+/// is absent.
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn meta_get(&self, key: &str) -> Result<Option<String>> {
     let mut conn = self.conn().await?;
-    let rows = toasty::sql::query(format!(
-        "SELECT value FROM app_meta WHERE key = {}",
-        sql_lit(key)
-    ))
-    .exec(&mut conn)
-    .await?;
-    Ok(rows.first().and_then(|row| match row {
-        Value::Record(record) => record.fields.first().cloned(),
-        _ => None,
-    }).and_then(|v| match v {
-        Value::String(s) => Some(s),
-        _ => None,
-    }))
+    let row = AppMeta::filter_by_key(key.to_owned())
+        .first()
+        .exec(&mut conn)
+        .await?;
+    Ok(row.map(|m| m.value))
 }
 
-/// Upsert a value into `app_meta`. Raw SQL for the same reason `meta_get` is.
+/// Upsert a value into `app_meta`.
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn meta_set(&self, key: &str, value: &str) -> Result<()> {
     let mut conn = self.conn().await?;
-    toasty::sql::query(format!(
-        "INSERT INTO app_meta (key, value) VALUES ({}, {}) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        sql_lit(key),
-        sql_lit(value)
-    ))
-    .exec(&mut conn)
-    .await?;
+    AppMeta::upsert_by_key(key.to_owned())
+        .value(value.to_owned())
+        .exec(&mut conn)
+        .await?;
     Ok(())
 }
 }

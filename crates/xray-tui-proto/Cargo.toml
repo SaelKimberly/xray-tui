@@ -40,6 +40,9 @@ toasty.workspace = true
 
 # ============ Performance & Memory ============
 smallvec.workspace = true
+
+# ============ Public-suffix DNS split (db-rewamp D2/D6) ============
+psl2 = "0.1.31"
 bstr = { version = "^1.13.1", default-features = false, features = ["std"] }
 aho-corasick.workspace = true
 # Small inline string for URL/credential text. `compact_str` replaces the

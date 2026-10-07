@@ -14,7 +14,7 @@ derived-state tables.
 | | |
 | --- | --- |
 | Tables | 10 (listed below) |
-| Schema tag | `PRAGMA user_version = 10` |
+| Schema tag | `PRAGMA user_version = 16` |
 | Migrations | **none** — a tag mismatch deletes and recreates the file (see [Changing the schema](#changing-the-schema)) |
 | Raw SQL | `profiles_query.rs` (the page), `endpoint_rank.rs` and `endpoint_ip.rs` (their index DDL plus the id-inlined reads/writes), and the bulk patch statements (ADR 0001, ADR 0003); `PRAGMA`s are the other standing exception, described under [Connection settings](#connection-settings) |
 
@@ -51,20 +51,16 @@ erDiagram
         BIGINT sig "non-credential half / grouping key"
         TEXT proto_kind "27 protocol kinds"
         TEXT transport_type "tcp|ws|grpc|http|quic|kcp|http_upgrade|x_http"
-        TEXT transport_data "JSON"
         TEXT security_type "none|tls|reality"
         TEXT security_sni "SNI (tls + reality)"
         TEXT security_fp "fingerprint"
         BOOLEAN security_insecure
-        TEXT security_data "JSON"
         TEXT config "JSON ProtocolConfig"
         BIGINT created_at
     }
     profile_stats {
         BIGINT protocol_id PK "FK protocols.id"
         BIGINT endpoint_id PK "FK endpoints.id"
-        TEXT core_type "xray|sing_box (per-pair)"
-        TEXT config_type "share_url|form"
         BIGINT last_used_at
         BIGINT last_seen_at "staleness + retention"
         TEXT latency "real|fast, NULL = untested"
@@ -96,7 +92,6 @@ erDiagram
         BOOLEAN enabled
         TEXT user_agent
         TEXT convert_target "clash"
-        TEXT core_type "auto|xray|sing_box"
         INTEGER sort_order
         BIGINT last_refreshed
         TEXT status "ok|error|never"
@@ -148,7 +143,6 @@ erDiagram
         BIGINT rank_display_seen "display link recency"
         BIGINT rank_speed
         BIGINT rank_traffic
-        BIGINT rank_config "form 0, share_url 1, other 2"
         BIGINT rank_newest_seen "view windows"
     }
 ```
@@ -196,7 +190,7 @@ identity uid `sig ^ cred_hash` (`xray-tui-proto`'s per-kind binary writer over
 non-default, explicitly-set fields only); `sig` is kept because it is the
 "same way configured servers" grouping key. Host and port are **not** part of
 the identity, so one protocol serves many endpoints. `config` holds the full
-typed `ProtocolConfig` as JSON; `transport_data`/`security_data` hold the
+typed `ProtocolConfig` as JSON (the single owner — the former `transport_data`/`security_data` copies were dropped, db-rewamp D8); the
 nested transport/security configs, and the scalar columns beside them
 (`transport_type`, `security_type`/`sni`/`fp`/`insecure`) are the display
 projections the page reads without touching the JSON. Changing what the identity
@@ -336,7 +330,7 @@ flowchart TD
     E -- yes --> F[delete the file, rebuild]
     E -- no --> G[read PRAGMA user_version]
     F --> G
-    G --> H{tag == 11?}
+    G --> H{tag == 16?}
     H -- no --> I[push_schema + set tag 11]
     H -- yes --> J[skip push_schema]
     I --> K[PRAGMAs: WAL, busy_timeout, NORMAL, foreign_keys]
@@ -360,7 +354,7 @@ sequenceDiagram
     T->>D: upsert_endpoints_bulk (identity fields only)
     T->>D: upsert_protocols_bulk (config, transport, security)
     T->>D: upsert_links_bulk — SOURCE columns only
-    Note over T,D: on UPDATE the link writes core_type, config_type and<br/>last_seen_at — the RESULT and TRAFFIC columns are written<br/>ON CREATE only, so a refresh cannot wipe a measurement
+    Note over T,D: on UPDATE the link writes last_seen_at<br/>(the SOURCE column) — the RESULT and TRAFFIC columns<br/>are written ON CREATE only, so a refresh cannot wipe a measurement
     T->>D: endpoint_rank::refresh (inside the transaction)
     T->>D: group links (last_seen_at per source)
     T->>T: commit
@@ -437,7 +431,7 @@ flowchart LR
     C --> D{native capable?}
     D -- yes --> E[NativeCoreServer in-process]
     D -- no --> F[subprocess: xray-core / sing-box]
-    B -.->|reads the deferred JSON| G[protocols.config / transport_data / security_data]
+    B -.->|reads the deferred JSON| G[protocols.config]
 ```
 
 ## Query map
