@@ -1,6 +1,7 @@
 # Checkpoint — DB rewamp
 
 ## Snapshot
+- HEAD `78bf59f`; tree clean. T8/T9/D6 landed + verified on turso + docs updated.
 - root `/home/user/oss/xray-tui`; branch `native-core-stub`; HEAD `8097cb9`.
 - Tree **clean**; the workstream is the last 5 commits.
 
