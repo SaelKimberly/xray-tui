@@ -618,6 +618,7 @@ pub fn collapse_expand(state: &mut AppState) {
 pub fn fields_to_parsed(
     kind: ProtocolKind,
     fields: &[(String, String)],
+    validation: &ValidationSettings,
 ) -> Result<ParsedProto, String> {
     let address = get_field(fields, "address").unwrap_or_default();
     let port = get_field(fields, "port")
@@ -709,11 +710,7 @@ pub fn fields_to_parsed(
     // every import path) — a form-built host with no registrable domain is
     // rejected here exactly as an imported one is. `allow_private_ips` is off
     // for the form: a single-label/private host cannot key an endpoint.
-    xray_tui_config::import_export::validate_host(
-        &parsed,
-        &xray_tui_config::import_export::ValidationSettings::default(),
-    )
-    .map_err(|e| e.to_string())?;
+    xray_tui_config::import_export::validate_host(&parsed, validation).map_err(|e| e.to_string())?;
     Ok(parsed)
 }
 
@@ -790,7 +787,8 @@ pub async fn confirm_add_server(state: &mut AppState) {
         _ => unreachable!(),
     };
 
-    let parsed = match fields_to_parsed(protocol, &fields) {
+    let settings = ValidationSettings::from(state.config.parsing.clone());
+    let parsed = match fields_to_parsed(protocol, &fields, &settings) {
         Ok(p) => p,
         Err(e) => {
             state.log_trace(
@@ -889,7 +887,8 @@ pub async fn confirm_edit_server(state: &mut AppState) {
         _ => unreachable!(),
     };
 
-    let parsed = match fields_to_parsed(protocol, &fields) {
+    let settings = ValidationSettings::from(state.config.parsing.clone());
+    let parsed = match fields_to_parsed(protocol, &fields, &settings) {
         Ok(p) => p,
         Err(e) => {
             state.log_trace(
