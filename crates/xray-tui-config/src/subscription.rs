@@ -352,6 +352,7 @@ fn file_profile(
                 || lower.starts_with("unique-local")
                 || lower.starts_with("localhost")
                 || lower.starts_with("unspecified")
+                || lower.starts_with("host has no registrable domain")
             {
                 summary.host_validation_count += 1;
                 summary.record_error(msg.as_str());
