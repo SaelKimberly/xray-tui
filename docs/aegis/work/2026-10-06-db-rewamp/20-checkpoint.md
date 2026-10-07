@@ -61,6 +61,35 @@ reverted this turn. Measured remaining shape after the model change
   never regex the pair.
 - Bump `SCHEMA_VERSION` to 17.
 
+### T4 surface (the ~18-file reality, from a full scan)
+Beyond the files already listed, these read `Endpoint.host`/`host_type` and MUST
+move in Phase 2 (or their helper): `xray-tui/src/lib.rs:87` (Edit-form
+`address`), `ui/actions_log.rs:50`, `ui/statistics.rs:35`, `ops/profiles.rs:811,912`,
+`ops/connect.rs:354,365` (warn `host=`), `ops/ping.rs` (`:173,177` probe addr,
+`:2122` fast-probe addr, `:2970,3043,3101,3475,3479` test hosts),
+`ops/ping/flow_cost.rs:912,925,931,1075,1255` (the lab's raw `ORDER BY e.host` —
+the other half of the lab port), `db/profiles_query.rs:336` (search
+`lower(e.host) LIKE`), `db/export.rs:226` (`ORDER BY … e.host`).
+
+### Design notes for Phase 2 / T8
+- **`is_ip` cannot be `domain.is_empty()` on `Endpoint`**: `domain` is empty for
+  BOTH an IP literal AND an exotic host. Put `is_ip` on `EndpointRow` as
+  `domain.is_empty() && !resolved_ips.is_empty()` — which makes the "IP literal →
+  `endpoint_ip` at import" writer load-bearing (else `is_ip()` is false for every
+  IP host and they fall out of the enrich seed). Exotic stays distinguishable
+  (neither `domain` nor an address).
+- **No single `Endpoint` host accessor**: a DNS name is `sub_domain + "." +
+  domain` (reconstructed) and an IP literal lives in `endpoint_ip` — so
+  `display_host`/`dns_name` belong on `EndpointRow` with the addresses threaded,
+  never a `&str` off `self.host`. (`display_host` was dead and is removed.)
+- **T8 can drop the RAW-column apparatus**: `band`/`rank_host`/`rank_weight` are
+  raw `ALTER TABLE` columns only because declaring them on the model "would need
+  a schema tag = a wipe". The rewamp already wipes (tag 16, T4/T8 bump again), so
+  declare `rank_bin`/`rank_weight`/`rank_domain`/`rank_sub_domain`/`rank_addr`/
+  `rank_newest_seen`/`band` as MODEL fields and delete the `ALTER TABLE` loop,
+  `backfill_bands`, `RankRow`'s raw-weight split, and the post-write
+  `rank_host` `UPDATE … SELECT host`.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of

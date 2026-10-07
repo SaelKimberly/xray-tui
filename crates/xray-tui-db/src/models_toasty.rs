@@ -306,13 +306,6 @@ impl Endpoint {
     pub const fn is_ip(&self) -> bool {
         matches!(self.host_type, HostType::Ipv4 | HostType::Ipv6)
     }
-
-    /// The Address-column text and the dial target: the name for a DNS host,
-    /// the literal for an IP host, empty for an exotic host.
-    #[must_use]
-    pub fn display_host(&self) -> &str {
-        &self.host
-    }
 }
 
 /// One resolved address of one DNS endpoint (`endpoint_ip`).
