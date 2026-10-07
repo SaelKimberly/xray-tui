@@ -127,6 +127,14 @@ with `allow_private_ips = true`.
   `if e.is_dns() { e.dns_name() } else { addresses.first() }`.
 - `dns_name()` does NOT exist yet (it was never added) — write it on `Endpoint`.
 
+## T14 gate PASSED (a7be3fa)
+turso 0.7.2 DOES honour WITHOUT ROWID behind `experimental_without_rowid(true)`
+(default builder rejects it); round-trip + ordered scan verified. Implementation
+is sequenced AFTER T4: the raw `DROP`+`CREATE … WITHOUT ROWID` DDL must
+hand-write the FINAL (post-T4) schema. Also enable the flag on EVERY connection
+path (`file_driver`, `export.rs`'s direct builder, test helpers) via
+`toasty_driver_turso::Turso::experimental_without_rowid(true)`.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of
