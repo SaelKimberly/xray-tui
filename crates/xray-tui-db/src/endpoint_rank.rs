@@ -434,10 +434,6 @@ const WEIGHT_COLUMN: &str = "ALTER TABLE endpoint_rank ADD COLUMN rank_weight BL
 const WEIGHT_META_TABLE: &str = "CREATE TABLE IF NOT EXISTS rank_weight_meta \
      (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)";
 
-/// The view windows read this column.
-const WINDOW_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS endpoint_rank_window ON endpoint_rank(rank_newest_seen)";
-
 /// The Active-view Address page: `WHERE band = 0 ORDER BY rank_host` is an
 /// index seek + ordered scan, no temp b-tree (the range-vs-order filesort the
 /// `(rank_newest_seen, host)` shape could not avoid — host lives on `endpoints`).
@@ -490,7 +486,6 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     // time) so a rollback still has one.
     for ddl in [
         COVERING_INDEX,
-        WINDOW_INDEX,
         BAND_HOST_INDEX,
         BAND_WINDOW_INDEX,
         WEIGHT_META_TABLE,

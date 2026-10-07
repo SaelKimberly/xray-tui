@@ -202,17 +202,24 @@ XRAY_TUI_SCALE=…,50000, file db → direct active, engine turso):
 `band=0 seek` = 0.059 ms. T0 baseline (74k real feed, TOASTY path) was 108 ms —
 so the binned index + direct reader take the page to low-millisecond.
 
+## T12 / T14 — an ARCHITECTURE question, surface before starting
+Both need hand-owning a table's `CREATE TABLE` DDL (toasty can't emit
+`REFERENCES` → T12; or `WITHOUT ROWID` → T14), which is exactly what
+`docs/database-manual-sql.md` §5 REJECTED. The raw-turso POCs prove turso
+SUPPORTS both, not that the maintenance cost is acceptable. A cheaper middle
+path: ONE post-`push_schema` "table rebuild" step gated on fresh-schema that
+both consume, so the hand-DDL lives in one place. This reverses a recorded
+decision → surface it, don't plow in.
+
 ## Next step (exact resume point)
-0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
-   `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of
-   it — `profiles_query` (search/order by `e.host`), `endpoint_rank`
-   (`dns_unresolved_endpoint(host_type, …)`, the rank `bin`), `export`
-   (host/host_type), `config_builder`/`native_connect`/`ping_native`
-   (`endpoint_essentials` dial host), `ui/profiles` (Address column + `== Dns`
-   flags), `enrich`/`events`/`ping` all move. Doing T4 alone leaves the tree
-   broken; the correct unit is T4+T8+T9 (host model + binned law + page/search).
-   Budget: the largest slice in the plan. The T4 attempt was reverted — HEAD is
-   green and committed; nothing is half-done.
+0. **T4 is the ONE remaining identity change (D2/D10 — an APPROVED user
+   decision, not tidy-up).** T8/T9 landed WITHOUT it (the binned law + search are
+   materialized on `endpoint_rank`, which reads `endpoints.host` at refresh), so
+   the perf goal is met; but the user's approved shape — `endpoints.domain`/
+   `sub_domain` as the identity input, `host`/`host_type` dropped, every address
+   (incl. IP literals) in `endpoint_ip` — is UNshipped. It needs the address
+   threading (plan → probe → `endpoint_essentials`) + the IP-literal import
+   writers. Reverting to T4 alone (not T4+T8+T9: those are done).
 1. **T4 — endpoint identity/host model.** Drop `endpoints.host`/`host_type`; add
    `domain`/`sub_domain`; identity = `stable_hash(ascii_name, port)` using
    `xray_tui_config::domain::split(host).ascii` for dns, the literal for ip,

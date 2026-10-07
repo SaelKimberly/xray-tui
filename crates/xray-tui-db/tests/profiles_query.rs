@@ -328,6 +328,44 @@ async fn the_direct_page_matches_the_toasty_page() {
             }
         }
     }
+
+    // The direct path binds params through `params_from_iter`; search (String
+    // prefix + the `rank_addr` Bytes range) and group (a String bind) must
+    // produce the SAME page as toasty, or a param-order/type mismatch ships to
+    // the file-backed UI untested.
+    for search in ["h1", "10.1", "443"] {
+        let req = PageRequest {
+            search: Some(search.to_string()),
+            ..request(PageSort::Test, true, 0, 100)
+        };
+        let direct = file_db.profiles_page(&req).await.expect("direct search");
+        let toasty = mem_db.profiles_page(&req).await.expect("toasty search");
+        assert_eq!(direct.ids, toasty.ids, "direct vs toasty search={search}");
+        assert_eq!(direct.total, toasty.total, "total search={search}");
+    }
+    // A group predicate binds a String id through the direct path. Both dbs
+    // get the same membership; the ids must match.
+    for db in [&file_db, &mem_db] {
+        let mut conn = db.connection().await.expect("conn");
+        for endpoint in [1_i64, 2] {
+            toasty::create!(xray_tui_db::models::EndpointGroup {
+                endpoint_id: EndpointId::new(endpoint),
+                group_id: "g1".to_string(),
+                last_seen_at: 0,
+            })
+            .exec(&mut conn)
+            .await
+            .expect("create group link");
+        }
+    }
+    let req = PageRequest {
+        group_id: Some("g1".to_string()),
+        ..request(PageSort::Test, true, 0, 100)
+    };
+    let direct = file_db.profiles_page(&req).await.expect("direct group");
+    let toasty = mem_db.profiles_page(&req).await.expect("toasty group");
+    assert_eq!(direct.ids, toasty.ids, "direct vs toasty group");
+    assert!(!direct.ids.is_empty(), "the group predicate selected rows");
 }
 
 #[tokio::test]
