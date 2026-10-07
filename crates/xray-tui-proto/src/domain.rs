@@ -77,6 +77,16 @@ mod tests {
     }
 
     #[test]
+    fn unlisted_tlds_are_admitted_by_the_psl_default_rule() {
+        // The PSL default rule gives an unlisted TLD a registrable domain, so
+        // LAN/private-scope names are NOT rejected by the T4/T5 rule (only
+        // single-label names and bare suffixes are).
+        for host in ["nas.local", "router.lan", "server.home.arpa"] {
+            assert!(split(host).is_some(), "{host} must be admitted");
+        }
+    }
+
+    #[test]
     fn single_label_and_bare_suffix_are_rejected() {
         for host in ["localhost", "pl", "co.uk", "com"] {
             assert!(split(host).is_none(), "{host} has no registrable domain");

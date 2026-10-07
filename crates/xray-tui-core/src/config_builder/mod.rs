@@ -124,16 +124,6 @@ impl BackendConfig {
     }
 }
 
-/// A single profile in a multi-inbound batch config.
-/// Bundles the endpoint, its per-pair link (core type), and the protocol,
-/// plus the pre-assigned SOCKS5 port.
-#[derive(Debug, Clone)]
-pub struct MultiInboundItem<'a> {
-    pub endpoint: &'a Endpoint,
-    pub link: &'a ProfileStats,
-    pub protocol: &'a Protocol,
-    pub assigned_port: u16,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
@@ -179,40 +169,6 @@ pub fn build(
     }
 }
 
-/// Build a multi-inbound config for batch real ping.
-///
-/// Creates N SOCKS5 inbounds (one per profile on its `assigned_port`),
-/// N proxy outbounds, plus standard dns-out/direct/block outbounds.
-/// Routing rules direct traffic from each inbound to its matching outbound.
-///
-/// Pattern from v2rayN's `LoadCoreConfigSpeedtest(List<ServerTestItem>)` —
-/// one core serves an entire batch page instead of spawning one core per profile.
-///
-/// The caller supplies the single core the batch runs on (the per-pair
-/// `core_type` column is gone, db-rewamp D3).
-pub fn build_multi(
-    items: &[MultiInboundItem],
-    core_type: ProtoCoreType,
-    base_params: &BuildParams,
-    dns: &DnsSetting,
-) -> Result<BackendConfig, BuildError> {
-    if items.is_empty() {
-        return Err(BuildError::InvalidProfile(
-            "build_multi: empty item list".to_string(),
-        ));
-    }
-    match core_type {
-        ProtoCoreType::Xray => {
-            let config = xray::XrayConfigBuilder::build_multi(items, core_type, base_params, dns)?;
-            Ok(BackendConfig::Xray(config))
-        }
-        ProtoCoreType::SingBox => {
-            let config =
-                singbox::SingBoxConfigBuilder::build_multi(items, core_type, base_params, dns)?;
-            Ok(BackendConfig::SingBox(config))
-        }
-    }
-}
 }
 
 #[cfg(test)]
