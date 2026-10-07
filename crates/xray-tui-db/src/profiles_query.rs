@@ -49,9 +49,6 @@ pub enum PageSort {
     Test,
     Address,
     Port,
-    LastSeen,
-    Speed,
-    Traffic,
     /// The endpoint's lowest resolved address (`endpoint_ip.ip_key`). The
     /// addresses are the only IP fact stored per endpoint, so this is the one
     /// sort the JSON-array column could not express at all.
@@ -68,7 +65,7 @@ pub enum PageSort {
 
 /// Which endpoints a batch plans — the "Fast + Real Ping" scope variants.
 ///
-/// Every variant is a predicate over the endpoint's materialized `rank_tier`
+/// Every variant is a predicate over the endpoint's materialized `rank_bin`
 /// (ADR 0003), so the plan is index-driven and needs no new stored column:
 ///
 /// | tier | means |
@@ -100,15 +97,19 @@ pub enum PlanScope {
 }
 
 impl PlanScope {
-    /// The `rank_tier` values this scope selects. Empty means "no predicate".
+    /// The `rank_bin` values this scope selects (db-rewamp D11: bins replace
+    /// tiers). Empty means "no predicate".
+    ///
+    /// Successful = any real success (`0..=5`); New = untested (`12`);
+    /// Failed = real-err/fast-err/dns-err (`13..=15`).
     #[must_use]
-    pub const fn tiers(self) -> &'static [i64] {
+    pub fn tiers(self) -> &'static [i64] {
         match self {
             Self::All => &[],
-            Self::Successful => &[0],
-            Self::New => &[2],
-            Self::SuccessfulAndNew => &[0, 2],
-            Self::Failed => &[3, 4, 5],
+            Self::Successful => &[0, 1, 2, 3, 4, 5],
+            Self::New => &[12],
+            Self::SuccessfulAndNew => &[0, 1, 2, 3, 4, 5, 12],
+            Self::Failed => &[13, 14, 15],
         }
     }
 }
@@ -236,24 +237,11 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
         // order. Flipping this term to ASC inverts the page against the
         // comparator — the parity test fails, not the field.
         PageSort::Test => vec![
-            term(rank_col("rank_dns"), true),
-            term(rank_col("rank_tier"), true),
+            term(rank_col("rank_bin"), true),
             term(rank_col("rank_weight"), false),
-            term(rank_col("rank_latency"), true),
-            term(rank_col("rank_seen"), false),
-            term(rank_col("rank_protocol"), true),
-            term("k.endpoint_id".to_string(), true),
-        ],
-        PageSort::LastSeen => vec![
-            term(rank_col("rank_display_seen"), true),
-            term("k.endpoint_id".to_string(), true),
-        ],
-        PageSort::Speed => vec![
-            term(rank_col("rank_speed"), true),
-            term("k.endpoint_id".to_string(), true),
-        ],
-        PageSort::Traffic => vec![
-            term(rank_col("rank_traffic"), true),
+            term(rank_col("rank_domain"), true),
+            term(rank_col("rank_sub_domain"), true),
+            term(rank_col("rank_addr"), true),
             term("k.endpoint_id".to_string(), true),
         ],
         PageSort::Address => vec![
@@ -337,14 +325,14 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
              OR CAST(e.port AS TEXT) LIKE {pattern} ESCAPE '\\')"
         ));
     }
-    // The plan scope reads the endpoint's materialized tier, so the scoped
-    // batch variants are an index range over the covering index — no new
-    // stored column and no per-link scan. Bound (never inlined) like every
-    // other predicate, and shared with the count so the footer cannot drift.
+    // The plan scope reads the endpoint's materialized BIN (db-rewamp D11),
+    // so the scoped batch variants are an index range. Bound (never inlined)
+    // like every other predicate, and shared with the count so the footer
+    // cannot drift.
     let tiers = req.scope.tiers();
     if !tiers.is_empty() {
         let binds: Vec<String> = tiers.iter().map(|t| sql.bind(*t)).collect();
-        sql.push(&format!(" AND k.rank_tier IN ({})", binds.join(", ")));
+        sql.push(&format!(" AND k.rank_bin IN ({})", binds.join(", ")));
     }
 }
 

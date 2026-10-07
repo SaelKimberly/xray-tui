@@ -715,7 +715,7 @@ fn build_display_rows(
 
         let info = state.endpoint_info.get(&row.endpoint.id.get());
         // One resolution source: the loaded row's persisted addresses — the
-        // same fact the ordering law's `rank_dns` is computed from
+        // same fact the ordering law's DNS band is computed from
         // (`endpoint_rank::dns_unresolved`). Reading the in-memory cache here
         // made `[name]` and the tier-5 band two different answers for the same
         // endpoint, which is what let a row show `[name]` beside a live exit IP.

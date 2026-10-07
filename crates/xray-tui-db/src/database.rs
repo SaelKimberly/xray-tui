@@ -80,9 +80,13 @@ use crate::retry_on_busy;
 // file is wiped for the clean re-import. Subsequent rewamp slices
 // (the host/identity model, the binned law) bump again.
 //
-// 16 = `app_meta(key, value)` added as a typed toasty model (the PSL-version
-// stamp). Toasty's `push_schema` owns it, so the raw-DDL inventory stays clean.
-pub const SCHEMA_VERSION: i64 = 16;
+// 16 = `app_meta(key, value)` as a typed model (PSL stamp).
+//
+// 17 = `endpoint_rank` reshaped to the BINNED law (db-rewamp D11): `rank_bin`/
+// `rank_domain`/`rank_sub_domain`/`rank_addr` replace `rank_dns`/`rank_tier`/
+// `rank_latency`/`rank_seen`/`rank_protocol`/`rank_display_seen`/`rank_speed`/
+// `rank_traffic`; one covering index `endpoint_rank_key`.
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does). A named alias because the signature
@@ -523,7 +527,7 @@ const LINK_STATEMENT_ROWS: usize = 400;
 /// A SQL TEXT literal: single quotes doubled, so a stored error message can
 /// never terminate the literal. The values come from our own rows, never from
 /// user input at this layer.
-fn sql_lit(s: &str) -> String {
+pub(crate) fn sql_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {
@@ -2648,7 +2652,7 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         // Both links sink to tier 5; recency decides.
         assert_eq!(row.links[0].protocol_id, ProtocolId::new(1002));
         assert_eq!(row.links[1].protocol_id, ProtocolId::new(1001));
-        assert_eq!(row.best_test_priority_key(true).unwrap().0, 5);
+        assert_eq!(row.best_test_priority_key(true).unwrap().0, 15, "dns-err bin");
     }
 
     #[tokio::test]

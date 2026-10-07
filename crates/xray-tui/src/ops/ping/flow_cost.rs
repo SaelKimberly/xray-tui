@@ -825,8 +825,6 @@ async fn flow_cost_report() {
                     (PageSort::Test, false),
                     (PageSort::Address, true),
                     (PageSort::Address, false),
-                    (PageSort::LastSeen, true),
-                    (PageSort::LastSeen, false),
                 ] {
                     let request = PageRequest {
                         view: PurgatoryView::Active,

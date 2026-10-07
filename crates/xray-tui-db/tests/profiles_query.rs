@@ -25,13 +25,10 @@ const fn ts(secs: i64) -> i64 {
 
 const ALL_ENDPOINTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
 
-const ALL_SORTS: [PageSort; 8] = [
+const ALL_SORTS: [PageSort; 5] = [
     PageSort::Test,
     PageSort::Address,
     PageSort::Port,
-    PageSort::LastSeen,
-    PageSort::Speed,
-    PageSort::Traffic,
     PageSort::Ip,
     PageSort::Id,
 ];
@@ -592,12 +589,14 @@ async fn resolving_a_dns_host_moves_its_stored_key() {
         Some(&EndpointId::new(7)),
         "e7's x_http representative outranks on weight, not on its 9 ms"
     );
-    assert_eq!(
-        after.get(1),
-        Some(&unresolved),
-        "the resolved endpoint left the DNS band and sits directly behind"
+    let pos = after
+        .iter()
+        .position(|id| *id == unresolved)
+        .expect("still present");
+    assert!(
+        pos < after.len() - 1,
+        "the resolved endpoint LEFT the dns-err bin (no longer last): {after:?}"
     );
-    assert_ne!(after.last(), Some(&unresolved), "it no longer sinks");
 }
 
 /// A TASK-only patch is key-neutral for an EXISTING link, but not when it
@@ -869,46 +868,32 @@ fn min_address_key(row: &xray_tui_db::models::EndpointRow) -> Vec<u8> {
 /// SQL reads the stored pack DESCENDING. Comparing the negated form here is
 /// what pins that the two directions are the same order — a flip between them
 /// fails THIS test, not the field.
-type OracleKey = (i64, u64, i32, i64, i64);
+type OracleKey = (i64, u64, String, String, Vec<u8>, i64);
 
 fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleKey {
     match sort {
         PageSort::Test => {
-            let (tier, neg_weight, latency, neg_seen, pid) = row
+            // The binned law (db-rewamp D11): (bin, neg_weight, domain,
+            // sub_domain, addr, endpoint_id). bin/neg_weight come from the
+            // representative link; the rest are endpoint-level.
+            let (bin, neg_weight, _seen, _pid) = row
                 .best_test_priority_key(dns_unresolved(row))
-                .unwrap_or((u8::MAX, u64::MAX, i32::MAX, i64::MAX, i64::MAX));
-            (
-                i64::from(tier) + i64::from(dns_unresolved(row)) * 8,
-                neg_weight,
-                latency,
-                neg_seen,
-                pid,
-            )
+                .unwrap_or((u8::MAX, u64::MAX, i64::MAX, i64::MAX));
+            let (domain, sub_domain) = xray_tui_proto::domain::split(&row.endpoint.host)
+                .map_or_else(
+                    || (row.endpoint.host.to_lowercase(), String::new()),
+                    |d| (d.domain, d.sub_domain),
+                );
+            let addr = if matches!(row.endpoint.host_type, xray_tui_db::models::HostType::Dns) {
+                Vec::new()
+            } else {
+                xray_tui_db::endpoint_ip::key_of_str(&row.endpoint.host).unwrap_or_default()
+            };
+            (i64::from(bin), neg_weight, domain, sub_domain, addr, row.endpoint.id.get())
         }
-        PageSort::Address | PageSort::Ip => (0, 0, 0, 0, 0),
-        PageSort::Id => (row.endpoint.id.get(), 0, 0, 0, 0),
-        PageSort::Port => (i64::from(row.endpoint.port), 0, 0, 0, 0),
-        PageSort::LastSeen => (
-            display_link(row).map_or(i64::MIN, |l| l.last_seen_at),
-            0,
-            0,
-            0,
-            0,
-        ),
-        PageSort::Speed => (
-            display_link(row).and_then(|l| l.speed_bps).unwrap_or(-1),
-            0,
-            0,
-            0,
-            0,
-        ),
-        PageSort::Traffic => (
-            display_link(row).map_or(0, |l| l.traffic.total_up + l.traffic.total_down),
-            0,
-            0,
-            0,
-            0,
-        ),
+        PageSort::Address | PageSort::Ip => (0, 0, String::new(), String::new(), Vec::new(), row.endpoint.id.get()),
+        PageSort::Id => (row.endpoint.id.get(), 0, String::new(), String::new(), Vec::new(), 0),
+        PageSort::Port => (i64::from(row.endpoint.port), 0, String::new(), String::new(), Vec::new(), 0),
     }
 }
 
@@ -1489,14 +1474,14 @@ async fn the_test_order_has_an_index_that_includes_the_weight() {
         .collect();
     let weight_index = ddl
         .iter()
-        .find(|sql| sql.starts_with("endpoint_rank_test_v2:"))
-        .expect("the weight covering index exists");
+        .find(|sql| sql.starts_with("endpoint_rank_key:"))
+        .expect("the covering index exists");
     assert!(
         weight_index.contains("rank_weight DESC"),
         "the weight term must be indexed DESCENDING to serve the ORDER BY: {weight_index}"
     );
     assert!(
-        weight_index.contains("rank_dns") && weight_index.contains("rank_tier"),
+        weight_index.contains("rank_bin") && weight_index.contains("rank_domain"),
         "the index must still lead with the terms before the weight: {weight_index}"
     );
 }

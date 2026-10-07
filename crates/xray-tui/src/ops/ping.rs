@@ -1363,7 +1363,7 @@ impl PlanWalk {
                 }
                 // The walk freezes its endpoint set BEFORE the first probe is
                 // dispatched, for EVERY scope including `All`. The scope
-                // predicate reads the endpoint's `rank_tier`, which this very
+                // predicate reads the endpoint's `rank_bin`, which this very
                 // batch changes as its results land, so an offset-paged walk
                 // over a mutating set silently SKIPS every endpoint that leaves
                 // the scope: a `Failed` run moves its own endpoints to tier 0 as
@@ -2529,7 +2529,7 @@ pub fn start_batch_then_real_ping(state: &mut AppState) {
 
 /// Fast + real over one SCOPE of the feed.
 ///
-/// The scope narrows which ENDPOINTS the walk visits (`rank_tier`, materialized
+/// The scope narrows which ENDPOINTS the walk visits (`rank_bin`, materialized
 /// by ADR 0003); every link of a selected endpoint is planned, so a scope is a
 /// plan filter and nothing about the per-link pipeline changes. Dedup is the
 /// same setting the unscoped variant uses.
@@ -2939,7 +2939,7 @@ mod tests {
 
     /// A plan scope narrows which ENDPOINTS the walk visits, so the plan — and
     /// therefore the probes — covers only the selected endpoints' links. The
-    /// scope is the feed query plus a `rank_tier` predicate; this is the seam
+    /// scope is the feed query plus a `rank_bin` predicate; this is the seam
     /// where the menu's scope reaches the SQL.
     #[tokio::test]
     async fn a_plan_scope_narrows_the_feed_walk() {
@@ -3003,7 +3003,7 @@ mod tests {
     }
 
     /// A scoped walk freezes its endpoint set before any probe is dispatched.
-    /// The scope predicate is the endpoint's `rank_tier`, which this run's own
+    /// The scope predicate is the endpoint's `rank_bin`, which this run's own
     /// results change — so an offset-paged walk over the LIVE predicate skips
     /// every endpoint that leaves the scope mid-walk (which is most of a
     /// `Failed` run, whose whole purpose is to move endpoints to a success tier).

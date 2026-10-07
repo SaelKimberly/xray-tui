@@ -540,31 +540,22 @@ pub struct EndpointRank {
     #[key]
     #[column("endpoint_id")]
     pub endpoint_id: EndpointId,
-    /// DNS-unresolved flag (1 = collapsed into the bottom band).
-    #[column("rank_dns")]
-    pub dns: i64,
-    /// Representative link's decision-16 tier (0 real-ok … 5 dns).
-    #[column("rank_tier")]
-    pub tier: i64,
-    /// Representative link's latency (`i32::MAX` outside the success tiers).
-    #[column("rank_latency")]
-    pub latency: i64,
-    /// Representative link's `last_seen_at` (epoch seconds); ordered
-    /// descending, so newer links lead.
-    #[column("rank_seen")]
-    pub seen: i64,
-    /// Representative link's protocol id (the order's tiebreak).
-    #[column("rank_protocol")]
-    pub protocol: i64,
-    /// Display link's `last_seen_at` (epoch seconds), [`crate::endpoint_rank::NO_SEEN`] when none.
-    #[column("rank_display_seen")]
-    pub display_seen: i64,
-    /// Display link's speed (bps), [`crate::endpoint_rank::NO_SPEED`] when none.
-    #[column("rank_speed")]
-    pub speed: i64,
-    /// Display link's total traffic (up + down), 0 when none.
-    #[column("rank_traffic")]
-    pub traffic: i64,
+    /// The representative link's delay BIN (db-rewamp D11): real<50..real≥1000
+    /// 0-5, fast<50..fast≥1000 6-11, untested 12, real-err 13, fast-err 14,
+    /// dns-err 15, purged 16. Folds the retired dns/tier/latency columns.
+    #[column("rank_bin")]
+    pub bin: i64,
+    /// Registrable domain of the endpoint host (empty for an IP/exotic host) —
+    /// the address tiebreak, materialized here so the page is one index scan.
+    #[column("rank_domain")]
+    pub domain: String,
+    /// The labels left of the domain (empty when the host IS the domain).
+    #[column("rank_sub_domain")]
+    pub sub_domain: String,
+    /// The IP literal's packed key for an IP host (empty for a DNS host) —
+    /// the address tiebreak's second term.
+    #[column("rank_addr")]
+    pub addr: Vec<u8>,
     /// Newest `last_seen_at` across the endpoint's links (epoch seconds): the
     /// view windows ask whether any link falls in the band, which is the same
     /// question as whether the newest one does — and reading it here keeps the
@@ -630,7 +621,7 @@ impl EndpointRow {
         link: &ProfileStats,
         weight: crate::weight::ConfigWeight,
         dns_unresolved: bool,
-    ) -> (u8, u64, i32, i64, i64) {
+    ) -> (u8, u64, i64, i64) {
         crate::endpoint_rank::RankLink::new(link, weight).key(dns_unresolved)
     }
 
@@ -702,7 +693,7 @@ impl EndpointRow {
     /// used by the main-table Test column sort. `None` when the endpoint has
     /// no links.
     #[must_use]
-    pub fn best_test_priority_key(&self, dns_unresolved: bool) -> Option<(u8, u64, i32, i64, i64)> {
+    pub fn best_test_priority_key(&self, dns_unresolved: bool) -> Option<(u8, u64, i64, i64)> {
         let weights = self.link_weights();
         let zero = crate::weight::ZERO_WEIGHT;
         self.links
@@ -936,8 +927,8 @@ mod tests {
         );
         assert_eq!(
             r.best_test_priority_key(false).expect("key").0,
-            1,
-            "the endpoint's representative key follows a LIVE link"
+            7,
+            "the endpoint's representative key follows a LIVE link (fast<100 bin)"
         );
     }
 
@@ -1026,7 +1017,7 @@ mod tests {
         // maximum — the negation a "no known stack" link sorts under.
         assert_eq!(
             r.best_test_priority_key(false),
-            Some((0, u64::MAX, 200, -1, 10))
+            Some((2, u64::MAX, -1, 10))
         );
         // Empty links -> None
         let empty = row(&[]);

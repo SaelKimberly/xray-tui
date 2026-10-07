@@ -125,33 +125,44 @@ impl RankLink {
     /// a live link whenever one exists; an endpoint whose links are all purged
     /// still gets a deterministic position for the Purgatory/All views.
     #[must_use]
-    pub const fn key(&self, dns_unresolved: bool) -> (u8, u64, i32, i64, i64) {
-        let tier = if self.purged {
-            6
-        } else if dns_unresolved {
-            5
-        } else if let Some(kind) = &self.error_kind {
-            match kind {
-                // A name-resolution failure surfaces on a real attempt, so it
-                // shares the real-err bucket.
-                ProfileErr::Real | ProfileErr::Name => 3,
-                ProfileErr::Fast => 4,
-            }
-        } else {
-            match self.measured {
-                Some(true) => 0,
-                Some(false) => 1,
-                None => 2,
-            }
-        };
-        let latency = if tier <= 1 { self.delay } else { i32::MAX };
+    pub const fn key(&self, dns_unresolved: bool) -> (u8, u64, i64, i64) {
+        // The representative-LINK key (db-rewamp D11): delay BIN, negated
+        // weight, then recency and protocol id. `latency` is gone (the bin
+        // buckets it); recency stays as a LINK tiebreak so the newest link
+        // represents its endpoint — it is deliberately NOT in the endpoint key
+        // (which orders by `domain`/`sub_domain`/`addr`), only in this
+        // same-endpoint selection.
         (
-            tier,
+            self.bin(dns_unresolved),
             u64::MAX - weight_u64(self.weight),
-            latency,
             -self.seen_secs,
             self.protocol_id,
         )
+    }
+
+    /// The delay bin (db-rewamp D11): real<50..real≥1000 = 0-5,
+    /// fast<50..fast≥1000 = 6-11, untested = 12, real-err = 13, fast-err = 14,
+    /// dns-err = 15, purged = 16. A real measurement stays above a fast one of
+    /// any delay.
+    #[must_use]
+    pub const fn bin(&self, dns_unresolved: bool) -> u8 {
+        if self.purged {
+            return 16;
+        }
+        if dns_unresolved {
+            return 15;
+        }
+        if let Some(kind) = &self.error_kind {
+            return match kind {
+                ProfileErr::Real | ProfileErr::Name => 13,
+                ProfileErr::Fast => 14,
+            };
+        }
+        match self.measured {
+            Some(true) => delay_bin(self.delay),
+            Some(false) => 6 + delay_bin(self.delay),
+            None => 12,
+        }
     }
 
     /// "Measured" rank of the display preference: real (0) before fast (1).
@@ -161,6 +172,23 @@ impl RankLink {
             Some(false) => Some(1),
             None => None,
         }
+    }
+}
+
+/// `0..5` for a delay: `<50 <100 <250 <500 <1000 ≥1000`.
+const fn delay_bin(delay: i32) -> u8 {
+    if delay < 50 {
+        0
+    } else if delay < 100 {
+        1
+    } else if delay < 250 {
+        2
+    } else if delay < 500 {
+        3
+    } else if delay < 1000 {
+        4
+    } else {
+        5
     }
 }
 
@@ -285,12 +313,13 @@ pub fn weight_from_discriminators(
 #[must_use]
 pub fn compute_rank(
     endpoint_id: EndpointId,
+    host: &str,
+    host_type: HostType,
     dns_unresolved: bool,
     override_protocol: Option<i64>,
     links: &[RankLink],
 ) -> Option<RankRow> {
-    let (tier, neg_weight, latency, neg_seen, protocol) =
-        links.iter().map(|l| l.key(dns_unresolved)).min()?;
+    let (bin, neg_weight, _, _) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
     let display = display_link_index(links, override_protocol).map(|i| links[i]);
     // The view windows ask whether any LIVE link falls in the band. A
     // purged-only endpoint therefore reports `NO_SEEN`, which is below every
@@ -303,18 +332,29 @@ pub fn compute_rank(
         .max()
         .unwrap_or(NO_SEEN);
     // The minimum key's weight term is `u64::MAX - weight`; invert it back.
+    let _ = display;
     let weight = ConfigWeight::from_be_bytes((u64::MAX - neg_weight).to_be_bytes());
+    // domain/sub_domain from the split (empty for an IP/exotic host); the addr
+    // term is the IP literal's packed key (empty for a DNS host), so a bin+weight
+    // tie among IP hosts orders by address and DNS hosts order by name.
+    let (domain, sub_domain) = match host_type {
+        HostType::Dns => xray_tui_proto::domain::split(host).map_or_else(
+            || (host.to_lowercase(), String::new()),
+            |d| (d.domain, d.sub_domain),
+        ),
+        HostType::Ipv4 | HostType::Ipv6 | HostType::Undefined => (String::new(), String::new()),
+    };
+    let addr = match host_type {
+        HostType::Ipv4 | HostType::Ipv6 => crate::endpoint_ip::key_of_str(host).unwrap_or_default(),
+        _ => Vec::new(),
+    };
     Some(RankRow {
         rank: EndpointRank {
             endpoint_id,
-            dns: i64::from(dns_unresolved),
-            tier: i64::from(tier),
-            latency: i64::from(latency),
-            seen: -neg_seen,
-            protocol,
-            display_seen: display.map_or(NO_SEEN, |l| l.seen_secs),
-            speed: display.map_or(NO_SPEED, |l| l.speed.unwrap_or(NO_SPEED)),
-            traffic: display.map_or(0, |l| l.traffic),
+            bin: i64::from(bin),
+            domain,
+            sub_domain,
+            addr,
             newest_seen,
         },
         weight,
@@ -337,6 +377,8 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<RankRow> {
         .collect();
     compute_rank(
         row.endpoint.id,
+        &row.endpoint.host,
+        row.endpoint.host_type,
         dns_unresolved(row),
         row.endpoint.manual_protocol_override.map(ProtocolId::get),
         &links,
@@ -362,8 +404,8 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<RankRow> {
 /// cannot express a composite whose last-but-one term is DESCENDING — and this
 /// index is what makes a page an index scan (~1 ms) instead of a sort over
 /// every endpoint (~240 ms). Additive (`IF NOT EXISTS`), no data of its own.
-const COVERING_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_test ON endpoint_rank(\
-     rank_dns, rank_tier, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)";
+const COVERING_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_key ON endpoint_rank(\
+     band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)";
 
 /// Rows per bulk statement.
 const RANK_CHUNK: usize = 400;
@@ -376,9 +418,8 @@ const RANK_CHUNK: usize = 400;
 /// on every single refresh — and a NULL there makes `profiles_anchor` fail
 /// rather than merely mis-sort, because the anchor binds each term's value back
 /// into a comparison.
-const RANK_COLUMNS: &str = "endpoint_id, rank_dns, rank_tier, rank_weight, \
-     rank_latency, rank_seen, rank_protocol, rank_display_seen, rank_speed, \
-     rank_traffic, rank_newest_seen";
+const RANK_COLUMNS: &str = "endpoint_id, rank_bin, rank_weight, rank_domain, \
+     rank_sub_domain, rank_addr, rank_newest_seen";
 
 /// The weight column: an 8-byte big-endian blob, `NOT NULL` so an un-refreshed
 /// row is still a legal ordering term.
@@ -395,14 +436,6 @@ const WEIGHT_COLUMN: &str = "ALTER TABLE endpoint_rank ADD COLUMN rank_weight BL
 
 /// The weight column's covering index — a NEW NAME, never an edit in place:
 /// `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on
-/// every existing database, and the old index would keep serving the new
-/// ORDER BY, dropping the page back to the ~240 ms filesort this index exists
-/// to avoid. The old index is kept (it costs only write time) so a rollback
-/// still has one.
-const WEIGHT_COVERING_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_test_v2 \
-     ON endpoint_rank(rank_dns, rank_tier, rank_weight DESC, rank_latency, \
-     rank_seen DESC, rank_protocol, endpoint_id)";
-
 /// One-row stamp for the compiled weight tables. A table of opinions that lives
 /// in code has no other way to know it is out of date.
 const WEIGHT_META_TABLE: &str = "CREATE TABLE IF NOT EXISTS rank_weight_meta \
@@ -464,7 +497,6 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     // time) so a rollback still has one.
     for ddl in [
         COVERING_INDEX,
-        WEIGHT_COVERING_INDEX,
         WINDOW_INDEX,
         BAND_HOST_INDEX,
         BAND_WINDOW_INDEX,
@@ -587,17 +619,13 @@ pub(crate) async fn write(
             .map(|row| {
                 let r = &row.rank;
                 format!(
-                    "({},{},{},{},{},{},{},{},{},{},{})",
+                    "({},{},{},{},{},{},{})",
                     r.endpoint_id.get(),
-                    r.dns,
-                    r.tier,
+                    r.bin,
                     row.weight.sql_literal(),
-                    r.latency,
-                    r.seen,
-                    r.protocol,
-                    r.display_seen,
-                    r.speed,
-                    r.traffic,
+                    crate::database::sql_lit(&r.domain),
+                    crate::database::sql_lit(&r.sub_domain),
+                    blob_lit(&r.addr),
                     r.newest_seen
                 )
             })
@@ -635,6 +663,8 @@ pub(crate) async fn write(
 
 /// The raw facts the rank law needs, straight from the stored columns.
 struct RawEndpoint {
+    host: String,
+    host_type: HostType,
     dns_unresolved: bool,
     override_protocol: Option<i64>,
 }
@@ -794,6 +824,8 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
             let links = by_endpoint.remove(&endpoint.id)?;
             compute_rank(
                 endpoint.id,
+                &endpoint.host,
+                endpoint.host_type,
                 dns_unresolved_endpoint(endpoint.host_type, resolved.contains(&endpoint.id.get())),
                 endpoint.manual_protocol_override.map(ProtocolId::get),
                 &links,
@@ -950,6 +982,8 @@ pub(crate) async fn refresh(
             let endpoint_links = links.get(id).unwrap_or(&empty);
             compute_rank(
                 EndpointId::new(*id),
+                &endpoint.host,
+                endpoint.host_type,
                 endpoint.dns_unresolved,
                 endpoint.override_protocol,
                 endpoint_links,
@@ -968,7 +1002,7 @@ async fn load_raw_endpoints(
     // the statement that already reads the ids, so the refresh stays a single
     // round trip.
     let rows = toasty::sql::query(format!(
-        "SELECT e.id, e.host_type, \
+        "SELECT e.id, e.host, e.host_type, \
          EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id), \
          e.manual_protocol_override FROM endpoints e WHERE e.id IN ({id_list})"
     ))
@@ -981,13 +1015,21 @@ async fn load_raw_endpoints(
         let Some(id) = field(0).and_then(as_i64) else {
             continue;
         };
-        let host_type = field(1).and_then(as_text).unwrap_or_default();
-        let has_address = field(2).and_then(as_i64).unwrap_or(0) != 0;
+        let host = field(1).and_then(as_text).unwrap_or_default();
+        let host_type = match field(2).and_then(as_text).as_deref() {
+            Some("dns") => HostType::Dns,
+            Some("ipv4") => HostType::Ipv4,
+            Some("ipv6") => HostType::Ipv6,
+            _ => HostType::Undefined,
+        };
+        let has_address = field(3).and_then(as_i64).unwrap_or(0) != 0;
         out.insert(
             id,
             RawEndpoint {
-                dns_unresolved: host_type == "dns" && !has_address,
-                override_protocol: field(3).and_then(as_i64),
+                host,
+                host_type,
+                dns_unresolved: matches!(host_type, HostType::Dns) && !has_address,
+                override_protocol: field(4).and_then(as_i64),
             },
         );
     }
@@ -999,6 +1041,18 @@ const fn as_i64(value: &Value) -> Option<i64> {
         Value::I64(n) => Some(*n),
         _ => None,
     }
+}
+
+/// A `x'…'` BLOB literal for the packed address key.
+fn blob_lit(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(3 + bytes.len() * 2);
+    out.push_str("x'");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out.push('\'');
+    out
 }
 
 fn as_text(value: &Value) -> Option<String> {
@@ -1047,23 +1101,29 @@ mod tests {
     }
 
     #[test]
-    fn a_higher_weight_outranks_latency_inside_a_tier() {
-        // The accepted inversion: measurement no longer decides within a tier.
-        let mut slow_reality = link(1, Some(true), 900, 10);
-        slow_reality.weight = weight(10);
-        let mut fast_tcp = link(2, Some(true), 40, 10);
-        fast_tcp.weight = weight(2);
+    fn a_higher_weight_outranks_within_a_bin() {
+        // The bin is the delay bucket and comes FIRST (db-rewamp D11), so the
+        // weight decides only WITHIN a bin: two links in the same bin, the
+        // heavier stack leads.
+        let mut heavy = link(1, Some(true), 900, 10);
+        heavy.weight = weight(10);
+        let mut light = link(2, Some(true), 940, 10);
+        light.weight = weight(2);
+        assert_eq!(heavy.key(false).0, light.key(false).0, "same bin (≥1000? no: both <1000)");
         assert!(
-            slow_reality.key(false) < fast_tcp.key(false),
-            "900ms reality must lead 40ms tcp inside tier 0"
+            heavy.key(false) < light.key(false),
+            "the heavier stack leads inside one bin"
         );
-        // …but the tier still dominates: a failed high-weight link never leads.
-        let mut failed = slow_reality;
+        // The bin still dominates the weight: a slow REAL (worse bin) never
+        // leads a fast REAL whatever its weight.
+        let fast = link(3, Some(true), 40, 10);
+        let mut slow_heavy = link(4, Some(true), 900, 10);
+        slow_heavy.weight = weight(10);
+        assert!(fast.key(false) < slow_heavy.key(false), "40ms bin 0 leads 900ms bin 4");
+        // …and a measured success never leads a failed link.
+        let mut failed = link(4, Some(true), 900, 10);
         failed.error_kind = Some(ProfileErr::Real);
-        assert!(
-            fast_tcp.key(false) < failed.key(false),
-            "a measured success outranks a failed reality link whatever its weight"
-        );
+        assert!(fast.key(false) < failed.key(false), "success leads a failed link");
     }
 
     #[test]
@@ -1092,11 +1152,15 @@ mod tests {
         weak.weight = weight(2);
         let mut strong = link(2, Some(true), 10, 5);
         strong.weight = weight(10);
-        let row = compute_rank(EndpointId::new(7), false, None, &[weak, strong]).expect("rank");
-        assert_eq!(
-            row.rank.protocol, 2,
-            "the heavier link is the representative"
-        );
+        let row = compute_rank(
+            EndpointId::new(7),
+            "h.example",
+            HostType::Dns,
+            false,
+            None,
+            &[weak, strong],
+        )
+        .expect("rank");
         assert_eq!(
             row.weight,
             weight(10),
@@ -1180,13 +1244,8 @@ mod tests {
     fn purged_links_sink_below_every_live_tier_including_dns() {
         let mut purged = link(1, Some(true), 5, 100);
         purged.purged = true;
-        assert_eq!(purged.key(false).0, 6, "purged is its own band");
-        assert_eq!(purged.key(true).0, 6, "and it outranks the DNS collapse");
-        assert_eq!(
-            purged.key(false).2,
-            i32::MAX,
-            "a purged link carries no latency into the order"
-        );
+        assert_eq!(purged.key(false).0, 16, "purged is its own band");
+        assert_eq!(purged.key(true).0, 16, "and it outranks the DNS collapse");
         // Below a fast/real error band: a purged real-ok link must not lead.
         let fast_err = RankLink {
             error_kind: Some(ProfileErr::Fast),
@@ -1200,23 +1259,39 @@ mod tests {
         let mut purged = link(1, Some(false), 10, 9_000);
         purged.purged = true;
         let links = [link(2, None, 0, 100), purged];
-        let rank = compute_rank(EndpointId::new(1), false, None, &links).expect("rank");
+        let rank = compute_rank(
+            EndpointId::new(1),
+            "h.example",
+            HostType::Dns,
+            false,
+            None,
+            &links,
+        )
+        .expect("rank");
         assert_eq!(
             rank.rank.newest_seen, 100,
             "a purged link's recency does not keep the endpoint in the Active window"
         );
         assert_eq!(
-            rank.rank.tier, 2,
+            rank.rank.bin, 12,
             "the live untested link is the representative"
         );
 
         let all_purged = [purged];
-        let rank = compute_rank(EndpointId::new(1), false, None, &all_purged).expect("rank");
+        let rank = compute_rank(
+            EndpointId::new(1),
+            "h.example",
+            HostType::Dns,
+            false,
+            None,
+            &all_purged,
+        )
+        .expect("rank");
         assert_eq!(
             rank.rank.newest_seen, NO_SEEN,
             "no live link -> below every window bound (Purgatory)"
         );
-        assert_eq!(rank.rank.tier, 6);
+        assert_eq!(rank.rank.bin, 16);
     }
 
     #[test]

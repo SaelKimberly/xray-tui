@@ -361,8 +361,8 @@ async fn dns_unresolved_endpoint_sinks_links_to_bottom() {
     let row = &rows[0];
     assert_eq!(
         row.best_test_priority_key(true).expect("key").0,
-        5,
-        "dns-unresolved dominates every link tier"
+        15,
+        "dns-unresolved dominates every link bin"
     );
 }
 
