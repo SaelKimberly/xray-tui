@@ -102,6 +102,31 @@ the other half of the lab port), `db/profiles_query.rs:336` (search
   `backfill_bands`, `RankRow`'s raw-weight split, and the post-write
   `rank_host` `UPDATE … SELECT host`.
 
+## T5 DONE (committed e40afed, fcd41c9)
+`validate_host` rejects a DNS name with no registrable domain (psl2 split is
+`None`), run BEFORE the `allow_private_ips` gate; `validate_host` is now `pub`
+and the Add/Edit form path calls it (one rule for form + import); the
+subscription importer's `file_profile` classifies the new message into
+`host_validation_count`. Behavior change: a domainless DNS name is rejected even
+with `allow_private_ips = true`.
+
+## T4 Phase-2 collapse (the advisory that makes it handable)
+- **Fixtures: derive INSIDE the helper, not 53 hand-edits.** `seed_endpoint(conn,
+  id, proto, host, host_type, port, seen)` (integration.rs:131, database.rs:2401)
+  and `endpoint_struct`/`endpoint`/`endpoint_row` helpers (database.rs:3025,
+  export.rs:424, config_builder:263, write_behind:1521, profiles_query:53) keep
+  their `(host, host_type)` signature and compute `domain`/`sub_domain` in the
+  body — so every call site compiles untouched. Same for the inline
+  `toasty::create!(Endpoint { … })` literals: give each a `derived(host,kind)`
+  pair. The `EndpointCreate` builder sites: `.domain(..)/.sub_domain(..)`.
+- **Address threading is 5 mechanical sites, not a wall.** `connect.rs:151` has
+  `row.resolved_ips` in hand — carry `(endpoint, resolved_ips, …)` and update
+  `ConfigBuilder::build` → `build_proxy_outbound` (xray.rs:296/singbox.rs:221),
+  `native_connect::endpoint_essentials` (:188), `ping_native.rs:224`,
+  `ui/mod.rs:927`. `endpoint_essentials(e, addresses)` =
+  `if e.is_dns() { e.dns_name() } else { addresses.first() }`.
+- `dns_name()` does NOT exist yet (it was never added) — write it on `Endpoint`.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of
