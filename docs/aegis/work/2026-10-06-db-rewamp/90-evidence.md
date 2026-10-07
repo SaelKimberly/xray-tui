@@ -53,3 +53,51 @@ turso *timings* remain (to be captured after S2 with the real schema).
 ### Advisory
 A claimed workspace/hakari self-cycle blocker is **false**: `cargo metadata`
 RC=0, `cargo check -p xray-tui-db` RC=0.
+
+## S2 boundary — T12/T14 probed and BLOCKED by turso 0.7.2
+
+Both remaining S2/S4 slices were implemented to the point of a direct engine
+probe (`crates/xray-tui-db/tests/zz_fk_probe.rs`, throwaway, removed). Result:
+**neither is implementable on the vendored turso 0.7.2.**
+
+### T12 (FK cascade) — BLOCKED, two independent causes
+
+1. **toasty 0.11 emits no `REFERENCES`.** `db.push_schema()` on a fresh DB
+   dumps every table without a single FK clause (verified by dumping
+   `sqlite_master.sql` after a real `Database::open`). The plan's "fresh-schema
+   DDL rebuild hook" would have to synthesize the FK DDL itself.
+2. **turso 0.7.2 refuses FKs on WITHOUT ROWID tables** — and the physical
+   index T8 already ships (`endpoint_rank_key`) IS a physical
+   `CREATE TABLE … WITHOUT ROWID`:
+   > `Parse error: foreign keys on WITHOUT ROWID tables are not supported`
+   A `REFERENCES` clause is accepted in the `CREATE TABLE` text but rejected at
+   INSERT: `Parse error: foreign keys on WITHOUT ROWID tables are not supported`
+   / `Constraint("foreign key mismatch …")`. So T12 and T14 are **mutually
+   exclusive on the same table** by design, and T12's four candidate child
+   tables (`endpoint_groups`, `profile_stats`, `endpoint_ip`, `endpoint_rank`)
+   all have `WITHOUT ROWID` parents or are themselves the WR table.
+
+### T14 (WITHOUT ROWID) — BLOCKED: turso 0.7.2 cannot write WR tables
+
+The turso table-encryption/physical-layout path supports `WITHOUT ROWID`
+**storage** but not its **mutation**:
+- `INSERT` — OK
+- `DELETE FROM t …` — `Parse error: DELETE from WITHOUT ROWID tables is not supported`
+- `UPDATE t SET …` — `Parse error: UPDATE of WITHOUT ROWID tables is not supported`
+- `CREATE INDEX … ON t` — `Parse error: CREATE INDEX on WITHOUT ROWID tables is not supported`
+
+Every one of T14's five candidate tables is row-deleted in normal operation
+(`endpoint_ip::delete_for`/`replace`, `endpoint_rank::prune`,
+`purge_expired`, `delete_endpoints`, `delete_group`, `clear_group_endpoints`),
+and `profile_stats`/`endpoint_rank` are UPDATE-heavy (the write-behind driver).
+`WITHOUT ROWID` therefore **breaks the write path** on every one of them.
+
+### Decision
+
+Both slices are **deferred, engine-blocked** — not deferred for cost. They are
+re-openable only on a turso release that supports FK-on-WR (T12) or
+DELETE/UPDATE on WR tables (T14); until then the measured −4.9 % disk win
+(T14) is unreachable, and the manual ordered deletes stay (they already run
+inside one transaction each, so there is no correctness gap — only duplication).
+
+The T13 direct reader is unaffected and remains the shipped performance win.

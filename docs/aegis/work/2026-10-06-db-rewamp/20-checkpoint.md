@@ -308,3 +308,22 @@ the `endpoint_ip` literal (IP/exotic) — the parse boundary keeps `host`/`host_
 - nextest: proto/config/core **740**, db **172**, tui **263** — all green.
 - Clippy delta vs HEAD (`git stash` A/B on the three touched crates) → **NONE**
   (the pre-existing WIP-branch red is untouched).
+
+## T12 / T14 — probed, BLOCKED (engine limit), evidence in 90-evidence.md
+
+Both remaining slices were implemented to a direct turso 0.7.2 probe. Neither is
+adoptable:
+- T12 (FK cascade): toasty emits no `REFERENCES`; turso rejects FKs on the
+  physical-index (`endpoint_rank_key`) `WITHOUT ROWID` table.
+- T14 (WITHOUT ROWID): turso WR is insert-only — DELETE/UPDATE/CREATE INDEX all
+  raise `Parse error: … WITHOUT ROWID tables …`, and every candidate table is
+  row-deleted in normal operation.
+Recorded in ADR 0011 ("Deferred — engine-blocked") and the plan annotations.
+The T13 direct reader (the shipped performance win) is unaffected.
+
+## Final state (this HEAD)
+
+S2 complete EXCEPT the two engine-blocked slices. T4 committed; SCHEMA_VERSION 18.
+Suites: proto/config/core 740, db 172, tui 263 — green; workspace check clean;
+clippy delta vs HEAD none; `cargo audit` 0 vulnerabilities (2 known allowed
+warnings, both dispositioned in AGENTS.md).
