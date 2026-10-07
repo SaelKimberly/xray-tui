@@ -266,7 +266,7 @@ ERROR, not a mis-sort.
 | *(PK autoindex)* | `endpoint_rank(endpoint_id)` | rank-row writes/lookups |
 | `endpoint_rank_key` *(raw)* | `endpoint_rank(band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)` | the default page order — a covering index, so the page is an index scan (~8.6 ms at 7,672 endpoints, ADR 0003). **A NEW NAME, never an edit in place**: `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on an existing database, which would drop the page back to the ~240 ms filesort |
 | `rank_weight_meta` *(raw)* | `rank_weight_meta(id, weight_version)` | one row: the version of the compiled weight tables that produced the stored weights. A mismatch at open recomputes every key — the ONLY trigger that can replace the all-zero default `ADD COLUMN` materialized for pre-existing rows |
-| `endpoint_rank_window` *(raw)* | `endpoint_rank(rank_newest_seen)` | the Active/Purgatory window and the count |
+| `endpoint_rank_band_window` *(raw)* | `endpoint_rank(band, rank_newest_seen)` | the directional reband sweep (`band=0 AND rank_newest_seen < ?`) |
 
 The two raw sets exist because toasty's `#[index]` is single-column and cannot
 express a mixed-direction composite. They are created with
