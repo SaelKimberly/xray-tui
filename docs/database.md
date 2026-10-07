@@ -134,15 +134,11 @@ erDiagram
     }
     endpoint_rank {
         BIGINT endpoint_id PK
-        BIGINT rank_dns "1 = DNS-unresolved (tier 5)"
-        BIGINT rank_tier "0 real-ok, 1 fast-ok, 2 untested, 3 real/name-err, 4 fast-err, 5 dns, 6 purged — also the batch plan-scope predicate"
-        BLOB rank_weight "static config weight (8 big-endian bytes, NOT NULL); ordered INSIDE the tier — the reliability prior"
-        BIGINT rank_latency "i32::MAX outside tiers 0-1"
-        BIGINT rank_seen "representative link last_seen_at"
-        BIGINT rank_protocol "order tiebreak"
-        BIGINT rank_display_seen "display link recency"
-        BIGINT rank_speed
-        BIGINT rank_traffic
+        BIGINT rank_bin "D11 bins: 0..5 real<50..>=1000, 6..11 fast, 12 untested, 13 real-err, 14 fast-err, 15 dns-err, 16 purged — also the batch plan-scope predicate"
+        BLOB rank_weight "static config weight (8 big-endian bytes, NOT NULL); ordered INSIDE the bin — the reliability prior"
+        TEXT rank_domain "registrable domain (eTLD+1), empty for an IP/exotic host (D2)"
+        TEXT rank_sub_domain "labels left of the domain"
+        BLOB rank_addr "packed IP-literal key, empty for a DNS host (the address tiebreak)"
         BIGINT rank_newest_seen "view windows"
     }
 ```
@@ -236,10 +232,10 @@ routing engine must resolve.
 
 **`endpoint_rank`** — the materialized per-endpoint ordering keys (ADR 0003).
 Each row is the decision-16 law evaluated for one endpoint over its links; the
-page's default order is an index scan of `endpoint_rank_test_v2`, which is why the
+page's default order is an index scan of `endpoint_rank_key`, which is why the
 Profiles tab stays fast at any offset. The values are computed **in Rust** by
 `endpoint_rank::RankLink::key` — the single implementation of the law, shared
-with the panel's link order — and never re-derived in SQL. `rank_dns` is the
+with the panel's link order — and never re-derived in SQL. `rank_bin` is the
 "DNS host with no address" flag; `rank_newest_seen` answers the Active/Purgatory
 window. `rank_weight` is the static config weight (spec
 `2026-10-01-static-config-weight-design`): a compiled prior over the link's
@@ -266,8 +262,7 @@ ERROR, not a mis-sort.
 | `index_endpoint_groups_by_endpoint_id` | `endpoint_groups(endpoint_id)` | an endpoint's groups |
 | `index_endpoint_groups_by_group_id` | `endpoint_groups(group_id)` | a group's endpoints (the query) |
 | *(PK autoindex)* | `endpoint_rank(endpoint_id)` | rank-row writes/lookups |
-| `endpoint_rank_test` *(raw)* | `endpoint_rank(rank_dns, rank_tier, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)` | the PRE-weight page order, still created by `ensure_in` and kept for rollback. It no longer serves any current ORDER BY — nothing sorts on `rank_latency` without `rank_weight` in between — and is a retirement candidate for the next release |
-| `endpoint_rank_test_v2` *(raw)* | `endpoint_rank(rank_dns, rank_tier, rank_weight DESC, rank_latency, rank_seen DESC, rank_protocol, endpoint_id)` | the default page order — a covering index, so the page is an index scan (~8.6 ms at 7,672 endpoints, ADR 0003). **A NEW NAME, never an edit in place**: `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on an existing database, which would drop the page back to the ~240 ms filesort |
+| `endpoint_rank_key` *(raw)* | `endpoint_rank(band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)` | the default page order — a covering index, so the page is an index scan (~8.6 ms at 7,672 endpoints, ADR 0003). **A NEW NAME, never an edit in place**: `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on an existing database, which would drop the page back to the ~240 ms filesort |
 | `rank_weight_meta` *(raw)* | `rank_weight_meta(id, weight_version)` | one row: the version of the compiled weight tables that produced the stored weights. A mismatch at open recomputes every key — the ONLY trigger that can replace the all-zero default `ADD COLUMN` materialized for pre-existing rows |
 | `endpoint_rank_window` *(raw)* | `endpoint_rank(rank_newest_seen)` | the Active/Purgatory window and the count |
 
