@@ -9,7 +9,7 @@ EndpointEssentials, HostKind, ProtocolConfig, ProtocolKind,
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    EndpointId, ErrorInfo, HostType, Latency, ProfileErr, ProfileStats, ProtocolId,
+    EndpointId, ErrorInfo, Latency, ProfileErr, ProfileStats, ProtocolId,
     PurgeReason, TrafficStats,
 };
 use crate::{Database, endpoint_ip};
@@ -39,10 +39,10 @@ impl ExportScope {
         match self {
             Self::Alive => {
                 "ps.purge_reason IS NULL AND ps.error_kind IS NULL AND ps.latency IS NOT NULL \
-                 AND (e.host_type != 'dns' OR EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id))"
+                 AND (e.domain = '' OR EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id))"
             }
             Self::Resolved => {
-                "(e.host_type IN ('ipv4', 'ipv6') OR EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id))"
+                "(e.domain = '' OR EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id))"
             }
             Self::Active => "er.band = 0 AND ps.purge_reason IS NULL",
             Self::Full => "ps.purge_reason IS NULL",
@@ -207,14 +207,14 @@ fn projection_sql(scope: ExportScope) -> String {
         )
     };
     format!(
-        "SELECT e.host, e.host_type, e.port, e.ports, \
+        "SELECT e.domain, e.sub_domain, e.port, e.ports, \
          pr.proto_kind, pr.transport_type, pr.security_type, pr.config, \
          ps.protocol_id, ps.endpoint_id, \
          ps.last_used_at, ps.last_seen_at, ps.latency, ps.latency_delay, ps.latency_ip, \
          ps.speed_bps, ps.error, ps.error_kind, ps.error_text, ps.purge_reason, \
          ps.traffic_today_up, ps.traffic_today_down, ps.traffic_total_up, ps.traffic_total_down, \
          ps.created_at, ps.updated_at, ps.version, {address_key} AS ip_key, \
-         CASE WHEN e.host_type IN ('ipv4', 'ipv6') THEN 1 \
+         CASE WHEN e.domain = '' THEN 1 \
               WHEN EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id) THEN 0 \
               ELSE 2 END AS address_rank \
          FROM profile_stats ps \
@@ -223,14 +223,14 @@ fn projection_sql(scope: ExportScope) -> String {
          LEFT JOIN endpoint_rank er ON er.endpoint_id = e.id \
          {address_join} WHERE {} \
          ORDER BY pr.proto_kind, pr.transport_type, pr.security_type, address_rank, \
-                  ip_key, e.host, e.port, ps.protocol_id, ps.endpoint_id",
+                  ip_key, e.domain, e.sub_domain, e.port, ps.protocol_id, ps.endpoint_id",
         scope.predicate()
     )
 }
 
 fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
-    let host = text(row, 0)?;
-    let host_type = host_type(&text(row, 1)?)?;
+    let domain = text(row, 0)?;
+    let sub_domain = text(row, 1)?;
     let port = u16::try_from(integer(row, 2)?)
         .map_err(|_| DatabaseError::Generic("export endpoint port out of range".into()))?;
     let ports = serde_json::from_str::<Vec<u16>>(&text(row, 3)?)
@@ -293,14 +293,27 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
     };
     let ip_key = optional_blob(row, 27)?.unwrap_or_default();
     let resolved_ip = endpoint_ip::ip_of(&ip_key);
+    // db-rewamp D2/D10: `domain` empty ⇒ an IP/exotic host whose literal lives
+    // in `endpoint_ip`; otherwise the DNS name is `sub_domain.domain`.
+    let (host, host_type) = if domain.is_empty() {
+        let literal = resolved_ip.map_or_else(String::new, |ip| ip.to_string());
+        let kind = match resolved_ip {
+            Some(std::net::IpAddr::V4(_)) => HostKind::Ipv4,
+            Some(std::net::IpAddr::V6(_)) => HostKind::Ipv6,
+            None => HostKind::Undefined,
+        };
+        (literal, kind)
+    } else {
+        let name = if sub_domain.is_empty() {
+            domain
+        } else {
+            format!("{sub_domain}.{domain}")
+        };
+        (name, HostKind::Dns)
+    };
     let endpoint = EndpointEssentials {
         host,
-        host_type: match host_type {
-            HostType::Ipv4 => HostKind::Ipv4,
-            HostType::Ipv6 => HostKind::Ipv6,
-            HostType::Dns => HostKind::Dns,
-            HostType::Undefined => HostKind::Undefined,
-        },
+        host_type,
         port,
         ports,
     };
@@ -365,15 +378,6 @@ fn optional_blob(row: &turso::Row, index: usize) -> Result<Option<Vec<u8>>> {
         ))),
     }
 }
-fn host_type(value: &str) -> Result<HostType> {
-    match value {
-        "ipv4" => Ok(HostType::Ipv4),
-        "ipv6" => Ok(HostType::Ipv6),
-        "dns" => Ok(HostType::Dns),
-        "undefined" => Ok(HostType::Undefined),
-        other => Err(DatabaseError::Generic(format!("unknown host type {other}"))),
-    }
-}
 fn profile_err(value: &str) -> Result<ProfileErr> {
     match value {
         "real" => Ok(ProfileErr::Real),
@@ -424,8 +428,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
     fn endpoint(id: i64, host: &str, host_type: HostType) -> Endpoint {
         Endpoint {
             id: EndpointId::new(id),
-            host: host.to_string(),
-            host_type,
+            domain: Endpoint::derive_domain(host, host_type).0,
+            sub_domain: Endpoint::derive_domain(host, host_type).1,
             port: 443,
             ports: Vec::new(),
             last_source: None,
@@ -515,8 +519,16 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
         db.upsert_link(&link(1000 + id, id, latency, error))
             .await
             .expect("link");
-        if !ips.is_empty() {
-            db.update_endpoint_resolution(EndpointId::new(id), ips.to_vec(), 1)
+        // db-rewamp D10: an IP-literal endpoint's address lives in
+        // `endpoint_ip` (the DIAL target), not on the row; a DNS endpoint's
+        // addresses come from the explicit `ips`.
+        let addrs: Vec<std::net::IpAddr> = if ips.is_empty() {
+            host.parse::<std::net::IpAddr>().ok().into_iter().collect()
+        } else {
+            ips.to_vec()
+        };
+        if !addrs.is_empty() {
+            db.update_endpoint_resolution(EndpointId::new(id), addrs, 1)
                 .await
                 .expect("resolution");
         }

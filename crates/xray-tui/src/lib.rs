@@ -84,8 +84,9 @@ pub(crate) fn profile_to_fields(
             flatten_json_to_fields(ss, &mut fields);
         }
     }
-    if !endpoint.host.is_empty() {
-        set_field(&mut fields, "address", &endpoint.host);
+    let address = endpoint.dns_name();
+    if !address.is_empty() {
+        set_field(&mut fields, "address", &address);
     }
     if endpoint.port > 0 {
         set_field(&mut fields, "port", &endpoint.port.to_string());

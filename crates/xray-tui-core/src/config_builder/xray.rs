@@ -101,6 +101,7 @@ impl XrayConfigBuilder {
     /// per-pair link) is handed to `inject_to` for the proxy outbound.
     pub fn build(
         endpoint: &Endpoint,
+        addresses: &[std::net::IpAddr],
         protocol: &Protocol,
         core_type: CoreType,
         params: &BuildParams,
@@ -109,7 +110,7 @@ impl XrayConfigBuilder {
     ) -> Result<XrayConfig, BuildError> {
         let mut config = skeleton(params, routing, dns);
         config.outbounds = vec![
-            build_proxy_outbound(endpoint, protocol, core_type, params.skip_cert_verify)?,
+            build_proxy_outbound(endpoint, addresses, protocol, core_type, params.skip_cert_verify)?,
             build_dns_outbound(),
             build_direct_outbound(),
             build_block_outbound(),
@@ -212,6 +213,7 @@ fn build_inbounds(params: &BuildParams) -> Vec<Inbound> {
 /// build-time override so TLS `insecure` reflects the user setting.
 fn build_proxy_outbound(
     endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
     protocol: &Protocol,
     core_type: CoreType,
     skip_cert_verify: bool,
@@ -220,7 +222,7 @@ fn build_proxy_outbound(
     protocol_config(protocol)?.inject_to(
         &mut conf,
         core_type,
-        Some(&endpoint_essentials(endpoint)),
+        Some(&endpoint_essentials(endpoint, addresses)),
         InjectOptions { skip_cert_verify },
     )?;
     let mut outbound: Outbound = serde_json::from_value(conf)?;
@@ -389,7 +391,7 @@ mod tests {
         let (endpoint, protocol, _link) = test_endpoint_protocol_link();
         let (params, rules, dns) = super::super::tests::default_params();
         let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &[], &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect("vless xray build must succeed");
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);
@@ -418,7 +420,7 @@ mod tests {
         protocol.config = Deferred::default();
         let (params, rules, dns) = super::super::tests::default_params();
         let err =
-            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &[], &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect_err("unloaded config must be rejected");
         assert!(
             err.to_string().contains("not loaded"),
@@ -439,7 +441,7 @@ mod tests {
         );
         let (params, rules, dns) = super::super::tests::default_params();
         let err =
-            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &[], &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect_err("reality without publicKey must be rejected");
         assert!(
             err.to_string().contains("reality"),
@@ -462,7 +464,7 @@ mod tests {
         );
         let (params, rules, dns) = super::super::tests::default_params();
         let err =
-            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &[], &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect_err("xray-core cannot build aes-256-cfb");
         assert!(
             err.to_string().contains("aes-256-cfb"),
@@ -480,7 +482,7 @@ mod tests {
         );
         let (params, rules, dns) = super::super::tests::default_params();
         let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &[], &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect("ss-2022 xray build must succeed");
         let json = serde_json::to_value(&config).unwrap();
         let proxy = json["outbounds"]
@@ -509,7 +511,7 @@ mod tests {
         );
         let (params, rules, dns) = super::super::tests::default_params();
         let config =
-            XrayConfigBuilder::build(&endpoint, &protocol, CoreType::Xray, &params, &rules, &dns)
+            XrayConfigBuilder::build(&endpoint, &[], &protocol, CoreType::Xray, &params, &rules, &dns)
                 .expect("hy2 xray build must succeed");
         let json = serde_json::to_value(&config).unwrap();
         assert_xray_top_level(&json);

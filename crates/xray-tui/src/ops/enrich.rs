@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
-use xray_tui_db::models::{Endpoint, EndpointId, HostType, Protocol};
+use xray_tui_db::models::{EndpointId, HostType, Protocol};
 use xray_tui_host_features::HostFeatures;
 
 use crate::AppState;
@@ -286,11 +286,11 @@ pub fn spawn_dns_resolve(state: &mut AppState, endpoint_id: i64, force: bool) {
     else {
         return;
     };
-    let host = row.endpoint.host.clone();
-    let host_type = row.endpoint.host_type;
+    let host = row.endpoint.dns_name();
+    let host_type = xray_tui_db::models::HostType::Dns;
     let sni = row
         .active_protocol()
-        .and_then(|(_, p)| extract_sni(p, &row.endpoint.host));
+        .and_then(|(_, p)| extract_sni(p, &row.endpoint.dns_name()));
     spawn_dns_resolve_host(state, endpoint_id, host, host_type, sni, force);
 }
 
@@ -615,10 +615,11 @@ fn release_waiters(
     }
 }
 
-/// One enrichment target: endpoint id, the endpoint, its persisted
-/// `endpoint_ip` address set, the persisted `resolved_at` (unix secs), and the
-/// SNI of its active protocol (None for linkless endpoints).
-type EnrichTarget = (i64, Endpoint, Vec<IpAddr>, Option<i64>, Option<String>);
+/// One enrichment target: endpoint id, its persisted `endpoint_ip` address set,
+/// the persisted `resolved_at` (unix secs), and the SNI of its active protocol
+/// (None for linkless endpoints). An IP-literal endpoint's address is IN the
+/// set (db-rewamp D10) — `is_dns()` distinguishes a DNS host without one.
+type EnrichTarget = (i64, Vec<IpAddr>, Option<i64>, Option<String>);
 
 /// Startup/refresh pass: seed `endpoint_info` for every endpoint that has no
 ///
@@ -630,7 +631,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
         .endpoints
         .iter()
         .filter(|r| {
-            r.endpoint.is_ip() || !r.resolved_ips.is_empty()
+            (!r.endpoint.is_dns()) || !r.resolved_ips.is_empty()
         })
         // An entry with no address and no attempt timestamp carries no
         // resolution information (an outbound-only event materializes one), so
@@ -644,11 +645,10 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
         .map(|r| {
             (
                 r.endpoint.id.get(),
-                r.endpoint.clone(),
                 r.resolved_ips.clone(),
                 r.endpoint.resolved_at,
                 r.active_protocol()
-                    .and_then(|(_, p)| extract_sni(p, &r.endpoint.host)),
+                    .and_then(|(_, p)| extract_sni(p, &r.endpoint.dns_name())),
             )
         })
         .collect();
@@ -665,13 +665,17 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
     // after a 7000-URL import).
     let mut feature_targets: Vec<(i64, EndpointInfo, Option<String>)> =
         Vec::with_capacity(targets.len());
-    for (endpoint_id, ep, cached_as, cached_at, sni) in targets {
+    for (endpoint_id, cached_as, cached_at, sni) in targets {
         let mut info = if cached_as.is_empty() {
-            // IP host — its own address is the "resolution".
+            // No `endpoint_ip` row: an exotic host with no literal to carry.
+            // The seed filter admitted it, so it stays explicit (the
+            // unspecified address is a placeholder, never dialed) rather than
+            // silently empty.
             EndpointInfo {
                 resolved_ips: vec![
-                    ep.host
-                        .parse()
+                    cached_as
+                        .first()
+                        .copied()
                         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
                 ],
                 country: None,
@@ -805,7 +809,7 @@ pub fn spawn_whitelist_pass(state: &mut AppState) {
             (
                 r.endpoint.id.get(),
                 r.active_protocol()
-                    .and_then(|(_, p)| extract_sni(p, &r.endpoint.host)),
+                    .and_then(|(_, p)| extract_sni(p, &r.endpoint.dns_name())),
                 state
                     .endpoint_info
                     .get(&r.endpoint.id.get())
@@ -949,7 +953,8 @@ mod tests {
     async fn stored_country_reaches_the_ui_without_the_mmdb() {
         use crate::ops::profiles::test_support::{fake_row, test_state};
         let mut row = fake_row(7, "dns.example", 1);
-        row.endpoint.host_type = HostType::Dns;
+        row.endpoint.domain = "dns.example".to_string();
+        row.endpoint.sub_domain = String::new();
         row.endpoint.resolved_at = Some(60);
         row.resolved_ips = vec!["1.1.1.1".parse().expect("ip")];
         let mut state = test_state(vec![row]).await;

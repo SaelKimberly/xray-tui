@@ -214,6 +214,7 @@ pub fn parse_probe_url(url: &str) -> Result<ProbeUrl, String> {
 /// class a batch counts.
 pub async fn real_ping(
     endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
     config: &ProtocolConfig,
     req: &NativeProbeReq<'_>,
 ) -> Result<NativeProbeResult, ProbeFailure> {
@@ -221,7 +222,7 @@ pub async fn real_ping(
         parse_probe_url(req.ping_url).map_err(|e| ProbeFailure::local(ProbeClass::Config, e))?;
     let params = NativeConnectParams::new(
         config.clone(),
-        endpoint_essentials(endpoint),
+        endpoint_essentials(endpoint, addresses),
         TargetAddr::new(target.host.as_str(), target.port),
     );
 

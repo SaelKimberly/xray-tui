@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         render_placeholder(frame, area, &palette);
         return;
     };
-    let profile_name = format!("{}:{}", profile.endpoint.host, profile.endpoint.port);
+    let profile_name = format!("{}:{}", profile.endpoint.dns_name(), profile.endpoint.port);
     let core_type = state.connected_core.map_or("", |c| c.as_str());
 
     // Split area into 3 sections

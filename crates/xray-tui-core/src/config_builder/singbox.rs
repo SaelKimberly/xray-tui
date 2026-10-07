@@ -92,6 +92,7 @@ impl SingBoxConfigBuilder {
     /// the per-pair link) is handed to `inject_to` for the proxy outbound.
     pub fn build(
         endpoint: &Endpoint,
+        addresses: &[std::net::IpAddr],
         protocol: &Protocol,
         core_type: CoreType,
         params: &BuildParams,
@@ -100,7 +101,7 @@ impl SingBoxConfigBuilder {
     ) -> Result<SingBoxConfig, BuildError> {
         let mut config = skeleton(params, routing, dns);
         config.outbounds = vec![
-            build_proxy_outbound(endpoint, protocol, core_type, params)?,
+            build_proxy_outbound(endpoint, addresses, protocol, core_type, params)?,
             build_direct_outbound(),
             build_block_outbound(),
         ];
@@ -149,6 +150,7 @@ fn skeleton(params: &BuildParams, routing: &[RoutingRule], dns: &DnsSetting) -> 
 /// owns the tag ("proxy" single / "proxy-{i}" multi) and the multiplex block.
 fn build_proxy_outbound(
     endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
     protocol: &Protocol,
     core_type: CoreType,
     params: &BuildParams,
@@ -157,7 +159,7 @@ fn build_proxy_outbound(
     protocol_config(protocol)?.inject_to(
         &mut out,
         core_type,
-        Some(&endpoint_essentials(endpoint)),
+        Some(&endpoint_essentials(endpoint, addresses)),
         InjectOptions {
             skip_cert_verify: params.skip_cert_verify,
         },
@@ -317,6 +319,7 @@ mod tests {
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
+            &[],
             &protocol,
             CoreType::SingBox,
             &params,
@@ -351,6 +354,7 @@ mod tests {
         let (params, rules, dns) = super::super::tests::default_params();
         let err = SingBoxConfigBuilder::build(
             &endpoint,
+            &[],
             &protocol,
             CoreType::SingBox,
             &params,
@@ -376,6 +380,7 @@ mod tests {
         let (params, rules, dns) = super::super::tests::default_params();
         let err = SingBoxConfigBuilder::build(
             &endpoint,
+            &[],
             &protocol,
             CoreType::SingBox,
             &params,
@@ -401,6 +406,7 @@ mod tests {
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
+            &[],
             &protocol,
             CoreType::SingBox,
             &params,
@@ -429,6 +435,7 @@ mod tests {
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
+            &[],
             &protocol,
             CoreType::SingBox,
             &params,
@@ -460,6 +467,7 @@ mod tests {
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
+            &[],
             &protocol,
             CoreType::SingBox,
             &params,
@@ -494,6 +502,7 @@ mod tests {
         let (params, rules, dns) = super::super::tests::default_params();
         let config = SingBoxConfigBuilder::build(
             &endpoint,
+            &[],
             &protocol,
             CoreType::SingBox,
             &params,

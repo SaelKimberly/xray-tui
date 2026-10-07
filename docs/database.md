@@ -14,7 +14,7 @@ derived-state tables.
 | | |
 | --- | --- |
 | Tables | 11 (listed below; `app_meta` is the key/value stamp table) |
-| Schema tag | `PRAGMA user_version = 17` |
+| Schema tag | `PRAGMA user_version = 18` |
 | Migrations | **none** — a tag mismatch deletes and recreates the file (see [Changing the schema](#changing-the-schema)) |
 | Raw SQL | `profiles_query.rs` (the page), `endpoint_rank.rs` and `endpoint_ip.rs` (their index DDL plus the id-inlined reads/writes), and the bulk patch statements (ADR 0001, ADR 0003); `PRAGMA`s are the other standing exception, described under [Connection settings](#connection-settings) |
 
@@ -31,9 +31,9 @@ erDiagram
     groups ||--o{ routing_rules : "scoped rules"
 
     endpoints {
-        BIGINT id PK "stable_hash(host, port)"
-        TEXT host "canonical host string"
-        TEXT host_type "ipv4|ipv6|dns|undefined"
+        BIGINT id PK "stable_hash(name, port)"
+        TEXT domain "eTLD+1; empty for an IP/exotic host (db-rewamp D2)"
+        TEXT sub_domain "labels left of the domain; empty otherwise"
         INTEGER port "primary port"
         TEXT ports "JSON array (multi-port specs)"
         TEXT last_source "hash of the source subscription"
@@ -158,11 +158,13 @@ went away.
 ### Identity and addresses
 
 **`endpoints`** — one row per `host:port`. `id` is a stable hash
-(`stable_hash(host, port)`; exotic kinds hash `("undefined", config_uid)`, which
-is why `host` can be empty). `host_type` decides how the row is dialled: an
-`ipv4`/`ipv6` host needs no resolution, a `dns` host resolves into
-`endpoint_ip`. `ports` carries a multi-port spec (JSON array, empty when the
-single `port` is the whole spec).
+(`stable_hash(name, port)`, where `name` is the canonical DNS name
+(`sub_domain.domain`) or the IP literal; exotic kinds hash `("", port)`, which
+is why `domain` can be empty). The host kind is DERIVED (db-rewamp D2/D10): a
+non-empty `domain` is a DNS name whose addresses live in `endpoint_ip`; an
+empty `domain` is an IP-literal or exotic host whose literal (if any) is the
+single `endpoint_ip` row — its dial target has no other home. `ports` carries a
+multi-port spec (JSON array, empty when the single `port` is the whole spec).
 
 **`endpoint_ip`** — a DNS endpoint's resolved addresses, **one row per address**
 (ADR 0005). `country` is the address's ISO-3166 alpha-2 code (`country.iso_code`
@@ -326,7 +328,7 @@ flowchart TD
     E -- no --> G[read PRAGMA user_version]
     F --> G
     G --> H{tag == 17?}
-    H -- no --> I[push_schema + set tag 17]
+    H -- no --> I[push_schema + set tag 18]
     H -- yes --> J[skip push_schema]
     I --> K[PRAGMAs: WAL, busy_timeout, NORMAL, foreign_keys]
     J --> K

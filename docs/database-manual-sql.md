@@ -203,15 +203,18 @@ So:
 | `upsert_endpoints_bulk` — one multi-row `INSERT … VALUES (…),(…) ON CONFLICT("id") DO UPDATE` per 400 rows, replacing one typed upsert per row | The typed builder cannot batch. The 2026-10-01 run issued **105,147 statements** for this family alone. | ~263 statements for the same rows. `AGENTS.md` decision 22 already carried the finding ("the import path's per-row typed upserts 360 ms per 2,000 links against 44.3 ms"); the fix had never been applied to this path. |
 | `upsert_endpoint_group_links_bulk` — same shape on `("endpoint_id","group_id")` | The largest single family: **204,592 statements**, half the import's total, because a 500-URL batch touches one endpoint once per protocol and each was its own statement. | ~511 statements. |
 
-**Both need `HostType::as_db_label()`, added for this.** The stored spelling is the embed
-derive's `snake_case` of the Rust ident — `ipv4` / `dns` / `ipv6` / `undefined`, verified against
-the 2026-10-01 feed (74,014 endpoints, no other spelling). It is **not** `Debug` and **not** any
-wire form. A wrong label does not fail the write: `host_type` is unconstrained text, so a typo
-silently mis-classifies the endpoint and the DNS gate starts disagreeing with the row. The
-round-trip is pinned by `multi_row_import_writers_round_trip_through_a_real_database`, which reads
-the column back **as text** rather than through the typed loader (which would hide the error), and
-by `multi_row_endpoint_upsert_replaces_and_preserves`, which proves the upsert replaces `host`/`port`
-and leaves `manual_protocol_override` and `resolved_at` alone — the import does not own them.
+**db-rewamp D10: the endpoints writer now writes `domain`/`sub_domain`, not `host`/`host_type`.**
+The `HostType::as_db_label()` round-trip this section used to require is gone with the columns: the
+stored TEXT is the psl2 split itself — `domain` (eTLD+1) plus `sub_domain` (the labels left of it),
+both empty for an IP-literal or exotic host — so a mistyped split, not a mistyped enum label, is the
+failure mode. `multi_row_import_writers_round_trip_through_a_real_database` reads the `domain` column
+back **as text** rather than through the typed loader (which would hide the error) and asserts the
+split's expected value per host kind; `multi_row_endpoint_upsert_replaces_and_preserves` proves the
+upsert replaces `domain`/`port` and leaves `manual_protocol_override` and `resolved_at` alone — the
+import does not own them. An IP-literal endpoint's address is written to `endpoint_ip` alongside its
+row (`state::persist_parsed`, `SourceSpec::write_window`), pinned by
+`streaming_import_splits_and_persists_in_batches` — the literal has no other home once `host` is
+dropped.
 
 ### `upsert_protocols_bulk` is DELIBERATELY NOT converted
 

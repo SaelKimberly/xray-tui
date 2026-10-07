@@ -1267,7 +1267,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use xray_tui_config::AppConfig;
-    use xray_tui_db::models::{EndpointRow, HostType, Latency};
+    use xray_tui_db::models::{EndpointRow, Latency};
 
     use crate::ops::profiles::test_support::fake_row;
     use crate::types::EndpointInfo;
@@ -2232,8 +2232,10 @@ mod tests {
             l.protocol_id = xray_tui_db::models::ProtocolId::new(pid);
         }
         ep2.protocols = ep1.protocols.clone();
-        ep1.endpoint.host_type = HostType::Ipv4;
-        ep2.endpoint.host_type = HostType::Ipv4;
+        ep1.endpoint.domain = String::new();
+        ep1.endpoint.sub_domain = String::new();
+        ep2.endpoint.domain = String::new();
+        ep2.endpoint.sub_domain = String::new();
         state.endpoints = vec![ep1, ep2];
         state.selected_index = 1;
 
@@ -2324,7 +2326,7 @@ mod tests {
         // a transient DNS-unresolved tier, so promotion must be explicit.
         let (mut state, tx) = event_state().await;
         let mut row = fake_row(1, "h1.example", 2); // p100, p101
-        row.endpoint.host_type = HostType::Dns; // unresolved -> all tier 5
+        // (a name fixture is already a DNS host)
         row.links[0].error = Some(xray_tui_db::models::ErrorInfo {
             kind: xray_tui_db::models::ProfileErr::Real,
             text: "timeout".into(),
@@ -2373,7 +2375,8 @@ mod tests {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 3, 7); // p7, p8, p9
         set_delay(&mut row, 9, 50, false); // fast-ok
-        row.endpoint.host_type = HostType::Ipv4;
+        row.endpoint.domain = String::new();
+        row.endpoint.sub_domain = String::new();
         state.endpoints = vec![row];
         state.selected_index = 0;
         state.selected_sub = Some(2); // points at p9 before the sort
@@ -2532,7 +2535,7 @@ mod tests {
         let (mut state, tx) = event_state().await;
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
         set_delay(&mut row, 7, 50, true); // real-ok
-        row.endpoint.host_type = HostType::Dns;
+        // (already a DNS host)
         row.resolved_ips.clear(); // a DNS host with no resolved address
         state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
         state.selected_index = 0;
@@ -2612,7 +2615,7 @@ mod tests {
         let mut row = row_with_protocols(100, 2, 7); // p7, p8
         set_delay(&mut row, 7, 50, false); // fast-ok
         set_delay(&mut row, 8, 10, true); // real-ok
-        row.endpoint.host_type = HostType::Dns;
+        // (already a DNS host)
         row.resolved_ips.clear(); // a DNS host with no resolved address
         state.endpoints = vec![row]; // no endpoint_info entry -> unresolved
         state.selected_index = 0;

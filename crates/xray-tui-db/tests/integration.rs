@@ -140,8 +140,8 @@ async fn seed_endpoint(
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(endpoint_id),
-        host: host.to_string(),
-        host_type,
+        domain: Endpoint::derive_domain(host, host_type).0,
+        sub_domain: Endpoint::derive_domain(host, host_type).1,
         port,
         ports: Vec::<u16>::new(),
     })
@@ -236,7 +236,7 @@ async fn page_rows_assemble_links_and_protocols() {
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row.endpoint.id, EndpointId::new(1));
-    assert_eq!(row.endpoint.host, "1.2.3.4");
+    assert!(row.endpoint.domain.is_empty(), "an IP host has no domain");
     assert_eq!(row.endpoint.port, 443);
     assert_eq!(row.links.len(), 2, "links carried per endpoint");
     assert_eq!(row.protocols.len(), 2, "protocols map built from links");
@@ -460,8 +460,8 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(4),
-        host: "4.4.4.4".to_string(),
-        host_type: HostType::Ipv4,
+        domain: Endpoint::derive_domain("4.4.4.4", HostType::Ipv4).0,
+        sub_domain: Endpoint::derive_domain("4.4.4.4", HostType::Ipv4).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -483,8 +483,8 @@ async fn purgatory_ids_match_assembled_rows_on_mixed_dataset() {
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(8),
-        host: "8.8.8.8".to_string(),
-        host_type: HostType::Ipv4,
+        domain: Endpoint::derive_domain("8.8.8.8", HostType::Ipv4).0,
+        sub_domain: Endpoint::derive_domain("8.8.8.8", HostType::Ipv4).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -587,8 +587,8 @@ async fn purge_expired_matches_all_links_semantics() {
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(1),
-        host: "1.1.1.1".to_string(),
-        host_type: HostType::Ipv4,
+        domain: Endpoint::derive_domain("1.1.1.1", HostType::Ipv4).0,
+        sub_domain: Endpoint::derive_domain("1.1.1.1", HostType::Ipv4).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -742,7 +742,7 @@ async fn get_endpoint_and_get_by_protocol_id() {
     seed_endpoint(&mut conn, 7, 3001, "10.0.0.1", HostType::Ipv4, 53, 100).await;
 
     let row = db.get_endpoint(EndpointId::new(7)).await.expect("get");
-    assert_eq!(row.as_ref().expect("row").endpoint.host, "10.0.0.1");
+    assert!(row.as_ref().expect("row").endpoint.domain.is_empty());
     assert_eq!(row.unwrap().links.len(), 1);
 
     let by_proto = db
@@ -775,8 +775,8 @@ async fn get_endpoint_returns_linkless_row_with_empty_links() {
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(41),
-        host: "linkless.example".to_string(),
-        host_type: HostType::Dns,
+        domain: Endpoint::derive_domain("linkless.example", HostType::Dns).0,
+        sub_domain: Endpoint::derive_domain("linkless.example", HostType::Dns).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -1032,8 +1032,8 @@ async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(2),
-        host: "2.2.2.2".to_string(),
-        host_type: HostType::Ipv4,
+        domain: Endpoint::derive_domain("2.2.2.2", HostType::Ipv4).0,
+        sub_domain: Endpoint::derive_domain("2.2.2.2", HostType::Ipv4).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -1142,8 +1142,8 @@ async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(2),
-        host: "2.2.2.2".to_string(),
-        host_type: HostType::Ipv4,
+        domain: Endpoint::derive_domain("2.2.2.2", HostType::Ipv4).0,
+        sub_domain: Endpoint::derive_domain("2.2.2.2", HostType::Ipv4).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -1350,8 +1350,8 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
 
     let endpoint = |port: u16| Endpoint {
         id: EndpointId::new(1),
-        host: "sub.example".to_string(),
-        host_type: HostType::Dns,
+        domain: Endpoint::derive_domain("sub.example", HostType::Dns).0,
+        sub_domain: Endpoint::derive_domain("sub.example", HostType::Dns).1,
         port,
         ports: Vec::<u16>::new(),
         last_source: Some("g1".to_string()),
@@ -1498,8 +1498,8 @@ async fn subscription_upsert_flow_assembles_group_rows() {
     // group-link upserts in dependency order.
     db.upsert_endpoint(&Endpoint {
         id: EndpointId::new(1),
-        host: "sub.example".to_string(),
-        host_type: HostType::Dns,
+        domain: Endpoint::derive_domain("sub.example", HostType::Dns).0,
+        sub_domain: Endpoint::derive_domain("sub.example", HostType::Dns).1,
         port: 443,
         ports: Vec::<u16>::new(),
         last_source: Some("g1".to_string()),
@@ -1645,8 +1645,8 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(9),
-        host: "9.9.9.9".to_string(),
-        host_type: HostType::Ipv4,
+        domain: Endpoint::derive_domain("9.9.9.9", HostType::Ipv4).0,
+        sub_domain: Endpoint::derive_domain("9.9.9.9", HostType::Ipv4).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -1693,8 +1693,8 @@ async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
         toasty::create!(Endpoint {
             created_at: 0,
             id: EndpointId::new(7),
-            host: "seeded.example".to_string(),
-            host_type: HostType::Ipv4,
+            domain: Endpoint::derive_domain("seeded.example", HostType::Ipv4).0,
+            sub_domain: Endpoint::derive_domain("seeded.example", HostType::Ipv4).1,
             port: 443,
             ports: Vec::<u16>::new(),
         })

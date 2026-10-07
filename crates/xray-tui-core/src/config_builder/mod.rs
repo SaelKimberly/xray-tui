@@ -5,7 +5,7 @@ pub mod clash_mixin;
 use crate::core_type::CoreType;
 use serde::Serialize;
 use serde_json::{Value, json};
-use xray_tui_db::models::{DnsSetting, Endpoint, HostType, Protocol, RoutingRule};
+use xray_tui_db::models::{DnsSetting, Endpoint, Protocol, RoutingRule};
 use xray_tui_proto::proto_spec::{
     CoreType as ProtoCoreType, EndpointEssentials, HostKind, ProtocolConfig, SupportError,
 };
@@ -57,19 +57,26 @@ pub fn shadowsocks_method(protocol: &Protocol) -> Option<String> {
     }
 }
 
-/// Map a db [`Endpoint`] to the proto [`EndpointEssentials`] the outbound
-/// injectors consume (host, host kind, and the full port spec). The db
-/// [`HostType`] mirrors proto [`HostKind`] 1:1.
+/// Map a db [`Endpoint`] + its resolved ADDRESSES to the proto
+/// [`EndpointEssentials`] the outbound injectors consume.
+///
+/// An IP host's literal lives in `endpoint_ip` (db-rewamp D10), not on the
+/// endpoint row, so the caller threads the addresses; a DNS host dials its
+/// reconstructed name. An exotic host (empty domain, no address) is Undefined.
 #[must_use]
-pub fn endpoint_essentials(e: &Endpoint) -> EndpointEssentials {
+pub fn endpoint_essentials(e: &Endpoint, addresses: &[std::net::IpAddr]) -> EndpointEssentials {
+    let (host, host_type) = if e.is_dns() {
+        (e.dns_name(), HostKind::Dns)
+    } else {
+        match addresses.first() {
+            Some(std::net::IpAddr::V4(_)) => (addresses[0].to_string(), HostKind::Ipv4),
+            Some(std::net::IpAddr::V6(_)) => (addresses[0].to_string(), HostKind::Ipv6),
+            None => (String::new(), HostKind::Undefined),
+        }
+    };
     EndpointEssentials {
-        host: e.host.clone(),
-        host_type: match e.host_type {
-            HostType::Ipv4 => HostKind::Ipv4,
-            HostType::Ipv6 => HostKind::Ipv6,
-            HostType::Dns => HostKind::Dns,
-            HostType::Undefined => HostKind::Undefined,
-        },
+        host,
+        host_type,
         port: e.port,
         ports: e.ports.clone(),
     }
@@ -148,6 +155,7 @@ impl ConfigBuilder {
 /// [`SupportError::UnsupportedProtocol`] → [`BuildError::Support`].
 pub fn build(
     endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
     protocol: &Protocol,
     core_type: ProtoCoreType,
     params: &BuildParams,
@@ -157,12 +165,12 @@ pub fn build(
     match core_type {
         ProtoCoreType::Xray => {
             let config =
-                xray::XrayConfigBuilder::build(endpoint, protocol, core_type, params, routing, dns)?;
+                xray::XrayConfigBuilder::build(endpoint, addresses, protocol, core_type, params, routing, dns)?;
             Ok(BackendConfig::Xray(config))
         }
         ProtoCoreType::SingBox => {
             let config = singbox::SingBoxConfigBuilder::build(
-                endpoint, protocol, core_type, params, routing, dns,
+                endpoint, addresses, protocol, core_type, params, routing, dns,
             )?;
             Ok(BackendConfig::SingBox(config))
         }
@@ -175,7 +183,7 @@ pub fn build(
 mod tests {
     use super::*;
     use toasty::{Deferred, Json};
-    use xray_tui_db::models::{ProfileStats, TrafficStats, Transport};
+    use xray_tui_db::models::{HostType, ProfileStats, TrafficStats, Transport};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
         CoreType as ProtoCoreType, ProtocolKind, SecurityConfig, SecurityType, TransportType,
@@ -219,8 +227,8 @@ mod tests {
     pub(super) fn endpoint(host: &str, port: u16) -> Endpoint {
         Endpoint {
             id: xray_tui_db::models::EndpointId::new(1),
-            host: host.to_string(),
-            host_type: HostType::Dns,
+            domain: Endpoint::derive_domain(host, HostType::Dns).0,
+            sub_domain: Endpoint::derive_domain(host, HostType::Dns).1,
             port,
             ports: Vec::new(),
             last_source: None,
@@ -414,7 +422,7 @@ mod tests {
         let protocol = protocol(ProtocolKind::Vless, vless_config());
                 let (params, rules, dns) = default_params();
         let json = assert_ok_dispatch(
-            ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::Xray, &params, &rules, &dns),
+            ConfigBuilder::build(&endpoint, &[], &protocol, ProtoCoreType::Xray, &params, &rules, &dns),
             ProtoCoreType::Xray,
             "vless",
             "protocol",
@@ -447,7 +455,7 @@ mod tests {
         let protocol = protocol(ProtocolKind::Tuic, tuic);
                 let (params, rules, dns) = default_params();
         let json = assert_ok_dispatch(
-            ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::SingBox, &params, &rules, &dns),
+            ConfigBuilder::build(&endpoint, &[], &protocol, ProtoCoreType::SingBox, &params, &rules, &dns),
             ProtoCoreType::SingBox,
             "tuic",
             "type",
@@ -488,7 +496,7 @@ mod tests {
         let protocol = protocol(ProtocolKind::Vless, config);
                 let (params, rules, dns) = default_params();
 
-        let err = ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::Xray, &params, &rules, &dns)
+        let err = ConfigBuilder::build(&endpoint, &[], &protocol, ProtoCoreType::Xray, &params, &rules, &dns)
             .expect_err("xray-core removed the http transport, so the build must refuse it");
         assert!(matches!(err, BuildError::Support(_)), "{err:?}");
         assert!(
@@ -498,7 +506,7 @@ mod tests {
 
         // The refusal is scoped to the core that removed it: the SAME config
         // still builds for sing-box, which implements the transport.
-                ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::SingBox, &params, &rules, &dns)
+                ConfigBuilder::build(&endpoint, &[], &protocol, ProtoCoreType::SingBox, &params, &rules, &dns)
             .expect("sing-box still implements the http transport");
     }
 
@@ -510,7 +518,7 @@ mod tests {
         let mut protocol = protocol(ProtocolKind::Vless, vless_config());
         protocol.config = Deferred::default();
                 let (params, rules, dns) = default_params();
-        let err = ConfigBuilder::build(&endpoint, &protocol, ProtoCoreType::Xray, &params, &rules, &dns)
+        let err = ConfigBuilder::build(&endpoint, &[], &protocol, ProtoCoreType::Xray, &params, &rules, &dns)
             .expect_err("unloaded config must be rejected");
         assert!(
             err.to_string().contains("not loaded"),
@@ -521,7 +529,7 @@ mod tests {
     #[test]
     fn endpoint_essentials_maps_host_type() {
         let e = endpoint("example.com", 443);
-        let ess = endpoint_essentials(&e);
+        let ess = endpoint_essentials(&e, &[]);
         assert_eq!(ess.host, "example.com");
         assert_eq!(ess.port, 443);
         assert_eq!(ess.host_type, HostKind::Dns);

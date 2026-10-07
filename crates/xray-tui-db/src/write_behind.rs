@@ -643,6 +643,10 @@ pub struct SourceBatch {
     pub links: Vec<crate::models_toasty::ProfileStats>,
     /// `endpoint_groups` rows parsed from this batch.
     pub group_links: Vec<crate::models_toasty::EndpointGroup>,
+    /// IP-literal endpoints in this batch: `(endpoint, its literal address)`.
+    /// With `endpoints.host` gone (db-rewamp D10) the literal's ONLY home is
+    /// `endpoint_ip`, so the import writes it here alongside the row.
+    pub ip_literals: Vec<(crate::models_toasty::EndpointId, std::net::IpAddr)>,
 }
 
 /// The write side of an import batch: 1:1 with [`SourceBatch`], so the patch IS
@@ -662,6 +666,8 @@ pub struct SourcePatch {
     pub links: Vec<crate::models_toasty::ProfileStats>,
     /// `endpoint_groups` rows to upsert.
     pub group_links: Vec<crate::models_toasty::EndpointGroup>,
+    /// IP-literal endpoints to write into `endpoint_ip` (db-rewamp D10).
+    pub ip_literals: Vec<(crate::models_toasty::EndpointId, std::net::IpAddr)>,
 }
 
 impl From<&SourceBatch> for SourcePatch {
@@ -672,6 +678,7 @@ impl From<&SourceBatch> for SourcePatch {
             protocols: batch.protocols.clone(),
             links: batch.links.clone(),
             group_links: batch.group_links.clone(),
+            ip_literals: batch.ip_literals.clone(),
         }
     }
 }
@@ -721,17 +728,22 @@ impl CacheSpec for SourceSpec {
         let mut protocols = Vec::new();
         let mut links = Vec::new();
         let mut group_links = Vec::new();
+        let mut ip_literals = Vec::new();
         for patch in patches {
             endpoints.extend_from_slice(&patch.endpoints);
             protocols.extend_from_slice(&patch.protocols);
             links.extend_from_slice(&patch.links);
             group_links.extend_from_slice(&patch.group_links);
+            ip_literals.extend_from_slice(&patch.ip_literals);
         }
         let stored_links = links.len();
         crate::database::upsert_endpoints_bulk(tx, &endpoints).await?;
         crate::database::upsert_protocols_bulk(tx, &protocols).await?;
         crate::database::upsert_links_bulk(tx, &links).await?;
         crate::database::upsert_endpoint_group_links_bulk(tx, &group_links).await?;
+        for (id, ip) in &ip_literals {
+            crate::endpoint_ip::replace(tx, *id, std::slice::from_ref(ip)).await?;
+        }
         Ok(stored_links)
     }
 
@@ -1521,8 +1533,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
     fn endpoint_row(id: i64) -> Endpoint {
         Endpoint {
             id: EndpointId::new(id),
-            host: format!("host{id}.example"),
-            host_type: HostType::Dns,
+            domain: Endpoint::derive_domain(&format!("host{id}.example"), HostType::Dns).0,
+            sub_domain: Endpoint::derive_domain(&format!("host{id}.example"), HostType::Dns).1,
             port: 443,
             ports: Vec::new(),
             last_source: None,
@@ -1569,6 +1581,7 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
             protocols: vec![loaded_protocol(1)],
             links: ids.iter().copied().take(links).map(link_row).collect(),
             group_links: Vec::new(),
+            ip_literals: Vec::new(),
         }
     }
 

@@ -725,7 +725,7 @@ fn build_display_rows(
             .and_then(|i| i.country.as_deref())
             .map_or_else(|| "\u{1F3F4}".to_string(), iso_to_flag);
         let address_port_str =
-            truncate_pad(&format!(" {}:{}", row.endpoint.host, row.endpoint.port), 34);
+            truncate_pad(&format!(" {}:{}", row.endpoint.dns_name(), row.endpoint.port), 34);
         // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
         // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
         let ip_feature =
@@ -1182,10 +1182,10 @@ fn render_footer(
         |row| {
             let core = state.resolved_core(row);
 
-            let addr = if row.endpoint.host.is_empty() {
+            let addr = if row.endpoint.dns_name().is_empty() {
                 "-"
             } else {
-                &row.endpoint.host
+                &row.endpoint.dns_name()
             };
             let port = row.endpoint.port.to_string();
             Line::from(vec![
@@ -1253,7 +1253,7 @@ fn render_confirmation_overlays(
             let profile_name = rows
                 .iter()
                 .find(|r| r.endpoint.id.get() == *delete_id)
-                .map(|r| format!("{}:{}", r.endpoint.host, r.endpoint.port))
+                .map(|r| format!("{}:{}", r.endpoint.dns_name(), r.endpoint.port))
                 .unwrap_or_default();
             render_confirmation_overlay(
                 frame,
@@ -1434,7 +1434,7 @@ mod page_window_tests {
             after[0].address_port_str.trim(),
             format!(
                 "{}:{}",
-                state.endpoints[0].endpoint.host, state.endpoints[0].endpoint.port
+                state.endpoints[0].endpoint.dns_name(), state.endpoints[0].endpoint.port
             )
         );
     }
@@ -2015,8 +2015,8 @@ mod tests {
         EndpointRow {
             endpoint: Endpoint {
                 id: xray_tui_db::models::EndpointId::new(id),
-                host: host.to_string(),
-                host_type: xray_tui_db::models::HostType::Ipv4,
+                domain: host.to_string(),
+                sub_domain: String::new(),
                 port: port as u16,
                 ports: Vec::new(),
                 last_source: None,

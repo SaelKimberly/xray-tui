@@ -272,19 +272,25 @@ fn security_embed(config: &ProtocolConfig) -> Security {
     }
 }
 
-/// Build a typed `Endpoint` row from parse-boundary endpoint essentials:
-/// id = `stable_hash(host, port)`, host kind from the address family.
+/// Build a typed `Endpoint` row from parse-boundary endpoint essentials.
+///
+/// Identity = `stable_hash(canonical_name, port)` (db-rewamp D10): the
+/// once-normalized DNS name, the IP literal, or empty for an exotic host; the
+/// split fills `domain`/`sub_domain`.
 #[must_use]
 pub fn endpoint_from_essentials(ep: &EndpointEssentials) -> Endpoint {
+    let host_type = match ep.host_type {
+        HostKind::Ipv4 => HostType::Ipv4,
+        HostKind::Ipv6 => HostType::Ipv6,
+        HostKind::Dns => HostType::Dns,
+        HostKind::Undefined => HostType::Undefined,
+    };
+    let name = Endpoint::derive_name(&ep.host, host_type);
+    let (domain, sub_domain) = Endpoint::derive_domain(&ep.host, host_type);
     Endpoint {
-        id: EndpointId::new(stable_hash(&ep.host, i64::from(ep.port))),
-        host: ep.host.clone(),
-        host_type: match ep.host_type {
-            HostKind::Ipv4 => HostType::Ipv4,
-            HostKind::Ipv6 => HostType::Ipv6,
-            HostKind::Dns => HostType::Dns,
-            HostKind::Undefined => HostType::Undefined,
-        },
+        id: EndpointId::new(stable_hash(&name, i64::from(ep.port))),
+        domain,
+        sub_domain,
         port: ep.port,
         ports: ep.ports.clone(),
         last_source: None,
@@ -398,8 +404,15 @@ pub async fn persist_parsed(
     let mut endpoints = Vec::with_capacity(parsed.endpoints.len());
     let mut links = Vec::with_capacity(parsed.endpoints.len());
     let mut group_links = Vec::with_capacity(parsed.endpoints.len());
+    let mut ip_literals: Vec<(EndpointId, std::net::IpAddr)> = Vec::new();
     for ep in &parsed.endpoints {
         let endpoint = endpoint_from_essentials(ep);
+        // An IP-literal host's address is the DIAL target and the rank `addr`
+        // tiebreak; with `host` gone (db-rewamp D10) it lives in `endpoint_ip`,
+        // so the import writes it (75% of a feed is IP literals).
+        if let Ok(ip) = ep.host.parse::<std::net::IpAddr>() {
+            ip_literals.push((endpoint.id, ip));
+        }
         let link = link_from_parsed_with_id(protocol.id, endpoint.id);
         if let Some(gid) = group_id {
             group_links.push(EndpointGroup {
@@ -424,6 +437,9 @@ pub async fn persist_parsed(
         xray_tui_db::upsert_protocols_bulk(&mut tx, &protocols).await?;
         xray_tui_db::upsert_links_bulk(&mut tx, &links).await?;
         xray_tui_db::upsert_endpoint_group_links_bulk(&mut tx, &group_links).await?;
+        for (id, ip) in &ip_literals {
+            xray_tui_db::endpoint_ip::replace(&mut tx, *id, std::slice::from_ref(ip)).await?;
+        }
         tx.commit().await?;
         Ok(())
     };

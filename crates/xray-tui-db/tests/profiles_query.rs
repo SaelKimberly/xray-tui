@@ -56,8 +56,8 @@ async fn seed_endpoint(
     toasty::create!(Endpoint {
         created_at: 0,
         id: EndpointId::new(id),
-        host: format!("h{id}.example"),
-        host_type,
+        domain: Endpoint::derive_domain(&format!("h{id}.example"), host_type).0,
+        sub_domain: Endpoint::derive_domain(&format!("h{id}.example"), host_type).1,
         port: 443,
         ports: Vec::<u16>::new(),
     })
@@ -894,7 +894,7 @@ async fn load_page_rows_preserves_page_and_link_order() {
 // means the SQL is wrong — the oracle is never adjusted to match it.
 
 fn dns_unresolved(row: &xray_tui_db::models::EndpointRow) -> bool {
-    row.endpoint.host_type == HostType::Dns && row.resolved_ips.is_empty()
+    row.endpoint.is_dns() && row.resolved_ips.is_empty()
 }
 
 /// The DISPLAY link as the spec defines it: the manual override when it names
@@ -938,15 +938,15 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
             let (bin, neg_weight, _seen, _pid) = row
                 .best_test_priority_key(dns_unresolved(row))
                 .unwrap_or((u8::MAX, u64::MAX, i64::MAX, i64::MAX));
-            let (domain, sub_domain) = xray_tui_proto::domain::split(&row.endpoint.host)
-                .map_or_else(
-                    || (row.endpoint.host.to_lowercase(), String::new()),
-                    |d| (d.domain, d.sub_domain),
-                );
-            let addr = if matches!(row.endpoint.host_type, xray_tui_db::models::HostType::Dns) {
+            let domain = row.endpoint.domain.clone();
+            let sub_domain = row.endpoint.sub_domain.clone();
+            let addr = if row.endpoint.is_dns() {
                 Vec::new()
             } else {
-                xray_tui_db::endpoint_ip::key_of_str(&row.endpoint.host).unwrap_or_default()
+                row.resolved_ips
+                    .first()
+                    .map(|ip| xray_tui_db::endpoint_ip::key_of(*ip))
+                    .unwrap_or_default()
             };
             // band = "has a live link" (threshold ts(0)); NO_SEEN-only -> 1.
             let band = i64::from(row.links.iter().all(|l| l.purge_reason.is_some()));
@@ -983,7 +983,7 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
             let mut expected: Vec<i64> = if sort == PageSort::Address {
                 let mut v: Vec<(String, i64)> = rows
                     .iter()
-                    .map(|r| (r.endpoint.host.clone(), r.endpoint.id.get()))
+                    .map(|r| (r.endpoint.dns_name(), r.endpoint.id.get()))
                     .collect();
                 v.sort_unstable();
                 v.into_iter().map(|(_, id)| id).collect()
@@ -1035,18 +1035,18 @@ async fn seed_projection_fixture() -> Database {
 
     for stmt in [
         // e1: IPv4, multi-port spec, subscription source, override, two links.
-        "INSERT INTO endpoints (id, host, host_type, port, ports, last_source, \
+        "INSERT INTO endpoints (id, domain, sub_domain, port, ports, last_source, \
          manual_protocol_override, resolved_at, created_at) VALUES \
-         (1, 'a.example', 'ipv4', 443, '[443,8443]', 'src-hash', 11, NULL, \
+         (1, 'a.example', '', 443, '[443,8443]', 'src-hash', 11, NULL, \
           1788220800)",
         // e2: DNS with a persisted resolution and a name failure.
-        "INSERT INTO endpoints (id, host, host_type, port, ports, last_source, \
+        "INSERT INTO endpoints (id, domain, sub_domain, port, ports, last_source, \
          manual_protocol_override, resolved_at, created_at) VALUES \
-         (2, 'b.example', 'dns', 8443, '[]', NULL, NULL, 1788352245, 1788220801)",
+         (2, 'b.example', '', 8443, '[]', NULL, NULL, 1788352245, 1788220801)",
         // e3: DNS with no resolution, a link whose protocol row is missing.
-        "INSERT INTO endpoints (id, host, host_type, port, ports, last_source, \
+        "INSERT INTO endpoints (id, domain, sub_domain, port, ports, last_source, \
          manual_protocol_override, resolved_at, created_at) VALUES \
-         (3, 'c.example', 'dns', 443, '[]', NULL, NULL, NULL, \
+         (3, 'c.example', '', 443, '[]', NULL, NULL, NULL, \
           1788220802)",
         // e1's address: the Ip sort needs more than one endpoint to have a
         // key, and the fixture's only other DNS host (e3) must stay
@@ -1233,10 +1233,10 @@ async fn page_projection_matches_the_orm_rows() {
     for (typed, projected) in typed.iter().zip(&projected) {
         let ctx = format!("endpoint {}", typed.endpoint.id.get());
         assert_eq!(typed.endpoint.id, projected.endpoint.id, "{ctx}: id");
-        assert_eq!(typed.endpoint.host, projected.endpoint.host, "{ctx}: host");
+        assert_eq!(typed.endpoint.domain, projected.endpoint.domain, "{ctx}: domain");
         assert_eq!(
-            typed.endpoint.host_type, projected.endpoint.host_type,
-            "{ctx}: host_type"
+            typed.endpoint.sub_domain, projected.endpoint.sub_domain,
+            "{ctx}: sub_domain"
         );
         assert_eq!(typed.endpoint.port, projected.endpoint.port, "{ctx}: port");
         assert_eq!(
@@ -1571,8 +1571,8 @@ async fn a_stale_weight_version_is_recomputed_at_open() {
         // hold trivially on an empty database and prove nothing.
         let endpoint = Endpoint {
             id: EndpointId::new(1),
-            host: "w.example".to_string(),
-            host_type: HostType::Ipv4,
+            domain: Endpoint::derive_domain("w.example", HostType::Ipv4).0,
+            sub_domain: Endpoint::derive_domain("w.example", HostType::Ipv4).1,
             port: 443,
             ports: Vec::new(),
             last_source: None,

@@ -23,7 +23,7 @@ use std::net::IpAddr;
 use crate::Database;
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    Endpoint, EndpointId, EndpointRow, ErrorInfo, HostType, Latency, ProfileErr,
+    Endpoint, EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr,
     ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats,
     Transport,
 };
@@ -732,8 +732,8 @@ impl Database {
 const PAGE_PROJECTION: &[&str] = &[
     // endpoints (11)
     "e.id",
-    "e.host",
-    "e.host_type",
+    "e.domain",
+    "e.sub_domain",
     "e.port",
     "e.ports",
     "e.last_source",
@@ -919,8 +919,8 @@ impl<'a> Projection<'a> {
 /// `endpoints` (11 columns, in [`PAGE_PROJECTION`] order).
 fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<IpAddr>)> {
     let id = p.next_endpoint_id()?;
-    let host: String = p.next()?;
-    let host_type: HostType = p.next()?;
+    let domain: String = p.next()?;
+    let sub_domain: String = p.next()?;
     let port: u16 = p.next()?;
     let ports: Vec<u16> = p.next_u16_vec()?;
     let last_source: Option<String> = p.next()?;
@@ -941,8 +941,8 @@ fn decode_projected_endpoint(p: &mut Projection<'_>) -> Result<(Endpoint, Vec<Ip
     Ok((
         Endpoint {
             id,
-            host,
-            host_type,
+            domain,
+            sub_domain,
             port,
             ports,
             last_source,
@@ -1158,7 +1158,7 @@ impl Database {
                 .filter_map(|l| protocols.get(&l.protocol_id).map(|p| (p.id, p.clone())))
                 .collect();
             let dns_unresolved = crate::endpoint_rank::dns_unresolved_endpoint(
-                endpoint.host_type,
+                endpoint.domain.as_str(),
                 !resolved_ips.is_empty(),
             );
             let mut row = EndpointRow {

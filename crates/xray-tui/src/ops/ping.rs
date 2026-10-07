@@ -170,11 +170,11 @@ pub fn start_tcp_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64) 
         );
         return;
     }
-    if row.endpoint.host.is_empty() {
+    let addr = dial_host(&row.endpoint, &row.resolved_ips);
+    if addr.is_empty() {
         state.log_trace("error", "tui::ops::ping", "Profile has no address");
         return;
     }
-    let addr = row.endpoint.host.clone();
     let port = if row.endpoint.port > 0 {
         row.endpoint.port
     } else {
@@ -243,6 +243,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
     // Resolve by the (endpoint, protocol) pair — see `start_tcp_ping` for why
     // protocol-only lookup is wrong for shared `Protocol` rows.
     let endpoint;
+    let addresses;
     let protocol_id_typed;
     if let Some(r) = state
         .endpoints
@@ -251,6 +252,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
         && let Some(l) = r.links.iter().find(|l| l.protocol_id.get() == protocol_id)
     {
         endpoint = r.endpoint.clone();
+        addresses = r.resolved_ips.clone();
         protocol_id_typed = l.protocol_id;
     } else {
         state.log_trace("error", "tui::ops::ping", "Profile not found for real ping");
@@ -347,6 +349,7 @@ pub fn start_real_ping(state: &mut AppState, endpoint_id: i64, protocol_id: i64)
 
         let result = ping_native::real_ping(
             &endpoint,
+            &addresses,
             &config,
             &NativeProbeReq {
                 ping_url: &ping_url,
@@ -603,7 +606,20 @@ enum PlanSource {
 struct PlanLink {
     link: ProfileStats,
     endpoint: Arc<Endpoint>,
+    /// The endpoint's resolved addresses (db-rewamp D10): an IP host's literal
+    /// lives here, not on the `Endpoint` row.
+    addresses: Vec<std::net::IpAddr>,
     protocol: DbProtocol,
+}
+
+/// The host a probe dials: a DNS host's reconstructed name, an IP host's
+/// literal from the address set (db-rewamp D10).
+fn dial_host(endpoint: &Endpoint, addresses: &[std::net::IpAddr]) -> String {
+    if endpoint.is_dns() {
+        endpoint.dns_name()
+    } else {
+        addresses.first().map(ToString::to_string).unwrap_or_default()
+    }
 }
 
 /// The order the feed walk probes in.
@@ -773,6 +789,7 @@ trait BatchProbeRunner: Send + Sync {
     fn real<'a>(
         &'a self,
         endpoint: &'a Endpoint,
+        addresses: &'a [std::net::IpAddr],
         config: &'a ProtocolConfig,
         req: NativeProbeReq<'a>,
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>>;
@@ -827,11 +844,12 @@ impl BatchProbeRunner for EngineProbeRunner {
     fn real<'a>(
         &'a self,
         endpoint: &'a Endpoint,
+        addresses: &'a [std::net::IpAddr],
         config: &'a ProtocolConfig,
         req: NativeProbeReq<'a>,
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
         Box::pin(async move {
-            match ping_native::real_ping(endpoint, config, &req).await {
+            match ping_native::real_ping(endpoint, addresses, config, &req).await {
                 Ok(result) => ProbeOutcome::Ok {
                     latency_ms: Some(result.latency_ms),
                     ip_info: result.ip_info,
@@ -903,6 +921,7 @@ pub(crate) struct BatchShared {
     /// Endpoint rows by id (real probes need the full endpoint). `Arc` so a
     /// probe clones the handle instead of holding a shard guard across an await.
     endpoints: DashMap<EndpointId, Arc<Endpoint>>,
+    addrs: DashMap<EndpointId, Vec<std::net::IpAddr>>,
     /// Protocol rows WITH their config, loaded once per `ProtocolId` per batch.
     ///
     /// A `Protocol` row is shared by every endpoint carrying the same config
@@ -1079,6 +1098,7 @@ impl BatchShared {
             batch_slot: p.batch_slot,
             fast_config: DashMap::new(),
             endpoints: DashMap::new(),
+            addrs: DashMap::new(),
             protocols: DashMap::new(),
             untestable: DashMap::new(),
             fast_sem: Arc::new(Semaphore::new(p.fast_concurrency.max(1))),
@@ -1717,6 +1737,9 @@ impl BatchShared {
             self.endpoints
                 .entry(plan.endpoint.id)
                 .or_insert_with(|| Arc::clone(&plan.endpoint));
+            self.addrs
+                .entry(plan.endpoint.id)
+                .or_insert_with(|| plan.addresses.clone());
             // A feed-wide plan reaches endpoints the UI never loads, so the
             // batch asks for their resolution itself: resolving "the endpoint by
             // id" in the result handler only ever sees the loaded page, which is
@@ -1738,9 +1761,9 @@ impl BatchShared {
                 {
                     let request = CoreEvent::DnsResolveRequest {
                         endpoint_id,
-                        host: plan.endpoint.host.clone(),
-                        host_type: plan.endpoint.host_type,
-                        sni: crate::ops::enrich::extract_sni(&plan.protocol, &plan.endpoint.host),
+                        host: plan.endpoint.dns_name(),
+                        host_type: xray_tui_db::models::HostType::Dns,
+                        sni: crate::ops::enrich::extract_sni(&plan.protocol, &plan.endpoint.dns_name()),
                     };
                     // A full channel drops it; the next batch (or a connect)
                     // asks again, so only a SENT one is recorded.
@@ -2093,7 +2116,11 @@ impl BatchShared {
         else {
             return ProbeOutcome::soft_failure("Endpoint not found for fast ping");
         };
-        let key = (endpoint.host.clone(), endpoint.port);
+        let addrs = self
+            .addrs
+            .get(&link.endpoint_id)
+            .map_or_else(Vec::new, |v| v.value().clone());
+        let key = (dial_host(&endpoint, &addrs), endpoint.port);
         let (is_owner, notify) = {
             let mut inner = self.fast_dedup.lock();
             if let Some(outcome) = inner.cache.get(&key) {
@@ -2117,12 +2144,11 @@ impl BatchShared {
             .fast_config
             .get(&(link.protocol_id, link.endpoint_id))
             .map_or(0, |v| *v.value());
-        // Borrowed, not cloned: `endpoint` is an owned `Arc` local held across
-        // the probe's await, so the address needs no second `String` per probe.
-        let addr = endpoint.host.as_str();
+        // The dial host: a DNS name (resolved below) or an IP literal.
+        let addr = dial_host(&endpoint, &addrs);
         let port = endpoint.port;
         if is_owner {
-            let outcome = self.runner.fast(config_type, addr, port, timeout).await;
+            let outcome = self.runner.fast(config_type, &addr, port, timeout).await;
             let mut inner = self.fast_dedup.lock();
             inner.cache.insert(key.clone(), outcome.clone());
             inner.in_flight.remove(&key);
@@ -2165,9 +2191,14 @@ impl BatchShared {
         else {
             return ProbeOutcome::soft_failure("Endpoint not found for real ping");
         };
+        let addresses = self
+            .addrs
+            .get(&link.endpoint_id)
+            .map_or_else(Vec::new, |v| v.value().clone());
         self.runner
             .real(
                 &endpoint,
+                &addresses,
                 &protocol.config,
                 NativeProbeReq {
                     ping_url: &self.ping_url,
@@ -2508,6 +2539,7 @@ fn plan_row_links(row: &EndpointRow) -> impl Iterator<Item = PlanLink> + '_ {
         Some(PlanLink {
             link: link.clone(),
             endpoint: Arc::clone(&endpoint),
+            addresses: row.resolved_ips.clone(),
             protocol,
         })
     })
@@ -2642,7 +2674,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use tokio::sync::mpsc;
-    use xray_tui_db::models::{ErrorInfo, HostType, Latency, ProfileErr};
+    use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
 
     use crate::ops::profiles::test_support::{fake_row, test_state};
     use crate::ops::scheduler::TaskScheduler;
@@ -2886,6 +2918,7 @@ mod tests {
         fn real<'a>(
             &'a self,
             endpoint: &'a Endpoint,
+            _addresses: &'a [std::net::IpAddr],
             _config: &'a ProtocolConfig,
             _req: NativeProbeReq<'a>,
         ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
@@ -2967,7 +3000,7 @@ mod tests {
                 let mut walk = PlanWalk::new(PlanSource::Feed(scope), db, 100);
                 let mut hosts: Vec<String> = Vec::new();
                 while let Some(links) = walk.next_page().await.expect("walk page") {
-                    hosts.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+                    hosts.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
                 }
                 hosts.sort();
                 hosts.dedup();
@@ -3025,7 +3058,10 @@ mod tests {
 
         let mut walk = PlanWalk::new(PlanSource::Feed(PlanScope::Failed), h.state.db.clone(), 1);
         let first = walk.next_page().await.expect("page").expect("a page");
-        let mut planned: Vec<String> = first.iter().map(|pl| pl.endpoint.host.clone()).collect();
+        let mut planned: Vec<String> = first
+            .iter()
+            .map(|pl| dial_host(&pl.endpoint, &pl.addresses))
+            .collect();
 
         // The batch's own results: the endpoints still unvisited would leave the
         // `Failed` scope now.
@@ -3040,7 +3076,7 @@ mod tests {
         }
 
         while let Some(links) = walk.next_page().await.expect("page") {
-            planned.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+            planned.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
         }
         planned.sort();
         assert_eq!(
@@ -3082,7 +3118,10 @@ mod tests {
 
         let mut walk = PlanWalk::new(PlanSource::Feed(PlanScope::All), h.state.db.clone(), 1);
         let first = walk.next_page().await.expect("page").expect("a page");
-        let mut planned: Vec<String> = first.iter().map(|pl| pl.endpoint.host.clone()).collect();
+        let mut planned: Vec<String> = first
+            .iter()
+            .map(|pl| dial_host(&pl.endpoint, &pl.addresses))
+            .collect();
         assert_eq!(planned, ["10.0.1.1"], "the first page is one endpoint");
 
         // The batch's own results: every remaining endpoint now outranks the one
@@ -3098,7 +3137,7 @@ mod tests {
         }
 
         while let Some(links) = walk.next_page().await.expect("page") {
-            planned.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+            planned.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
         }
         planned.sort();
         assert_eq!(
@@ -3243,6 +3282,16 @@ mod tests {
                 .upsert_endpoint(&row.endpoint)
                 .await
                 .expect("upsert endpoint");
+            // db-rewamp D10: addresses live in `endpoint_ip`, and the feed
+            // walk reads them back through the page query — without this a
+            // fixture endpoint's dial host is empty.
+            if !row.resolved_ips.is_empty() {
+                state
+                    .db
+                    .update_endpoint_resolution(row.endpoint.id, row.resolved_ips.clone(), 1)
+                    .await
+                    .expect("resolution");
+            }
             for link in &row.links {
                 state.db.upsert_link(link).await.expect("upsert link");
                 if let Some(proto) = row.protocols.get(&link.protocol_id) {
@@ -3396,7 +3445,7 @@ mod tests {
     #[tokio::test]
     async fn dns_resolution_request_is_claimed_once_per_batch() {
         let mut row = fake_row(1, "example.test", 1);
-        row.endpoint.host_type = HostType::Dns;
+        // already a DNS host
         let rows = vec![row];
         let mut h = harness(rows.clone()).await;
         let plan = plan_from_rows(&rows);
@@ -3472,11 +3521,14 @@ mod tests {
                 3,
                 "the first page carries the feed-wide count"
             );
-            hosts.extend(links.iter().map(|pl| pl.endpoint.host.clone()));
+            hosts.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
         }
         assert_eq!(pages, 3, "5 endpoints at 2 per page");
         hosts.sort();
-        let mut expected: Vec<String> = rows.iter().map(|r| r.endpoint.host.clone()).collect();
+        let mut expected: Vec<String> = rows
+            .iter()
+            .map(|r| dial_host(&r.endpoint, &r.resolved_ips))
+            .collect();
         expected.sort();
         assert_eq!(hosts, expected, "every link in the feed is planned");
     }
@@ -3702,7 +3754,7 @@ mod tests {
         let shared = Arc::new(BatchShared::new(params));
         // Per-address, so this is the ONLY link in the batch that hard-fails.
         *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
-            rows[0].endpoint.host.clone(),
+            rows[0].endpoint.dns_name(),
             ProbeOutcome::Failed {
                 text: "connection timed out".into(),
                 class: ProbeClass::Timeout,
@@ -3831,7 +3883,7 @@ mod tests {
         h.state.batch_progress = Some(params.meters.clone());
         let shared = Arc::new(BatchShared::new(params));
         *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
-            rows[0].endpoint.host.clone(),
+            rows[0].endpoint.dns_name(),
             ProbeOutcome::Failed {
                 text: "connection timed out".into(),
                 class: ProbeClass::Timeout,
@@ -3887,7 +3939,7 @@ mod tests {
         let shared = Arc::new(BatchShared::new(params));
         // Per-address, so this is the ONLY link in the batch that hard-fails.
         *h.runner.fast_by_addr.lock() = std::collections::HashMap::from([(
-            rows[0].endpoint.host.clone(),
+            rows[0].endpoint.dns_name(),
             ProbeOutcome::Failed {
                 text: "connection timed out".into(),
                 class: ProbeClass::Timeout,

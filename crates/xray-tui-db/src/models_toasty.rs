@@ -269,9 +269,13 @@ pub enum Latency {
 #[table = "endpoints"]
 pub struct Endpoint {
     #[key]
-    pub id: EndpointId, // stable_hash(host, port) for known types; stable_hash("undefined", config_uid) for exotic
-    pub host: String, // canonical host string; empty for undefined
-    pub host_type: HostType,
+    pub id: EndpointId, // identity = stable_hash(canonical_name, port); see `Endpoint::derive_name`
+    /// Registrable domain (eTLD+1, db-rewamp D2), empty for an IP-literal or
+    /// exotic host. The identity input.
+    pub domain: String,
+    /// Labels left of the domain; empty when the host IS the domain or is not
+    /// DNS. Host-kind is DERIVED (`is_dns`).
+    pub sub_domain: String,
     pub port: u16,                   // primary port; 0 for undefined
     pub ports: Vec<u16>,             // full port spec; empty when single-port
     pub last_source: Option<String>, // hash of source subscription
@@ -291,21 +295,43 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// True for a DNS-name host: the one kind that resolves before dialling.
-    ///
-    /// The single read point for the DNS predicate (db-rewamp D10): the
-    /// host-kind becomes DERIVED once `host_type` is dropped, so readers go
-    /// through here and only this body moves.
+    /// Derive `(domain, sub_domain)` from a host + its kind (db-rewamp D2/D10).
+    /// A DNS host splits via psl2 (validated importers always split; the
+    /// fallback lowercases); an IP/exotic host stores empty strings and its
+    /// literal (if an IP) is written to `endpoint_ip` by the import path.
     #[must_use]
-    pub const fn is_dns(&self) -> bool {
-        matches!(self.host_type, HostType::Dns)
+    pub fn derive_domain(host: &str, kind: HostType) -> (String, String) {
+        match kind {
+            HostType::Dns => match xray_tui_proto::domain::split(host) {
+                Some(d) => (d.domain, d.sub_domain),
+                None => (host.to_lowercase(), String::new()),
+            },
+            HostType::Ipv4 | HostType::Ipv6 | HostType::Undefined => (String::new(), String::new()),
+        }
     }
 
-    /// True for an IP-literal host (dialled directly, no resolution).
+    /// The identity input: the canonical DNS name, the IP literal, or empty.
     #[must_use]
-    pub const fn is_ip(&self) -> bool {
-        matches!(self.host_type, HostType::Ipv4 | HostType::Ipv6)
+    pub fn derive_name(host: &str, kind: HostType) -> String {
+        match kind {
+            HostType::Dns => xray_tui_proto::domain::split(host).map_or_else(
+                || host.to_lowercase(),
+                |d| if d.sub_domain.is_empty() { d.domain } else { format!("{}.{}", d.sub_domain, d.domain) },
+            ),
+            HostType::Ipv4 | HostType::Ipv6 => host.to_string(),
+            HostType::Undefined => String::new(),
+        }
     }
+
+    /// The canonical DNS name (`sub_domain.domain`), empty for a non-DNS host.
+    #[must_use]
+    pub fn dns_name(&self) -> String {
+        if self.sub_domain.is_empty() { self.domain.clone() } else { format!("{}.{}", self.sub_domain, self.domain) }
+    }
+
+    /// True for a DNS-name host (`domain` non-empty). The DERIVED kind (D10).
+    #[must_use]
+    pub const fn is_dns(&self) -> bool { !self.domain.is_empty() }
 }
 
 /// One resolved address of one DNS endpoint (`endpoint_ip`).
@@ -763,8 +789,8 @@ mod tests {
         let mut row = EndpointRow {
             endpoint: Endpoint {
                 id: EndpointId::new(1),
-                host: "h.example".to_string(),
-                host_type: HostType::Ipv4,
+                domain: Endpoint::derive_domain("h.example", HostType::Ipv4).0,
+                sub_domain: Endpoint::derive_domain("h.example", HostType::Ipv4).1,
                 port: 443,
                 ports: Vec::new(),
                 last_source: None,
@@ -1300,8 +1326,8 @@ mod tests {
         let created = toasty::create!(Endpoint {
             created_at: 0,
             id: EndpointId::new(42),
-            host: "1.2.3.4".to_string(),
-            host_type: HostType::Ipv4,
+            domain: Endpoint::derive_domain("1.2.3.4", HostType::Ipv4).0,
+            sub_domain: Endpoint::derive_domain("1.2.3.4", HostType::Ipv4).1,
             port: 443,
             ports: Vec::<u16>::new(),
         })

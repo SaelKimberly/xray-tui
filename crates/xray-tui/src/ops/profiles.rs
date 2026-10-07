@@ -1278,18 +1278,21 @@ pub(crate) mod test_support {
             Ok(std::net::IpAddr::V6(_)) => HostType::Ipv6,
             Err(_) => HostType::Dns,
         };
-        // A named fixture host is a RESOLVED DNS endpoint (a synthetic
-        // address), so it is live rather than dns-unresolved — the state the
-        // real import writes for a host that resolves.
-        let resolved_ips = if matches!(host_type, HostType::Dns) {
-            vec!["10.0.0.1".parse().expect("addr")]
+        let (domain, sub_domain) = Endpoint::derive_domain(host, host_type);
+        // db-rewamp D10: an endpoint's addresses live in `endpoint_ip`, so a
+        // named fixture host is a RESOLVED DNS endpoint (a synthetic address)
+        // and an IP-literal fixture carries its own literal — the exact shape
+        // the import writes. Without either, the fixture would be a row whose
+        // dial target and address columns are empty.
+        let resolved_ips = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            vec![ip]
         } else {
-            Vec::new()
+            vec!["10.0.0.1".parse().expect("addr")]
         };
         let endpoint = Endpoint {
             id: EndpointId::new(id),
-            host: host.to_string(),
-            host_type,
+            domain,
+            sub_domain,
             port: 443,
             ports: Vec::new(),
             last_source: None,

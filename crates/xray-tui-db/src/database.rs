@@ -86,7 +86,11 @@ use crate::retry_on_busy;
 // `rank_domain`/`rank_sub_domain`/`rank_addr` replace `rank_dns`/`rank_tier`/
 // `rank_latency`/`rank_seen`/`rank_protocol`/`rank_display_seen`/`rank_speed`/
 // `rank_traffic`; one covering index `endpoint_rank_key`.
-pub const SCHEMA_VERSION: i64 = 17;
+//
+// 18 = `endpoints.host`/`host_type` dropped (db-rewamp D2/D10): the identity
+// input is the derived `(domain, sub_domain)` split, and every address lives in
+// `endpoint_ip` (an IP-literal endpoint's dial target has no other home).
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// One resolved address of an endpoint, with the ISO-3166 alpha-2 country the
 /// geo step wrote (`None` until it does). A named alias because the signature
@@ -1023,7 +1027,7 @@ impl Database {
                 .collect();
             let resolved_ips = resolved.remove(&endpoint.id).unwrap_or_default();
             let dns_unresolved = crate::endpoint_rank::dns_unresolved_endpoint(
-                endpoint.host_type,
+                endpoint.domain.as_str(),
                 !resolved_ips.is_empty(),
             );
             let mut row = EndpointRow {
@@ -1072,8 +1076,8 @@ impl Database {
                 async move {
                     let mut conn = db.conn().await?;
                     Endpoint::upsert_by_id(endpoint.id)
-                        .host(endpoint.host.clone())
-                        .host_type(endpoint.host_type)
+                        .domain(endpoint.domain.clone())
+                        .sub_domain(endpoint.sub_domain.clone())
                         .port(endpoint.port)
                         .ports(endpoint.ports.clone())
                         .last_source(endpoint.last_source.clone())
@@ -1892,7 +1896,7 @@ pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> 
     for chunk in eps.chunks(IMPORT_STATEMENT_ROWS) {
         let mut sql = String::with_capacity(chunk.len() * 96 + 96);
         sql.push_str(
-            "INSERT INTO \"endpoints\" (\"id\", \"host\", \"host_type\", \"port\", \"ports\", \
+            "INSERT INTO \"endpoints\" (\"id\", \"domain\", \"sub_domain\", \"port\", \"ports\", \
              \"last_source\", \"created_at\") VALUES ",
         );
         for (i, e) in chunk.iter().enumerate() {
@@ -1903,8 +1907,8 @@ pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> 
                 sql,
                 "({}, {}, {}, {}, {}, {}, {})",
                 e.id.get(),
-                sql_lit(&e.host),
-                sql_lit(e.host_type.as_db_label()),
+                sql_lit(&e.domain),
+                sql_lit(&e.sub_domain),
                 e.port,
                 sql_lit(&blob_lit(&e.ports)),
                 e.last_source
@@ -1914,8 +1918,8 @@ pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> 
             );
         }
         sql.push_str(
-            " ON CONFLICT(\"id\") DO UPDATE SET \"host\" = excluded.\"host\", \
-             \"host_type\" = excluded.\"host_type\", \"port\" = excluded.\"port\", \
+            " ON CONFLICT(\"id\") DO UPDATE SET \"domain\" = excluded.\"domain\", \
+             \"sub_domain\" = excluded.\"sub_domain\", \"port\" = excluded.\"port\", \
              \"ports\" = excluded.\"ports\", \"last_source\" = excluded.\"last_source\"",
         );
         toasty::sql::statement(sql).exec(tx).await?;
@@ -2132,8 +2136,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
                 &mut conn,
                 &[Endpoint {
                     id: EndpointId::new(id),
-                    host: format!("h{i}.example"),
-                    host_type: ht,
+                    domain: Endpoint::derive_domain(&format!("h{i}.example"), ht).0,
+                    sub_domain: Endpoint::derive_domain(&format!("h{i}.example"), ht).1,
                     port: 443 + i as u16,
                     ports: if i == 0 { vec![] } else { vec![80, 443] },
                     last_source: None,
@@ -2174,7 +2178,7 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         {
             let id = 900 + i as i64;
             let rows = toasty::sql::query(format!(
-                "SELECT host_type, ports FROM endpoints WHERE id = {id}"
+                "SELECT domain, ports FROM endpoints WHERE id = {id}"
             ))
             .exec(&mut conn)
             .await
@@ -2185,18 +2189,16 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
             };
             let label = match &record.fields[0] {
                 toasty_core::stmt::Value::String(s) => s.as_str(),
-                other => panic!("host_type must round-trip as TEXT, got {other:?}"),
+                other => panic!("domain must round-trip as TEXT, got {other:?}"),
             };
-            assert_eq!(
-                label,
-                ht.as_db_label(),
-                "the stored label must be exactly what as_db_label writes",
-            );
-            assert_eq!(
-                HostType::from_db_label(label),
-                Some(ht),
-                "the label must parse back to the same variant",
-            );
+            // `domain` is the name for a DNS host, empty for an IP/exotic one
+            // (db-rewamp D2/D10) — the stored text IS the identity's domain part.
+            let expected = if matches!(ht, HostType::Dns) {
+                format!("h{i}.example")
+            } else {
+                String::new()
+            };
+            assert_eq!(label, expected, "the stored domain must match the split");
             let groups = toasty::sql::query(format!(
                 "SELECT COUNT(*) FROM endpoint_groups WHERE endpoint_id = {id} AND group_id = 'grp-1' AND last_seen_at = 42"
             ))
@@ -2222,8 +2224,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         let mut conn = db.connection().await.expect("conn");
         let mut ep = Endpoint {
             id: EndpointId::new(1),
-            host: "old.example".to_owned(),
-            host_type: HostType::Ipv4,
+            domain: Endpoint::derive_domain("old.example", HostType::Ipv4).0,
+            sub_domain: Endpoint::derive_domain("old.example", HostType::Ipv4).1,
             port: 1,
             ports: Vec::new(),
             last_source: None,
@@ -2243,14 +2245,15 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         .exec(&mut conn)
         .await
         .expect("set owned columns");
-        ep.host = "new.example".to_owned();
+        ep.domain = "new.example".to_owned();
+        ep.sub_domain = String::new();
         ep.port = 2;
         upsert_endpoints_bulk(&mut conn, &[ep])
             .await
             .expect("second");
 
         let rows = toasty::sql::query(
-            "SELECT host, port, manual_protocol_override, resolved_at FROM endpoints WHERE id = 1",
+            "SELECT domain, port, manual_protocol_override, resolved_at FROM endpoints WHERE id = 1",
         )
         .exec(&mut conn)
         .await
@@ -2273,7 +2276,7 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
                 other => panic!("column {i}: expected an integer, got {other:?}"),
             }
         };
-        assert_eq!(text(0), "new.example", "host must be replaced");
+        assert_eq!(text(0), "new.example", "domain must be replaced");
         assert_eq!(int(1), 2, "port must be replaced");
         assert_eq!(int(2), 77, "manual_protocol_override must survive");
         assert_eq!(int(3), 1234, "resolved_at must survive");
@@ -2452,8 +2455,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         toasty::create!(Endpoint {
             created_at: 0,
             id: EndpointId::new(endpoint_id),
-            host: host.to_string(),
-            host_type,
+            domain: Endpoint::derive_domain(host, host_type).0,
+            sub_domain: Endpoint::derive_domain(host, host_type).1,
             port,
             ports: Vec::<u16>::new(),
         })
@@ -2611,7 +2614,7 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         seed_endpoint(&mut conn, 7, 3001, "10.0.0.1", HostType::Ipv4, 53, 100).await;
 
         let row = db.get_endpoint(EndpointId::new(7)).await.expect("get");
-        assert_eq!(row.as_ref().expect("row").endpoint.host, "10.0.0.1");
+        assert!(row.as_ref().expect("row").endpoint.domain.is_empty(), "a literal IP host has no domain");
         assert_eq!(row.unwrap().links.len(), 1);
 
         let by_proto = db
@@ -2642,8 +2645,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         toasty::create!(Endpoint {
             created_at: 0,
             id: EndpointId::new(1),
-            host: "unresolved.example".to_string(),
-            host_type: HostType::Dns,
+            domain: Endpoint::derive_domain("unresolved.example", HostType::Dns).0,
+            sub_domain: Endpoint::derive_domain("unresolved.example", HostType::Dns).1,
             port: 443,
             ports: Vec::<u16>::new(),
             // no address rows -> unresolved (the child table owns that fact)
@@ -2703,8 +2706,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         toasty::create!(Endpoint {
             created_at: 0,
             id: EndpointId::new(77),
-            host: "1.1.1.1".to_string(),
-            host_type: HostType::Ipv4,
+            domain: Endpoint::derive_domain("1.1.1.1", HostType::Ipv4).0,
+            sub_domain: Endpoint::derive_domain("1.1.1.1", HostType::Ipv4).1,
             port: 443,
             ports: Vec::<u16>::new(),
         })
@@ -2722,7 +2725,7 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
             .exec(&mut conn)
             .await
             .expect("read");
-        assert_eq!(endpoint.expect("endpoint").host, "1.1.1.1");
+        assert_eq!(endpoint.expect("endpoint").domain, "");
     }
 
     #[tokio::test]
@@ -3067,8 +3070,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
     fn endpoint_struct(id: i64, host: &str, host_type: HostType, port: u16) -> Endpoint {
         Endpoint {
             id: EndpointId::new(id),
-            host: host.to_string(),
-            host_type,
+            domain: Endpoint::derive_domain(host, host_type).0,
+            sub_domain: Endpoint::derive_domain(host, host_type).1,
             port,
             ports: Vec::new(),
             last_source: None,
@@ -3118,10 +3121,10 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
     #[tokio::test]
     async fn upsert_endpoint_is_idempotent() {
         let db = Database::in_memory().await.expect("in-memory db");
-        db.upsert_endpoint(&endpoint_struct(1, "1.2.3.4", HostType::Ipv4, 443))
+        db.upsert_endpoint(&endpoint_struct(1, "a.example", HostType::Dns, 443))
             .await
             .expect("upsert");
-        db.upsert_endpoint(&endpoint_struct(1, "9.9.9.9", HostType::Ipv4, 8443))
+        db.upsert_endpoint(&endpoint_struct(1, "b.example", HostType::Dns, 8443))
             .await
             .expect("upsert again");
 
@@ -3139,7 +3142,7 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
             .await
             .expect("read")
             .expect("row");
-        assert_eq!(ep.host, "9.9.9.9", "identity fields refresh on re-upsert");
+        assert_eq!(ep.domain, "b.example", "identity fields refresh on re-upsert");
         assert_eq!(ep.port, 8443);
 
         // Owned state (resolution cache, manual override) survives re-upserts.

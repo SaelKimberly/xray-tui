@@ -571,8 +571,8 @@ mod tests {
         let endpoint_id = xray_tui_db::models::EndpointId::new(1);
         db.upsert_endpoint(&xray_tui_db::models::Endpoint {
             id: endpoint_id,
-            host: "198.51.100.7".to_owned(),
-            host_type: xray_tui_db::models::HostType::Ipv4,
+            domain: String::new(),
+            sub_domain: String::new(),
             port: 443,
             ports: Vec::new(),
             last_source: None,

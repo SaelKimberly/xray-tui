@@ -126,7 +126,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         return;
     }
 
-    let (endpoint, protocol_id, proto_kind) = {
+    let (endpoint, addresses, protocol_id, proto_kind) = {
         let Some(row) = state
             .endpoints
             .iter()
@@ -148,7 +148,12 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             );
             return;
         };
-        (row.endpoint.clone(), link.protocol_id, protocol.proto_kind)
+        (
+            row.endpoint.clone(),
+            row.resolved_ips.clone(),
+            link.protocol_id,
+            protocol.proto_kind,
+        )
     };
 
     // If already connected/disconnecting, send stop signal first
@@ -351,7 +356,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         if let Some(reason) = refused {
             tracing::warn!(
                 target: "tui::ops::connect",
-                host = %endpoint.host,
+                host = %endpoint.dns_name(),
                 kind = %proto_kind,
                 core = %runtime_core,
                 rules = routing.len(),
@@ -362,7 +367,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             if asks_native(forced) {
                 tracing::warn!(
                     target: "tui::ops::connect",
-                    host = %endpoint.host,
+                    host = %endpoint.dns_name(),
                     kind = %proto_kind,
                     core = %runtime_core,
                     "protocol_core_overrides asked for the native core: override NOT honored"
@@ -386,6 +391,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
             native_connect::run_native_session(
                 &params,
                 &endpoint,
+                &addresses,
                 &protocol,
                 &tx,
                 &state_log_sender,
@@ -399,6 +405,7 @@ pub fn connect_to_profile(state: &mut AppState, endpoint_id: i64) {
         // 1. Build config
         let backend_config = match ConfigBuilder::build(
             &endpoint,
+            &addresses,
             &protocol,
             match runtime_core {
                 CoreType::Xray => ProtoCoreType::Xray,

@@ -273,3 +273,38 @@ decision → surface it, don't plow in.
 - Clippy: MY files clean; the workspace gate is red from PRE-EXISTING lints on
   this WIP branch (native/context.rs, tls/spec, route/compiler, proto mod.rs
   len_zero) — untouched by this work.
+
+## T4 LANDED (db-rewamp D2/D10) — SCHEMA_VERSION 18
+
+`endpoints.host`/`host_type` DROPPED; `domain`/`sub_domain` (the psl2 eTLD+1 split)
+are the identity input; host kind is DERIVED (`Endpoint::is_dns()`, `dns_name()`,
+`derive_domain`, `derive_name`). `Endpoint::derive_domain` is `const`-free but
+`is_dns`/`dns_unresolved`/`dns_unresolved_endpoint` are `const fn`.
+
+**The named blocker is closed in this commit.** Every import entry point now writes
+an IP-literal endpoint's address to `endpoint_ip` alongside its row, because the
+literal has no other home once `host` is gone:
+- `state::persist_parsed` — `ip_literals` collected in the batch loop, written
+  inside the SAME transaction via `endpoint_ip::replace`.
+- `ops/stream_import.rs::parse_batch` + `ops/subscriptions.rs` — `ip_literals`
+  rides `SourceBatch`/`SourcePatch`, and `SourceSpec::write_window` writes them in
+  the driver's transaction (one writer, not four).
+
+Invariant test `streaming_import_splits_and_persists_in_batches` asserts every
+imported IP literal has EXACTLY one `endpoint_ip` row (and the whole set matches).
+
+**Export decode** rebuilds `host`/`HostKind` from `domain`+`sub_domain` (DNS) or
+the `endpoint_ip` literal (IP/exotic) — the parse boundary keeps `host`/`host_type`.
+`export.rs` predicates switched `e.host_type = 'ipv4'` → `e.domain = ''`.
+
+**`endpoint_rank::backfill_bands`** rank_host subquery reads
+`CASE WHEN sub_domain='' THEN domain ELSE sub_domain||'.'||domain END`.
+
+**Docs:** AGENTS.md decision 4 (tag 18 + history), models_toasty line, `docs/database.md`
+(ER block + identity prose + tag), `docs/database-manual-sql.md` §Import (D10 note).
+
+## Verification at this HEAD (T4)
+- `cargo check --workspace --all-targets` → 0 errors.
+- nextest: proto/config/core **740**, db **172**, tui **263** — all green.
+- Clippy delta vs HEAD (`git stash` A/B on the three touched crates) → **NONE**
+  (the pre-existing WIP-branch red is untouched).

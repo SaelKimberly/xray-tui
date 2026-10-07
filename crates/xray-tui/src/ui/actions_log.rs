@@ -47,7 +47,7 @@ fn server_summary(state: &AppState) -> (String, String, u16, String) {
             let proto = r
                 .active_protocol()
                 .map_or(ProtocolKind::Custom, |(_, p)| p.proto_kind);
-            let addr = r.endpoint.host.clone();
+            let addr = r.endpoint.dns_name();
             let port = r.endpoint.port;
             let core = state.resolved_core(r).to_string();
             (proto.to_string(), addr, port, core)

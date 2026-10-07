@@ -385,6 +385,7 @@ fn parse_batch(
     let mut protocols: Vec<xray_tui_db::models::Protocol> = Vec::new();
     let mut links: Vec<xray_tui_db::models::ProfileStats> = Vec::new();
     let mut group_links: Vec<xray_tui_db::models::EndpointGroup> = Vec::new();
+    let mut ip_literals: Vec<(xray_tui_db::models::EndpointId, std::net::IpAddr)> = Vec::new();
 
     for profile in &profiles {
         let parsed = &profile.parsed;
@@ -400,6 +401,11 @@ fn parse_batch(
             let link = crate::state::link_from_parsed_with_id(protocol.id, endpoint.id);
             if seen_links.insert((link.protocol_id.get(), link.endpoint_id.get())) {
                 if seen_endpoints.insert(endpoint.id.get()) {
+                    // An IP-literal host's address lives in `endpoint_ip`
+                    // (db-rewamp D10) — the import writes it with the row.
+                    if let Ok(ip) = ep.host.parse::<std::net::IpAddr>() {
+                        ip_literals.push((endpoint.id, ip));
+                    }
                     endpoints.push(endpoint.clone());
                 }
                 links.push(link.clone());
@@ -424,6 +430,7 @@ fn parse_batch(
             protocols,
             links,
             group_links,
+            ip_literals,
         },
         batch_summary,
     )
@@ -749,6 +756,32 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(meta.ids.len(), 4);
+
+        // db-rewamp D10 invariant: an IP-literal endpoint's address lives in
+        // `endpoint_ip` (its only home once `endpoints.host` is gone), and
+        // exactly one row — the literal itself. Without this the import would
+        // write an endpoint whose dial target / rank `addr` / page Address
+        // column are all empty, unnoticed (fixtures seed `resolved_ips` by
+        // hand, so only a real import exercises the writer).
+        let ids: Vec<_> = meta.ids.iter().copied().collect();
+        let resolutions = db.endpoint_resolutions(&ids).await.expect("addresses");
+        let expected: std::collections::HashSet<std::net::IpAddr> = [
+            "1.2.3.4", "5.6.7.8", "9.10.11.12", "13.14.15.16",
+        ]
+        .iter()
+        .map(|h| h.parse().unwrap())
+        .collect();
+        let stored: std::collections::HashSet<std::net::IpAddr> = resolutions
+            .values()
+            .flat_map(|addrs| addrs.iter().map(|(ip, _)| *ip))
+            .collect();
+        assert_eq!(
+            stored, expected,
+            "every imported IP literal must have exactly one endpoint_ip row",
+        );
+        for addrs in resolutions.values() {
+            assert_eq!(addrs.len(), 1, "one address per literal");
+        }
     }
 
     /// A feed that streams past the decode budget must stop early instead of

@@ -505,6 +505,7 @@ pub async fn persist_parsed_urls(
         let mut protocols: Vec<xray_tui_db::models::Protocol> = Vec::new();
         let mut links: Vec<xray_tui_db::models::ProfileStats> = Vec::new();
         let mut group_links: Vec<xray_tui_db::models::EndpointGroup> = Vec::new();
+        let mut ip_literals: Vec<(xray_tui_db::models::EndpointId, std::net::IpAddr)> = Vec::new();
 
         for profile in &profiles {
             let parsed = &profile.parsed;
@@ -520,6 +521,9 @@ pub async fn persist_parsed_urls(
                 let link = crate::state::link_from_parsed_with_id(protocol.id, endpoint.id);
                 if seen_links.insert((link.protocol_id.get(), link.endpoint_id.get())) {
                     if seen_endpoints.insert(endpoint.id.get()) {
+                        if let Ok(ip) = ep.host.parse::<std::net::IpAddr>() {
+                            ip_literals.push((endpoint.id, ip));
+                        }
                         endpoints.push(endpoint.clone());
                     }
                     links.push(link.clone());
@@ -545,6 +549,7 @@ pub async fn persist_parsed_urls(
             protocols,
             links,
             group_links,
+            ip_literals,
         });
         next_seq += 1;
 

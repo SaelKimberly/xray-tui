@@ -20,7 +20,7 @@ use toasty_core::driver::operation::TransactionMode;
 use toasty_core::stmt::Value;
 
 use crate::models_toasty::{
-    Endpoint, EndpointId, EndpointRank, EndpointRow, HostType, Latency, ProfileErr,
+    Endpoint, EndpointId, EndpointRank, EndpointRow, Latency, ProfileErr,
     ProfileStats, Protocol, ProtocolId,
 };
 use xray_tui_proto::proto_spec::{
@@ -189,6 +189,19 @@ const fn delay_bin(delay: i32) -> u8 {
     }
 }
 
+/// The endpoint's own packed address key for the rank `addr` tiebreak (db-rewamp
+/// D10): an IP host's literal lives in `endpoint_ip`; a DNS host gets an empty key.
+fn endpoint_addr_key(row: &EndpointRow) -> Vec<u8> {
+    if row.endpoint.is_dns() {
+        Vec::new()
+    } else {
+        row.resolved_ips
+            .first()
+            .map(|ip| crate::endpoint_ip::key_of(*ip))
+            .unwrap_or_default()
+    }
+}
+
 /// True when the endpoint is a DNS host whose resolution has not landed —
 /// the flag that collapses its links into one band (decision 16, tier 5).
 ///
@@ -197,8 +210,8 @@ const fn delay_bin(delay: i32) -> u8 {
 /// is not a different state: it stamps `resolved_at` and leaves the address
 /// set empty, which is exactly the unresolved band this flag is for.
 #[must_use]
-pub const fn dns_unresolved_endpoint(host_type: HostType, has_address: bool) -> bool {
-    matches!(host_type, HostType::Dns) && !has_address
+pub const fn dns_unresolved_endpoint(domain: &str, has_address: bool) -> bool {
+    !domain.is_empty() && !has_address
 }
 
 /// True for an [`EndpointRow`].
@@ -310,8 +323,9 @@ pub fn weight_from_discriminators(
 #[must_use]
 pub fn compute_rank(
     endpoint_id: EndpointId,
-    host: &str,
-    host_type: HostType,
+    domain: &str,
+    sub_domain: &str,
+    addr: Vec<u8>,
     dns_unresolved: bool,
     links: &[RankLink],
 ) -> Option<RankRow> {
@@ -328,26 +342,12 @@ pub fn compute_rank(
         .unwrap_or(NO_SEEN);
     // The minimum key's weight term is `u64::MAX - weight`; invert it back.
     let weight = ConfigWeight::from_be_bytes((u64::MAX - neg_weight).to_be_bytes());
-    // domain/sub_domain from the split (empty for an IP/exotic host); the addr
-    // term is the IP literal's packed key (empty for a DNS host), so a bin+weight
-    // tie among IP hosts orders by address and DNS hosts order by name.
-    let (domain, sub_domain) = match host_type {
-        HostType::Dns => xray_tui_proto::domain::split(host).map_or_else(
-            || (host.to_lowercase(), String::new()),
-            |d| (d.domain, d.sub_domain),
-        ),
-        HostType::Ipv4 | HostType::Ipv6 | HostType::Undefined => (String::new(), String::new()),
-    };
-    let addr = match host_type {
-        HostType::Ipv4 | HostType::Ipv6 => crate::endpoint_ip::key_of_str(host).unwrap_or_default(),
-        _ => Vec::new(),
-    };
     Some(RankRow {
         rank: EndpointRank {
             endpoint_id,
             bin: i64::from(bin),
-            domain,
-            sub_domain,
+            domain: domain.to_string(),
+            sub_domain: sub_domain.to_string(),
             addr,
             newest_seen,
         },
@@ -371,8 +371,9 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<RankRow> {
         .collect();
     compute_rank(
         row.endpoint.id,
-        &row.endpoint.host,
-        row.endpoint.host_type,
+        &row.endpoint.domain,
+        &row.endpoint.sub_domain,
+        endpoint_addr_key(row),
         dns_unresolved(row),
         &links,
     )
@@ -562,7 +563,7 @@ async fn backfill_bands(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     toasty::sql::query(format!(
         "UPDATE endpoint_rank SET \
          band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END, \
-         rank_host = (SELECT host FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
+         rank_host = (SELECT CASE WHEN e.sub_domain = '' THEN e.domain ELSE e.sub_domain || '.' || e.domain END FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
          WHERE band IS NULL"
     ))
     .exec(conn)
@@ -640,7 +641,7 @@ pub(crate) async fn write(
         toasty::sql::query(format!(
             "UPDATE endpoint_rank SET \
              band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END, \
-             rank_host = (SELECT host FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
+             rank_host = (SELECT CASE WHEN e.sub_domain = '' THEN e.domain ELSE e.sub_domain || '.' || e.domain END FROM endpoints e WHERE e.id = endpoint_rank.endpoint_id) \
              WHERE endpoint_id IN ({ids})"
         ))
         .exec(conn)
@@ -651,8 +652,9 @@ pub(crate) async fn write(
 
 /// The raw facts the rank law needs, straight from the stored columns.
 struct RawEndpoint {
-    host: String,
-    host_type: HostType,
+    domain: String,
+    sub_domain: String,
+    addr: Vec<u8>,
     dns_unresolved: bool,
 }
 
@@ -778,6 +780,29 @@ pub(crate) async fn prune(
     Ok(endpoint_ids.len())
 }
 
+/// The first packed address key per endpoint (for the rank `addr` tiebreak) —
+/// an IP host's literal lives in `endpoint_ip` now (db-rewamp D10).
+async fn first_ip_keys(
+    conn: &mut impl toasty::Executor,
+) -> crate::Result<std::collections::HashMap<i64, Vec<u8>>> {
+    let rows = toasty::sql::query(
+        "SELECT endpoint_id, ip_key FROM endpoint_ip ORDER BY endpoint_id, ip_key",
+    )
+    .exec(conn)
+    .await?;
+    let mut out: std::collections::HashMap<i64, Vec<u8>> = std::collections::HashMap::new();
+    for row in &rows {
+        let Value::Record(record) = row else { continue };
+        let Some(id) = record.fields.first().and_then(as_i64) else {
+            continue;
+        };
+        if let Some(key) = record.fields.get(1).and_then(as_blob) {
+            out.entry(id).or_insert(key);
+        }
+    }
+    Ok(out)
+}
+
 /// Recompute EVERY endpoint's stored keys from its current links.
 ///
 /// For the wholesale resets (`clear_all_stats`), for an upgraded database whose
@@ -794,6 +819,7 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
     // `config` JSON stays unloaded.
     let weights = protocol_weights(conn).await?;
     let resolved = resolved_endpoint_ids(conn).await?;
+    let addr_keys = first_ip_keys(conn).await?;
     let mut by_endpoint: HashMap<EndpointId, Vec<RankLink>> = HashMap::new();
     for link in links {
         let weight = weights
@@ -809,11 +835,13 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
         .into_iter()
         .filter_map(|endpoint| {
             let links = by_endpoint.remove(&endpoint.id)?;
+            let addr = addr_keys.get(&endpoint.id.get()).cloned().unwrap_or_default();
             compute_rank(
                 endpoint.id,
-                &endpoint.host,
-                endpoint.host_type,
-                dns_unresolved_endpoint(endpoint.host_type, resolved.contains(&endpoint.id.get())),
+                &endpoint.domain,
+                &endpoint.sub_domain,
+                addr,
+                dns_unresolved_endpoint(&endpoint.domain, resolved.contains(&endpoint.id.get())),
                 &links,
             )
         })
@@ -968,8 +996,9 @@ pub(crate) async fn refresh(
             let endpoint_links = links.get(id).unwrap_or(&empty);
             compute_rank(
                 EndpointId::new(*id),
-                &endpoint.host,
-                endpoint.host_type,
+                &endpoint.domain,
+                &endpoint.sub_domain,
+                endpoint.addr.clone(),
                 endpoint.dns_unresolved,
                 endpoint_links,
             )
@@ -987,7 +1016,8 @@ async fn load_raw_endpoints(
     // the statement that already reads the ids, so the refresh stays a single
     // round trip.
     let rows = toasty::sql::query(format!(
-        "SELECT e.id, e.host, e.host_type, \
+        "SELECT e.id, e.domain, e.sub_domain, \
+         (SELECT ip.ip_key FROM endpoint_ip ip WHERE ip.endpoint_id = e.id LIMIT 1), \
          EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id) \
          FROM endpoints e WHERE e.id IN ({id_list})"
     ))
@@ -1000,20 +1030,17 @@ async fn load_raw_endpoints(
         let Some(id) = field(0).and_then(as_i64) else {
             continue;
         };
-        let host = field(1).and_then(as_text).unwrap_or_default();
-        let host_type = match field(2).and_then(as_text).as_deref() {
-            Some("dns") => HostType::Dns,
-            Some("ipv4") => HostType::Ipv4,
-            Some("ipv6") => HostType::Ipv6,
-            _ => HostType::Undefined,
-        };
-        let has_address = field(3).and_then(as_i64).unwrap_or(0) != 0;
+        let domain = field(1).and_then(as_text).unwrap_or_default();
+        let sub_domain = field(2).and_then(as_text).unwrap_or_default();
+        let addr = field(3).and_then(as_blob).unwrap_or_default();
+        let has_address = field(4).and_then(as_i64).unwrap_or(0) != 0;
         out.insert(
             id,
             RawEndpoint {
-                host,
-                host_type,
-                dns_unresolved: matches!(host_type, HostType::Dns) && !has_address,
+                dns_unresolved: !domain.is_empty() && !has_address,
+                domain,
+                sub_domain,
+                addr,
             },
         );
     }
@@ -1037,6 +1064,13 @@ fn blob_lit(bytes: &[u8]) -> String {
     }
     out.push('\'');
     out
+}
+
+fn as_blob(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Bytes(b) => Some(b.clone()),
+        _ => None,
+    }
 }
 
 fn as_text(value: &Value) -> Option<String> {
@@ -1139,7 +1173,8 @@ mod tests {
         let row = compute_rank(
             EndpointId::new(7),
             "h.example",
-            HostType::Dns,
+            "",
+            Vec::new(),
             false,
             &[weak, strong],
         )
@@ -1245,7 +1280,8 @@ mod tests {
         let rank = compute_rank(
             EndpointId::new(1),
             "h.example",
-            HostType::Dns,
+            "",
+            Vec::new(),
             false,
             &links,
         )
@@ -1263,7 +1299,8 @@ mod tests {
         let rank = compute_rank(
             EndpointId::new(1),
             "h.example",
-            HostType::Dns,
+            "",
+            Vec::new(),
             false,
             &all_purged,
         )

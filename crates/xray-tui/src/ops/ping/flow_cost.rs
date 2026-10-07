@@ -167,6 +167,7 @@ impl BatchProbeRunner for NullRunner {
     fn real<'a>(
         &'a self,
         _endpoint: &'a Endpoint,
+        _addresses: &'a [std::net::IpAddr],
         _config: &'a ProtocolConfig,
         _req: NativeProbeReq<'a>,
     ) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send + 'a>> {
@@ -898,7 +899,7 @@ async fn flow_cost_report() {
                 // the host order can be driven from an index instead of a sort.
                 let mut conn = db.connection().await.expect("conn");
                 let _ = toasty::sql::query(
-                    "CREATE INDEX IF NOT EXISTS idx_measure_host ON endpoints(host, port)",
+                    "CREATE INDEX IF NOT EXISTS idx_measure_host ON endpoints(domain, sub_domain, port)",
                 )
                 .exec(&mut conn)
                 .await;
@@ -907,7 +908,7 @@ async fn flow_cost_report() {
                     (
                         "raw: Address order, endpoint_rank-driven",
                         "SELECT k.endpoint_id FROM endpoint_rank k JOIN endpoints e ON e.id = k.endpoint_id \
-                         WHERE k.rank_newest_seen >= ?1 ORDER BY e.host ASC, k.endpoint_id ASC LIMIT 200"
+                         WHERE k.rank_newest_seen >= ?1 ORDER BY e.domain ASC, e.sub_domain ASC, k.endpoint_id ASC LIMIT 200"
                             .to_owned(),
                     ),
                     (
@@ -920,13 +921,13 @@ async fn flow_cost_report() {
                         "raw: Address order, forced host index",
                         "SELECT k.endpoint_id FROM endpoints e INDEXED BY idx_measure_host \
                          JOIN endpoint_rank k ON k.endpoint_id = e.id WHERE k.rank_newest_seen >= ?1 \
-                         ORDER BY e.host ASC, k.endpoint_id ASC LIMIT 200"
+                         ORDER BY e.domain ASC, e.sub_domain ASC, k.endpoint_id ASC LIMIT 200"
                             .to_owned(),
                     ),
                     (
                         "raw: Address order, rank-driven + host join",
                         "SELECT k.endpoint_id FROM endpoint_rank k JOIN endpoints e ON e.id = k.endpoint_id \
-                         WHERE k.rank_newest_seen >= ?1 ORDER BY e.host ASC LIMIT 200"
+                         WHERE k.rank_newest_seen >= ?1 ORDER BY e.domain ASC, e.sub_domain ASC LIMIT 200"
                             .to_owned(),
                     ),
                     (
@@ -1070,7 +1071,7 @@ async fn flow_cost_report() {
                                 "SELECT k.endpoint_id FROM endpoint_rank k \
                                  JOIN endpoints e ON e.id = k.endpoint_id \
                                  WHERE k.rank_newest_seen >= {threshold} \
-                                 ORDER BY e.host ASC, k.endpoint_id ASC LIMIT 200"
+                                 ORDER BY e.domain ASC, e.sub_domain ASC, k.endpoint_id ASC LIMIT 200"
                             ),
                         ),
                         (
@@ -1250,7 +1251,7 @@ async fn measure_page_scale() {
                         "SELECT k.endpoint_id FROM endpoint_rank k \
                          JOIN endpoints e ON e.id = k.endpoint_id \
                          WHERE k.rank_newest_seen >= {threshold} \
-                         ORDER BY e.host ASC, k.endpoint_id ASC LIMIT 200"
+                         ORDER BY e.domain ASC, e.sub_domain ASC, k.endpoint_id ASC LIMIT 200"
                     ),
                 ),
                 (
@@ -1470,7 +1471,7 @@ async fn flow_cost_network() {
             // it fails on the production path.
             let config = protocol.config.get().0.clone();
             let attempt = Instant::now();
-            match crate::ops::ping_native::real_ping(&row.endpoint, &config, &req).await {
+            match crate::ops::ping_native::real_ping(&row.endpoint, &[], &config, &req).await {
                 Ok(r) => latencies.push(r.latency_ms),
                 Err(failure) => {
                     failures += 1;
@@ -1653,7 +1654,7 @@ async fn flow_cost_transport_control() {
         std::collections::BTreeMap::new();
     let mut ok = 0usize;
     for (endpoint, protocol_id, config) in &found {
-        let key = match crate::ops::ping_native::real_ping(endpoint, config, &req).await {
+        let key = match crate::ops::ping_native::real_ping(endpoint, &[], config, &req).await {
             Ok(_) => {
                 ok += 1;
                 "OK".to_owned()

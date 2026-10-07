@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use xray_tui_core::grpc_client::SysStats;
 use xray_tui_core::log_heed::LogMessage;
 use xray_tui_core::{BuildParams, CoreType};
-use xray_tui_db::models::{Endpoint, HostType, Protocol};
+use xray_tui_db::models::{Endpoint, Protocol};
 use xray_tui_native::inbound::outbound::ProxyOutbound;
 use xray_tui_native::server::{NativeCoreServer, ServerConfig};
 use xray_tui_native::telemetry::{NativeEvent, Telemetry};
@@ -37,6 +37,7 @@ const TELEMETRY_CAP: usize = 16;
 pub async fn run_native_session(
     params: &BuildParams,
     endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
     protocol: &Protocol,
     tx: &mpsc::Sender<CoreEvent>,
     log_sender: &Option<std::sync::mpsc::SyncSender<LogMessage>>,
@@ -82,7 +83,7 @@ pub async fn run_native_session(
     let proxy = ProxyOutbound {
         protocol: config,
         kind: protocol.proto_kind,
-        server: endpoint_essentials(endpoint),
+        server: endpoint_essentials(endpoint, addresses),
         resolved_ip: None,
     };
     let (telemetry, mut events_rx) = Telemetry::new(TELEMETRY_CAP);
@@ -185,15 +186,22 @@ pub async fn run_native_session(
 /// consumes (mirrors `xray_tui_core::config_builder::endpoint_essentials` —
 /// kept local because that helper is crate-private to xray-tui-core).
 #[must_use]
-pub(crate) fn endpoint_essentials(endpoint: &Endpoint) -> EndpointEssentials {
+pub(crate) fn endpoint_essentials(
+    endpoint: &Endpoint,
+    addresses: &[std::net::IpAddr],
+) -> EndpointEssentials {
+    let (host, host_type) = if endpoint.is_dns() {
+        (endpoint.dns_name(), HostKind::Dns)
+    } else {
+        match addresses.first() {
+            Some(std::net::IpAddr::V4(_)) => (addresses[0].to_string(), HostKind::Ipv4),
+            Some(std::net::IpAddr::V6(_)) => (addresses[0].to_string(), HostKind::Ipv6),
+            None => (String::new(), HostKind::Undefined),
+        }
+    };
     EndpointEssentials {
-        host: endpoint.host.clone(),
-        host_type: match endpoint.host_type {
-            HostType::Ipv4 => HostKind::Ipv4,
-            HostType::Ipv6 => HostKind::Ipv6,
-            HostType::Dns => HostKind::Dns,
-            HostType::Undefined => HostKind::Undefined,
-        },
+        host,
+        host_type,
         port: endpoint.port,
         ports: endpoint.ports.clone(),
     }

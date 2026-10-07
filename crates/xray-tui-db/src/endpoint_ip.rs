@@ -124,7 +124,7 @@ pub(crate) async fn ensure(conn: &mut impl toasty::Executor) -> Result<()> {
 /// full replacement, because the set is what the resolver just returned:
 /// prune-what-is-gone would need the old set, and a re-resolution is rare
 /// enough (TTL-gated) that rewriting one to three rows is the cheap path.
-pub(crate) async fn replace(
+pub async fn replace(
     conn: &mut impl toasty::Executor,
     endpoint_id: EndpointId,
     ips: &[IpAddr],
