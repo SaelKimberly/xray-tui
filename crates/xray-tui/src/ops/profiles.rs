@@ -418,7 +418,7 @@ pub(crate) const PROFILES_PAGE_SIZE: usize = 200;
 /// the stored rank keys are computed with, so the comparator, the page SQL and
 /// the keys cannot disagree. `state.endpoint_info` is a display cache and is
 /// deliberately not consulted: it can lag the row.
-pub(crate) const fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow) -> bool {
+pub(crate) fn endpoint_dns_unresolved(_state: &AppState, row: &EndpointRow) -> bool {
     xray_tui_db::endpoint_rank::dns_unresolved(row)
 }
 

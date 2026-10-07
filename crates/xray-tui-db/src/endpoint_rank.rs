@@ -178,8 +178,8 @@ pub const fn dns_unresolved_endpoint(host_type: HostType, has_address: bool) -> 
 
 /// True for an [`EndpointRow`].
 #[must_use]
-pub const fn dns_unresolved(row: &EndpointRow) -> bool {
-    dns_unresolved_endpoint(row.endpoint.host_type, !row.resolved_ips.is_empty())
+pub fn dns_unresolved(row: &EndpointRow) -> bool {
+    row.endpoint.is_dns() && row.resolved_ips.is_empty()
 }
 
 /// Index of the endpoint's display link.

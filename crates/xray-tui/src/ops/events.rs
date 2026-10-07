@@ -642,8 +642,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     .iter()
                     .find(|r| r.endpoint.id.get() == endpoint_id)
                     .map_or((0, false), |r| {
-                        use xray_tui_db::models::HostType;
-                        (r.endpoint.id.get(), r.endpoint.host_type == HostType::Dns)
+                        (r.endpoint.id.get(), r.endpoint.is_dns())
                     });
                 let ip_info_clone = ip_info.clone();
                 let writer = Arc::clone(&state.link_stage);

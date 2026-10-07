@@ -15,7 +15,7 @@ use xray_tui_db::Database;
 use xray_tui_db::LinkGroups;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{
-    Endpoint, EndpointId, EndpointRow, HostType, Latency, ProfileStats, ProtocolId, PurgatoryView,
+    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, PurgatoryView,
     TaskKind,
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
@@ -1732,7 +1732,7 @@ impl BatchShared {
             // the early-drop lint is about.
             let sent = {
                 let mut requested = self.resolve_requested.lock();
-                if plan.endpoint.host_type == HostType::Dns
+                if plan.endpoint.is_dns()
                     && !self.dns_resolution_is_fresh(&plan.endpoint)
                     && !requested.contains(&endpoint_id)
                 {
@@ -2642,7 +2642,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use tokio::sync::mpsc;
-    use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
+    use xray_tui_db::models::{ErrorInfo, HostType, Latency, ProfileErr};
 
     use crate::ops::profiles::test_support::{fake_row, test_state};
     use crate::ops::scheduler::TaskScheduler;

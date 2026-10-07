@@ -456,7 +456,7 @@ fn compute_test_cell(
             xray_tui_native::security::fingerprint::resolve_fingerprint(p.security.fp.as_deref()).1
         });
     let (mut text, style) = test_cell_content(
-        row.endpoint.host_type == xray_tui_db::models::HostType::Dns,
+        row.endpoint.is_dns(),
         resolved,
         untestable,
         purged,
@@ -729,7 +729,7 @@ fn build_display_rows(
         // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
         // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
         let ip_feature =
-            if row.endpoint.host_type == xray_tui_db::models::HostType::Dns && !resolved {
+            if row.endpoint.is_dns() && !resolved {
                 "\u{1F3C1}".to_string()
             } else if info
                 .is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
@@ -796,7 +796,7 @@ fn build_display_rows(
             })
             .unwrap_or_default();
         let (panel_ips, panel_resolve_hint) = if panel_ips.is_empty() {
-            if row.endpoint.host_type == xray_tui_db::models::HostType::Dns {
+            if row.endpoint.is_dns() {
                 ("[?]".to_string(), true)
             } else {
                 (panel_ips, false)

@@ -630,8 +630,7 @@ pub fn spawn_enrich_ip_hosts(state: &mut AppState) {
         .endpoints
         .iter()
         .filter(|r| {
-            matches!(r.endpoint.host_type, HostType::Ipv4 | HostType::Ipv6)
-                || !r.resolved_ips.is_empty()
+            r.endpoint.is_ip() || !r.resolved_ips.is_empty()
         })
         // An entry with no address and no attempt timestamp carries no
         // resolution information (an outbound-only event materializes one), so

@@ -290,6 +290,31 @@ pub struct Endpoint {
     pub group_links: Deferred<Vec<EndpointGroup>>,
 }
 
+impl Endpoint {
+    /// True for a DNS-name host: the one kind that resolves before dialling.
+    ///
+    /// The single read point for the DNS predicate (db-rewamp D10): the
+    /// host-kind becomes DERIVED once `host_type` is dropped, so readers go
+    /// through here and only this body moves.
+    #[must_use]
+    pub const fn is_dns(&self) -> bool {
+        matches!(self.host_type, HostType::Dns)
+    }
+
+    /// True for an IP-literal host (dialled directly, no resolution).
+    #[must_use]
+    pub const fn is_ip(&self) -> bool {
+        matches!(self.host_type, HostType::Ipv4 | HostType::Ipv6)
+    }
+
+    /// The Address-column text and the dial target: the name for a DNS host,
+    /// the literal for an IP host, empty for an exotic host.
+    #[must_use]
+    pub fn display_host(&self) -> &str {
+        &self.host
+    }
+}
+
 /// One resolved address of one DNS endpoint (`endpoint_ip`).
 ///
 /// Replaces the JSON-array `endpoints.resolved_as` column: the set is
