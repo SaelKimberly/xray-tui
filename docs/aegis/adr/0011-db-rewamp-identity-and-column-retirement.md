@@ -36,10 +36,13 @@ the file) with no production reader.
    schema: a form config and an identical share URL share one `Protocol` row.
    `IDENTITY_VERSION` 2 → 3; the identity goldens are re-pinned.
 5. **D2 (helper only) — the split owner + its version guard.** `psl2 = 0.1.31`
-   backs `xray_tui_config::domain::split` (ONE normalizer: `analyze`, IDNA→
-   punycode). The PSL version is stamped in a generic `app_meta(key,value)` table
-   at startup; a mismatch logs a re-import warning (the split re-keys endpoints).
-6. **Schema tag 14 → 15** (a wipe): the dropped columns would be NOT NULL on a
+   backs `xray_tui_proto::domain::split` (ONE normalizer: `analyze`, IDNA→
+   punycode; re-exported from `xray_tui_config::domain`). It lives in `proto`
+   because both `config` and `db` depend on it and the db rank refresh needs the
+   split (a T8 prerequisite). The PSL version is stamped in the typed
+   `app_meta(key,value)` table at startup; a mismatch logs a re-import warning
+   (the split re-keys endpoints).
+6. **Schema tag 14 → 16** (a wipe; 15 was the intermediate that dropped the columns, 16 added the typed `app_meta` model): the dropped columns would be NOT NULL on a
    v14 file while the model no longer has them, so every import INSERT would fail.
 
 ## Deferred (accepted, not implemented)

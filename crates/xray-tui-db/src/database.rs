@@ -719,7 +719,6 @@ const fn purge_reason_str(reason: crate::models_toasty::PurgeReason) -> &'static
     }
 }
 
-/// Extract the first INTEGER column of the first row (used for PRAGMA reads).
 impl Database {
 /// Read a value from the typed `app_meta` key/value table, `None` when the key
 /// is absent.
@@ -745,6 +744,7 @@ pub async fn meta_set(&self, key: &str, value: &str) -> Result<()> {
 }
 }
 
+/// Extract the first INTEGER column of the first row (used for PRAGMA reads).
 fn first_i64(rows: &[Value]) -> Option<i64> {
     rows.first().and_then(|v| {
         if let Value::Record(fields) = v {

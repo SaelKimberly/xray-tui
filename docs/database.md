@@ -13,7 +13,7 @@ derived-state tables.
 
 | | |
 | --- | --- |
-| Tables | 10 (listed below) |
+| Tables | 11 (listed below; `app_meta` is the key/value stamp table) |
 | Schema tag | `PRAGMA user_version = 16` |
 | Migrations | **none** — a tag mismatch deletes and recreates the file (see [Changing the schema](#changing-the-schema)) |
 | Raw SQL | `profiles_query.rs` (the page), `endpoint_rank.rs` and `endpoint_ip.rs` (their index DDL plus the id-inlined reads/writes), and the bulk patch statements (ADR 0001, ADR 0003); `PRAGMA`s are the other standing exception, described under [Connection settings](#connection-settings) |
