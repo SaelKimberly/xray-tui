@@ -232,7 +232,14 @@ DDL on five toasty-owned tables. turso 0.7.2 gates it behind
 but it must be set on **every** connection path (`file_driver()`, `export.rs`'s direct
 builder, test helpers); `push_schema` cannot emit it, so those tables need raw
 `DROP`+`CREATE` DDL at the wipe; typed toasty read/write against a WITHOUT ROWID
-table must be verified. **Take only if a turso run proves it**; otherwise defer.
+table must be verified. **GATE PASSED (2026-10-06, `crates/xray-tui-db/tests/turso_planner.rs::turso_without_rowid_support`):**
+turso 0.7.2 rejects `CREATE TABLE … WITHOUT ROWID` on the default builder
+(`Parse error: WITHOUT ROWID tables are an experimental feature`) and accepts it
+with `experimental_without_rowid(true)`, round-tripping data and ordered scans.
+So the mechanism is real. **Implementation is sequenced AFTER T4** — the raw
+`DROP`+`CREATE … WITHOUT ROWID` DDL must hand-write the FINAL schema (the
+`domain`/`sub_domain` shape), so writing it against today's `host`/`host_type`
+columns would be immediately invalidated.
 
 ### 4.2 Foreign keys — adopt cascade (D12)
 

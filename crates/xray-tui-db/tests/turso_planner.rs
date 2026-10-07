@@ -140,3 +140,68 @@ async fn turso_planner_gate() {
     .await;
     println!("\n[reband sweep]\n  {p:?}");
 }
+
+/// T14 gate: does turso 0.7.2 actually support `WITHOUT ROWID` behind its
+/// experimental flag, and does it round-trip data through it?
+///
+/// The design defers WITHOUT ROWID (5 integer-key tables ≈ −4.9% disk) unless
+/// this proves the engine honours it end-to-end — the SQLite-planner disk
+/// numbers alone are not enough, because turso's implementation is
+/// experimental and default-off.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "turso capability gate (db-rewamp T14)"]
+async fn turso_without_rowid_support() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("wr.db");
+    // Default builder: the flag is OFF.
+    let db_off = Builder::new_local(path.to_str().expect("path"))
+        .build()
+        .await
+        .expect("build off");
+    let conn_off = db_off.connect().expect("connect off");
+    let err = conn_off
+        .execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID",
+            (),
+        )
+        .await;
+    println!("[flag OFF] CREATE ... WITHOUT ROWID -> {err:?}");
+
+    let dir2 = tempfile::tempdir().expect("tempdir");
+    let path2 = dir2.path().join("wron.db");
+    let db_on = Builder::new_local(path2.to_str().expect("path"))
+        .experimental_without_rowid(true)
+        .build()
+        .await
+        .expect("build on");
+    let conn_on = db_on.connect().expect("connect on");
+    let create = conn_on
+        .execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID",
+            (),
+        )
+        .await;
+    println!("[flag ON ] CREATE ... WITHOUT ROWID -> {create:?}");
+    assert!(create.is_ok(), "flag ON must allow WITHOUT ROWID");
+
+    conn_on
+        .execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')", ())
+        .await
+        .expect("insert");
+    let mut rows = conn_on.query("SELECT v FROM t WHERE id = 2", ()).await.expect("select");
+    let row = rows.next().await.expect("next").expect("row");
+    let v: String = row.get(0).expect("v");
+    println!("[flag ON ] round-trip id=2 -> {v:?}");
+    assert_eq!(v, "world", "WITHOUT ROWID round-trips");
+    let mut rows = conn_on
+        .query("SELECT id FROM t ORDER BY id DESC", ())
+        .await
+        .expect("ordered");
+    let mut order = Vec::new();
+    while let Some(r) = rows.next().await.expect("next") {
+        order.push(r.get::<i64>(0).expect("id"));
+    }
+    println!("[flag ON ] ORDER BY id DESC -> {order:?}");
+    assert_eq!(order, vec![2, 1], "ordered scan over a WITHOUT ROWID table");
+    println!("\nVERDICT: turso honours WITHOUT ROWID behind experimental_without_rowid(true).");
+}
