@@ -135,6 +135,36 @@ hand-write the FINAL (post-T4) schema. Also enable the flag on EVERY connection
 path (`file_driver`, `export.rs`'s direct builder, test helpers) via
 `toasty_driver_turso::Turso::experimental_without_rowid(true)`.
 
+## T4 Phase-2 — DEFINITIVE characterization (4 attempts, all reverted)
+The model swap is NOT a mechanical 50-fixture edit. It requires threading the
+endpoint's resolved ADDRESS through the probe/config plumbing, because an IP
+host's dial literal now lives only in `endpoint_ip` (the model drops `host`):
+
+- `ConfigBuilder::build` / `build_proxy_outbound` (xray+singbox) /
+  `MultiInboundItem` already take `addresses` (my Phase-2 edits did this) — but:
+- The FAST/REAL probes dial `endpoint.host` (`ops/ping.rs:2122` `let addr =
+  endpoint.host.as_str()`, `:2096` the dedup key `(endpoint.host, port)`), where
+  `endpoint` is an `Arc<Endpoint>` from the PLAN — it has no addresses. So
+  `PlanLink`/`PlanWalk`/`BatchShared` must carry `resolved_ips` from the page row
+  (the plan already comes from the page, so it's available, but every plan item
+  and its construction sites change).
+- `ops/enrich.rs:289` (`row.endpoint.host` for the resolver) → `dns_name()`.
+- `ui/mod.rs:861` (display), `:927` (`endpoint_essentials`), `connect.rs:354/365`
+  (warn `host=`), `db_monitor.rs:574` (fixture) — mechanical once the plumbing is
+  threaded.
+
+**Verdict:** T4-Phase2 = a DESIGN change (address plumbing through plan → probe →
+build), i.e. the T4+T8+T9 slice. It cannot be landed green as a mechanical edit;
+it needs its own focused session with the plan-struct change designed first.
+Fixtures are collapsible (derive inside `seed_endpoint`/`endpoint_struct`;
+`docker literal` form → `Endpoint::derive_domain(lit, kind)`), done in the
+reverted attempts.
+
+Also verified this turn: `seed_endpoint` bodies + the ~11 literal creates are
+the fixture surface (not 53); a regex over `host: <lit>.to_string(),\n host_type:
+HostType::K,` is safe (literal form), but a regex over the `host:`/`host_type:`
+PAIR also hits fn signatures — match the literal form only.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of
