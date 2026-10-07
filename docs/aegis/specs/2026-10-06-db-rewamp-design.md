@@ -386,3 +386,24 @@ single-label; 30 trailing-dot; multi-part TLDs present.
   app-side page exceeds the tick budget on turso).
 - No folding of `endpoint_rank` into `endpoints` (D5).
 - No `endpoint_ip` text column (rejected — one spelling of an address).
+
+### 3.11 T8/T9 do NOT require T4 (reframe + the law's selection tiebreak)
+
+The binned law is materialized **on `endpoint_rank`** (§3.2), and that table's
+refresh ALREADY reads `endpoints.host`/`host_type` (`endpoint_rank.rs` derives
+`rank_host` from `(SELECT host FROM endpoints e …)` and bulk-reads `host_type`).
+So T8/T9 computes the split at REFRESH time — `psl2 split(host)` →
+`rank_domain`/`rank_sub_domain`; pack the IP literal → `rank_addr` — and the page
+orders/filters on those `endpoint_rank` columns. **`endpoints.host`/`host_type`
+stay untouched**, so T8/T9 lands the headline win (one covering index + binned
+order + locked sort) with NO address threading and no fixture churn. Dropping
+`host` from `endpoints` is an independent later tidiness slice (T4), not a
+prerequisite. This supersedes the plan's "T4 ≡ T8 ≡ T9 one commit" note.
+
+**Law detail the §3.1 key omits.** `(bin, ⌐weight, domain, sub_domain, addr,
+endpoint_id)` has `domain`/`sub_domain`/`addr`/`endpoint_id` CONSTANT across an
+endpoint's links, so it cannot pick the REPRESENTATIVE link. The representative
+is `argmin(bin, ⌐weight, protocol_id)` — `latency`/`recency` drop out of link
+selection because `bin` already buckets the delay. The stored endpoint key is
+`(bin, weight, domain, sub_domain, addr, endpoint_id)` with `bin`/`weight` from
+that representative.

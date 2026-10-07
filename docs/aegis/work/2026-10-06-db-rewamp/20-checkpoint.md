@@ -165,6 +165,25 @@ the fixture surface (not 53); a regex over `host: <lit>.to_string(),\n host_type
 HostType::K,` is safe (literal form), but a regex over the `host:`/`host_type:`
 PAIR also hits fn signatures — match the literal form only.
 
+## T8/T9 UNBLOCKED from T4 (do this next — the headline win)
+Recorded in spec §3.11: the binned law materializes on `endpoint_rank`, whose
+refresh ALREADY reads `endpoints.host` — so T8/T9 needs NO T4. Approach:
+1. `EndpointRank` model: replace `dns/tier/latency/seen/protocol/display_seen/
+   speed/traffic` with `bin: i64`, `domain: String`, `sub_domain: String`,
+   `addr: Vec<u8>`; keep `newest_seen`. `rank_weight`/`band` stay raw (or move to
+   the model — the wipe is happening). Bump `SCHEMA_VERSION` (17).
+2. `compute_rank`: representative = `argmin(bin, ⌐weight, protocol_id)`; bin from
+   the representative (`real<50..real≥1000` 0-5, `fast<50..fast≥1000` 6-11,
+   untested 12, real-err 13, fast-err 14, dns-err 15, purged 16); domain/sub =
+   `psl2 split(endpoints.host)` when `host_type == Dns` else empty; addr = packed
+   literal when `Ipv4|Ipv6` else empty.
+3. `RANK_COLUMNS`/`write`/the SELECT/`ensure_in` index →
+   `endpoint_rank_key(band, rank_bin, rank_weight DESC, rank_domain,
+   rank_sub_domain, rank_addr, endpoint_id)`; drop `rank_host`/the Address index.
+4. `profiles_query`: the Test order → the binned key; search → prefix on
+   `rank_domain`/`rank_sub_domain` + the addr range (or `endpoints.domain` later).
+5. Re-pin the profiles_query oracle + rank unit tests.
+
 ## Next step (exact resume point)
 0. **T4 ≡ T8 ≡ T9 are ONE non-green commit.** Measured this turn: dropping
    `Endpoint.host`/`host_type` is ~12 files and the compiler is not the end of
