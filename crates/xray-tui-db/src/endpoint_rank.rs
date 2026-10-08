@@ -391,16 +391,6 @@ pub fn rank_of_row(row: &EndpointRow) -> Option<RankRow> {
 // engine parses ~0.8 ms per bound parameter (200 ids = 174 ms; the same
 // statement with literals = 9.7 ms), which would dominate every refresh.
 
-/// The Test order (decision 16): the default sort, and the one the tab
-/// scrolls under.
-///
-/// It stays a raw statement because toasty's `#[index]` is single-column and
-/// cannot express a composite whose last-but-one term is DESCENDING — and this
-/// index is what makes a page an index scan (~1 ms) instead of a sort over
-/// every endpoint (~240 ms). Additive (`IF NOT EXISTS`), no data of its own.
-const COVERING_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_key ON endpoint_rank(\
-     band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)";
-
 /// Rows per bulk statement.
 const RANK_CHUNK: usize = 400;
 
@@ -415,39 +405,14 @@ const RANK_CHUNK: usize = 400;
 const RANK_COLUMNS: &str = "endpoint_id, rank_bin, rank_weight, rank_domain, \
      rank_sub_domain, rank_addr, rank_newest_seen";
 
-/// The weight column: an 8-byte big-endian blob, `NOT NULL` so an un-refreshed
-/// row is still a legal ordering term.
+/// Fill the ordering keys and heal stale ones. The table's DDL (and its
+/// indexes) now lives in `crate::schema::ddl`, run by the migration runner
+/// before this; this is the DATA half, once per open.
 ///
-/// BLOB, not INTEGER: SQLite orders blobs by memcmp, which makes `ORDER BY
-/// rank_weight DESC` the Rust comparator's order BY CONSTRUCTION over the whole
-/// 64-bit range. An INTEGER would store any value ≥ 2^63 as negative and sort
-/// it LAST, and would cost bit 15 of the dominant security band as well.
-/// `NOT NULL DEFAULT` materializes "worst" for every pre-existing row, which is
-/// a valid position; the `WEIGHT_VERSION` check below is what replaces it with
-/// real weights.
-const WEIGHT_COLUMN: &str = "ALTER TABLE endpoint_rank ADD COLUMN rank_weight BLOB \
-     NOT NULL DEFAULT x'0000000000000000'";
-
-/// The weight column's covering index — a NEW NAME, never an edit in place:
-/// `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on
-/// One-row stamp for the compiled weight tables. A table of opinions that lives
-/// in code has no other way to know it is out of date.
-const WEIGHT_META_TABLE: &str = "CREATE TABLE IF NOT EXISTS rank_weight_meta \
-     (id INTEGER PRIMARY KEY CHECK (id = 0), weight_version INTEGER NOT NULL)";
-
-/// The directional reband sweep seeks `band = 0 AND rank_newest_seen < ?`.
-const BAND_WINDOW_INDEX: &str = "CREATE INDEX IF NOT EXISTS endpoint_rank_band_window \
-     ON endpoint_rank(band, rank_newest_seen)";
-
-/// Create the rank table and, on a database that has none yet, fill it from
-/// the current link state. Runs once per database: an upgraded one pays the
-/// backfill here, at open, instead of on its first page.
+/// One transaction, so the fill and the heal land together and no implicit
+/// write lock outlives the call (leaving one behind made the next writer on the
+/// pool time out with "database is locked").
 pub(crate) async fn ensure(conn: &mut toasty::Connection) -> crate::Result<()> {
-    // The table itself comes from the schema (tag 8) — this only creates the
-    // indexes and, on a database whose keys are not materialized yet, fills
-    // them. One transaction: the indexes and the fill land together, and no
-    // implicit write lock outlives the call (leaving one behind made the next
-    // writer on the pool time out with "database is locked").
     let mut tx = conn
         .transaction_builder()
         .mode(TransactionMode::Immediate)
@@ -462,25 +427,12 @@ pub(crate) async fn ensure(conn: &mut toasty::Connection) -> crate::Result<()> {
 }
 
 async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
-    // `band` is a RAW column on this derived table (NOT a toasty model field),
-    // so the page's Active membership is a stored `band = 0` — no schema-tag
-    // bump, no file wipe. ADD COLUMN is attempted every open; the
-    // duplicate-column error on an already-migrated database is expected and
-    // ignored. (`rank_host` died with `PageSort::Address` — db-rewamp §3.2.)
-    for alter in [
-        "ALTER TABLE endpoint_rank ADD COLUMN band INTEGER",
-        WEIGHT_COLUMN,
-    ] {
-        let _ = toasty::sql::query(alter).exec(conn).await;
-    }
-    // A NEW index name, not an edited one: `IF NOT EXISTS` makes a changed
-    // column list a no-op on every database that already has the old index,
-    // which would keep serving the new ORDER BY and drop the page back to the
-    // ~240 ms filesort. The old index is left in place (it costs only write
-    // time) so a rollback still has one.
-    for ddl in [COVERING_INDEX, BAND_WINDOW_INDEX, WEIGHT_META_TABLE] {
-        toasty::sql::query(ddl).exec(conn).await?;
-    }
+    // The DDL that used to open this function — the two `ALTER TABLE ADD
+    // COLUMN`s, the covering/band-window indexes and the meta table — now
+    // lives in `crate::schema::ddl` and runs from the migration runner BEFORE
+    // this call (`Database::open`). What remains is DATA: heal absent rows and
+    // recompute keys whose weight tables changed.
+    //
     // The compiled weight tables are opinions that live in code, so an upgrade
     // can invalidate every stored weight. This check MUST sit on the populated
     // branch below: an upgraded database takes the `> 0` path, and a NULL-based

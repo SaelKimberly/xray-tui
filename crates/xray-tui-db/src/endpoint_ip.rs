@@ -42,12 +42,6 @@ const FAMILY_V6: u8 = 6;
 /// Longest key: the family byte plus 16 address octets.
 const MAX_KEY_LEN: usize = 17;
 
-/// Index the ordering key: a covering index, because toasty's `#[index]` is
-/// single-column and a page's IP sort wants `(ip_key, endpoint_id)` without a
-/// row lookup. Additive (`IF NOT EXISTS`), like the `endpoint_rank` indexes.
-const BY_KEY_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS endpoint_ip_by_key ON endpoint_ip(ip_key, endpoint_id)";
-
 /// The sortable key of an address. Byte order is address order, IPv4 first.
 #[must_use]
 pub fn key_of(ip: IpAddr) -> Vec<u8> {
@@ -110,12 +104,6 @@ pub fn key_from_hex(hex: &str) -> Option<IpAddr> {
         *slot = u8::try_from(hi * 16 + lo).ok()?;
     }
     ip_of(&key[..bytes.len() / 2])
-}
-
-/// Create the table's covering index. Idempotent; runs at every open.
-pub(crate) async fn ensure(conn: &mut impl toasty::Executor) -> Result<()> {
-    toasty::sql::query(BY_KEY_INDEX).exec(conn).await?;
-    Ok(())
 }
 
 /// Replace the resolved address set of `endpoint_id` with `ips`.

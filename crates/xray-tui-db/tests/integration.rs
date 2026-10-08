@@ -9,15 +9,14 @@
 use jiff::Timestamp;
 use toasty::{Deferred, Json};
 use xray_tui_db::models::{
-    DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRow, ErrorInfo, Group,
-    HostType, Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason,
+    DnsSetting, Endpoint, EndpointGroup, EndpointId, EndpointRow, ErrorInfo, Group, HostType,
+    Latency, ProfileErr, ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason,
     RoutingRule, Security, TrafficStats, Transport,
 };
 use xray_tui_db::{Database, LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
-ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
-    VlessConfig,
+    ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType, VlessConfig,
 };
 
 /// Helper: create in-memory database.
@@ -678,9 +677,9 @@ async fn backfill_bands_fills_null_band_rows_on_reopen() {
         // A pre-columns rank row: band NULL — the state every upgrading
         // user's rows are in before the first reopen.
         toasty::sql::query("UPDATE endpoint_rank SET band = NULL WHERE endpoint_id = 1")
-        .exec(&mut conn)
-        .await
-        .expect("null the band");
+            .exec(&mut conn)
+            .await
+            .expect("null the band");
     }
     // Reopen: ensure_in sees COUNT > 0 and runs backfill_bands over the NULL
     // rows, setting band.
@@ -1676,10 +1675,15 @@ async fn fresh_open_creates_schema_and_sets_user_version_tag() {
     );
 }
 
-/// A file carrying a different schema tag is DISCARDED, not migrated
-/// (decision 4) — the path a pre-alpha upgrade takes whenever a table is
-/// added or a column changes. Pinned here because it is destructive and
-/// load-bearing: the row seeded under the old tag must be gone afterwards.
+/// A file whose cursor names a schema this build does NOT know is recreated.
+///
+/// `8` is a PRE-MIGRATION tag (the old `user_version` world, where 1..17 were
+/// unrelated schemas). The migration runner reports that as
+/// `IncompatibleSchema`, and `open` applies the pre-alpha wipe (AGENTS decision
+/// 4). Pinned because it is destructive: the row seeded under the old tag must
+/// be gone. An OLDER SUPPORTED version would migrate instead — see
+/// `schema_migrate.rs`, and `open_reopen_preserves_data` for the current-tag
+/// no-op.
 #[tokio::test]
 async fn open_wipes_a_file_with_a_mismatched_schema_tag() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1885,8 +1889,7 @@ async fn apply_link_patches_writes_patched_groups_for_every_row() {
     assert_eq!(traffic_row.traffic.total_up, 33);
     assert_eq!(traffic_row.traffic.total_down, 44);
     assert_eq!(
-        traffic_row.last_seen_at,
-        traffic_row.last_seen_at,
+        traffic_row.last_seen_at, traffic_row.last_seen_at,
         "columns outside the patched groups are unchanged"
     );
 }

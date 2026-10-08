@@ -319,42 +319,36 @@ impl Database {
 
         let mut conn = db.connection().await?;
 
-        let rows = toasty::sql::query("PRAGMA user_version")
-            .exec(&mut conn)
-            .await?;
-        let current_version = first_i64(&rows).unwrap_or(0);
-        if current_version != SCHEMA_VERSION {
-            match db.push_schema().await {
-                Ok(()) => {
-                    toasty::sql::query(format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-                        .exec(&mut conn)
-                        .await?;
+        // The schema's single owner (see `crate::schema`). It replaces the old
+        // `user_version` tag, whose only outcomes were "run push_schema" or
+        // "delete the file": a supported older version now MIGRATES, and only a
+        // file whose cursor names an UNKNOWN schema takes the documented wipe.
+        match crate::schema::migrate(&db, &mut conn).await {
+            Ok(_state) => {}
+            Err(crate::error::DatabaseError::IncompatibleSchema(version)) => {
+                // A foreign or pre-migration file: unreadable by this code.
+                // The pre-alpha policy is a wipe (AGENTS decision 4), now an
+                // EXPLICIT verdict rather than an inferred `CREATE TABLE`
+                // failure.
+                tracing::warn!(
+                    version,
+                    latest = crate::schema::LATEST,
+                    "incompatible DB schema, recreating from scratch"
+                );
+                drop(conn);
+                if Path::new(path_str).exists() {
+                    remove_stale_mvcc_log_for_wal(Path::new(path_str))?;
+                    std::fs::remove_file(path_str)?;
                 }
-                Err(e) => {
-                    // Existing tables (pre-T8 schema or half-created DB):
-                    // drop the file and rebuild with the 7-table schema.
-                    tracing::warn!(
-                        version = current_version,
-                        error = %e,
-                        "incompatible DB schema, recreating from scratch"
-                    );
-                    drop(conn);
-                    if Path::new(path_str).exists() {
-                        remove_stale_mvcc_log_for_wal(Path::new(path_str))?;
-                        std::fs::remove_file(path_str)?;
-                    }
-                    remove_all_db_sidecars(Path::new(path_str))?;
-                    concurrent_writes = requested_mvcc;
-                    let driver = file_driver(path_str, concurrent_writes);
-                    db = Self::try_open_db(driver).await?;
-                    let mut fresh = db.connection().await?;
-                    db.push_schema().await?;
-                    toasty::sql::query(format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-                        .exec(&mut fresh)
-                        .await?;
-                    conn = fresh;
-                }
+                remove_all_db_sidecars(Path::new(path_str))?;
+                concurrent_writes = requested_mvcc;
+                let driver = file_driver(path_str, concurrent_writes);
+                db = Self::try_open_db(driver).await?;
+                let mut fresh = db.connection().await?;
+                crate::schema::migrate(&db, &mut fresh).await?;
+                conn = fresh;
             }
+            Err(e) => return Err(e),
         }
 
         configure_journal_mode(&mut conn, concurrent_writes).await?;
@@ -375,19 +369,14 @@ impl Database {
             .await?;
 
         Self::init_default_groups(&mut conn).await?;
-        // Materialized per-endpoint ordering keys (decision 21): additive
-        // side table, created here and backfilled when empty. A database that
-        // predates it pays the fill once, at open.
+        // The ordering keys' DDL now lives in `crate::schema` (run by
+        // `migrate` above). What remains here is the DATA work: backfill an
+        // empty table, heal absent rows, and recompute keys when the compiled
+        // weight tables changed. A database that predates it pays once, here.
         if std::env::var("XRAY_TUI_SKIP_RANK_ENSURE").is_err()
             && let Err(e) = crate::endpoint_rank::ensure(&mut conn).await
         {
             tracing::warn!(target: "xray_tui_db", "endpoint_rank: {e}");
-        }
-        // `endpoint_ip`'s covering index — the address-ordered read path. Raw
-        // DDL for the same reason the rank indexes are: toasty's `#[index]` is
-        // single-column, and the sort wants `(ip_key, endpoint_id)` together.
-        if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
-            tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
         let direct = match open_direct_conn(path_str, concurrent_writes).await {
             Ok(c) => Some(Arc::new(tokio::sync::Mutex::new(c))),
@@ -507,7 +496,10 @@ impl Database {
             .await?;
 
         let mut conn = db.connection().await?;
-        db.push_schema().await?;
+        // Same single schema owner as the file path (see `crate::schema`): on an
+        // in-memory database the cursor is always 0, so this creates the tables
+        // and the raw DDL exactly once.
+        crate::schema::migrate(&db, &mut conn).await?;
 
         toasty::sql::query("PRAGMA busy_timeout=5000")
             .exec(&mut conn)
@@ -526,19 +518,14 @@ impl Database {
             .await?;
 
         Self::init_default_groups(&mut conn).await?;
-        // Materialized per-endpoint ordering keys (decision 21): additive
-        // side table, created here and backfilled when empty. A database that
-        // predates it pays the fill once, at open.
+        // The ordering keys' DDL now lives in `crate::schema` (run by
+        // `migrate` above). What remains here is the DATA work: backfill an
+        // empty table, heal absent rows, and recompute keys when the compiled
+        // weight tables changed. A database that predates it pays once, here.
         if std::env::var("XRAY_TUI_SKIP_RANK_ENSURE").is_err()
             && let Err(e) = crate::endpoint_rank::ensure(&mut conn).await
         {
             tracing::warn!(target: "xray_tui_db", "endpoint_rank: {e}");
-        }
-        // `endpoint_ip`'s covering index — the address-ordered read path. Raw
-        // DDL for the same reason the rank indexes are: toasty's `#[index]` is
-        // single-column, and the sort wants `(ip_key, endpoint_id)` together.
-        if let Err(e) = crate::endpoint_ip::ensure(&mut conn).await {
-            tracing::warn!(target: "xray_tui_db", "endpoint_ip: {e}");
         }
         Ok(Self {
             db,
@@ -799,7 +786,7 @@ impl Database {
 }
 
 /// Extract the first INTEGER column of the first row (used for PRAGMA reads).
-fn first_i64(rows: &[Value]) -> Option<i64> {
+pub(crate) fn first_i64(rows: &[Value]) -> Option<i64> {
     rows.first().and_then(|v| {
         if let Value::Record(fields) = v {
             fields.first().and_then(|f| match f {

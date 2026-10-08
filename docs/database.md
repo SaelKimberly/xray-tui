@@ -15,7 +15,7 @@ derived-state tables.
 | --- | --- |
 | Tables | 11 (listed below; `app_meta` is the key/value stamp table) |
 | Schema tag | `PRAGMA user_version = 18` |
-| Migrations | **none** — a tag mismatch deletes and recreates the file (see [Changing the schema](#changing-the-schema)) |
+| Migrations | `crate::schema` — `PRAGMA user_version` is a CURSOR. A current file is a no-op, a fresh file applies the seed, a supported older version applies the pending steps, and only an UNKNOWN cursor deletes and recreates the file (see [Changing the schema](#changing-the-schema)) |
 | Raw SQL | `profiles_query.rs` (the page), `endpoint_rank.rs` and `endpoint_ip.rs` (their index DDL plus the id-inlined reads/writes), and the bulk patch statements (ADR 0001, ADR 0003); `PRAGMA`s are the other standing exception, described under [Connection settings](#connection-settings) |
 
 ## Entity map
@@ -327,15 +327,16 @@ flowchart TD
     E -- yes --> F[delete the file, rebuild]
     E -- no --> G[read PRAGMA user_version]
     F --> G
-    G --> H{tag == 17?}
-    H -- no --> I[push_schema + set tag 18]
-    H -- yes --> J[skip push_schema]
+    G --> H{"cursor vs LATEST (18)"}
+    H -- "== 18" --> J["ensure raw DDL (idempotent)"]
+    H -- "== 0" --> I["push_schema + raw DDL, set cursor 18"]
+    H -- "unknown" --> W["IncompatibleSchema: wipe and rebuild"]
     I --> K[PRAGMAs: WAL, busy_timeout, NORMAL, foreign_keys]
     J --> K
+    W --> K
     K --> L[default group if none]
-    L --> M["endpoint_rank::ensure: indexes + backfill or repair"]
-    M --> N["endpoint_ip::ensure: covering index"]
-    N --> O[ready]
+    L --> M["endpoint_rank::ensure: backfill or repair (DATA; the DDL lives in crate::schema)"]
+    M --> O[ready]
 ```
 
 ### Import / subscription refresh
@@ -448,15 +449,21 @@ flowchart LR
 
 1. **Add a column or table** to `models_toasty.rs` (or raw DDL at open for tables
    toasty cannot express — currently only the two index sets).
-2. **Bump `SCHEMA_VERSION`** in `database.rs`. That is not a migration: a
-   mismatched `user_version` makes `open()` **delete the file** and rebuild it
-   empty (decision 4). The project is pre-alpha and treats the database as
-   re-importable fixture data — but a bump still destroys user data, so it is a
-   deliberate call, never a convenience.
+2. **Add a migration step** in `crates/xray-tui-db/src/schema/` and bump
+   `LATEST`/`SCHEMA_VERSION` (they must agree; a test pins it). An existing file
+   at the previous version then applies the step instead of being deleted. The
+   cursor SEEDS at 18, so the first change after that is 19.
+   **Only a cursor naming an unknown schema wipes** — a pre-migration or foreign
+   file — and `open` reports that as `IncompatibleSchema` before recreating. The
+   project is pre-alpha and treats the database as re-importable fixture data,
+   but a wipe must now be a deliberate choice, not the default path for a column
+   addition.
 3. **If the change touches identity** (any field a protocol's `write_identity`
-   writes), also bump `IDENTITY_VERSION` in `xray-tui-proto` and re-pin the
-   identity goldens: stored uids become unrelated values, so the wipe in step 2
-   is mandatory, not optional.
+   writes), bump `IDENTITY_VERSION` in `xray-tui-proto`, re-pin the identity
+   goldens, and give the re-key its OWN migration step — do NOT bump
+   `SCHEMA_VERSION` for it: the schema did not change, and a cursor bump would
+   report a perfectly compatible file as `IncompatibleSchema` and wipe an
+   already-imported feed. Stamp `app_meta.identity_version` in that step.
 
    **Format vs value — the rule above is about the FORMAT.** What the writer
    writes (tags, order, which values are elided) decides the version. A change

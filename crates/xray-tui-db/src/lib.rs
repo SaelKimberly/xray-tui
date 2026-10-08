@@ -25,4 +25,5 @@ pub mod endpoint_rank;
 pub mod export;
 pub mod profiles_query;
 mod retry;
+pub mod schema;
 pub mod write_behind;

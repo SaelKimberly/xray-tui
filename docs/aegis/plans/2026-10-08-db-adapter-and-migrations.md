@@ -463,5 +463,53 @@ driver's. No test was lost: the one `sql_exec.rs` test
 write-behind parity test became `file_db_link_window_writes_the_staged_values`
 (there is one write path now, so a raw-vs-pooled comparison is moot).
 
-### S4 — next
+### S4 — SHIPPED (2026-10-08)
+
+Landed: `crates/xray-tui-db/src/schema/{mod.rs,ddl.rs}` — the schema's single
+owner. `PRAGMA user_version` is now a migration CURSOR, not a wipe tag, and the
+runner has four explicit outcomes: `Current` (cursor == `LATEST`; ensure the
+idempotent raw DDL, no table touch), `Applied` (cursor 0; create the tables then
+the raw DDL, set the cursor), `IncompatibleSchema` (any other cursor — a
+pre-migration or foreign file, reported so `open` applies its documented wipe),
+plus a `push_schema`-failure mapping to `IncompatibleSchema` for an untagged
+foreign file (a `CREATE TABLE` without `IF NOT EXISTS` failing IS the signal).
+
+**Design choice — the migration SEEDS at the current tag, and tables stay with
+`push_schema`.** Two decisions the spec left open, both resolved toward "one
+owner, no second spelling":
+
+1. The cursor seeds at `SCHEMA_VERSION` (18), NOT 1. An existing tag-18 file is
+   therefore already current and a fresh file applies 18 — no data touched
+   either way; every later change is 19+.
+2. The `CREATE TABLE` statements are NOT copied into `ddl.rs`. A toasty model's
+   table is emitted by `push_schema` from the model definition, and that IS the
+   schema of record until the typed layer is retired (the deferred S7). Hand-
+   writing 13 long `CREATE TABLE`s would create a second spelling of the same
+   fact with no reader forcing them to agree. So the v18 path calls
+   `push_schema` for the tables and `ddl.rs` for everything toasty cannot
+   express — which is exactly the raw set that was scattered across
+   `endpoint_ip.rs` and `endpoint_rank.rs`, now in one file with its causes.
+
+`ddl.rs` holds: `endpoint_ip_by_key`, `endpoint_rank_key`,
+`endpoint_rank_band_window`, `rank_weight_meta`, and the two
+`ALTER TABLE endpoint_rank ADD COLUMN`s (`band`, `rank_weight`) — which are
+NOT idempotent (no `IF NOT EXISTS` on this engine), so the runner tolerates the
+duplicate-column error and propagates any other. Deleted: `endpoint_ip::ensure`
+and the DDL half of `endpoint_rank::ensure_in` (its DATA half — repair, band
+backfill, weight recompute — stays).
+
+Evidence:
+- `cargo nextest run -p xray-tui-db` — **182 passed, 2 skipped**.
+- `crates/xray-tui-db/tests/schema_migrate.rs` (new, 5 tests): `LATEST ==
+  SCHEMA_VERSION`; a fresh file gets the tables AND both raw columns AND the
+  three raw indexes; a reopen of a current file preserves data (a no-op); three
+  consecutive reopens tolerate the duplicate-column ALTER; an unknown cursor
+  (17) is RECREATED, not migrated (the seeded row is gone).
+- `open_wipes_a_file_with_a_mismatched_schema_tag` (pre-existing) now exercises
+  the `IncompatibleSchema(8)` path; `open_recreates_incompatible_schema` the
+  untagged-foreign path.
+- `open_reopen_preserves_data` / `route_probes_survive_reopen_via_schema_tag`
+  unchanged and green — the "reopen does NOT wipe" acceptance.
+
+### S5 — next
 
