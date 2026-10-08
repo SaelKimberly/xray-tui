@@ -64,8 +64,9 @@ the engine facts cited here).
 
 | Site | What it does | Cause | What the typed path costs | Pinned by |
 | --- | --- | --- | --- | --- |
-| `profiles_query.rs` (whole file) | The Profiles page: count + ordered ids + one-statement hydration, ids inlined; `profiles_walk_page` is the same ordered-id SELECT with NO count (the batch's plan walk asks for the feed-wide total once instead of once per page, which was `O(feed²/200)`); the plan-scope predicate (`rank_tier IN (…)`, bound, shared by the page, the walk and the count, so a scoped batch and its footer cannot drift) | C2 (covering-index ordering), C6 | 488 ms per page typed (`in_list`, ~600 binds) vs 49.6 ms inlined (ADR 0001); a `ROW_NUMBER()` window sort is 1757 ms vs 8.6 ms index-driven (ADR 0003); the scope predicate is an index range on the same covering index, so it costs no extra storage | `every_statement_runs_against_a_pushed_schema` — the only site with a direct statement-vs-schema guard — plus `walk_pages_match_the_page_ids_and_count_once` for the count-free variant and `plan_scopes_select_by_materialized_tier` for the scope |
-| `database.rs` `LINK_UPSERT_PREFIX` + `link_values_sql` + `exec_link_upsert` | `apply_link_patches` and `upsert_links_bulk`: one multi-row `INSERT … VALUES (…),(…) ON CONFLICT(protocol_id, endpoint_id) DO UPDATE …` per (400-row chunk, group action — three groups, so eight bucket shapes) | C1, C5 (`UPDATE … FROM (VALUES …)` is a parse error) | 29.0 ms → 10.0 ms per 512-patch window; 360 ms → 44.3 ms per 2,000 imported links (ADR 0002 amendment 4) | `apply_link_patches_writes_patched_groups_for_every_row`, `…isolates_column_groups`, `…survives_a_stale_snapshot_without_clobbering`, `…applies_a_window_wider_than_one_statement_chunk`, `…upserts_absent_and_near_miss_pairs_exactly`, `link_patch_inserts_a_missing_row_and_refreshes_its_key`; the import path by `subscription_upsert_flow_assembles_group_rows` |
+| `profiles_query.rs` (whole file) | The Profiles page: count + ordered ids + one-statement hydration, ids inlined; `profiles_walk_page` is the same ordered-id SELECT with NO count (the batch's plan walk asks for the feed-wide total once instead of once per page, which was `O(feed²/200)`); the plan-scope predicate (`rank_tier IN (…)`, bound, shared by the page, the walk and the count, so a scoped batch and its footer cannot drift) | C2 (covering-index ordering), C4 (the id-inlined projection runs on the raw `Database::direct` connection, whose uncached `prepare` dodges the driver's unbounded per-text statement cache — see the dated section below), C6 | 488 ms per page typed (`in_list`, ~600 binds) vs 49.6 ms inlined (ADR 0001); a `ROW_NUMBER()` window sort is 1757 ms vs 8.6 ms index-driven (ADR 0003); the scope predicate is an index range on the same covering index, so it costs no extra storage | `every_statement_runs_against_a_pushed_schema` — the only site with a direct statement-vs-schema guard — plus `walk_pages_match_the_page_ids_and_count_once` for the count-free variant and `plan_scopes_select_by_materialized_tier` for the scope |
+| `database.rs` `LINK_UPSERT_PREFIX` + `link_values_sql` + `exec_link_upsert` | `apply_link_patches` and `upsert_links_bulk`: one multi-row `INSERT … VALUES (…),(…) ON CONFLICT(protocol_id, endpoint_id) DO UPDATE …` per (400-row chunk, group action — three groups, so eight bucket shapes) | C1, C4 (the inlined-literal writer runs on the raw write connection via `SqlConn`, or the driver caches a compiled program per window — forever), C5 (`UPDATE … FROM (VALUES …)` is a parse error) | 29.0 ms → 10.0 ms per 512-patch window; 360 ms → 44.3 ms per 2,000 imported links (ADR 0002 amendment 4) | `apply_link_patches_writes_patched_groups_for_every_row`, `…isolates_column_groups`, `…survives_a_stale_snapshot_without_clobbering`, `…applies_a_window_wider_than_one_statement_chunk`, `…upserts_absent_and_near_miss_pairs_exactly`, `link_patch_inserts_a_missing_row_and_refreshes_its_key`; the import path by `subscription_upsert_flow_assembles_group_rows`; the RAW path by `raw_link_window_writes_like_the_pooled_path` |
+| `sql_exec.rs` `SqlConn` seam (`RawConn`, `raw_turso_error`) | One `exec_sql`/`query_sql` surface over a toasty executor OR a raw `turso::Connection`, so the bulk helpers serve both without a second SQL builder; `raw_turso_error` classifies raw contention as retryable | C4 (the driver's `prepare_cached` map is unbounded and keyed by text; the raw connection's `query`/`execute` use the uncached `prepare`), C6 | The statement text is the SAME on both paths (`sql_exec.rs::tests`) — the seam changes the executor, not the SQL | `raw_busy_errors_are_retryable` (contention reaches `retry_on_busy`), `raw_link_window_writes_like_the_pooled_path` (raw == pooled) |
 | `database.rs` `link_patch_conflict_sql` | The per-action `DO UPDATE SET` list — the column-group disjointness, in SQL, for THREE groups (RESULT / PURGE / TRAFFIC) | C1 (the action is per-statement, so the groups must be bucketed) | n/a — this *is* the group contract; `contains`-decided, so an unknown bit cannot drop a group. `purge_reason` is its own group because this action writes a FIXED column set from each patch's snapshot, so riding RESULT would let a phase-1 fast half rewrite a verdict it never classified (ADR 0006) | `apply_link_patches_isolates_column_groups` (seeds a verdict, then proves a stale RESULT-only patch leaves it intact while a PURGE-only patch moves it and nothing else), `link_patches_leave_columns_outside_their_groups_alone`, `subscription_upsert_flow_assembles_group_rows` |
 | `database.rs` PRAGMAs (`user_version`, `journal_mode=WAL`, `busy_timeout`, `synchronous=NORMAL`, `foreign_keys=ON`) | Connection and durability settings, per connection | C3 | `busy_timeout`/`synchronous` never reach pool-created connections if set once at open — that was the "database is locked" storm | Every `Database::open`/`in_memory` call; the tag semantics by `open_wipes_a_file_with_a_mismatched_schema_tag`, `fresh_open_creates_schema_and_sets_user_version_tag`, `open_reopen_preserves_data` |
 | `database.rs` (`sql_lit`, `error_kind_str`, `purge_reason_str`) | Literal escaping and the `CHECK`-constrained storage spellings (the `purge_reason` spellings are toasty's own, verified by a column-shape probe) | C1 (a hand-built statement has no encoder) | A wrong spelling is rejected by the column `CHECK` or the test that runs it, never silently stored | Any test that round-trips an error through the writers — `apply_link_patches_writes_patched_groups_for_every_row`, `page_projection_matches_the_orm_rows` |
@@ -100,6 +101,15 @@ the engine facts cited here).
    `set_query_timeout`, `interrupt`, and `experimental_mvcc_passive_checkpoint`
    are out of reach (RAW SQL is not: `toasty::sql::query/statement` is the
    supported channel and is what every site above uses).
+   **The missing `prepare_cached` control has a measured cost.** The driver's
+   `exec_sql_inner` calls `prepare_cached(sql_str)` for EVERY statement, and the
+   per-connection map it fills is **unbounded and keyed by SQL text**
+   (`turso_sdk_kit-0.7.2/src/rsapi.rs:895`), each entry a compiled
+   `Arc<PreparedProgram>`. An inlined-literal statement is a new text on every
+   call, so the map grew without bound (~116–310 KiB per distinct text,
+   measured) — see the dated section below. The escape hatch is the app's own
+   raw connection (`Database::direct`), whose `turso::Connection::query` uses
+   the UNCACHED `prepare`.
 5. **Schema management** — `push_schema` emits `CREATE TABLE` with no
    `IF NOT EXISTS`, so it runs once, guarded by `PRAGMA user_version`
    (decision 4); a tag mismatch **wipes** the file. There is no migration
@@ -307,3 +317,68 @@ statements and the `retries` count. Without it the tx-scoped callees' deliberate
 write-behind `toasty::query` event with no enclosing `db_method` span, so they all landed in the
 `unattributed` bucket and the public `apply_link_patches` / `set_endpoint_ip_countries` rows read
 zero in production even though those methods were being called.
+
+## The driver's statement cache is unbounded — hydrate on the raw connection (2026-10-08)
+
+**Symptom.** A long session (imports + tests + a feed-wide batch) reached ~1.5 GB RSS on a
+13 MB database. Reproduced headlessly against a copy of a real feed (11,585 endpoints):
+400 page hydrations with fresh ids grew RSS **+123,580 KiB, linear** (~309 KiB/call); the
+same page twice over grew nothing (text-keyed, saturates); `profiles_page` (bound `?N`)
+stayed flat.
+
+**Cause (C4, measured).** `turso_sdk_kit-0.7.2/src/rsapi.rs:895` —
+`TursoConnection.cached_statements: HashMap<String, Arc<CachedStatement>>`: no capacity, no
+eviction. `prepare_cached` (`:1089`) inserts one entry per SQL **text**, each holding a
+compiled `Arc<turso_core::PreparedProgram>`. `toasty-driver-turso-0.11.0/src/lib.rs:1219`
+routes **every** statement through it (`exec_sql_inner`). An inlined-literal statement is a
+new text on every call, so the page hydration (ids inlined for the C6 perf win) compiled and
+retained a program per page — forever. An A/B on identical unique texts: toasty `exec`
+**+34,884 KiB / 300 calls** (~116 KiB/call) against the raw `turso::Connection::query`
+**+0 KiB**.
+
+**Fix.** `turso::Connection::query`/`execute` (`turso-0.7.2/src/connection.rs:110,117`) use
+the UNCACHED `prepare`. `Database::direct` is such a connection (already used by
+`page_ids_direct`); `Database::load_page_projection` now runs its SQL there via `Sql::exec_raw`
+(`turso::Row` → `Value::Record` by storage class, the mirror of the driver's own
+`from_turso_infer` for a raw statement), keeping the inlining perf and dropping the retention.
+A file db takes the raw path; an in-memory db (no second connection) keeps the toasty path,
+which is the oracle the raw path is pinned to (`page_projection_raw_matches_toasty`).
+
+**Measured after:** the same 400 fresh-id hydrations plateau at **+8 MB** (was +123 MB).
+
+**The write side, same owner (2026-10-08).** The leak is not read-only. `WriteBehind<LinkSpec>`
+(and the same `apply_link_patches_tx` / `exec_link_upsert` / `upsert_endpoints_bulk` /
+`upsert_endpoint_group_links_bulk` / `endpoint_rank::write` bodies) INLINE their literals, so a
+flush window's SQL text varies on every call. Measured on a file db, 20-link slice, 200
+windows: an IDENTICAL stamp **saturates at +1,752 KiB**, a varying stamp **grows +26,088 KiB
+linear** — and at 200 links the pre-fix linear growth was **+188,684 KiB**. The typed writers
+(`upsert_protocols_bulk`, `endpoint_ip::set_country`) bind their values, so their text is
+stable and they do NOT leak.
+
+**Fix — the `SqlConn` seam (`sql_exec.rs`).** One trait (`exec_sql`/`query_sql`) with a
+blanket impl over any `toasty::Executor` and an impl for `RawConn(&turso::Connection)` lets the
+SAME helper body serve both: the bulk helpers now take `&mut impl SqlConn`, so the toasty
+callers are unchanged and the RAW path is a drop-in. `CacheSpec` gained `const RAW` +
+`write_window_raw`/`refresh_raw`; `LinkSpec` sets `RAW = true`, and `WriteBehind::flush` opens a
+raw `BEGIN`/`COMMIT` (with `rollback` on ANY failure, including a COMMIT that conflicts under
+MVCC) on a SEPARATE raw write connection (`Database::write_conn`), NOT the reader's `direct` —
+sharing one mutex would serialize every page load behind a write transaction.
+
+**Busy classification is load-bearing on the raw path.** `export::turso_error` flattens every
+turso error to `DatabaseError::Generic`, which `is_busy_error` rejects — so an MVCC commit
+conflict or a WAL wait on the raw connection would be a PERMANENT failure that re-stages the
+window instead of retrying, the one class `retry_on_busy` exists for. `sql_exec::raw_turso_error`
+mirrors the driver's own `classify_turso_error` (`Busy`/`BusySnapshot`, a `"conflict"` message →
+a toasty serialization failure), pinned by `raw_busy_errors_are_retryable`.
+
+**Measured after (write side):** the same 200 varying `WriteBehind<LinkSpec>` windows plateau at
+**+6.5 MB** (was +188 MB). Parity is pinned by `raw_link_window_writes_like_the_pooled_path`
+(a file db — RAW — and an in-memory db — pooled — write byte-identical rows for one patch).
+
+**Still open — the import window.** `SourceSpec::write_window` runs the raw families
+(`upsert_endpoints_bulk`/`upsert_links_bulk`/`upsert_endpoint_group_links_bulk`/
+`insert_literals_bulk`) AND the TYPED `upsert_protocols_bulk` in ONE transaction. A raw turso
+tx and a toasty tx are different sessions, so moving that window to raw needs either a
+hand-built raw protocols INSERT (replicating toasty's enum spellings + config blob) or a
+protocols-first two-tx split (safe: orphan protocols are legal, links-without-protocols are
+not). Not done here.

@@ -29,7 +29,7 @@ use crate::models_toasty::{
 };
 use toasty::Deferred;
 use toasty::schema::Load;
-use toasty_core::stmt::Value;
+use toasty_core::stmt::{Value, ValueRecord};
 use xray_tui_proto::proto_spec::{ProtocolKind, SecurityType, TransportType};
 
 /// Default rows per page.
@@ -202,7 +202,48 @@ impl Sql {
         }
         Ok(out)
     }
+
+    /// Run the statement on the LONG-LIVED direct turso connection and return
+    /// every row as a `Value::Record`, in the shape toasty's own raw-SQL path
+    /// produces.
+    ///
+    /// The toasty driver routes EVERY statement through the connection's
+    /// `prepare_cached`, whose statement map (`turso_sdk_kit::rsapi::
+    /// TursoConnection::cached_statements`) is **unbounded** and keyed by SQL
+    /// text: every distinct statement is compiled and retained for the
+    /// connection's life. The projection's ids are INLINED as literals (see the
+    /// perf note on [`Database::load_page_projection`]), so its text is unique
+    /// per page — a fresh page compiled and cached on every load, ~116-310 KiB
+    /// each, forever. `turso::Connection::query` uses the UNCACHED `prepare`,
+    /// so running the projection here keeps the inlining perf and drops the
+    /// retention.
+    ///
+    /// Values are converted by STORAGE CLASS, exactly as the driver's own
+    /// `from_turso_infer` does for a raw statement (`SqlReturn::Infer`), so the
+    /// shared decoder reads the same `Value`s the toasty path would hand it.
+    async fn exec_raw(&self, conn: &turso::Connection) -> Result<Vec<Value>> {
+        let params: Vec<turso::Value> = self.params.iter().map(to_turso_value).collect();
+        let mut rows = conn
+            .query(self.text.clone(), turso::params_from_iter(params))
+            .await
+            .map_err(crate::export::turso_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(crate::export::turso_error)? {
+            let mut items = Vec::with_capacity(row.column_count());
+            for index in 0..row.column_count() {
+                let value = row.get_value(index).map_err(crate::export::turso_error)?;
+                items.push(from_turso_value(value));
+            }
+            out.push(Value::Record(ValueRecord::from_vec(items)));
+        }
+        Ok(out)
+    }
 }
+
+/// turso `Value` → toasty `Value` by SQLite storage class — the mirror of the
+/// driver's `from_turso_infer`. Kept as a re-export so the seam and this module
+/// cannot drift.
+use crate::sql_exec::from_turso_value;
 
 /// toasty `Value` → turso `Value` (only the page's bind kinds: ints, text, blobs).
 fn to_turso_value(v: &Value) -> turso::Value {
@@ -1101,7 +1142,6 @@ impl Database {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut conn = self.connection().await?;
         let mut sql = Sql::new();
         sql.push("SELECT ");
         sql.push(&PAGE_PROJECTION.join(", "));
@@ -1121,8 +1161,21 @@ impl Database {
         if !include_purged {
             sql.push(" AND ps.purge_reason IS NULL");
         }
-        let rows = sql.exec(&mut conn).await?;
-        drop(conn);
+        // The ids are inlined as literals, so this statement's text is unique
+        // per page. toasty's driver routes every statement through the
+        // connection's `prepare_cached`, whose statement map is unbounded and
+        // keyed by text — so each page's fresh text would compile and retain a
+        // program for the connection's life. Run it on the raw connection
+        // (`query` = uncached `prepare`) when one exists; the toasty path stays
+        // for an in-memory db (no second connection) and is the oracle the raw
+        // path is pinned to (`page_projection_raw_matches_toasty`).
+        let rows = if let Some(direct) = &self.direct {
+            let conn = direct.lock().await;
+            sql.exec_raw(&conn).await?
+        } else {
+            let mut conn = self.connection().await?;
+            sql.exec(&mut conn).await?
+        };
 
         let mut endpoints: HashMap<EndpointId, (Endpoint, Vec<IpAddr>)> = HashMap::new();
         let mut links: HashMap<EndpointId, Vec<ProfileStats>> = HashMap::new();

@@ -454,3 +454,25 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
 - ☐ **`upsert_protocols_bulk` is still one statement per row** — needs writer-side `as_db_label`
   for `TransportType`/`SecurityType`/`ProtocolKind` (each with a DB round-trip test) and the
   confirmed encoding of the two JSON blob columns.
+
+## Phase 32 — Driver statement-cache leak (unbounded, text-keyed) ✅
+
+- ✅ **Root cause found and measured** — `turso_sdk_kit`'s `TursoConnection.cached_statements` is an
+  UNBOUNDED `HashMap` keyed by SQL text (no eviction), and `toasty-driver-turso` routes EVERY
+  statement through `prepare_cached`. Our inlined-literal SQL (ids/values/timestamps — the C6 perf
+  choice) is a new text per call, so each call compiled and retained an `Arc<PreparedProgram>`
+  (~116–310 KiB) forever: `load_page_projection` with fresh ids grew **+123,580 KiB / 400 calls**,
+  a varying `WriteBehind<LinkSpec>` window **+188,684 KiB / 200**. Text-keyed proven both ways (an
+  IDENTICAL text saturates; a varying one climbs). No per-probe leak (engine + hyper-glue loops flat).
+- ✅ **Reads fixed** — `load_page_projection` runs on the raw uncached `Database::direct`
+  connection (`turso::Connection::query` uses `prepare`, not `prepare_cached`): **+123 MB → +8 MB**.
+- ✅ **Writes fixed** — a `SqlConn` seam over a toasty executor OR a raw `turso::Connection` lets the
+  bulk helpers keep one SQL builder; `CacheSpec::RAW` + a raw `BEGIN`/`COMMIT` run
+  `WriteBehind<LinkSpec>` on a SEPARATE raw `Database::write_conn` (not the reader's `direct`):
+  **+188 MB → +6.5 MB**. Raw contention stays retryable (`raw_turso_error`), the raw tx rolls back on
+  any failure including a conflicting MVCC COMMIT, and a file-db vs in-memory parity test pins the
+  raw window against the pooled one.
+- ☐ **The import window still takes the pooled path** — `SourceSpec::write_window` mixes the raw
+  families with the typed `upsert_protocols_bulk` in ONE transaction (a raw tx and a toasty tx are
+  different sessions). Moving it needs a hand-built raw protocols INSERT or a protocols-first
+  two-tx split. See `docs/database-manual-sql.md`.

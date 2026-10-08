@@ -1023,6 +1023,13 @@ async fn page_order_matches_the_rust_oracle_for_every_sort() {
 /// never set (`task_id`, `version`, a dangling `protocol_id`).
 async fn seed_projection_fixture() -> Database {
     let db = Database::in_memory().await.expect("in-memory db");
+    seed_projection_into(&db).await;
+    db
+}
+
+/// Seed the projection fixture into an EXISTING database, so a file-backed one
+/// exercises the raw reader path the in-memory tests fall back past.
+async fn seed_projection_into(db: &Database) {
     let mut conn = db.connection().await.expect("conn");
 
     for stmt in [
@@ -1144,7 +1151,6 @@ async fn seed_projection_fixture() -> Database {
 
     let ids: Vec<EndpointId> = (1..=3).map(EndpointId::new).collect();
     db.refresh_endpoint_ranks(&ids).await.expect("seed ranks");
-    db
 }
 
 fn assert_same_link(typed: &ProfileStats, projected: &ProfileStats, ctx: &str) {
@@ -1171,6 +1177,59 @@ fn assert_same_link(typed: &ProfileStats, projected: &ProfileStats, ctx: &str) {
     assert_eq!(typed.created_at, projected.created_at, "{ctx}: created_at");
     assert_eq!(typed.updated_at, projected.updated_at, "{ctx}: updated_at");
     assert_eq!(typed.version, projected.version, "{ctx}: version");
+}
+
+/// The raw reader (a file db → the direct turso connection, whose `query` uses
+/// the UNCACHED `prepare`) must return exactly what the toasty path does. The
+/// toasty driver caches every statement text in the connection forever, and the
+/// projection inlines the page's ids, so its text is unique per page: the
+/// file-backed path runs in production, and this pins it against the cached
+/// path (the in-memory db, which has no second connection).
+#[tokio::test]
+async fn page_projection_raw_matches_toasty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_db = Database::open(dir.path().join("proj.db"))
+        .await
+        .expect("file db");
+    assert!(file_db.uses_direct_reader(), "a file db has a direct reader");
+    seed_projection_into(&file_db).await;
+    let mem_db = seed_projection_fixture().await;
+
+    let ids: Vec<EndpointId> = (1..=3).map(EndpointId::new).collect();
+    for include_purged in [true, false] {
+        let raw = file_db
+            .load_page_projection(&ids, include_purged)
+            .await
+            .expect("raw rows");
+        let cached = mem_db
+            .load_page_projection(&ids, include_purged)
+            .await
+            .expect("cached rows");
+        let ctx = format!("include_purged = {include_purged}");
+        assert_eq!(raw.len(), cached.len(), "{ctx}: row count");
+        for (raw, cached) in raw.iter().zip(&cached) {
+            assert_eq!(raw.endpoint.id, cached.endpoint.id, "{ctx}: endpoint id");
+            assert_eq!(
+                raw.resolved_ips, cached.resolved_ips,
+                "{ctx}: resolved_ips"
+            );
+            assert_eq!(
+                raw.protocols.len(),
+                cached.protocols.len(),
+                "{ctx}: protocol count"
+            );
+            assert_eq!(raw.links.len(), cached.links.len(), "{ctx}: link count");
+            for (raw, cached) in raw.links.iter().zip(&cached.links) {
+                assert_eq!(
+                    raw.protocol_id, cached.protocol_id,
+                    "{ctx}: link protocol_id"
+                );
+                assert_eq!(raw.latency, cached.latency, "{ctx}: link latency");
+                assert_eq!(raw.error, cached.error, "{ctx}: link error");
+                assert_eq!(raw.traffic, cached.traffic, "{ctx}: link traffic");
+            }
+        }
+    }
 }
 
 /// The projection is the typed hydration's equal: same endpoints, same links

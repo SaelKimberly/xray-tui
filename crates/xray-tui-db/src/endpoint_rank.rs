@@ -588,7 +588,7 @@ async fn scalar_i64(conn: &mut impl toasty::Executor, sql: &str) -> crate::Resul
 /// reads are: they are integers the database produced, never user text, and
 /// the engine charges ~0.8 ms per bound parameter.
 pub(crate) async fn write(
-    conn: &mut impl toasty::Executor,
+    conn: &mut impl crate::sql_exec::SqlConn,
     ranks: &[RankRow],
 ) -> crate::Result<usize> {
     let threshold = crate::models_toasty::now_epoch()
@@ -611,10 +611,9 @@ pub(crate) async fn write(
             })
             .collect::<Vec<_>>()
             .join(",");
-        toasty::sql::query(format!(
+        conn.exec_sql(format!(
             "INSERT OR REPLACE INTO endpoint_rank ({RANK_COLUMNS}) VALUES {values}"
         ))
-        .exec(conn)
         .await?;
         // `band` is a RAW column (not in the toasty model): INSERT OR REPLACE
         // re-inserts the row and nulls it, so re-set it for this chunk — the
@@ -627,12 +626,11 @@ pub(crate) async fn write(
             .map(|row| row.rank.endpoint_id.get().to_string())
             .collect::<Vec<_>>()
             .join(",");
-        toasty::sql::query(format!(
+        conn.exec_sql(format!(
             "UPDATE endpoint_rank SET \
              band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END \
              WHERE endpoint_id IN ({ids})"
         ))
-        .exec(conn)
         .await?;
     }
     Ok(ranks.len())
@@ -904,7 +902,7 @@ pub(crate) async fn repair_missing(conn: &mut impl toasty::Executor) -> crate::R
 /// (patch flush, bulk upsert, error sweep) calls it for the endpoints it
 /// touched, so a stored key is never older than the write that invalidated it.
 pub(crate) async fn refresh(
-    conn: &mut impl toasty::Executor,
+    conn: &mut impl crate::sql_exec::SqlConn,
     endpoint_ids: &[EndpointId],
 ) -> crate::Result<usize> {
     let mut ids: Vec<i64> = endpoint_ids.iter().map(|id| id.get()).collect();
@@ -926,7 +924,8 @@ pub(crate) async fn refresh(
     // load would re-scan the whole protocols table on every flush window. The
     // deferred `config` JSON is NOT touched — nothing in the formula reads it.
     let mut links: HashMap<i64, Vec<RankLink>> = HashMap::new();
-    let rows = toasty::sql::query(format!(
+    let rows = conn
+        .query_sql(format!(
         "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, ps.latency, ps.latency_delay, \
          ps.last_seen_at, ps.speed_bps, ps.traffic_total_up, ps.traffic_total_down, \
          ps.purge_reason, \
@@ -934,8 +933,7 @@ pub(crate) async fn refresh(
          FROM profile_stats ps LEFT JOIN protocols pr ON pr.id = ps.protocol_id \
          WHERE ps.endpoint_id IN ({id_list})"
     ))
-    .exec(conn)
-    .await?;
+        .await?;
     for row in &rows {
         let Value::Record(record) = row else { continue };
         let field = |i: usize| record.fields.get(i);
@@ -996,21 +994,21 @@ pub(crate) async fn refresh(
 }
 
 async fn load_raw_endpoints(
-    conn: &mut impl toasty::Executor,
+    conn: &mut impl crate::sql_exec::SqlConn,
     id_list: &str,
 ) -> crate::Result<HashMap<i64, RawEndpoint>> {
     // The DNS band's input is "has a resolved address", which is a question
     // for `endpoint_ip`, not for the endpoint row — one correlated EXISTS in
     // the statement that already reads the ids, so the refresh stays a single
     // round trip.
-    let rows = toasty::sql::query(format!(
+    let rows = conn
+        .query_sql(format!(
         "SELECT e.id, e.domain, e.sub_domain, \
          (SELECT ip.ip_key FROM endpoint_ip ip WHERE ip.endpoint_id = e.id LIMIT 1), \
          EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id) \
          FROM endpoints e WHERE e.id IN ({id_list})"
     ))
-    .exec(conn)
-    .await?;
+        .await?;
     let mut out = HashMap::new();
     for row in &rows {
         let Value::Record(record) = row else { continue };

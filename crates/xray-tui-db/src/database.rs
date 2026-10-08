@@ -108,6 +108,15 @@ pub struct Database {
     /// in-memory database, where the toasty path is used. The export reader
     /// opens its own per-call connection instead: it is a one-off.
     pub(crate) direct: Option<Arc<tokio::sync::Mutex<turso::Connection>>>,
+    /// A SECOND long-lived raw connection, used ONLY by the inlined-literal
+    /// writers (`WriteBehind<LinkSpec>`) so they run with the UNCACHED
+    /// `prepare` and stop growing the driver's per-text statement cache.
+    ///
+    /// Separate from [`Self::direct`] on purpose: that one serves the page-read
+    /// hot path, and sharing a single mutex would serialize every page load
+    /// behind a write transaction. `None` for an in-memory db, where the writers
+    /// take the pooled toasty path.
+    pub(crate) write_conn: Option<Arc<tokio::sync::Mutex<turso::Connection>>>,
 }
 
 /// Which mutable column groups a [`LinkPatch`] writes.
@@ -217,6 +226,14 @@ async fn open_direct_conn(path: &str, concurrent_writes: bool) -> Result<turso::
     let _ = conn
         .pragma_update("journal_mode", format!("'{journal}'"))
         .await;
+    // The per-connection settings `conn()` applies to every pooled connection:
+    // the raw link writer runs on THIS connection (its inlined-literal upsert
+    // would otherwise grow the driver's unbounded statement cache), and a
+    // concurrent writer must queue behind the lock holder rather than fail
+    // instantly, exactly as the pooled writers do.
+    let _ = conn.pragma_update("busy_timeout", "5000").await;
+    let _ = conn.pragma_update("synchronous", "NORMAL").await;
+    let _ = conn.pragma_update("foreign_keys", "ON").await;
     Ok(conn)
 }
 
@@ -388,12 +405,23 @@ impl Database {
                 None
             }
         };
+        // A second raw connection for the inlined-literal writers (see the
+        // field doc): separate from the reader so a flush never blocks a page
+        // load. A failure degrades to the pooled path, exactly as the reader.
+        let write_conn = match open_direct_conn(path_str, concurrent_writes).await {
+            Ok(c) => Some(Arc::new(tokio::sync::Mutex::new(c))),
+            Err(e) => {
+                tracing::warn!(target: "xray_tui_db", "raw writer unavailable: {e}");
+                None
+            }
+        };
         Ok(Self {
             db,
             concurrent_writes,
             path: Some(PathBuf::from(path_str)),
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
             direct,
+            write_conn,
         })
     }
 
@@ -403,6 +431,18 @@ impl Database {
     #[must_use]
     pub fn uses_direct_reader(&self) -> bool {
         self.direct.is_some()
+    }
+
+    /// The long-lived raw turso connection the inlined-literal WRITERS use,
+    /// when this is a file db.
+    ///
+    /// [`crate::sql_exec::RawConn`] wraps it so those writers run with the
+    /// UNCACHED `prepare` and stop growing the driver's per-text statement
+    /// cache. It is a SEPARATE connection from the reader (see the field docs).
+    /// `None` for an in-memory db; those callers stay on the pooled toasty path.
+    #[must_use]
+    pub(crate) fn write_conn(&self) -> Option<Arc<tokio::sync::Mutex<turso::Connection>>> {
+        self.write_conn.clone()
     }
 
     /// Open a toasty DB by constructing builder. Separate for recovery logic.
@@ -538,6 +578,7 @@ impl Database {
             path: None,
             export_lock: Arc::new(tokio::sync::Mutex::new(())),
             direct: None,
+            write_conn: None,
         })
     }
 
@@ -716,7 +757,7 @@ const LINK_SOURCE_CONFLICT_SQL: &str = " ON CONFLICT(protocol_id, endpoint_id) D
 /// One multi-row upsert statement for a set of rows whose conflict action is
 /// uniform.
 async fn exec_link_upsert(
-    tx: &mut impl Executor,
+    tx: &mut impl crate::sql_exec::SqlConn,
     rows: &[ProfileStats],
     conflict: &str,
     now: i64,
@@ -731,7 +772,7 @@ async fn exec_link_upsert(
             sql.push_str(&link_values_sql(link, now));
         }
         sql.push_str(conflict);
-        toasty::sql::statement(sql).exec(tx).await?;
+        tx.exec_sql(sql).await?;
     }
     Ok(())
 }
@@ -1207,7 +1248,7 @@ impl Database {
     /// `now` is the stamp the rows are written with, for the same reason — the
     /// caller's clock is the driver's.
     pub(crate) async fn apply_link_patches_tx(
-        tx: &mut impl toasty::Executor,
+        tx: &mut impl crate::sql_exec::SqlConn,
         patches: &[LinkPatch],
         now: i64,
     ) -> Result<usize> {
@@ -1250,7 +1291,7 @@ impl Database {
                     sql.push_str(&link_values_sql(&patch.link, now));
                 }
                 sql.push_str(&conflict);
-                toasty::sql::statement(sql).exec(tx).await?;
+                tx.exec_sql(sql).await?;
             }
         }
 
@@ -1887,7 +1928,7 @@ const IMPORT_STATEMENT_ROWS: usize = LINK_STATEMENT_ROWS;
 /// leaves them alone, and an import must not clear an operator's override or
 /// stamp a resolution the resolver owns.
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
-pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> Result<()> {
+pub async fn upsert_endpoints_bulk(tx: &mut impl crate::sql_exec::SqlConn, eps: &[Endpoint]) -> Result<()> {
     use std::fmt::Write as _;
     if eps.is_empty() {
         return Ok(());
@@ -1922,7 +1963,7 @@ pub async fn upsert_endpoints_bulk(tx: &mut impl Executor, eps: &[Endpoint]) -> 
              \"sub_domain\" = excluded.\"sub_domain\", \"port\" = excluded.\"port\", \
              \"ports\" = excluded.\"ports\", \"last_source\" = excluded.\"last_source\"",
         );
-        toasty::sql::statement(sql).exec(tx).await?;
+        tx.exec_sql(sql).await?;
     }
     Ok(())
 }
@@ -1987,7 +2028,7 @@ pub async fn upsert_protocols_bulk(tx: &mut impl Executor, ps: &[Protocol]) -> R
 /// `last_used_at` is likewise never touched here (its owner is
 /// [`Database::update_last_used`]).
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
-pub async fn upsert_links_bulk(tx: &mut impl Executor, links: &[ProfileStats]) -> Result<()> {
+pub async fn upsert_links_bulk(tx: &mut impl crate::sql_exec::SqlConn, links: &[ProfileStats]) -> Result<()> {
     // One multi-row upsert per chunk instead of one typed upsert per row
     // (measured 2026-09-16 over the reference feed: 2,000 links 360 ms → 48 ms).
     exec_link_upsert(tx, links, LINK_SOURCE_CONFLICT_SQL, now_epoch()).await?;
@@ -2034,7 +2075,7 @@ pub async fn set_endpoint_ip_countries_once(
 /// was its own statement. Chunked at 400 that is ~511.
 #[tracing::instrument(target = "db_method", skip_all, fields(retries = tracing::field::Empty))]
 pub async fn upsert_endpoint_group_links_bulk(
-    tx: &mut impl Executor,
+    tx: &mut impl crate::sql_exec::SqlConn,
     egs: &[EndpointGroup],
 ) -> Result<()> {
     use std::fmt::Write as _;
@@ -2066,7 +2107,7 @@ pub async fn upsert_endpoint_group_links_bulk(
              \"last_seen_at\" = excluded.\"last_seen_at\", \
              \"sort_order\" = excluded.\"sort_order\"",
         );
-        toasty::sql::statement(sql).exec(tx).await?;
+        tx.exec_sql(sql).await?;
     }
     Ok(())
 }
