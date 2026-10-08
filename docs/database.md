@@ -232,13 +232,15 @@ routing engine must resolve.
 
 ### Derived state
 
-**`endpoint_rank`** — the materialized per-endpoint ordering keys (ADR 0003).
-Each row is the decision-16 law evaluated for one endpoint over its links; the
-page's default order is an index scan of `endpoint_rank_key`, which is why the
-Profiles tab stays fast at any offset. The values are computed **in Rust** by
-`endpoint_rank::RankLink::key` — the single implementation of the law, shared
-with the panel's link order — and never re-derived in SQL. `rank_bin` is the
-"DNS host with no address" flag; `rank_newest_seen` answers the Active/Purgatory
+**`endpoint_rank`** — the materialized per-endpoint ordering keys (ADR 0003;
+full write-up: `docs/ordering_law.md`). Each row is the decision-16 law
+evaluated for one endpoint over its links; the page's default order is an index
+scan of `endpoint_rank_key`, which is why the Profiles tab stays fast at any
+offset. The values are computed **in Rust** by `endpoint_rank::RankLink::key` —
+the single implementation of the law, shared with the panel's link order — and
+never re-derived in SQL. `rank_bin` is the representative link's coarse delay
+band (real `<50..≥1000` = 0–5, fast = 6–11, untested 12, error 13/14, DNS
+unresolved 15, purged 16); `rank_newest_seen` answers the Active/Purgatory
 window. `rank_weight` is the static config weight (spec
 `2026-10-01-static-config-weight-design`): a compiled prior over the link's
 transport/security discriminators, stored as 8 big-endian bytes so SQL's memcmp
