@@ -1144,7 +1144,7 @@ mod tests {
 
     /// Fresh in-memory DB holding only the scratch probe model.
     async fn probe_db() -> toasty::Db {
-        let driver = toasty_driver_turso::Turso::in_memory();
+        let driver = crate::driver::Turso::in_memory();
         let db = toasty::Db::builder()
             .models(toasty::models!(ScratchEmbedProbe))
             .build(driver)
@@ -1335,7 +1335,7 @@ mod tests {
     /// Endpoint's newtype key column round-trips through the real model.
     #[tokio::test]
     async fn endpoint_id_newtype_column_roundtrip() {
-        let driver = toasty_driver_turso::Turso::in_memory();
+        let driver = crate::driver::Turso::in_memory();
         let mut db = toasty::Db::builder()
             .models(toasty::models!(Endpoint))
             .build(driver)

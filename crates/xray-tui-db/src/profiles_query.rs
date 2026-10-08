@@ -232,7 +232,7 @@ impl Sql {
             let mut items = Vec::with_capacity(row.column_count());
             for index in 0..row.column_count() {
                 let value = row.get_value(index).map_err(crate::export::turso_error)?;
-                items.push(from_turso_value(value));
+                items.push(from_turso_infer(value));
             }
             out.push(Value::Record(ValueRecord::from_vec(items)));
         }
@@ -243,7 +243,7 @@ impl Sql {
 /// turso `Value` → toasty `Value` by SQLite storage class — the mirror of the
 /// driver's `from_turso_infer`. Kept as a re-export so the seam and this module
 /// cannot drift.
-use crate::sql_exec::from_turso_value;
+use crate::driver::from_turso_infer;
 
 /// toasty `Value` → turso `Value` (only the page's bind kinds: ints, text, blobs).
 fn to_turso_value(v: &Value) -> turso::Value {

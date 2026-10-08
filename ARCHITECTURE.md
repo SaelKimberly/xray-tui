@@ -745,34 +745,28 @@ and conflict text as serialization failures. Public DB mutators and rank mainten
 retry whole transaction bodies; `LinkWriter` re-stages failed drained windows.
 `Database::conn()` sets `PRAGMA busy_timeout=5000` on every pooled connection
 acquisition; the pragma in `open()` is per-connection and never reaches
-pool-created conns (the raw `direct`/`write_conn` connections apply the same
+pool-created conns (the raw `direct` connection applies the same
 per-connection pragmas at open). Rank DDL uses `TransactionMode::Immediate` so MVCC data
 transactions do not own schema initialization.
 
-**The driver's statement cache is unbounded — the inlined-literal writers run on
-a raw connection (2026-10-08).** `toasty-driver-turso` routes EVERY statement
-through `turso_sdk_kit`'s `prepare_cached`, whose per-connection map is
-**unbounded and keyed by SQL text**: each distinct statement is compiled
-(`Arc<PreparedProgram>`) and retained for the connection's life. Our bulk writers
-and the page hydration INLINE their literals (ids, values, timestamps) for the
-engine's ~0.8 ms/bind cost, so every call is a new text — a leak measured at
-~116-310 KiB per distinct text (`load_page_projection` with fresh ids grew
-+123,580 KiB over 400 calls; a varying `WriteBehind<LinkSpec>` window
-+188,684 KiB over 200). `turso::Connection::query`/`execute` use the UNCACHED
-`prepare`, so `crates/xray-tui-db/src/sql_exec.rs` is a `SqlConn` seam — one
-`exec_sql`/`query_sql` surface over ANY `toasty::Executor` (blanket impl) OR a
-raw `RawConn(&turso::Connection)`. The bulk helpers take `&mut impl SqlConn`, so
-the toasty callers are unchanged and the RAW path is a drop-in (same SQL, different
-executor). `Database::direct` serves the reads; a SEPARATE `Database::write_conn`
-serves `WriteBehind<LinkSpec>` (RAW) so a flush never serializes behind a page
-load. Both paths go through the driver's own `classify_turso_error` mapping —
-`sql_exec::raw_turso_error` keeps raw contention `Busy` errors RETRYABLE, or
-`retry_on_busy` would re-stage a window that should have been retried — and the
-raw flush rolls back on ANY failure (a conflicting MVCC `COMMIT` included). An
-in-memory db has no raw connection and keeps the pooled path, which is the oracle
-the raw path is pinned against. The import window's raw families STILL take the
-pooled path until its typed `upsert_protocols_bulk` sibling is moved (see
-`docs/database-manual-sql.md`).
+**The statement cache is routed at its boundary — the crate owns its driver (2026-10-08).**
+The published `toasty-driver-turso` routes EVERY statement through
+`turso_sdk_kit`'s `prepare_cached`, whose per-connection map is **unbounded and
+keyed by SQL text**: each distinct statement is compiled and retained for the
+connection's life. Our bulk writers INLINE their literals (ids, values,
+timestamps) for the engine's ~0.8 ms/bind cost, so every call is a new text —
+a leak measured at ~116-310 KiB per distinct text. The crate now vendors a
+LOCAL-ONLY fork of that driver (`crates/xray-tui-db/src/driver/`, from toasty
+`main` at its `turso = "0.8"` bump) and routes each `Operation` by whether its
+text is stable: `RawSql` (the inlined-literal bulk statements) → the UNCACHED
+`prepare`; `Insert`/`QuerySql` (engine-generated) → `prepare_cached`. That
+boundary IS the fix, with no LRU or counter. So the retired `SqlConn`/`RawConn`
+seam and `Database::write_conn` are gone: the bulk writers run on the POOLED
+driver and keep their literal-inlining win. `Database::direct` (the page's
+execution-layer bypass, ~80x read win) stays. Contention classification
+(`driver::error::classify_turso_error`) keeps `Busy`/`BusySnapshot`/`conflict`
+errors RETRYABLE, or `retry_on_busy` would re-stage a window that should have
+been retried. See `docs/database-manual-sql.md`.
 
 **Journal mode:** fresh/recreated file DBs default to WAL. **WAL is deliberate** (2026-10-02): an A/B on synthetic feeds found MVCC **1.2-4.8x slower** than WAL at 32 concurrent writers, so MVCC stays opt-in behind `XRAY_TUI_TURSO_CONCURRENT_WRITES=1`.
 

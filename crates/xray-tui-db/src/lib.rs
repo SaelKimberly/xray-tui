@@ -18,11 +18,11 @@ pub use write_behind::{
 };
 pub use xray_tui_proto::proto_spec::weight;
 
-mod database;
+pub mod database;
+pub mod driver;
 pub mod endpoint_ip;
 pub mod endpoint_rank;
 pub mod export;
 pub mod profiles_query;
 mod retry;
-pub mod sql_exec;
 pub mod write_behind;

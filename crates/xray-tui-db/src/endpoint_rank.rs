@@ -20,8 +20,8 @@ use toasty_core::driver::operation::TransactionMode;
 use toasty_core::stmt::Value;
 
 use crate::models_toasty::{
-    Endpoint, EndpointId, EndpointRank, EndpointRow, Latency, ProfileErr,
-    ProfileStats, Protocol, ProtocolId,
+    Endpoint, EndpointId, EndpointRank, EndpointRow, Latency, ProfileErr, ProfileStats, Protocol,
+    ProtocolId,
 };
 use xray_tui_proto::proto_spec::{
     SecurityType, TransportType,
@@ -478,11 +478,7 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     // which would keep serving the new ORDER BY and drop the page back to the
     // ~240 ms filesort. The old index is left in place (it costs only write
     // time) so a rollback still has one.
-    for ddl in [
-        COVERING_INDEX,
-        BAND_WINDOW_INDEX,
-        WEIGHT_META_TABLE,
-    ] {
+    for ddl in [COVERING_INDEX, BAND_WINDOW_INDEX, WEIGHT_META_TABLE] {
         toasty::sql::query(ddl).exec(conn).await?;
     }
     // The compiled weight tables are opinions that live in code, so an upgrade
@@ -588,7 +584,7 @@ async fn scalar_i64(conn: &mut impl toasty::Executor, sql: &str) -> crate::Resul
 /// reads are: they are integers the database produced, never user text, and
 /// the engine charges ~0.8 ms per bound parameter.
 pub(crate) async fn write(
-    conn: &mut impl crate::sql_exec::SqlConn,
+    conn: &mut impl toasty::Executor,
     ranks: &[RankRow],
 ) -> crate::Result<usize> {
     let threshold = crate::models_toasty::now_epoch()
@@ -611,9 +607,10 @@ pub(crate) async fn write(
             })
             .collect::<Vec<_>>()
             .join(",");
-        conn.exec_sql(format!(
+        toasty::sql::statement(format!(
             "INSERT OR REPLACE INTO endpoint_rank ({RANK_COLUMNS}) VALUES {values}"
         ))
+        .exec(conn)
         .await?;
         // `band` is a RAW column (not in the toasty model): INSERT OR REPLACE
         // re-inserts the row and nulls it, so re-set it for this chunk — the
@@ -626,11 +623,12 @@ pub(crate) async fn write(
             .map(|row| row.rank.endpoint_id.get().to_string())
             .collect::<Vec<_>>()
             .join(",");
-        conn.exec_sql(format!(
+        toasty::sql::statement(format!(
             "UPDATE endpoint_rank SET \
              band = CASE WHEN rank_newest_seen >= {threshold} THEN 0 ELSE 1 END \
              WHERE endpoint_id IN ({ids})"
         ))
+        .exec(conn)
         .await?;
     }
     Ok(ranks.len())
@@ -821,7 +819,10 @@ pub(crate) async fn backfill_all(conn: &mut impl toasty::Executor) -> crate::Res
         .into_iter()
         .filter_map(|endpoint| {
             let links = by_endpoint.remove(&endpoint.id)?;
-            let addr = addr_keys.get(&endpoint.id.get()).cloned().unwrap_or_default();
+            let addr = addr_keys
+                .get(&endpoint.id.get())
+                .cloned()
+                .unwrap_or_default();
             compute_rank(
                 endpoint.id,
                 &endpoint.domain,
@@ -902,7 +903,7 @@ pub(crate) async fn repair_missing(conn: &mut impl toasty::Executor) -> crate::R
 /// (patch flush, bulk upsert, error sweep) calls it for the endpoints it
 /// touched, so a stored key is never older than the write that invalidated it.
 pub(crate) async fn refresh(
-    conn: &mut impl crate::sql_exec::SqlConn,
+    conn: &mut impl toasty::Executor,
     endpoint_ids: &[EndpointId],
 ) -> crate::Result<usize> {
     let mut ids: Vec<i64> = endpoint_ids.iter().map(|id| id.get()).collect();
@@ -924,8 +925,7 @@ pub(crate) async fn refresh(
     // load would re-scan the whole protocols table on every flush window. The
     // deferred `config` JSON is NOT touched — nothing in the formula reads it.
     let mut links: HashMap<i64, Vec<RankLink>> = HashMap::new();
-    let rows = conn
-        .query_sql(format!(
+    let rows = toasty::sql::query(format!(
         "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, ps.latency, ps.latency_delay, \
          ps.last_seen_at, ps.speed_bps, ps.traffic_total_up, ps.traffic_total_down, \
          ps.purge_reason, \
@@ -933,7 +933,8 @@ pub(crate) async fn refresh(
          FROM profile_stats ps LEFT JOIN protocols pr ON pr.id = ps.protocol_id \
          WHERE ps.endpoint_id IN ({id_list})"
     ))
-        .await?;
+    .exec(conn)
+    .await?;
     for row in &rows {
         let Value::Record(record) = row else { continue };
         let field = |i: usize| record.fields.get(i);
@@ -994,21 +995,21 @@ pub(crate) async fn refresh(
 }
 
 async fn load_raw_endpoints(
-    conn: &mut impl crate::sql_exec::SqlConn,
+    conn: &mut impl toasty::Executor,
     id_list: &str,
 ) -> crate::Result<HashMap<i64, RawEndpoint>> {
     // The DNS band's input is "has a resolved address", which is a question
     // for `endpoint_ip`, not for the endpoint row — one correlated EXISTS in
     // the statement that already reads the ids, so the refresh stays a single
     // round trip.
-    let rows = conn
-        .query_sql(format!(
+    let rows = toasty::sql::query(format!(
         "SELECT e.id, e.domain, e.sub_domain, \
          (SELECT ip.ip_key FROM endpoint_ip ip WHERE ip.endpoint_id = e.id LIMIT 1), \
          EXISTS (SELECT 1 FROM endpoint_ip ip WHERE ip.endpoint_id = e.id) \
          FROM endpoints e WHERE e.id IN ({id_list})"
     ))
-        .await?;
+    .exec(conn)
+    .await?;
     let mut out = HashMap::new();
     for row in &rows {
         let Value::Record(record) = row else { continue };
@@ -1113,7 +1114,11 @@ mod tests {
         heavy.weight = weight(10);
         let mut light = link(2, Some(true), 940, 10);
         light.weight = weight(2);
-        assert_eq!(heavy.key(false).0, light.key(false).0, "same bin (≥1000? no: both <1000)");
+        assert_eq!(
+            heavy.key(false).0,
+            light.key(false).0,
+            "same bin (≥1000? no: both <1000)"
+        );
         assert!(
             heavy.key(false) < light.key(false),
             "the heavier stack leads inside one bin"
@@ -1123,11 +1128,17 @@ mod tests {
         let fast = link(3, Some(true), 40, 10);
         let mut slow_heavy = link(4, Some(true), 900, 10);
         slow_heavy.weight = weight(10);
-        assert!(fast.key(false) < slow_heavy.key(false), "40ms bin 0 leads 900ms bin 4");
+        assert!(
+            fast.key(false) < slow_heavy.key(false),
+            "40ms bin 0 leads 900ms bin 4"
+        );
         // …and a measured success never leads a failed link.
         let mut failed = link(4, Some(true), 900, 10);
         failed.error_kind = Some(ProfileErr::Real);
-        assert!(fast.key(false) < failed.key(false), "success leads a failed link");
+        assert!(
+            fast.key(false) < failed.key(false),
+            "success leads a failed link"
+        );
     }
 
     #[test]

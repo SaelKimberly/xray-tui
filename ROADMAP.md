@@ -466,13 +466,14 @@ batch). Plan: `docs/aegis/plans/2026-10-02-write-contention-and-dns-timing-fixes
   IDENTICAL text saturates; a varying one climbs). No per-probe leak (engine + hyper-glue loops flat).
 - ✅ **Reads fixed** — `load_page_projection` runs on the raw uncached `Database::direct`
   connection (`turso::Connection::query` uses `prepare`, not `prepare_cached`): **+123 MB → +8 MB**.
-- ✅ **Writes fixed** — a `SqlConn` seam over a toasty executor OR a raw `turso::Connection` lets the
-  bulk helpers keep one SQL builder; `CacheSpec::RAW` + a raw `BEGIN`/`COMMIT` run
-  `WriteBehind<LinkSpec>` on a SEPARATE raw `Database::write_conn` (not the reader's `direct`):
-  **+188 MB → +6.5 MB**. Raw contention stays retryable (`raw_turso_error`), the raw tx rolls back on
-  any failure including a conflicting MVCC COMMIT, and a file-db vs in-memory parity test pins the
-  raw window against the pooled one.
-- ☐ **The import window still takes the pooled path** — `SourceSpec::write_window` mixes the raw
-  families with the typed `upsert_protocols_bulk` in ONE transaction (a raw tx and a toasty tx are
-  different sessions). Moving it needs a hand-built raw protocols INSERT or a protocols-first
-  two-tx split. See `docs/database-manual-sql.md`.
+- ✅ **Writes fixed** — the crate now OWNS a local-only driver fork (`crates/xray-tui-db/src/driver/`,
+  from toasty `main` at its `turso = "0.8"` bump) whose `Connection::exec` routes `Operation::RawSql`
+  (the inlined-literal bulk statements) through the UNCACHED `prepare` and `Insert`/`QuerySql` through
+  `prepare_cached`: **+188 MB → plateau**. The old `SqlConn`/`RawConn` seam, `CacheSpec::RAW`,
+  `write_window_raw`/`refresh_raw` and `Database::write_conn` are RETIRED — the bulk writers run on the
+  pooled driver and keep their literal-inlining win. Contention stays retryable
+  (`driver::error::classify_turso_error`), and a file-db link-window test pins the write path.
+- ✅ **The import window is one transaction** — retired with the seam: every helper takes
+  `&mut impl toasty::Executor`, so `SourceSpec::write_window`'s raw families and the typed
+  `upsert_protocols_bulk` run on ONE pooled transaction, with the inlined-literal statements served
+  by the fork's uncached `RawSql` route. See `docs/database-manual-sql.md`.

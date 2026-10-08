@@ -6,10 +6,15 @@ license.workspace = true
 
 [dependencies]
 # ============ ORM ============
-toasty = { workspace = true, features = ["turso", "serde", "jiff"] }
-toasty-driver-turso = "0.11"
+# `turso` here is the DRIVER only: the vendored local-only fork
+# (`src/driver/`) replaces `toasty-driver-turso`, so the `turso` feature is
+# deliberately NOT enabled on `toasty` (else upstream's driver would return
+# via the feature flag and dual-resolve its own turso pin).
+toasty = { workspace = true, features = ["serde", "jiff"] }
 toasty-core = "0.11"
-turso = "0.7.2"
+toasty-sql = "0.11"
+turso = "0.8"
+async-trait = "0.1"
 
 # ============ Time ============
 jiff = { workspace = true }
@@ -39,7 +44,7 @@ workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
-toasty = { workspace = true, features = ["turso", "serde", "jiff"] }
+toasty = { workspace = true, features = ["serde", "jiff"] }
 jiff = { workspace = true }
 xray-tui-proto = { path = "../xray-tui-proto", version = "0.1.0" }
 tempfile.workspace = true

@@ -123,38 +123,6 @@ pub trait CacheSpec: Send + Sync + 'static {
         patches: &'a [Self::Patch],
     ) -> impl Future<Output = crate::Result<()>> + Send + 'a;
 
-    /// Whether the driver runs this spec's window on the RAW, UNCACHED
-    /// connection ([`crate::sql_exec::RawConn`]) instead of the pooled toasty
-    /// executor.
-    ///
-    /// True for a spec whose statements INLINE their literals (see the module
-    /// header): such a window's SQL text varies on every call, and the toasty
-    /// driver caches one compiled program per distinct text — forever. The raw
-    /// path uses the uncached `prepare`, so the inlining perf stays and the
-    /// retention goes. A spec whose statements are bound (stable text) leaves
-    /// this `false` and keeps the cache.
-    const RAW: bool = false;
-
-    /// The RAW-path window (called only when [`Self::RAW`] and a direct
-    /// connection exists). The driver owns the transaction. The default is
-    /// unreachable: a `RAW = false` spec never takes this path.
-    fn write_window_raw<'a>(
-        conn: &'a turso::Connection,
-        patches: &'a [Self::Patch],
-    ) -> impl Future<Output = crate::Result<usize>> + Send + 'a {
-        let _ = (conn, patches);
-        async { unreachable!("write_window_raw on a non-raw spec") }
-    }
-
-    /// The RAW-path refresh (called only when [`Self::RAW`]).
-    fn refresh_raw<'a>(
-        conn: &'a turso::Connection,
-        patches: &'a [Self::Patch],
-    ) -> impl Future<Output = crate::Result<()>> + Send + 'a {
-        let _ = (conn, patches);
-        async { unreachable!("refresh_raw on a non-raw spec") }
-    }
-
     /// The pending entries a drained row is re-staged as after a failed write.
     ///
     /// Defaults to the identity: one row, under the key it was drained from.
@@ -329,7 +297,7 @@ impl<S: CacheSpec> WriteBehind<S> {
     )]
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "the raw transaction must hold the connection guard across its window, refresh and commit; dropping the guard early would release the transaction before COMMIT"
+        reason = "the transaction must hold the connection guard across its window, refresh and commit; dropping the guard early would release the transaction before COMMIT"
     )]
     pub async fn flush(&self) -> crate::Result<usize> {
         let _guard = self.gate.lock().await;
@@ -355,47 +323,6 @@ impl<S: CacheSpec> WriteBehind<S> {
                 move || {
                     let db = Arc::clone(&db);
                     async move {
-                        // A raw spec runs its inlined-literal window on the
-                        // UNCACHED connection when one exists (a file db). An
-                        // in-memory db has none, so it falls through to the
-                        // pooled path — which is also the oracle the raw path
-                        // is pinned against.
-                        if S::RAW
-                            && let Some(direct) = db.write_conn()
-                        {
-                            let conn = direct.lock().await;
-                            let begin = if db.uses_concurrent_writes() {
-                                "BEGIN CONCURRENT"
-                            } else {
-                                "BEGIN"
-                            };
-                            conn.execute(begin, ())
-                                .await
-                                .map_err(crate::sql_exec::raw_turso_error)?;
-                            // Both the window AND the COMMIT: under MVCC a
-                            // `BEGIN CONCURRENT` conflict surfaces AT COMMIT,
-                            // and a leftover open transaction would make the
-                            // retry's `BEGIN` fail ("within a transaction") and
-                            // stay broken — so ANY failure rolls back.
-                            let result = match async {
-                                let n = S::write_window_raw(&conn, chunk).await?;
-                                S::refresh_raw(&conn, chunk).await?;
-                                Ok::<usize, crate::DatabaseError>(n)
-                            }
-                            .await
-                            {
-                                Ok(n) => conn
-                                    .execute("COMMIT", ())
-                                    .await
-                                    .map(|_| n)
-                                    .map_err(crate::sql_exec::raw_turso_error),
-                                Err(e) => Err(e),
-                            };
-                            if result.is_err() {
-                                let _ = conn.execute("ROLLBACK", ()).await;
-                            }
-                            return result;
-                        }
                         let mut conn = db.connection().await?;
                         let mut tx = conn.transaction().await?;
                         let n = S::write_window(&mut tx, chunk).await?;
@@ -905,38 +832,6 @@ impl CacheSpec for LinkSpec {
 
     fn key_of(row: &Self::Row) -> Self::Key {
         (row.link.protocol_id, row.link.endpoint_id, row.groups)
-    }
-
-    /// The link upsert INLINES its literals (ids, latencies, error text, the
-    /// epoch stamp), so a flush window is a new SQL text every time — and the
-    /// toasty driver caches every distinct text forever (measured: a 20-link
-    /// window with an identical stamp saturates at +1,752 KiB; with a varying
-    /// stamp it grows +26,088 KiB over 200 windows). Run it on the raw
-    /// connection.
-    const RAW: bool = true;
-
-    async fn write_window_raw(
-        conn: &turso::Connection,
-        patches: &[Self::Patch],
-    ) -> crate::Result<usize> {
-        if patches.is_empty() {
-            return Ok(0);
-        }
-        crate::database::Database::apply_link_patches_tx(
-            &mut crate::sql_exec::RawConn(conn),
-            patches,
-            crate::models_toasty::now_epoch(),
-        )
-        .await
-    }
-
-    async fn refresh_raw(conn: &turso::Connection, patches: &[Self::Patch]) -> crate::Result<()> {
-        let mut touched: Vec<crate::models_toasty::EndpointId> =
-            patches.iter().map(|p| p.link.endpoint_id).collect();
-        touched.sort_unstable();
-        touched.dedup();
-        crate::endpoint_rank::refresh(&mut crate::sql_exec::RawConn(conn), &touched).await?;
-        Ok(())
     }
 
     /// The old `LinkWriter::drain` merge, verbatim: one patch per link, the
@@ -1594,14 +1489,12 @@ mod tests {
 
     use super::{SourceBatch, SourceSpec};
     use crate::models_toasty::{
-        Endpoint, HostType, ProfileStats, Protocol, ProtocolId, Security, TrafficStats,
-        Transport,
+        Endpoint, HostType, ProfileStats, Protocol, ProtocolId, Security, TrafficStats, Transport,
     };
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
-ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
-        VlessConfig,
+        ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType, VlessConfig,
     };
 
     /// A protocol row with its JSON columns LOADED — `upsert_protocols_bulk`
@@ -1834,30 +1727,29 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         row
     }
 
-    /// The RAW path (a FILE db, uncached `prepare`) must write EXACTLY what the
-    /// pooled toasty path writes. The in-memory tests only ever take the pooled
-    /// path — a file db is what routes `WriteBehind<LinkSpec>` through
-    /// `write_window_raw`/`refresh_raw`, so this is the only test that runs the
-    /// production link-writer path against its toasty twin (the leak fix's
-    /// whole point, and the guard a divergence in `apply_link_patches_tx`-on-
-    /// `RawConn` would trip).
+    /// A FILE db's link window writes the staged values.
+    ///
+    /// A file db is the only configuration that opens a pooled driver over an
+    /// on-disk database (with its WAL/sidecar handling), so it is the one path
+    /// the in-memory tests do not exercise. Asserted directly, since there is
+    /// only one write path now.
     #[tokio::test]
-    async fn raw_link_window_writes_like_the_pooled_path() {
+    async fn file_db_link_window_writes_the_staged_values() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_db = Arc::new(
-            crate::Database::open(dir.path().join("raw.db"))
+            crate::Database::open(dir.path().join("file.db"))
                 .await
                 .expect("file db"),
         );
-        assert!(file_db.uses_direct_reader(), "a file db takes the RAW path");
-        let mem_db = Arc::new(crate::Database::in_memory().await.expect("mem db"));
-        for db in [&file_db, &mem_db] {
-            db.upsert_endpoint(&endpoint_row(1)).await.expect("endpoint");
-            db.upsert_protocol(&loaded_protocol(1))
-                .await
-                .expect("protocol");
-            db.upsert_link(&link_row(1)).await.expect("link");
-        }
+        file_db
+            .upsert_endpoint(&endpoint_row(1))
+            .await
+            .expect("endpoint");
+        file_db
+            .upsert_protocol(&loaded_protocol(1))
+            .await
+            .expect("protocol");
+        file_db.upsert_link(&link_row(1)).await.expect("link");
 
         let seeded = link_row(1);
         let mut row = link_row(1);
@@ -1869,26 +1761,17 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
         row.last_seen_at = 1_700_000_123;
         row.purge_reason = Some(PurgeReason::NotTls);
 
-        let mut stored = Vec::new();
-        for db in [&file_db, &mem_db] {
-            let driver =
-                WriteBehind::<LinkSpec>::new(Arc::clone(db), 512, Duration::from_millis(200));
-            driver.stage(&row, LinkGroups::RESULT.union(LinkGroups::PURGE));
-            assert_eq!(driver.flush().await.expect("flush"), 1, "one link written");
-            stored.push(stored_link(db, 1).await);
-        }
+        let driver =
+            WriteBehind::<LinkSpec>::new(Arc::clone(&file_db), 512, Duration::from_millis(200));
+        driver.stage(&row, LinkGroups::RESULT.union(LinkGroups::PURGE));
+        assert_eq!(driver.flush().await.expect("flush"), 1, "one link written");
 
-        // Raw (file) and pooled (in-memory) must be byte-identical.
-        assert_eq!(stored[0].latency, stored[1].latency, "raw == pooled latency");
-        assert_eq!(stored[0].error, stored[1].error, "raw == pooled error");
+        let stored = stored_link(&file_db, 1).await;
+        assert_eq!(stored.latency, Some(Latency::Fast { delay: 42 }));
+        assert_eq!(stored.error.as_ref().map(|e| e.text.as_str()), Some("boom"));
+        assert_eq!(stored.purge_reason, Some(PurgeReason::NotTls));
         assert_eq!(
-            stored[0].purge_reason, stored[1].purge_reason,
-            "raw == pooled purge verdict"
-        );
-        // And the raw path actually wrote the staged values.
-        assert_eq!(stored[0].latency, Some(Latency::Fast { delay: 42 }));
-        assert_eq!(
-            stored[0].last_seen_at, seeded.last_seen_at,
+            stored.last_seen_at, seeded.last_seen_at,
             "a RESULT|PURGE patch does not own last_seen_at, so it is untouched"
         );
     }
