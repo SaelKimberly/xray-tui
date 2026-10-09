@@ -511,5 +511,51 @@ Evidence:
 - `open_reopen_preserves_data` / `route_probes_survive_reopen_via_schema_tag`
   unchanged and green — the "reopen does NOT wipe" acceptance.
 
-### S5 — next
+### S5 — PROBED AND REJECTED (2026-10-08), with an empirical reproduction
+
+`REFERENCES … ON DELETE CASCADE` on the derived child tables was implemented
+(the crate's own driver fork splices a TABLE-LEVEL FK into each
+`CREATE TABLE`, since toasty's db `Schema` carries no relation info and
+`push_schema` cannot emit one) and then **reverted**: the cascade creates a
+delete-race WEDGE that the manual ordered deletes do not have.
+
+The reproduction (`crates/xray-tui-db/tests/foreign_keys.rs`, written, run, then
+deleted with the revert): seed an endpoint, `delete_endpoints` it, then run the
+DEFERRED country write for it — the same ordering the geo queue produces, because
+`ops::enrich::queue_country` pushes into the `WriteBehind<CountrySpec>` driver
+with **no existence re-check** and the flush runs up to `GEO_DRAIN_INTERVAL`
+(5 s) later. Measured output:
+
+```
+country_write_for_a_deleted_endpoint_is_reported ... GEO AFTER DELETE: Err(toasty error: FOREIGN KEY constraint failed)
+```
+
+`endpoint_ip::set_country`'s MISSING-row arm CREATES the row ("the lookup and
+the address write race by design"); before the FK that was a harmless insert,
+with the FK it is a violation → `WriteBehind::flush` re-stages the window AND
+every later one and returns `Err`, permanently wedging ALL country writes.
+
+`endpoint_rank` has the same defect by a different route: `LinkSpec::refresh`
+runs `endpoint_rank::refresh` → `write` (`INSERT OR REPLACE INTO endpoint_rank`)
+INSIDE the write-behind transaction for every touched endpoint, so a link patch
+that races a delete inserts a rank row for a dead endpoint — the LINK writer
+(every ping result) then wedges the same way. (`apply_link_patches_once`'s
+post-commit refresh swallows the error, so that path degrades to a silently
+missing rank row instead — also wrong.)
+
+**What this does NOT change:** the manual ordered deletes already provide the
+cascade correctly and transactionally — `delete_endpoints_once` and
+`purge_expired_once` run `endpoint_ip::delete_for` + `endpoint_rank::prune`
+inside the SAME transaction that deletes the endpoint. FK cascade was a belt to
+those braces, and the belt is the thing that breaks.
+
+**Disposition:** T12 is REJECTED, not deferred. Do not re-add these FKs without
+also making every rank/address writer skip a missing parent — and note that
+would be MORE code than the manual deletes it would replace. Recorded in the
+spec §2 D6 and ADR 0011. `profile_stats`/`endpoint_groups` FKs were also
+rejected: their parent is not guaranteed to exist first (the import writes links
+and group links independently of their parents — 9 fixtures failed on it), so a
+constraint there is simply wrong.
+
+### S6 — next
 

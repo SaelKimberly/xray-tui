@@ -106,12 +106,23 @@ becomes a real option to measure rather than a blocked one.
   trap and the bump lands at S0a. **D keeps toasty's engine** — it is NOT full
   removal; it wins on 0.8 + DDL ownership + the cache leak only (§12.3), and its
   turso-level half is reused if staged-A later follows.
-- **D6 — T12 becomes reachable; T14 does NOT.** Hand-owned DDL means
-  `REFERENCES … ON DELETE CASCADE` can be emitted (rowid tables accept FK
-  cascade) → T12 unblocked. T14 (`WITHOUT ROWID`) is **engine**-blocked: turso
-  refuses DELETE/UPDATE on WR tables independent of who writes the CREATE (0.8.2
-  `delete.rs:51`, `update.rs:261`). ADR 0011 already notes T12 and T14 cannot
-  both apply to the same table (turso rejects FK on WR tables).
+- **D6 — T12 and T14 are both rejected/deferred, for different reasons.**
+  T14 (`WITHOUT ROWID`) is **engine**-blocked: turso refuses DELETE/UPDATE on WR
+  tables independent of who writes the CREATE (0.8.2 `delete.rs:51`,
+  `update.rs:261`). **T12 (`REFERENCES … ON DELETE CASCADE`) was implemented and
+  REVERTED** (S5, 2026-10-08): the driver fork CAN emit the clause (a table-level
+  FK spliced into `CREATE TABLE`, since toasty's db `Schema` carries no relation
+  info), but the cascade introduces a delete-race WEDGE. `set_country`'s
+  missing-row arm CREATES its row (the geo queue pushes with no existence
+  re-check, flushed up to 5 s later), and `LinkSpec::refresh` inserts rank rows
+  inside the write-behind transaction — so a delete that races either makes the
+  flush take the create path for a dead endpoint, raise `FOREIGN KEY constraint
+  failed`, and `WriteBehind` re-stage the window and every later one forever.
+  Measured: `GEO AFTER DELETE: Err(FOREIGN KEY constraint failed)`. The manual
+  ordered deletes (`endpoint_ip::delete_for`, `endpoint_rank::prune`, both
+  already inside the deleting transaction) provide the cascade correctly, so the
+  FK is a belt that is the thing that breaks. **Not to be re-added without also
+  making every rank/address writer skip a missing parent.**
 
 **In-scope workstream (after the S1–S3 deferral): S0a + S0b (driver fork) → S4
 (migrations) → S5 (T12 FK) → S6 (MVCC).** It still delivers the three measured
@@ -336,7 +347,7 @@ need explicit owners. Resolution:
 | **S2 (DEFERRED)** | `adapter/` + port `profiles_query::Projection` / `export` decode | — | deferred 2026-10-08 |
 | **S3 (DEFERRED)** | `Model` derive + batch builders (raw writers) | — | deferred 2026-10-08 |
 | **S4** | `schema/` module: ALL DDL into the versioned list; the fork's `push_schema` body swaps from `create_table` → `schema::migrate` (open() unchanged); re-express "incompatible file" as an explicit tag/schema check (the old signal was `push_schema` FAILING) | open/migration tests | **DDL/index consolidation (the user's ask)** |
-| **S5** | Keep toasty for the typed query layer; T12 FK cascade + per-connection `foreign_keys=ON`. (No `db_monitor` change — §12.4.) | workspace suite | T12 shipped |
+| **S5 (REJECTED)** | T12 FK cascade was tried and reverted — it wedges the geo/link write-behind on a delete race (see D6). The manual ordered deletes stay the cascade owner. | — | decided: no FK |
 | **S6** | Re-benchmark MVCC on 0.8 (`experimental_mvcc_passive_checkpoint`); decide MVCC-default | `flow_cost` + a real-feed A/B | the MVCC decision, measured |
 | **S7 (UNPLANNED)** | Full toasty removal (adapter + macro replace the query layer) — **requires the deferred S1–S3** | — | not reachable without S1–S3 |
 
@@ -402,8 +413,9 @@ optional.
   probe), and a foreign/unsupported file must be detected — never silently
   migrated into a broken shape. Pinned by a test that opens a foreign-tagged file
   and asserts the wipe/recreate path fires.
-- **S5:** T12 FK cascade fires through a *pooled* connection (not only the
-  `open()` one); `PRAGMA foreign_keys=ON` present in `conn()`.
+- **(REJECTED) S5:** T12 FK cascade was implemented, reproduced as a
+  delete-race wedge (`GEO AFTER DELETE: Err(FOREIGN KEY constraint failed)`),
+  and reverted. The manual ordered deletes remain the cascade owner.
 - **S6:** MVCC vs WAL A/B on a real-feed copy, reporting total wall time,
   p50/p95/p99 wait, conflicts/retries, checkpoint viability — the input to the
   MVCC-default decision.
