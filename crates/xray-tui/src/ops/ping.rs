@@ -15,8 +15,7 @@ use xray_tui_db::Database;
 use xray_tui_db::LinkGroups;
 use xray_tui_db::models::Protocol as DbProtocol;
 use xray_tui_db::models::{
-    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, PurgatoryView,
-    TaskKind,
+    Endpoint, EndpointId, EndpointRow, Latency, ProfileStats, ProtocolId, PurgatoryView, TaskKind,
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_native::capability;
@@ -618,7 +617,10 @@ fn dial_host(endpoint: &Endpoint, addresses: &[std::net::IpAddr]) -> String {
     if endpoint.is_dns() {
         endpoint.dns_name()
     } else {
-        addresses.first().map(ToString::to_string).unwrap_or_default()
+        addresses
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_default()
     }
 }
 
@@ -1453,8 +1455,17 @@ const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 /// markers older than the configured TTL are cleared before the terminal event
 /// lands. Links the batch did not touch (dedup-retired siblings, queue-full/stop
 /// skips) are exactly the ones whose stale markers this clears.
-const fn wal_checkpoint_enabled(concurrent_writes: bool) -> bool {
-    !concurrent_writes
+/// Whether the batch end runs `wal_checkpoint(PASSIVE)`.
+///
+/// It used to be `!concurrent_writes`, because under MVCC the engine rejected
+/// the statement outright ("PASSIVE checkpoint requires
+/// experimental_mvcc_passive_checkpoint") — so an MVCC database grew its logical
+/// log unbounded for the whole process life. `file_driver` now sets that flag
+/// with the MVCC opt-in, so the statement succeeds under both journal modes and
+/// the gate has no reason to exist. Kept as a named predicate so the reason is
+/// visible and a future engine change has one place to point at.
+const fn wal_checkpoint_enabled(_concurrent_writes: bool) -> bool {
+    true
 }
 
 async fn finish_batch(shared: &BatchShared) {
@@ -1484,9 +1495,10 @@ async fn finish_batch(shared: &BatchShared) {
             "batch flush failed after {FINAL_FLUSH_ATTEMPTS} attempts: {e}"
         );
     }
-    // WAL growth is bounded only in WAL mode. Turso MVCC rejects the current
-    // driver's `wal_checkpoint(PASSIVE)` path; MVCC owns its logical-log
-    // checkpoint policy. Do not turn a known engine error into batch noise.
+    // Log growth is bounded in both journal modes now: `file_driver` enables
+    // the MVCC passive-checkpoint flag alongside the MVCC opt-in, so
+    // `wal_checkpoint(PASSIVE)` succeeds under MVCC too (it used to be rejected,
+    // leaving MVCC's log unbounded).
     if wal_checkpoint_enabled(shared.db.uses_concurrent_writes())
         && let Ok(Ok(mut conn)) =
             tokio::time::timeout(std::time::Duration::from_secs(2), shared.db.connection()).await
@@ -1763,7 +1775,10 @@ impl BatchShared {
                         endpoint_id,
                         host: plan.endpoint.dns_name(),
                         host_type: xray_tui_db::models::HostType::Dns,
-                        sni: crate::ops::enrich::extract_sni(&plan.protocol, &plan.endpoint.dns_name()),
+                        sni: crate::ops::enrich::extract_sni(
+                            &plan.protocol,
+                            &plan.endpoint.dns_name(),
+                        ),
                     };
                     // A full channel drops it; the next batch (or a connect)
                     // asks again, so only a SENT one is recorded.
@@ -2843,9 +2858,14 @@ mod tests {
         }
     }
 
+    /// The gate is open in BOTH modes now that the MVCC passive-checkpoint flag
+    /// accompanies the MVCC opt-in (`file_driver`). It was `!concurrent_writes`
+    /// because the engine rejected the statement under MVCC; inverting it is the
+    /// point of that fix.
     #[test]
-    fn mvcc_skips_wal_checkpoint() {
-        assert!(!wal_checkpoint_enabled(true));
+    fn checkpoint_runs_under_both_journal_modes() {
+        assert!(wal_checkpoint_enabled(true), "MVCC now checkpoints");
+        assert!(wal_checkpoint_enabled(false), "WAL still checkpoints");
     }
 
     /// Deterministic probe runner: fixed outcomes + call recording + an
@@ -3000,7 +3020,11 @@ mod tests {
                 let mut walk = PlanWalk::new(PlanSource::Feed(scope), db, 100);
                 let mut hosts: Vec<String> = Vec::new();
                 while let Some(links) = walk.next_page().await.expect("walk page") {
-                    hosts.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
+                    hosts.extend(
+                        links
+                            .iter()
+                            .map(|pl| dial_host(&pl.endpoint, &pl.addresses)),
+                    );
                 }
                 hosts.sort();
                 hosts.dedup();
@@ -3076,7 +3100,11 @@ mod tests {
         }
 
         while let Some(links) = walk.next_page().await.expect("page") {
-            planned.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
+            planned.extend(
+                links
+                    .iter()
+                    .map(|pl| dial_host(&pl.endpoint, &pl.addresses)),
+            );
         }
         planned.sort();
         assert_eq!(
@@ -3137,7 +3165,11 @@ mod tests {
         }
 
         while let Some(links) = walk.next_page().await.expect("page") {
-            planned.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
+            planned.extend(
+                links
+                    .iter()
+                    .map(|pl| dial_host(&pl.endpoint, &pl.addresses)),
+            );
         }
         planned.sort();
         assert_eq!(
@@ -3521,7 +3553,11 @@ mod tests {
                 3,
                 "the first page carries the feed-wide count"
             );
-            hosts.extend(links.iter().map(|pl| dial_host(&pl.endpoint, &pl.addresses)));
+            hosts.extend(
+                links
+                    .iter()
+                    .map(|pl| dial_host(&pl.endpoint, &pl.addresses)),
+            );
         }
         assert_eq!(pages, 3, "5 endpoints at 2 per page");
         hosts.sort();

@@ -423,6 +423,14 @@ optional.
 - **(REJECTED) S5:** T12 FK cascade was implemented, reproduced as a
   delete-race wedge (`GEO AFTER DELETE: Err(FOREIGN KEY constraint failed)`),
   and reverted. The manual ordered deletes remain the cascade owner.
+- **S6b (MVCC viability, 2026-10-08):** the MVCC opt-in's two blockers are
+  cleared — `file_driver` now sets `experimental_mvcc_passive_checkpoint` (the
+  engine rejected `wal_checkpoint(PASSIVE)` under MVCC, so its log grew without
+  bound) and the checkpoint gate is open in both modes; write loss is 0 on
+  disjoint rows (the production shape) and re-staged otherwise. **WAL stays the
+  default** on the on-disk-format cost (an MVCC file is unreadable by stock
+  SQLite tooling; the conversion is one-way) and the unresolved real-feed
+  throughput.
 - **S6 (DONE):** MVCC vs WAL A/B on turso 0.8, synthetic 8,000-endpoint feed, two
   runs per arm. **WAL stays the default**: the sequential geo rows show a
   reproducible MVCC tax (1.1–1.6× slower), and the contended fan-in row swung

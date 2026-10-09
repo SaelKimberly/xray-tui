@@ -64,6 +64,29 @@ turso themselves.
    shipped.** `XRAY_TUI_TURSO_CONCURRENT_WRITES=1` remains the opt-in, and a
    real-feed A/B is the trigger to revisit.
 
+   **Both former blockers are now fixed, so MVCC is VIABLE, not broken — the
+   default is a policy choice, measured below.**
+   - *Checkpoint gap (was: MVCC ran with NO checkpoint).* The engine rejected the
+     app's only log-bounding statement outright — `PRAGMA wal_checkpoint(PASSIVE)`
+     → `PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint` — so an
+     MVCC database grew its logical log without bound (measured 59 KiB after 500
+     rows, still climbing). `file_driver` now enables that flag with the MVCC
+     opt-in, and `ping.rs::wal_checkpoint_enabled` (was `!concurrent_writes`) is
+     open in both modes. Verified: same statement `Ok`, log drains to 0, pinned by
+     `database::tests::mvcc_checkpoint_succeeds_on_the_open_path` (which FAILS with
+     the exact engine error if the flag is removed).
+   - *Write failures.* Not a production problem: 0 retry exhaustion on the
+     DISJOINT rows production writes, and `WriteBehind::flush` re-stages on any
+     error, so even an exhausted write is deferred, not lost.
+   - *Remaining costs of a flip:* (a) an MVCC file is NOT readable by stock SQLite
+     tooling (it answers `file is not a database`), and the conversion is ONE-WAY
+     (the code converts a fresh file INTO MVCC, never back) — external
+     backup/inspection/debug tooling stops working on the app's own data; (b)
+     throughput is mixed (MVCC faster on disjoint writes, 1.1-1.6x slower on the
+     sequential geo mix, ~3x slower on heavy row overlap). Because (a) is a
+     user-visible tooling loss and (b) is unresolved on a real feed, the DEFAULT
+     stays WAL; the opt-in is sound and now correctly checkpointed.
+
 ## Rejected
 
 - **S1–S3 (an adapter + `xray-tui-db-macro` derive crate) — DEFERRED** by user

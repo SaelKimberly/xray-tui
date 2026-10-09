@@ -231,7 +231,16 @@ async fn open_direct_conn(path: &str, concurrent_writes: bool) -> Result<turso::
 fn file_driver(path: &str, concurrent_writes: bool) -> crate::driver::Turso {
     let driver = crate::driver::Turso::file(path);
     if concurrent_writes {
-        driver.concurrent_writes()
+        // The checkpoint flag MUST accompany the MVCC opt-in. Without it the
+        // engine rejects the app's only log-bounding statement outright —
+        // `PRAGMA wal_checkpoint(PASSIVE)` answers "PASSIVE checkpoint requires
+        // experimental_mvcc_passive_checkpoint" — so an MVCC database grows its
+        // logical log without bound for the life of the process (measured:
+        // 59 KiB after 500 rows and still climbing; 0 with the flag). With the
+        // flag the same statement returns Ok and the log drains to 0.
+        driver
+            .concurrent_writes()
+            .experimental_mvcc_passive_checkpoint(true)
     } else {
         driver
     }
@@ -2296,6 +2305,110 @@ mod tests {
         });
         assert_eq!(mode, Some("wal"));
     }
+    /// SCRATCH PROBE (S6d): does `experimental_mvcc_passive_checkpoint` make
+    /// `PRAGMA wal_checkpoint(PASSIVE)` work under MVCC?
+    ///
+    /// Today the app runs MVCC with NO checkpoint at all
+    /// (`ping.rs::wal_checkpoint_enabled` is `!concurrent_writes`), because the
+    /// engine rejected the passive checkpoint. If the flag fixes that, an
+    /// MVCC-default path becomes viable; if not, the gap is structural.
+    /// The MVCC checkpoint now works on the REAL `Database::open` path.
+    ///
+    /// This is the regression guard for the fix in `file_driver`: the MVCC
+    /// opt-in must also enable the passive-checkpoint flag, or the app's only
+    /// log-bounding statement is rejected and the logical log grows without
+    /// bound. Asserted directly, because the failure is a silently growing file.
+    #[tokio::test]
+    async fn mvcc_checkpoint_succeeds_on_the_open_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mvcc-ckpt.db");
+        let db = Database::open_with_concurrent_writes(&path, true)
+            .await
+            .expect("open mvcc");
+        assert!(db.uses_concurrent_writes());
+        let mut conn = db.connection().await.expect("conn");
+        for n in 0..200 {
+            toasty::sql::statement(format!(
+                "INSERT INTO endpoints (id, created_at, domain, sub_domain, port, ports) \
+                 VALUES ({n}, 0, 'ck.example', 'ck.example', 443, '[]')"
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("insert");
+        }
+        let rows = toasty::sql::query("PRAGMA wal_checkpoint(PASSIVE)")
+            .exec(&mut conn)
+            .await
+            .expect("MVCC must accept the passive checkpoint (file_driver sets the flag)");
+        assert!(!rows.is_empty(), "the checkpoint returns its status row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "scratch probe"]
+    async fn mvcc_checkpoint_probe() {
+        async fn arm(label: &str, mvcc: bool, flag: bool) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("ckpt.db");
+            let mut driver = crate::driver::Turso::file(path.to_str().unwrap());
+            if mvcc {
+                driver = driver.concurrent_writes();
+            }
+            if flag {
+                driver = driver.experimental_mvcc_passive_checkpoint(true);
+            }
+            let db = toasty::Db::builder()
+                .models(toasty::models!(
+                    Endpoint,
+                    Protocol,
+                    ProfileStats,
+                    EndpointGroup,
+                    Group,
+                    RoutingRule,
+                    DnsSetting,
+                    RouteProbes,
+                    AppMeta,
+                    EndpointRank,
+                    EndpointIp
+                ))
+                .build(driver)
+                .await
+                .expect("build");
+            let mut conn = db.connection().await.expect("conn");
+            crate::schema::migrate(&db, &mut conn)
+                .await
+                .expect("migrate");
+            for n in 0..500 {
+                toasty::sql::statement(format!(
+                    "INSERT INTO endpoints (id, created_at, domain, sub_domain, port, ports) \
+                     VALUES ({n}, 0, 'ck.example', 'ck.example', 443, '[]')"
+                ))
+                .exec(&mut conn)
+                .await
+                .expect("insert");
+            }
+            toasty::sql::statement("CREATE INDEX IF NOT EXISTS ck_probe ON endpoints (port)")
+                .exec(&mut conn)
+                .await
+                .expect("index");
+            // Commit anything outstanding, then try the checkpoint.
+            let r = toasty::sql::query("PRAGMA wal_checkpoint(PASSIVE)")
+                .exec(&mut conn)
+                .await;
+            match r {
+                Ok(rows) => {
+                    println!("CKPT {label:<24} mvcc={mvcc:<5} flag={flag:<5} -> Ok({rows:?})");
+                }
+                Err(e) => println!("CKPT {label:<24} mvcc={mvcc:<5} flag={flag:<5} -> Err({e})"),
+            }
+            let sz = std::fs::metadata(&path).map_or(0, |m| m.len());
+            let log = std::fs::metadata(format!("{}-log", path.display())).map_or(0, |m| m.len());
+            println!("     db={sz}B log={log}B");
+        }
+        arm("wal", false, false).await;
+        arm("mvcc-noflag", true, false).await;
+        arm("mvcc-flag", true, true).await;
+    }
+
     /// SCRATCH PROBE (S6c): the GEO write path under duplicated-fan-in geometry.
     ///
     /// `set_endpoint_ip_countries` is the writer the flow-cost lab's mix arm

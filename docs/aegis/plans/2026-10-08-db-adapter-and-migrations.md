@@ -639,6 +639,18 @@ flipping the default now would be choosing between contradictory measurements.
 change. This is materially weaker than the 2026-09-24 rollout's 1.2–4.8× tax, so
 a future run may well flip it; it is a live question, not a closed one.
 
+**Follow-up landed with this measurement: the MVCC checkpoint gap is FIXED.**
+`PRAGMA wal_checkpoint(PASSIVE)` was rejected under MVCC
+(`PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint`), and
+`ping.rs::wal_checkpoint_enabled` was `!concurrent_writes` — so an MVCC database
+ran with NO checkpoint and grew its logical log unbounded (59 KiB after 500 rows,
+still climbing; 0 with the flag). `file_driver` now enables
+`experimental_mvcc_passive_checkpoint` with the MVCC opt-in and the gate is open
+in both modes. Pinned by
+`database::tests::mvcc_checkpoint_succeeds_on_the_open_path`, which fails with the
+engine's own error when the flag is removed. **MVCC is therefore viable; the
+default remains WAL on the on-disk-format and throughput grounds above.**
+
 **Deviation from T6.1's stated method (recorded).** The plan asked for
 `experimental_mvcc_passive_checkpoint` to be enabled and for p50/p95/p99 wait
 plus checkpoint viability. Neither happened: the flag is **not reachable** from

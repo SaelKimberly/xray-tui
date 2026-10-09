@@ -821,10 +821,7 @@ async fn flow_cost_report() {
                 // Direction × sort: the reload uses the state's own pair, and a
                 // mixed-direction composite index cannot serve the reverse of
                 // every term.
-                for (sort, ascending) in [
-                    (PageSort::Test, true),
-                    (PageSort::Test, false),
-                ] {
+                for (sort, ascending) in [(PageSort::Test, true), (PageSort::Test, false)] {
                     let request = PageRequest {
                         view: PurgatoryView::Active,
                         active_threshold: view_request.active_threshold,
