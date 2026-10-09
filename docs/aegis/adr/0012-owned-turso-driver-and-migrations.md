@@ -186,10 +186,14 @@ argument that should be quoted first.
 
 ## Consequences
 
-- The crate depends on its OWN driver source: a `toasty-core` bump is "take the
-  bump AND re-sync the fork". `toasty` is pre-0.x-1.0 and its driver crate
-  already took a breaking change in 0.11. Retirement trigger: upstream fixes the
-  cache leak AND ships a `turso`-0.8 driver.
+- The crate depends on its OWN driver source, and that source is **INTERNAL and
+  maintained in-house** (user decision, 2026-10-08) — it is not exposed to other
+  crates and will never be reused, so there is no obligation to track upstream's
+  shape. The obligation that remains is mechanical: `toasty-core`'s
+  `Driver`/`Connection` traits are the seam the engine calls, so a toasty bump can
+  break these impls and the fix is ours. Kept close to upstream where free, so a
+  puzzling line can still be diffed against `thirdparty/toasty`. `turso` is pinned
+  directly and bumped when wanted. No retirement trigger: this code is permanent.
 - `turso` is pinned directly (0.8.2) on ONE core; every `turso::Builder` flag
   (incl. `experimental_mvcc_passive_checkpoint`) is reachable.
 - `Database::direct` (the page's execution-layer bypass, ~80× read win) STAYS —

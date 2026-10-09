@@ -14,6 +14,19 @@
 //! serverless (`turso_serverless`) arms are dropped. This crate is a file/
 //! in-memory database; nothing here talks to a remote.
 //!
+//! **This is INTERNAL code, not a tracking fork (decision 2026-10-08).** It is
+//! not exposed to any other crate and will never be reused outside
+//! `xray-tui-db`, so it is maintained IN-HOUSE against what `turso` actually
+//! does — no obligation to mirror upstream's shape, only to keep the nine
+//! `toasty_core::driver` trait impls compiling. The consequence to weigh before
+//! a `toasty-core` bump: `Driver`/`Connection` are the seam the engine calls, so
+//! a bump can break these impls and the fix is ours. `turso` itself is pinned
+//! directly (currently 0.8.2) and bumped when we want it.
+//!
+//! Kept close to the upstream source where that costs nothing, so a reader can
+//! diff a puzzling line against `thirdparty/toasty`; but readability and our own
+//! needs win over diff-closeness when they conflict.
+//!
 //! The vendored code owns all NINE required trait methods — `Driver::{url,
 //! capability, connect, generate_migration, reset_db}` and
 //! `Connection::{exec, push_schema, applied_migrations, apply_migration}`.
