@@ -459,11 +459,19 @@ flowchart LR
    but a wipe must now be a deliberate choice, not the default path for a column
    addition.
 3. **If the change touches identity** (any field a protocol's `write_identity`
-   writes), bump `IDENTITY_VERSION` in `xray-tui-proto`, re-pin the identity
-   goldens, and give the re-key its OWN migration step — do NOT bump
-   `SCHEMA_VERSION` for it: the schema did not change, and a cursor bump would
-   report a perfectly compatible file as `IncompatibleSchema` and wipe an
-   already-imported feed. Stamp `app_meta.identity_version` in that step.
+   writes), bump `IDENTITY_VERSION` in `xray-tui-proto` and re-pin the identity
+   goldens — but do **NOT** bump `SCHEMA_VERSION` for it: the schema did not
+   change, and a cursor bump would report a perfectly compatible file as
+   `IncompatibleSchema` and wipe an already-imported feed.
+   **A re-key has NO detector today.** There is no `app_meta.identity_version`
+   reader/writer and no re-key step in `crate::schema` (the spec's §5.1
+   `Step::Rebuild` was never built), so nothing compares stored uids against
+   `IDENTITY_VERSION`: a re-key leaves every stored uid stale and the next import
+   inserts a SECOND `Protocol` row per config under the new uids, breaking
+   identity dedup SILENTLY. Until that machinery exists, ship the reset yourself —
+   a hand-written reset entry in `xray-tui-db/src/schema/ddl.rs` guarded by your
+   own marker, or an `IncompatibleSchema`-style wipe. This mirrors AGENTS.md
+   decision 11.
 
    **Format vs value — the rule above is about the FORMAT.** What the writer
    writes (tags, order, which values are elided) decides the version. A change

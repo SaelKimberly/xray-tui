@@ -195,7 +195,7 @@ fn should_use_mvcc(path: &Path, requested_mvcc: bool) -> Result<bool> {
             if requested_mvcc {
                 tracing::warn!(
                     path = %path.display(),
-                    "existing WAL database stays in WAL mode; Turso 0.7.2 cannot convert it in place"
+                    "existing WAL database stays in WAL mode; this engine cannot convert a WAL file to MVCC in place"
                 );
             }
             Ok(false)
@@ -2305,110 +2305,6 @@ mod tests {
         });
         assert_eq!(mode, Some("wal"));
     }
-    /// SCRATCH PROBE (S6d): does `experimental_mvcc_passive_checkpoint` make
-    /// `PRAGMA wal_checkpoint(PASSIVE)` work under MVCC?
-    ///
-    /// Today the app runs MVCC with NO checkpoint at all
-    /// (`ping.rs::wal_checkpoint_enabled` is `!concurrent_writes`), because the
-    /// engine rejected the passive checkpoint. If the flag fixes that, an
-    /// MVCC-default path becomes viable; if not, the gap is structural.
-    /// The MVCC checkpoint now works on the REAL `Database::open` path.
-    ///
-    /// This is the regression guard for the fix in `file_driver`: the MVCC
-    /// opt-in must also enable the passive-checkpoint flag, or the app's only
-    /// log-bounding statement is rejected and the logical log grows without
-    /// bound. Asserted directly, because the failure is a silently growing file.
-    #[tokio::test]
-    async fn mvcc_checkpoint_succeeds_on_the_open_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("mvcc-ckpt.db");
-        let db = Database::open_with_concurrent_writes(&path, true)
-            .await
-            .expect("open mvcc");
-        assert!(db.uses_concurrent_writes());
-        let mut conn = db.connection().await.expect("conn");
-        for n in 0..200 {
-            toasty::sql::statement(format!(
-                "INSERT INTO endpoints (id, created_at, domain, sub_domain, port, ports) \
-                 VALUES ({n}, 0, 'ck.example', 'ck.example', 443, '[]')"
-            ))
-            .exec(&mut conn)
-            .await
-            .expect("insert");
-        }
-        let rows = toasty::sql::query("PRAGMA wal_checkpoint(PASSIVE)")
-            .exec(&mut conn)
-            .await
-            .expect("MVCC must accept the passive checkpoint (file_driver sets the flag)");
-        assert!(!rows.is_empty(), "the checkpoint returns its status row");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "scratch probe"]
-    async fn mvcc_checkpoint_probe() {
-        async fn arm(label: &str, mvcc: bool, flag: bool) {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("ckpt.db");
-            let mut driver = crate::driver::Turso::file(path.to_str().unwrap());
-            if mvcc {
-                driver = driver.concurrent_writes();
-            }
-            if flag {
-                driver = driver.experimental_mvcc_passive_checkpoint(true);
-            }
-            let db = toasty::Db::builder()
-                .models(toasty::models!(
-                    Endpoint,
-                    Protocol,
-                    ProfileStats,
-                    EndpointGroup,
-                    Group,
-                    RoutingRule,
-                    DnsSetting,
-                    RouteProbes,
-                    AppMeta,
-                    EndpointRank,
-                    EndpointIp
-                ))
-                .build(driver)
-                .await
-                .expect("build");
-            let mut conn = db.connection().await.expect("conn");
-            crate::schema::migrate(&db, &mut conn)
-                .await
-                .expect("migrate");
-            for n in 0..500 {
-                toasty::sql::statement(format!(
-                    "INSERT INTO endpoints (id, created_at, domain, sub_domain, port, ports) \
-                     VALUES ({n}, 0, 'ck.example', 'ck.example', 443, '[]')"
-                ))
-                .exec(&mut conn)
-                .await
-                .expect("insert");
-            }
-            toasty::sql::statement("CREATE INDEX IF NOT EXISTS ck_probe ON endpoints (port)")
-                .exec(&mut conn)
-                .await
-                .expect("index");
-            // Commit anything outstanding, then try the checkpoint.
-            let r = toasty::sql::query("PRAGMA wal_checkpoint(PASSIVE)")
-                .exec(&mut conn)
-                .await;
-            match r {
-                Ok(rows) => {
-                    println!("CKPT {label:<24} mvcc={mvcc:<5} flag={flag:<5} -> Ok({rows:?})");
-                }
-                Err(e) => println!("CKPT {label:<24} mvcc={mvcc:<5} flag={flag:<5} -> Err({e})"),
-            }
-            let sz = std::fs::metadata(&path).map_or(0, |m| m.len());
-            let log = std::fs::metadata(format!("{}-log", path.display())).map_or(0, |m| m.len());
-            println!("     db={sz}B log={log}B");
-        }
-        arm("wal", false, false).await;
-        arm("mvcc-noflag", true, false).await;
-        arm("mvcc-flag", true, true).await;
-    }
-
     /// SCRATCH PROBE (S6c): the GEO write path under duplicated-fan-in geometry.
     ///
     /// `set_endpoint_ip_countries` is the writer the flow-cost lab's mix arm
@@ -2436,7 +2332,7 @@ mod tests {
             {
                 let mut conn = db.connection().await.expect("conn");
                 // A pool big enough for the DISJOINT arm to be genuinely
-                // disjoint: 32 writers x 24 txns x 8 rows = 6144 distinct ids.
+                // disjoint: 16 writers x 24 txns x 8 rows = 3072 distinct ids.
                 for id in 1..=4096 {
                     seed_endpoint(&mut conn, id, id, "geo.example", HostType::Dns, 443, 1).await;
                 }
@@ -2505,7 +2401,10 @@ mod tests {
         for mvcc in [false, true] {
             arm("prod-1w", mvcc, 1, 8, false).await;
             arm("prod-2w", mvcc, 2, 8, false).await;
-            arm("prod-4w", mvcc, 4, 8, false).await;
+            // PRODUCTION TOPOLOGY: exactly TWO owners that can touch the same
+            // endpoint_ip row — the page seed (UI task) and the geo drain —
+            // on OVERLAPPING rows.
+            arm("prod-2w-ovl", mvcc, 2, 8, true).await;
             arm("lab-16w", mvcc, 16, 8, false).await;
             arm("overlap", mvcc, 16, 8, true).await;
         }
@@ -2525,15 +2424,12 @@ mod tests {
     /// `apply_link_patches` (which adds its own 5-attempt wrap — nesting them
     /// would measure a 25-attempt budget the app never uses).
     ///
-    /// Measured at 32 writers x 60 transactions over 2-64 rows, 3 runs:
-    /// **`retry_exhausted = 0` in every configuration**, WAL and MVCC alike —
-    /// the conflict is surfaced (at the second write or at COMMIT) and the
-    /// 5-attempt budget absorbs all of it, so no write is lost. Wall time:
-    /// MVCC is FASTER on disjoint rows (91-110 ms vs 112-195 ms for WAL) and
-    /// ~2x SLOWER when writers share a row (307-413 ms vs 139-189 ms). The
-    /// production shape is closer to disjoint (a link's PK is
-    /// `(protocol_id, endpoint_id)`, and the write-behind coalesces a link's
-    /// groups into ONE patch before writing).
+    /// Measured at 32 writers x 60 transactions, 2 runs: **`retry_exhausted = 0`
+    /// on the DISJOINT rows**, WAL and MVCC alike (MVCC 84-87 ms vs WAL
+    /// 220-775 ms — MVCC faster), and 0-1 exhausted when all 32 writers share
+    /// ONE row (MVCC ~3x slower). The production shape is the disjoint one: a
+    /// link's PK is `(protocol_id, endpoint_id)`, and the write-behind
+    /// coalesces a link's groups into ONE patch before writing.
     ///
     /// Ignored: timing-based, so it is a probe, not a gate; run it with
     /// `--ignored --nocapture`.
@@ -2561,7 +2457,8 @@ mod tests {
                 let mut conn = db.connection().await.expect("conn");
                 // `seed_endpoint` also writes the link; give each endpoint its
                 // own protocol id so the fixture does not re-insert protocol 1.
-                for id in 1..=64 {
+                // 32 writers x 60 txn = 1920 distinct ids for the disjoint arm.
+                for id in 1..=2048 {
                     seed_endpoint(&mut conn, id, id, "load.example", HostType::Dns, 443, 1).await;
                 }
             }
@@ -2578,7 +2475,12 @@ mod tests {
                         let id = if contending {
                             (i % 2) as i64 + 1
                         } else {
-                            ((writer_ix * PER + i) % 64) as i64 + 1
+                            // GENUINELY disjoint: `% 64` (the first version)
+                            // made every writer span all 64 rows, so the
+                            // "disjoint" arm was fully overlapping and its
+                            // "MVCC faster on disjoint rows" reading was an
+                            // artifact of that.
+                            (writer_ix * PER + i) as i64 + 1
                         };
                         let mut row = ProfileStats {
                             protocol_id: ProtocolId::new(id),

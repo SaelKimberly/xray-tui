@@ -1458,8 +1458,8 @@ const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 /// Whether the batch end runs `wal_checkpoint(PASSIVE)`.
 ///
 /// It used to be `!concurrent_writes`, because under MVCC the engine rejected
-/// the statement outright ("PASSIVE checkpoint requires
-/// experimental_mvcc_passive_checkpoint") — so an MVCC database grew its logical
+/// the statement outright with `PASSIVE checkpoint requires
+/// experimental_mvcc_passive_checkpoint` — so an MVCC database grew its logical
 /// log unbounded for the whole process life. `file_driver` now sets that flag
 /// with the MVCC opt-in, so the statement succeeds under both journal modes and
 /// the gate has no reason to exist. Kept as a named predicate so the reason is

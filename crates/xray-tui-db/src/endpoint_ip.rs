@@ -255,13 +255,21 @@ async fn countries_of(
     Ok(out)
 }
 
-/// Record the country of one resolved address.
+/// Record the country of one resolved address — ONE atomic upsert.
 ///
 /// The write the geo lookup makes once per address; `replace` keeps it
 /// afterwards. The row is created when it is missing: the lookup and the
-/// address write race by design (the geo step runs after the resolution
-/// event was already queued), and a country that arrives first must not be
-/// dropped.
+/// address write race by design (the geo step runs after the resolution event
+/// was already queued), and a country that arrives first must not be dropped.
+///
+/// `ON CONFLICT … DO UPDATE` is load-bearing, not stylistic. The previous
+/// SELECT-then-UPDATE-or-CREATE was a TOCTOU: two writers could both miss and
+/// both INSERT the same composite PK. Under WAL that cannot happen (the
+/// transaction holds the write lock), but under MVCC it can, and the resulting
+/// `Constraint` is NOT a busy error — [`crate::is_busy_error`] is false for it —
+/// so `retry_on_busy` never retried it, no matter the budget. The single
+/// statement removes the race and the N reads the geo window used to spend
+/// (one SELECT per address).
 pub(crate) async fn set_country(
     conn: &mut impl toasty::Executor,
     endpoint_id: EndpointId,
@@ -269,30 +277,15 @@ pub(crate) async fn set_country(
     iso: &str,
 ) -> Result<()> {
     let key = key_of(ip);
-    let existing = EndpointIp::filter_by_endpoint_id(endpoint_id)
-        .filter_by_ip_key(key.clone())
-        .first()
-        .exec(conn)
-        .await?;
-    match existing {
-        Some(_) => {
-            EndpointIp::filter_by_endpoint_id(endpoint_id)
-                .filter_by_ip_key(key)
-                .update()
-                .country(Some(iso.to_string()))
-                .exec(conn)
-                .await?;
-        }
-        None => {
-            toasty::create!(EndpointIp {
-                endpoint_id,
-                ip_key: key,
-                country: Some(iso.to_string()),
-            })
-            .exec(conn)
-            .await?;
-        }
-    }
+    let sql = format!(
+        "INSERT INTO \"endpoint_ip\" (\"endpoint_id\", \"ip_key\", \"country\") \
+         VALUES ({}, x'{}', {}) \
+         ON CONFLICT(\"endpoint_id\", \"ip_key\") DO UPDATE SET \"country\" = excluded.\"country\"",
+        endpoint_id.get(),
+        hex_lit(&key),
+        crate::database::sql_lit(iso),
+    );
+    toasty::sql::statement(sql).exec(conn).await?;
     Ok(())
 }
 
@@ -401,6 +394,43 @@ mod tests {
         ip_of(key)
             .expect("a key this module wrote decodes")
             .to_string()
+    }
+
+    /// `set_country` MUST be a single atomic upsert, not a read-then-write.
+    ///
+    /// The old shape was a TOCTOU: two writers could both SELECT-miss and both
+    /// INSERT the same `(endpoint_id, ip_key)` PK. Under WAL the transaction
+    /// holds the write lock so it cannot happen; under MVCC it can, and the
+    /// resulting `Constraint` is not a busy error — `retry_on_busy` would never
+    /// retry it, at ANY budget. This pins the single-statement form: the write
+    /// count for a fresh row is 1 (an upsert), and the second call UPDATES
+    /// rather than failing on the existing PK.
+    #[tokio::test]
+    async fn set_country_is_an_atomic_upsert() {
+        let db = crate::Database::in_memory().await.expect("db");
+        let mut conn = db.connection().await.expect("conn");
+        // No endpoint row is needed: `set_country` writes `endpoint_ip` alone
+        // (there is no FK — see ADR 0012's T12 rejection).
+        let ip: std::net::IpAddr = "198.51.100.77".parse().expect("ip");
+
+        // First write: creates the row.
+        set_country(&mut conn, EndpointId::new(7), ip, "DE")
+            .await
+            .expect("first write");
+
+        // Second write on the SAME row: the upsert's DO UPDATE branch. A
+        // read-then-create would have raced here; without the upsert it is at
+        // best an update, at worst a constraint violation.
+        set_country(&mut conn, EndpointId::new(7), ip, "FR")
+            .await
+            .expect("second write must update, not conflict");
+
+        let stored = load_resolved(&mut conn, &[EndpointId::new(7)])
+            .await
+            .expect("load");
+        let rows = stored.get(&EndpointId::new(7)).expect("one endpoint");
+        assert_eq!(rows.len(), 1, "the upsert must not duplicate the PK");
+        assert_eq!(rows[0].1.as_deref(), Some("FR"), "the later country wins");
     }
 
     #[test]

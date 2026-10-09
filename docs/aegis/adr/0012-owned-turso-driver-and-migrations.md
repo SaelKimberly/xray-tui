@@ -75,9 +75,20 @@ turso themselves.
      open in both modes. Verified: same statement `Ok`, log drains to 0, pinned by
      `database::tests::mvcc_checkpoint_succeeds_on_the_open_path` (which FAILS with
      the exact engine error if the flag is removed).
-   - *Write failures.* Not a production problem: 0 retry exhaustion on the
-     DISJOINT rows production writes, and `WriteBehind::flush` re-stages on any
-     error, so even an exhausted write is deferred, not lost.
+   - *Write failures.* Not a production problem, after two fixes: 0 retry
+     exhaustion on the DISJOINT rows production writes, 0 at the production
+     2-writer overlap, and at most ONE at 32-way single-row overlap (re-staged by
+     `WriteBehind::flush`, not dropped). The fixes:
+     (a) `driver::error::classify_turso_error` matched `"conflict"` CASE-
+     SENSITIVELY, so the engine's `Conflict: {0}` spelling fell through to
+     `driver_operation_failed` and was never retried at any budget — now
+     case-insensitive, with both spellings pinned by test;
+     (b) `endpoint_ip::set_country` was a SELECT-then-UPDATE-or-CREATE TOCTOU:
+     under MVCC two writers could both miss and both INSERT the same composite PK,
+     and that `Constraint` is NOT a busy error, so no retry budget could help. It
+     is now ONE `ON CONFLICT … DO UPDATE` statement, which also removes the N
+     reads per geo window. (Under WAL the TOCTOU could not fire — the transaction
+     holds the write lock — which is why only the MVCC layout exposed it.)
    - *Remaining costs of a flip:* (a) an MVCC file is NOT readable by stock SQLite
      tooling (it answers `file is not a database`), and the conversion is ONE-WAY
      (the code converts a fresh file INTO MVCC, never back) — external

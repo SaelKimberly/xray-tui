@@ -426,8 +426,11 @@ optional.
 - **S6b (MVCC viability, 2026-10-08):** the MVCC opt-in's two blockers are
   cleared — `file_driver` now sets `experimental_mvcc_passive_checkpoint` (the
   engine rejected `wal_checkpoint(PASSIVE)` under MVCC, so its log grew without
-  bound) and the checkpoint gate is open in both modes; write loss is 0 on
-  disjoint rows (the production shape) and re-staged otherwise. **WAL stays the
+  bound) and the checkpoint gate is open in both modes. Write loss is 0 on
+  disjoint rows (the production shape) and at the production 2-writer overlap;
+  the MVCC-only geo failures it once showed were TWO defects now fixed — a
+  case-sensitive `conflict` match that skipped the retry entirely, and
+  `set_country`'s SELECT-then-INSERT TOCTOU (now one `ON CONFLICT … DO UPDATE`). **WAL stays the
   default** on the on-disk-format cost (an MVCC file is unreadable by stock
   SQLite tooling; the conversion is one-way) and the unresolved real-feed
   throughput.

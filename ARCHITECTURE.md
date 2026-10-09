@@ -773,7 +773,7 @@ been retried. See `docs/database-manual-sql.md`.
 **Import upserts:** `upsert_endpoints_bulk` and `upsert_endpoint_group_links_bulk` are multi-row (chunked at `IMPORT_STATEMENT_ROWS` = `LINK_STATEMENT_ROWS` = 400); `upsert_protocols_bulk` is still one typed upsert per row and is the largest surviving import cost at a measured 117 us/row. Raw SQL writers that touch an embed-enum column must go through a tested `as_db_label` (`HostType::as_db_label`) — the stored spelling is the derive's `snake_case` ident, which is neither `Debug` nor the wire form, and a wrong one fails silently.
 `XRAY_TUI_TURSO_CONCURRENT_WRITES=1` opts them into Turso MVCC; existing WAL
 files remain WAL, existing MVCC files retain MVCC, and intentional schema wipes
-remove `-wal`, `-shm`, and `-log` sidecars before recreation. Turso 0.7.2 cannot
+remove `-wal`, `-shm`, and `-log` sidecars before recreation. The engine cannot
 convert a WAL-header file in place. `Database::uses_concurrent_writes()` is the
 per-handle authority; batch completion skips the incompatible WAL passive
 checkpoint for MVCC handles. Real-feed contention evidence remains a benchmark

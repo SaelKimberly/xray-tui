@@ -97,36 +97,40 @@ the engine facts cited here).
    `Database::open`/`in_memory` call in the suite executing the DDL).
 3. **Per-connection settings** — the driver owns connection creation.
 4. **Connection access** — `Db::driver() -> &dyn Driver` exposes no turso
-   connection, so `register_external_scalar_function`, `prepare_cached` control,
-   `set_query_timeout`, `interrupt`, and `experimental_mvcc_passive_checkpoint`
-   are out of reach (RAW SQL is not: `toasty::sql::query/statement` is the
-   supported channel and is what every site above uses).
-   **The missing `prepare_cached` control has a measured cost.** The driver's
-   `exec_sql_inner` calls `prepare_cached(sql_str)` for EVERY statement, and the
-   per-connection map it fills is **unbounded and keyed by SQL text**
-   (`turso_sdk_kit-0.7.2/src/rsapi.rs:895`), each entry a compiled
-   `Arc<PreparedProgram>`. An inlined-literal statement is a new text on every
-   call, so the map grew without bound (~116–310 KiB per distinct text,
-   measured) — see the dated section below. The escape hatch is the app's own
-   raw connection (`Database::direct`), whose `turso::Connection::query` uses
-   the UNCACHED `prepare`.
-5. **Schema management** — `push_schema` emits `CREATE TABLE` with no
-   `IF NOT EXISTS`, so it runs once, guarded by `PRAGMA user_version`
-   (decision 4); a tag mismatch **wipes** the file. There is no migration
-   machinery, and none is planned while the database is re-importable fixture
-   data.
+   connection, so `register_external_scalar_function`, `set_query_timeout` and
+   `interrupt` are still out of reach from the APP's side (RAW SQL is not:
+   `toasty::sql::query/statement` is the supported channel and is what every
+   site above uses).
+   **The `prepare_cached` control and `experimental_mvcc_passive_checkpoint` used
+   to be on this list and no longer are — the crate owns its driver.** The fork
+   in `crates/xray-tui-db/src/driver/` routes `Operation::RawSql` through the
+   UNCACHED `prepare` and `Insert`/`QuerySql` through `prepare_cached`
+   (ADR 0012), so the unbounded per-text cache the published driver accumulated
+   (measured ~116–310 KiB per distinct text) cannot grow on the inlined-literal
+   path; and `file_driver` enables the MVCC passive-checkpoint flag. The
+   `Database::direct` raw connection STAYS for the page's execution-layer bypass,
+   which is a read win unrelated to the cache.
+5. **Schema management** — `push_schema` still emits `CREATE TABLE` with no
+   `IF NOT EXISTS`, but it is no longer guarded by a wipe tag: `crate::schema`
+   is the migration runner (ADR 0012). `PRAGMA user_version` is a CURSOR seeded
+   at `SCHEMA_VERSION` (18); a current file is a no-op, a fresh file applies the
+   seed, a supported older version applies the pending steps, and only an
+   UNKNOWN cursor is `IncompatibleSchema` (which `open` answers with the
+   pre-alpha wipe). Hand-written DDL lives in `schema/ddl.rs`, not scattered
+   through `ensure*`. See decision 4 in AGENTS.md.
 6. **No STRICT tables, generated columns, or materialized views** — see §5.
 7. **No caller-supplied driver** — `Database::open` builds `Turso::file(path)`
    internally, so an experiment with a driver flag (`.concurrent_writes()`, any
    `experimental_*`) cannot reuse `open`: a probe has to rebuild the driver *and*
    the `toasty::models!(…)` list itself. A `#[cfg(test)]`/example hook taking a
-   driver would remove that duplication.
+   driver would remove that duplication. Still true AFTER the driver fork: the
+   fork changed who owns the driver, not `open`'s signature.
 
 ## 5. Rejected manual paths (so they are not re-proposed)
 
 | Proposal | Verdict | Why |
 | --- | --- | --- |
-| Enable MVCC (`journal_mode=mvcc` + `BEGIN CONCURRENT`, `Turso::concurrent_writes()`) | rejected | Measured: reader p50 56.5 µs (WAL) → 85.9 µs (MVCC), p95 66.8 → 97.0 µs, writer 5,120 rows / 0 errors in both arms — and the MVCC arm is verified engaged (`journal_mode=mvcc`, 379 KB logical log). Also `PRAGMA wal_checkpoint(PASSIVE)` — the batch-end/quit checkpoint — **fails** under MVCC ("PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint", a builder flag the driver does not expose), MVCC is process-local (`MVCC does not support multiprocess access`), and it adds a `<db>-log` file the wipe paths do not delete |
+| Enable MVCC **as the default** (`Turso::concurrent_writes()`) | rejected | The original reasons were: a measured reader tax (p50 56.5 → 85.9 µs, p95 66.8 → 97.0 µs) and a **checkpoint gap** (`PRAGMA wal_checkpoint(PASSIVE)` failed with "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"). The checkpoint half is now FIXED — `file_driver` sets that flag with the opt-in, so the log drains (0 with the flag vs 59 KiB-and-climbing without) and `ping.rs`'s batch-end checkpoint runs in both modes. What still makes it an opt-in, per ADR 0012 D-D: an MVCC file is unreadable by stock SQLite tooling and the conversion is one-way, MVCC is process-local, and real-feed throughput is unresolved (mixed against WAL). It also adds a `<db>-log` file the wipe paths do not delete |
 | Hand-create tables as STRICT | rejected (for now) | STRICT gives **no storage and no speed change** (4,000 rows: 83 pages / 339,968 bytes in both schemas; a full-surface scan 2.72 ms heap vs 2.76 ms STRICT) and its only unlocks are validation and custom types. Its type vocabulary is also **flag-dependent**: without the custom-types flag `BIGINT` and `BOOLEAN` are `Parse error: unknown datatype` in a STRICT table (those are what toasty's DDL emits), and they become legal only with `experimental_custom_types(true)`. So adopting STRICT means hand-owning the **entire** schema DDL *and* turning on an experimental engine flag, for validation alone. (Typed toasty access on a hand-created STRICT table does work: verified create + read.) Revisit only if type validation becomes a requirement |
 | Custom types (`CREATE TYPE … BASE blob OPERATOR '<'`) for the address column | rejected | Reachable only with `experimental_custom_types(true)`; the packed-BLOB column already orders and indexes correctly (byte order IS address order) and needs no experimental flag. The operator would buy expressiveness, not speed, and duplicate an existing fact |
 | Split `endpoint_ip.ip_key` into `(family, addr)` | rejected | Requires the experimental custom-types flag for `array_agg` (which the driver then returns as TEXT — `String("{\"X'040A0001'\",…}")`, not `Value::List` of blobs, so the cheap decode is unreachable); the split is not cheaper (`group_concat(hex(addr))` 806 µs vs the shipped 724 µs per 200-row page); and it makes `PageSort::Ip` worse (the correct `(family, addr)` term needs two correlated subqueries: 16.49 ms vs 9.97 ms packed; the single-subquery variant cannot produce a pair) |
@@ -326,25 +330,31 @@ zero in production even though those methods were being called.
 same page twice over grew nothing (text-keyed, saturates); `profiles_page` (bound `?N`)
 stayed flat.
 
-**Cause (C4, measured).** `turso_sdk_kit-0.7.2/src/rsapi.rs:895` —
+**Cause (C4, measured).** `turso_sdk_kit/src/rsapi.rs` —
 `TursoConnection.cached_statements: HashMap<String, Arc<CachedStatement>>`: no capacity, no
-eviction. `prepare_cached` (`:1089`) inserts one entry per SQL **text**, each holding a
-compiled `Arc<turso_core::PreparedProgram>`. `toasty-driver-turso-0.11.0/src/lib.rs:1219`
-routes **every** statement through it (`exec_sql_inner`). An inlined-literal statement is a
+eviction. `prepare_cached` inserts one entry per SQL **text**, each holding a compiled
+`Arc<turso_core::PreparedProgram>`. The PUBLISHED `toasty-driver-turso-0.11.0/src/lib.rs:1254`
+routed **every** statement through it (`exec_sql_inner`). An inlined-literal statement is a
 new text on every call, so the page hydration (ids inlined for the C6 perf win) compiled and
 retained a program per page — forever. An A/B on identical unique texts: toasty `exec`
 **+34,884 KiB / 300 calls** (~116 KiB/call) against the raw `turso::Connection::query`
 **+0 KiB**.
 
-**Fix.** `turso::Connection::query`/`execute` (`turso-0.7.2/src/connection.rs:110,117`) use
-the UNCACHED `prepare`. `Database::direct` is such a connection (already used by
-`page_ids_direct`); `Database::load_page_projection` now runs its SQL there via `Sql::exec_raw`
-(`turso::Row` → `Value::Record` by storage class, the mirror of the driver's own
-`from_turso_infer` for a raw statement), keeping the inlining perf and dropping the retention.
-A file db takes the raw path; an in-memory db (no second connection) keeps the toasty path,
-which is the oracle the raw path is pinned to (`page_projection_raw_matches_toasty`).
+**Fix (2026-10-08 — supersedes the earlier `Database::direct`-as-escape-hatch account).** The
+crate now OWNS its driver (`crates/xray-tui-db/src/driver/`, ADR 0012), and the fix is at the
+boundary the leak lives on: `Connection::exec` routes `Operation::RawSql` — the hand-built,
+literal-inlined statements that `toasty::sql::query`/`statement` produce — through the
+UNCACHED `prepare`, and keeps `prepare_cached` for the engine-generated `Insert`/`QuerySql`
+(stable text, compile-once). No LRU, no counter, no second connection. The old `sql_exec.rs`
+`SqlConn` seam and `Database::write_conn` are RETIRED; `Database::direct` STAYS only because
+it serves the page's execution-layer bypass (a read win, unrelated to the cache) and its
+`exec_raw` reads still decode with the fork's `from_turso_infer`. A file db takes the raw
+path; an in-memory db keeps the toasty path, which is the oracle the raw path is pinned to
+(`page_projection_raw_matches_toasty`).
 
-**Measured after:** the same 400 fresh-id hydrations plateau at **+8 MB** (was +123 MB).
+**Measured after:** the same 400 fresh-id hydrations plateau at **+8 MB** (was +123 MB), and
+the routing itself is pinned by `tests/cache_routing.rs` (0 KiB uncached vs 59,336 KiB when
+the routing is flipped to `Cached`).
 
 **The write side, same owner (2026-10-08).** The leak is not read-only. `WriteBehind<LinkSpec>`
 (and the same `apply_link_patches_tx` / `exec_link_upsert` / `upsert_endpoints_bulk` /

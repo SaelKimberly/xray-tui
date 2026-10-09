@@ -617,29 +617,37 @@ calls `restage` on any error, so the window is written on the next drain.
 
 **Separate probe — do MVCC conflicts lose writes?** No, at the budget the app
 actually uses. `database::tests::mvcc_load_probe` (ignored; 32 writers × 60
-transactions over 2–64 rows, 3 runs) wraps the tx-scoped write in **ONE**
-`retry_on_busy(…, 5)` — production's exact budget; nesting the public
-`apply_link_patches` would have measured 25 attempts and proved nothing.
-Result: **`retry_exhausted = 0` in every configuration, WAL and MVCC alike.** The
-conflict is real and surfaced (at the second write statement, or at COMMIT), and
-the 5-attempt budget absorbs all of it. Wall time: MVCC is **faster on disjoint
-rows** (91–110 ms vs WAL's 112–195 ms) and **~2× slower when writers share a
-row** (307–413 ms vs 139–189 ms).
+transactions, 2 runs) wraps the tx-scoped write in **ONE** `retry_on_busy(…, 5)` —
+production's exact budget; nesting the public `apply_link_patches` would have
+measured 25 attempts and proved nothing. Result: **`retry_exhausted = 0` on the
+DISJOINT rows, WAL and MVCC alike** (MVCC 84–87 ms vs WAL 220–775 ms — MVCC
+faster), and **0–1 exhausted** when all 32 writers share ONE row (MVCC ~3× slower).
+(An earlier version of this probe `% 64`-folded every writer onto the same 64
+rows, so its "disjoint" label was wrong; the fixture now gives each writer a
+distinct id block.)
 
-**Decision: MVCC stays an OPT-IN — the reason is throughput, not correctness,
-and it is now a weak verdict.** Correctness is cleared *for the production shape*
-(no write loss at the generic budget on disjoint rows; an exhausted write is
-re-staged, not dropped), and MVCC wins on the shape production actually has (a link's
-PK is `(protocol_id, endpoint_id)`; the write-behind coalesces a link's groups
-into one patch, so same-row contention is rare) while losing on the geo mixed
-stream (1.1–1.6× slower) and on same-row contention. The two labs disagree, so
-flipping the default now would be choosing between contradictory measurements.
-**The trigger for a different answer is a real-feed A/B with more repetitions**
-(and the missing `experimental_mvcc_passive_checkpoint` hook, below) — not a code
-change. This is materially weaker than the 2026-09-24 rollout's 1.2–4.8× tax, so
-a future run may well flip it; it is a live question, not a closed one.
+**Decision: MVCC stays an OPT-IN — the reason is throughput and tooling, not
+correctness, and the verdict is weak.** Correctness is clear on every shape
+measured: 0 write loss on disjoint rows, on the production 2-writer overlap, and
+even the single-row case loses at most 1 write — which `WriteBehind::flush`
+re-stages rather than drops. MVCC wins on the shape production has (disjoint rows)
+and loses on heavy overlap and on the geo mixed stream (1.1–1.6×). What actually
+keeps WAL the default is the **on-disk-format cost**: an MVCC file is unreadable by
+stock SQLite tooling and the conversion is one-way. **The trigger for a different
+answer is a real-feed A/B with more repetitions** — not a code change. This is
+materially weaker than the 2026-09-24 rollout's 1.2–4.8× tax, so a future run may
+well flip it; it is a live question, not a closed one.
 
-**Follow-up landed with this measurement: the MVCC checkpoint gap is FIXED.**
+**Follow-up landed with this measurement: the MVCC checkpoint gap is FIXED, and
+two MVCC-only geo defects were fixed.** (a) `driver::error::classify_turso_error`
+matched `"conflict"` case-sensitively, so the engine's `Conflict: {0}` spelling
+classified as a hard error and was NEVER retried at any budget; it is now
+case-insensitive, pinned with both spellings. (b) `set_country` was a
+SELECT-then-UPDATE-or-CREATE TOCTOU that under MVCC let two writers both INSERT
+the same PK — a `Constraint`, which is not a busy error, so no retry budget could
+help; it is now one `ON CONFLICT … DO UPDATE` (also dropping the N reads per geo
+window), pinned by `set_country_is_an_atomic_upsert`. After both, the production
+2-writer overlap measures 0 exhaustion in both journal modes.
 `PRAGMA wal_checkpoint(PASSIVE)` was rejected under MVCC
 (`PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint`), and
 `ping.rs::wal_checkpoint_enabled` was `!concurrent_writes` — so an MVCC database
@@ -652,13 +660,15 @@ engine's own error when the flag is removed. **MVCC is therefore viable; the
 default remains WAL on the on-disk-format and throughput grounds above.**
 
 **Deviation from T6.1's stated method (recorded).** The plan asked for
-`experimental_mvcc_passive_checkpoint` to be enabled and for p50/p95/p99 wait
-plus checkpoint viability. Neither happened: the flag is **not reachable** from
-the app (`file_driver` calls only `.concurrent_writes()`; nothing calls
-`.experimental_mvcc_passive_checkpoint(true)`), and the lab reports ns/op per arm
-plus a failure count, not wait percentiles. The checkpoint row was not produced
-and the checkpoint blocker (`wal_checkpoint(PASSIVE)` fails under MVCC) was NOT
-exercised. A future MVCC measurement must add a `file_driver` env hook and re-run.
+`experimental_mvcc_passive_checkpoint` and for p50/p95/p99 wait plus checkpoint
+viability. The FIRST RUN did neither — the flag was unreachable (`file_driver`
+called only `.concurrent_writes()`) and the lab reports ns/op per arm, not wait
+percentiles. **The checkpoint half is now closed**: a follow-up measured the
+statement directly (see the "MVCC checkpoint gap is FIXED" block above),
+`file_driver` enables the flag, and the gap is pinned by a real assertion
+(`mvcc_checkpoint_succeeds_on_the_open_path`). The wait-percentile rows are still
+not produced, and are not needed for a verdict that turns on the checkpoint,
+on-disk format and throughput.
 
 **Honest limits.** Synthetic 8,000-endpoint feed, not the 74k reference; two runs
 per arm for the geo rows; the fan-in row is n=3 per run; no real-feed copy was

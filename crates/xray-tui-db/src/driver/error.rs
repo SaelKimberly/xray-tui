@@ -26,7 +26,16 @@ use turso::Error as TursoError;
 pub(super) fn classify_turso_error(err: TursoError) -> Error {
     match err {
         TursoError::Busy(msg) | TursoError::BusySnapshot(msg) => Error::serialization_failure(msg),
-        TursoError::Error(msg) if msg.contains("conflict") => Error::serialization_failure(msg),
+        // Case-INSENSITIVE on purpose. `turso_core` renders this class two ways —
+        // `Write-write conflict` (lowercase) and `Conflict: {0}` (capital, from
+        // its own `Conflict` variant) — and `turso_sdk_kit` funnels BOTH into
+        // the catch-all `TursoError::Error(String)` with no dedicated arm. A
+        // case-sensitive `contains` therefore missed the capital spelling, which
+        // became `driver_operation_failed` → `is_busy_error` false → NEVER
+        // retried, silently outside every retry budget.
+        TursoError::Error(msg) if msg.to_ascii_lowercase().contains("conflict") => {
+            Error::serialization_failure(msg)
+        }
         TursoError::Readonly(msg) => Error::read_only_transaction(msg),
         TursoError::IoError(_, _) => Error::connection_lost(err),
         _ => Error::driver_operation_failed(err),
@@ -52,7 +61,11 @@ mod tests {
         for err in [
             turso::Error::Busy("busy".to_string()),
             turso::Error::BusySnapshot("busy snapshot".to_string()),
+            // Both spellings the engine actually emits, through the catch-all
+            // `Error(String)` arm that `turso_sdk_kit` funnels them into.
             turso::Error::Error("write conflict".to_string()),
+            turso::Error::Error("Conflict: another writer committed".to_string()),
+            turso::Error::Error("Write-write conflict".to_string()),
         ] {
             assert!(retryable(err), "contention must classify as retryable");
         }
