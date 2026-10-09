@@ -89,22 +89,75 @@ turso themselves.
      is now ONE `ON CONFLICT … DO UPDATE` statement, which also removes the N
      reads per geo window. (Under WAL the TOCTOU could not fire — the transaction
      holds the write lock — which is why only the MVCC layout exposed it.)
-   - *Remaining costs of a flip:* (a) an MVCC file is not readable by **stock**
-     SQLite tooling (sqlite3 answers `file is not a database`) — but the Turso
-     project's own `tursodb` CLI READS it (verified: 50/50 rows of a file this app
-     wrote, `-log` sidecar included), and `tursodb … .dump` emits portable SQL
-     that reimports cleanly into stock SQLite (verified round trip). So (a) is a
-     TOOLING-CHOICE cost, not the one-way trap this ADR first recorded: the way
-     back is `tursodb <db> .dump | sqlite3 new.db`. It still bites anyone reaching
-     for `sqlite3`/DB-Browser out of habit, which is why it stays listed; (b)
-     throughput is MIXED BY PATH and must not be read as a single verdict:
-     MVCC is the faster arm for the LINK writer in most runs
-     (`mvcc_load_probe`: 84-195 ms vs WAL's 192-775 ms, disjoint rows), while on
-     the GEO writer it is parity on disjoint rows and ~4.5x slower under heavy row
-     overlap (`geo_under_mvcc_probe`, post-`set_countries_bulk`: WAL 55 ms vs
-     MVCC 240-257 ms). Because (a) is a user-visible tooling loss and (b) is
+   - *Remaining costs of a flip:* **(a) the file is not stock-SQLite-readable.**
+     `sqlite3` answers `file is not a database`; the Turso project's `tursodb` CLI
+     does read it (verified: `.tables` lists all 12 tables of a file this app
+     wrote). But **there is NO verified convert-back path**, and a first attempt
+     to document one was a DATA-LOSS TRAP — recorded here so nobody re-derives it:
+     `tursodb … .dump | sqlite3 new.db` (i) does not emit `PRAGMA user_version`,
+     and the resulting file has tables at cursor 0, which `schema::migrate` reads
+     as a foreign file → `IncompatibleSchema(0)` → `Database::open` **silently
+     deletes and recreates it** (measured: 7 rows → 0, no error); and (ii) the
+     dump itself is not reliably reproducible — from a child process it produced
+     0 bytes, while the same file dumped 13 tables from a shell later. So (a)
+     stands as this ADR first recorded it: reaching for standard tooling stops
+     working, and there is no supported way back short of a SQLite-format dump
+     that this project does not have. **(c) MVCC is SINGLE-PROCESS** — the engine
+     rejects multiprocess access outright (`core/database.rs`: "cannot open MVCC
+     database with experimental multiprocess WAL: MVCC does not support
+     multiprocess access"). A second app instance, or any external tool holding
+     the file open alongside the app, is a HARD failure, not a slow path — and
+     nothing in this session's work touched that, so it is the strongest remaining
+     operational cost, stronger than the tooling one; (b) throughput is MIXED BY PATH and must not be read as a single verdict:
+     for the LINK writer MVCC is the faster arm in most runs (`mvcc_load_probe`:
+     84-195 ms vs WAL's 192-775 ms on disjoint rows), while on the GEO writer it is
+     PARITY on disjoint rows (post-`set_countries_bulk`: WAL 145-225 ms vs MVCC
+     166-204 ms — note batching helped WAL far more, inverting an earlier
+     per-row run that had MVCC "faster") and **~4.5x slower** under heavy row
+     overlap (WAL 55 ms vs MVCC 240-257 ms). Every figure is single-digit-run and
+     noise-dominated at these scales; none should be read as a direction. Because (a) is a user-visible tooling loss and (b) is
      unresolved on a real feed, the DEFAULT stays WAL; the opt-in is sound and now
      correctly checkpointed.
+
+### MVCC research (2026-10-08, against the engine's own docs + source at v0.8.2)
+
+Checked our implementation against `thirdparty/turso` (`docs/manual.md`,
+`docs/agent-guides/mvcc.md`, `core/mvcc/`). Findings that bear on the default:
+
+1. **The engine says MVCC is not production-ready.** `docs/manual.md:590`:
+   "**Note:** the feature is not production ready so do not use it for critical
+   data right now." That is the single strongest argument for keeping WAL the
+   default, and it is the engine's own statement, not our measurement.
+2. **`mvcc_checkpoint_threshold` is never set by us, and its default is
+   effectively OFF.** The engine's auto-checkpoint trigger defaults to
+   `DEFAULT_LOG_CHECKPOINT_THRESHOLD = 4120 * 1000` pages
+   (`core/mvcc/persistent_storage/logical_log.rs:270`) — 4.12 M pages, which no
+   session of ours approaches. Combined with our checkpoint running only at batch
+   end / quit, an MVCC session accumulates the logical log AND its version store
+   for its whole life. **A concrete, unfixed inefficiency in OUR code** (it does
+   not affect the WAL default, which is why it is not a today-bug).
+3. **Row versions live in memory** (`mvcc.md`: "large working sets use a lot of
+   memory"). We import 74 k endpoints / 33 k links; that is exactly a large
+   working set, and the memory cost is invisible to our current probes (which use
+   hundreds of rows). A real-feed MVCC measurement must watch RSS, not just wall
+   time.
+4. **Uncheckpointed MVCC changes are invisible to non-MVCC readers.**
+   `docs/manual.md:116`: "If a database is written to using MVCC and then opened
+   again without MVCC, the changes are not visible unless first checkpointed."
+   This is the mechanism behind the flaky `tursodb .dump` (0 bytes from a child
+   process, 13 tables later from a shell after the log had been replayed): it is
+   not a tursodb version gap, it is the missing checkpoint.
+5. **MVCC is snapshot isolation, not serializable** (`mvcc.md`), so it does not
+   prevent write skew — the class the `set_country` TOCTOU belonged to. Audited
+   the other write paths for it: `upsert_endpoint`/`upsert_protocol`/`upsert_link`
+   use atomic `upsert_by_*`/`ON CONFLICT`, so `set_country` was the only instance.
+6. **`BEGIN CONCURRENT` is the documented best practice for every MVCC write
+   transaction** (`docs/manual.md:224`) — our `TransactionMode::Default` mapping
+   already does this when the opt-in is on. No gap.
+
+Net: nothing here changes the default decision (it stays WAL), but items 2 and 3
+are real work items for anyone pursuing an MVCC default, and item 1 is the
+argument that should be quoted first.
 
 ## Rejected
 

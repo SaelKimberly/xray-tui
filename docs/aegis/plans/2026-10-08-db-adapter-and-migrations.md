@@ -638,12 +638,13 @@ rows, so its "disjoint" label was wrong; the fixture now gives each writer a
 distinct id block.)
 
 **Decision: MVCC stays an OPT-IN — the reason is throughput and tooling, not
-correctness, and the verdict is weak.** (The tooling half of that shrank further:
-the Turso project's own `tursodb` CLI reads our MVCC files and `.dump`s them back
-into stock SQLite — so the cost is which tool you reach for, not an inability to
-read or convert. That removes the strongest argument against flipping the
-default, leaving throughput. A flip is now a live, low-risk change if the
-real-feed numbers hold.) Correctness is clear on every shape
+correctness, and the verdict is weak.** (**Correction:** the tooling half did NOT
+shrink — a documented `tursodb .dump | sqlite3` path was tested and turned out to
+be a data-loss trap (the dump carries no `user_version`, so the reimported file
+hits `IncompatibleSchema(0)` and the app silently wipes it: 7 rows → 0), and the
+dump was not reproducible from a child process. See ADR D-D cost (a). So the
+default stays WAL on the recorded costs, and MVCC also remains SINGLE-PROCESS
+(D-D cost (c)) — a second app instance is a hard failure.) Correctness is clear on every shape
 measured: 0 write loss on disjoint rows, on the production 2-writer overlap, and
 even the single-row case loses at most 1 write — which `WriteBehind::flush`
 re-stages rather than drops. MVCC wins on the shape production has (disjoint rows)
