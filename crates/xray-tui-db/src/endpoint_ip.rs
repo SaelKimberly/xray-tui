@@ -7,9 +7,9 @@
 //!
 //! # Why not the engine's `inet` type
 //!
-//! Turso 0.7.2 ships `inet` as a built-in custom type,
+//! Turso ships `inet` as a built-in custom type,
 //! `CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value)
-//! DECODE value` (`turso_core-0.7.2/schema.rs:840`). It validates, and does
+//! DECODE value` (`turso_core` `schema.rs`). It validates, and does
 //! nothing else: with no `OPERATOR '<'` the engine refuses to order or index a
 //! column of that type (`cannot ORDER BY column 'ip' of type 'inet': type does
 //! not declare OPERATOR '<'`), and it is inert outside a STRICT table, which

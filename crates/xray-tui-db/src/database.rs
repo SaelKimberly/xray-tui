@@ -2305,7 +2305,7 @@ mod tests {
         });
         assert_eq!(mode, Some("wal"));
     }
-    /// SCRATCH PROBE (S6c): the GEO write path under duplicated-fan-in geometry.
+    /// The GEO write path under several concurrency topologies — the A/B
     ///
     /// `set_endpoint_ip_countries` is the writer the flow-cost lab's mix arm
     /// reports failing under MVCC but not WAL (WAL counts exactly one failure

@@ -363,7 +363,7 @@ impl Endpoint {
 /// rendered from the bytes on read (`Ipv4Addr`/`Ipv6Addr`), which is an
 /// 8/16-byte copy, not a parse, and one fact cannot disagree with itself.
 ///
-/// That is the one thing the engine's own `inet` type cannot do. Turso 0.7.2
+/// That is the one thing the engine's own `inet` type cannot do. Turso
 /// declares it `BASE text ENCODE validate_ipaddr(value) DECODE value` — no
 /// `OPERATOR '<'`, so `ORDER BY ip` / `CREATE INDEX … (ip)` are parse errors;
 /// adding the operator makes them legal but orders the TEXT form, i.e.
