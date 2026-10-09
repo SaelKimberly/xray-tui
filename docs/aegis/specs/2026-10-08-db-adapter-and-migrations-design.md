@@ -62,8 +62,10 @@ Measured/verified, not assumed:
 | `WITHOUT ROWID` DELETE/UPDATE | **still refused** (`turso_core-0.8.x translate/delete.rs:51`, `update.rs:261`) — T14 stays blocked |
 
 Net: 0.8's headline does not touch our hot path. Its only possibly-meaningful
-win is a **fresh MVCC re-measurement** under group commit — a benchmark, not a
-code benefit. The S6 benchmark below decides.
+candidate was a **fresh MVCC re-measurement** under group commit — and S6 ran it:
+the sequential tax is reproducible, the contended row is inconclusive across two
+runs, so **WAL stays the default**. 0.8's value here is structural (the owned
+driver, the leak fix, one turso core, migrations), not MVCC.
 
 What 0.8 *does* unblock structurally is the version itself: owning our driver
 (§12) lets us declare `turso = "0.8"` at S0a — after which the `Builder` flags
@@ -348,7 +350,7 @@ need explicit owners. Resolution:
 | **S3 (DEFERRED)** | `Model` derive + batch builders (raw writers) | — | deferred 2026-10-08 |
 | **S4** | `schema/` module: ALL DDL into the versioned list; the fork's `push_schema` body swaps from `create_table` → `schema::migrate` (open() unchanged); re-express "incompatible file" as an explicit tag/schema check (the old signal was `push_schema` FAILING) | open/migration tests | **DDL/index consolidation (the user's ask)** |
 | **S5 (REJECTED)** | T12 FK cascade was tried and reverted — it wedges the geo/link write-behind on a delete race (see D6). The manual ordered deletes stay the cascade owner. | — | decided: no FK |
-| **S6** | Re-benchmark MVCC on 0.8 (`experimental_mvcc_passive_checkpoint`); decide MVCC-default | `flow_cost` + a real-feed A/B | the MVCC decision, measured |
+| **S6 (MEASURED)** | MVCC vs WAL A/B on 0.8 — **WAL stays the default** (the sequential tax is reproducible; the fan-in row is noise: 1.12 ms vs 10.01 ms across two runs). Details in the plan's execution notes. | `flow_cost` | decision: no flip |
 | **S7 (UNPLANNED)** | Full toasty removal (adapter + macro replace the query layer) — **requires the deferred S1–S3** | — | not reachable without S1–S3 |
 
 **Order:** S0a first (the pure dependency swap; the fork + turso 0.8), then S0b
@@ -416,9 +418,12 @@ optional.
 - **(REJECTED) S5:** T12 FK cascade was implemented, reproduced as a
   delete-race wedge (`GEO AFTER DELETE: Err(FOREIGN KEY constraint failed)`),
   and reverted. The manual ordered deletes remain the cascade owner.
-- **S6:** MVCC vs WAL A/B on a real-feed copy, reporting total wall time,
-  p50/p95/p99 wait, conflicts/retries, checkpoint viability — the input to the
-  MVCC-default decision.
+- **S6 (DONE):** MVCC vs WAL A/B on turso 0.8, synthetic 8,000-endpoint feed, two
+  runs per arm. **WAL stays the default**: the sequential geo rows show a
+  reproducible MVCC tax (1.1–1.6× slower), and the contended fan-in row swung
+  1.12 ms → 10.01 ms across two identical runs (noise at n=3), so there is no
+  repeatable gain to justify a flip. The remaining path to a different answer is
+  a real-feed A/B with more repetitions, not a code change.
 
 ## 9. Risks
 
@@ -457,7 +462,7 @@ optional.
   in-scope plan (S0a/S0b, S4, S5, S6) depends on them.
 - No relations / eager-loading engine (the page assembles joins in memory).
 - No query builder / DSL (SQL is written by hand; the derive converts results).
-- No MVCC-default flip before S6's measurement.
+- No MVCC-default flip — S6 measured it and WAL stays the default (see §12.5 and the plan's S6 notes).
 - No STRICT tables (dropped for validation-only, `database-manual-sql.md` §5).
 - **No full toasty removal in this plan (Option D keeps the query engine)** —
   §12's driver fork keeps the typed query layer. Duplicating or replacing toasty's
@@ -671,8 +676,8 @@ measured in this repo:
 in its **batching/staging contract** — its **raw-connection half** IS deleted at
 S0b (§12.2/T0b.2: `CacheSpec::RAW`, `write_window_raw`/`refresh_raw`, the
 `:364` `write_conn()` branch). It
-becomes a REAL question only if **S6 flips the MVCC default** (a measured
-outcome, not a given) — at which point the *flush cadence* could be revisited,
+becomes a REAL question only if **S6 flipped the MVCC default** — it did NOT
+(measured 2026-10-08: WAL stays default) — at which point the *flush cadence* could be revisited,
 because MVCC would make each commit cheaper and one-per-statement less costly.
 Even then the layer is likely to stay: reason 3 (UI non-blocking) is independent
 of the journal mode, and the batch pipeline still wants ONE transaction per

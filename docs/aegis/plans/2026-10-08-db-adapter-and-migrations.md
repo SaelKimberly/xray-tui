@@ -311,7 +311,7 @@ reporting total wall time, p50/p95/p99 wait, conflicts/retries, checkpoint
 viability.
 **Change gate:** only if the measurement beats the retired 1.2–4.8× tax does
 `XRAY_TUI_TURSO_CONCURRENT_WRITES` default flip; otherwise WAL stays default and
-this task closes with the recorded number.
+this task closes with the recorded number. **Outcome: no flip** (execution notes).
 **Follow-up (only if the default flips):** spec §12.5 — revisit the
 `WriteBehind` *flush cadence* under MVCC. Do NOT drop the layer: `stage()` is
 non-blocking on the UI task and the batch pipeline wants one transaction per
@@ -557,5 +557,46 @@ rejected: their parent is not guaranteed to exist first (the import writes links
 and group links independently of their parents — 9 fixtures failed on it), so a
 constraint there is simply wrong.
 
-### S6 — next
+### S6 — MEASURED (2026-10-08): WAL stays the default on turso 0.8
+
+A/B on turso 0.8.2 with the ADR-0008 lab (`flow_cost_contention`), a synthetic
+8,000-endpoint feed seeded twice (WAL file + a fresh MVCC file, since 0.8 cannot
+convert in place), two independent runs per arm, `REPS=3` per row. The trickle
+row is one wall-clock measurement per run; the import arms FAIL in BOTH arms
+(the documented lab limitation — its slice comes from `load_page_rows`, which
+filters to protocols whose deferred `config` is loaded, and `upsert_protocols_bulk`
+refuses a protocol with an unloaded config), so the import rows are DISCARDED and
+only the geo rows are a valid A/B.
+
+| row (ns/op) | WAL run 1 | WAL run 2 | MVCC run 1 | MVCC run 2 | verdict |
+| --- | --- | --- | --- | --- | --- |
+| seq geo flush BATCHED (100 rows) | 3.64 ms | 3.83 ms | 5.04 ms | 4.18 ms | **MVCC 1.1–1.4× slower** (reproducible) |
+| seq geo PER-ADDRESS | 123 µs | 128 µs | 193 µs | 149 µs | **MVCC 1.2–1.6× slower** (reproducible) |
+| fan-in geo PER-ADDRESS / 16 writers | 3.41 ms | 3.10 ms | 1.12 ms | 10.01 ms | **inconclusive** — MVCC 1.12–10.01 ms (n=3, noisy) vs WAL's stable ~3.1–3.4 ms |
+| write failures | 408 | 408 | 468 | 470 | MVCC surfaces MORE conflicts as failures |
+| flush trickle (4028 rows @ 12/s) | 32 flushes | 32 flushes | 32 flushes | 32 flushes | identical (write-behind floor unchanged) |
+
+**Decision: do NOT flip the MVCC default.** The SEQUENTIAL tax is reproducible
+across both runs and both shapes; the fan-in "win" — the one row 0.8's group
+commit is supposed to help — appeared as 3.05× faster in run 1 and 3.1× slower in
+run 2, i.e. it is noise-dominated at n=3 and not a repeatable gain. And MVCC
+still produces MORE write failures than WAL (468/470 vs 408/408): the conflicts
+that WAL absorbs behind `busy_timeout` surface as errors. `XRAY_TUI_TURSO_CONCURRENT_WRITES`
+stays an opt-in, exactly as the 2026-09-24 rollout spec concluded; 0.8's group
+commit does not reverse it on this workload.
+
+**Honest limits.** Synthetic 8,000-endpoint feed, not the 74k reference; two runs
+per arm; the fan-in row is n=3 per run (the lab fans 16 writers, where the
+retired spec used 32); no real-feed copy was available in this environment, so
+"the 74k feed behaves the same" is an inference, not a measurement. The decision
+does not depend on it — the reproducible half (sequential tax) already answers
+"should this be the default", and the answer is no.
+
+**What 0.8 DID buy** (independent of this decision): the crate now owns its
+driver, so the statement-cache leak is fixed at its source, `turso` is pinned
+directly on ONE core, `experimental_mvcc_passive_checkpoint` is reachable, and
+the schema is migrated rather than wiped. The MVCC default was never the
+justification for the upgrade.
+
+### S7 — unplanned (deferred enabler)
 
