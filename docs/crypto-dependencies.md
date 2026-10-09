@@ -70,9 +70,10 @@ entry; they are deliberately **not** in `ignore` so they keep showing up):
 | Advisory | Reachability | Why not fixed here |
 | --- | --- | --- |
 | RUSTSEC-2023-0071 (`rsa`, Marvin attack) | `toasty-driver-mysql → sqlx-mysql`, a driver no workspace member enables (SQLite/turso only) | ignored as unreachable; no fixed release |
-| RUSTSEC-2026-0253 (`lru 0.16.4`, unsound: `LruCache::pop` panic safety) | `toasty-driver-turso → turso_core → tantivy → lru` | 0.16.4 is the newest 0.16.x and tantivy pins `^0.16.3`; we never call `pop`, and the UB needs a panic inside tantivy's cache (the FTS path this app does not populate) |
+| RUSTSEC-2026-0253 (`lru 0.16.4`, unsound: `LruCache::pop` panic safety) | `xray-tui-db/src/driver/ (the crate's own turso driver fork) → turso_core 0.8.2 → tantivy → lru` | 0.16.4 is the newest 0.16.x and tantivy pins `^0.16.3`; we never call `pop`, and the UB needs a panic inside tantivy's cache (the FTS path this app does not populate). **Provenance updated 2026-10-08**: the chain used to run through the published `toasty-driver-turso`; that crate is no longer a dependency (ADR 0012), so the same `turso_core` arrives via our own `driver/` fork |
 | RUSTSEC-2025-0141 (`bincode 1.3.3`, unmaintained) | `heed → heed-types` | upstream owns the migration to bincode 2's different API |
 | RUSTSEC-2025-0134 (`rustls-pemfile`, unmaintained) | `toasty-driver-postgresql → tokio-postgres`, an unactivated optional driver chain | disappears with the driver chain |
+| `yoke-derive 0.8.3` (**yanked**, a registry warning rather than a RUSTSEC advisory) | `turso_core 0.8.2 → icu_* → yoke → yoke-derive` | arrives with the turso 0.8.2 bump (ADR 0012); a proc-macro, build-time only, and no fixed version is reachable while ICU 2.3 pins this major. Not in `ignore`: it keeps showing up so a future bump notices it |
 
 ## 5. Rejected alternatives (so they are not re-proposed)
 

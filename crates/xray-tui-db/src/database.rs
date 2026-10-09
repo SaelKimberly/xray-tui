@@ -2296,6 +2296,150 @@ mod tests {
         });
         assert_eq!(mode, Some("wal"));
     }
+    /// Concurrent single-ping-shaped transactions under `retry_on_busy`, MVCC vs
+    /// WAL, counting successes and RETRY EXHAUSTION.
+    ///
+    /// This answers the question the MVCC-default decision turns on: MVCC
+    /// surfaces a same-row conflict at the SECOND write statement (or at COMMIT)
+    /// rather than blocking, so the question is not "does it conflict" but
+    /// "does the retry budget absorb it". `retry_exhausted` is the number that
+    /// matters — a non-zero value means a lost write with MVCC as the default.
+    ///
+    /// It deliberately mirrors PRODUCTION's retry budget: ONE `retry_on_busy`
+    /// (5 attempts) around the tx-scoped write, NOT the public
+    /// `apply_link_patches` (which adds its own 5-attempt wrap — nesting them
+    /// would measure a 25-attempt budget the app never uses).
+    ///
+    /// Measured at 32 writers x 60 transactions over 2-64 rows, 3 runs:
+    /// **`retry_exhausted = 0` in every configuration**, WAL and MVCC alike —
+    /// the conflict is surfaced (at the second write or at COMMIT) and the
+    /// 5-attempt budget absorbs all of it, so no write is lost. Wall time:
+    /// MVCC is FASTER on disjoint rows (91-110 ms vs 112-195 ms for WAL) and
+    /// ~2x SLOWER when writers share a row (307-413 ms vs 139-189 ms). The
+    /// production shape is closer to disjoint (a link's PK is
+    /// `(protocol_id, endpoint_id)`, and the write-behind coalesces a link's
+    /// groups into ONE patch before writing).
+    ///
+    /// Ignored: timing-based, so it is a probe, not a gate; run it with
+    /// `--ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "timing probe; prints a table, asserts nothing"]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "probe arithmetic over a tiny fixed endpoint count"
+    )]
+    async fn mvcc_load_probe() {
+        const WRITERS: usize = 32;
+        const PER: usize = 60;
+
+        async fn arm(label: &str, mvcc: bool, contending: bool) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("load.db");
+            let db = Arc::new(
+                Database::open_with_concurrent_writes(&path, mvcc)
+                    .await
+                    .expect("open"),
+            );
+            assert_eq!(db.uses_concurrent_writes(), mvcc);
+            {
+                let mut conn = db.connection().await.expect("conn");
+                // `seed_endpoint` also writes the link; give each endpoint its
+                // own protocol id so the fixture does not re-insert protocol 1.
+                for id in 1..=64 {
+                    seed_endpoint(&mut conn, id, id, "load.example", HostType::Dns, 443, 1).await;
+                }
+            }
+            let ok = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let exhausted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let t0 = std::time::Instant::now();
+            let mut set = tokio::task::JoinSet::new();
+            for writer_ix in 0..WRITERS {
+                let db = Arc::clone(&db);
+                let ok = Arc::clone(&ok);
+                let exhausted = Arc::clone(&exhausted);
+                set.spawn(async move {
+                    for i in 0..PER {
+                        let id = if contending {
+                            (i % 2) as i64 + 1
+                        } else {
+                            ((writer_ix * PER + i) % 64) as i64 + 1
+                        };
+                        let mut row = ProfileStats {
+                            protocol_id: ProtocolId::new(id),
+                            endpoint_id: EndpointId::new(id),
+                            last_used_at: None,
+                            last_seen_at: 1,
+                            latency: Some(Latency::Fast {
+                                delay: (i % 900) as i32,
+                            }),
+                            speed_bps: None,
+                            error: None,
+                            purge_reason: None,
+                            traffic: TrafficStats {
+                                today_up: 0,
+                                today_down: 0,
+                                total_up: 0,
+                                total_down: 0,
+                            },
+                            created_at: 0,
+                            updated_at: 0,
+                            version: 1,
+                            protocol: toasty::Deferred::default(),
+                            endpoint: toasty::Deferred::default(),
+                        };
+                        row.latency = Some(Latency::Fast {
+                            delay: (i % 900) as i32,
+                        });
+                        let row_patch = LinkPatch {
+                            link: row,
+                            groups: LinkGroups::RESULT,
+                        };
+                        // Mirror PRODUCTION exactly: `WriteBehind::flush` wraps
+                        // ONE `retry_on_busy` around the tx-scoped write, which
+                        // itself does not retry. Calling the public
+                        // `apply_link_patches` here would wrap it TWICE (5x5 = 25
+                        // attempts), which is not the budget the app uses.
+                        let handle = Arc::clone(&db);
+                        let row_patch = row_patch.clone();
+                        let r = crate::retry_on_busy(
+                            || async {
+                                let mut conn = handle.connection().await?;
+                                let mut tx = conn.transaction().await?;
+                                let written = Database::apply_link_patches_tx(
+                                    &mut tx,
+                                    std::slice::from_ref(&row_patch),
+                                    now_epoch(),
+                                )
+                                .await?;
+                                tx.commit().await?;
+                                Ok(written)
+                            },
+                            5,
+                        )
+                        .await;
+                        if r.is_ok() {
+                            ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            exhausted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            while set.join_next().await.is_some() {}
+            println!(
+                "PROBE {label:<10} mvcc={mvcc:<5} contend={contending:<5} wall={:>8.2?} ok={:<4} retry_exhausted={}",
+                t0.elapsed(),
+                ok.load(std::sync::atomic::Ordering::Relaxed),
+                exhausted.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+        for mvcc in [false, true] {
+            arm("disjoint", mvcc, false).await;
+            arm("contend", mvcc, true).await;
+        }
+    }
+
     #[tokio::test]
     async fn mvcc_conflict_replays_without_losing_update() {
         let dir = tempfile::tempdir().expect("tempdir");
