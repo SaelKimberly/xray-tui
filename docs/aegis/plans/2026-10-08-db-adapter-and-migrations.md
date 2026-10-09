@@ -283,7 +283,11 @@ the file is no longer deleted for a mere column add.
 
 ---
 
-## S5 — T12 FK cascade
+## S5 — T12 FK cascade (REJECTED — see the execution notes)
+
+> **Not executed as written.** Implemented, reproduced as a delete-race wedge,
+> and reverted; the manual ordered deletes stay the cascade owner. The task
+> below is kept only as the record of what was attempted.
 
 ### T5.1 — FK cascade DDL + per-connection pragma
 

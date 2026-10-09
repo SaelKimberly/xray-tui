@@ -335,9 +335,14 @@ need explicit owners. Resolution:
   pre-migration world. After S4 they must say: schema changes are migrations;
   identity re-keys are `Step::Rebuild` (or a Rust data migration); the file is
   no longer deleted for a mere column add. The docs are updated in S4.
-- **T12 lands here** once S4 swaps `push_schema` to the migration runner: the four
-  child tables get `REFERENCES … ON DELETE CASCADE`, and `PRAGMA foreign_keys=ON`
-  moves into the per-connection setup (already required).
+- **T12 does NOT land here — REJECTED (S5, 2026-10-08).** It was implemented
+  (the fork can splice a table-level `REFERENCES … ON DELETE CASCADE`) and
+  reverted: the cascade creates a delete-race WEDGE, because the geo queue's
+  `set_country` has a CREATE arm with no existence re-check and `LinkSpec::refresh`
+  inserts rank rows inside the write-behind transaction — so a delete racing
+  either raises `FOREIGN KEY constraint failed` and `WriteBehind` re-stages
+  forever. Reproduced: `GEO AFTER DELETE: Err(FOREIGN KEY constraint failed)`.
+  The manual ordered deletes already own the cascade, transactionally. See D6.
 
 ## 6. Migration stages (incremental; each independently useful)
 
