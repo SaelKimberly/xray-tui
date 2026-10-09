@@ -1495,10 +1495,12 @@ async fn finish_batch(shared: &BatchShared) {
             "batch flush failed after {FINAL_FLUSH_ATTEMPTS} attempts: {e}"
         );
     }
-    // Log growth is bounded in both journal modes now: `file_driver` enables
-    // the MVCC passive-checkpoint flag alongside the MVCC opt-in, so
-    // `wal_checkpoint(PASSIVE)` succeeds under MVCC too (it used to be rejected,
-    // leaving MVCC's log unbounded).
+    // `wal_checkpoint(PASSIVE)` is accepted in both journal modes now: it used
+    // to be REJECTED under MVCC ("PASSIVE checkpoint requires
+    // experimental_mvcc_passive_checkpoint"), so the batch simply skipped it.
+    // The log is not left to grow by that — the engine auto-checkpoints MVCC on
+    // the commit path at ~4.12 MB — but without the flag those auto-checkpoints
+    // take the blocking `Truncate` mode, which `file_driver` now avoids.
     if wal_checkpoint_enabled(shared.db.uses_concurrent_writes())
         && let Ok(Ok(mut conn)) =
             tokio::time::timeout(std::time::Duration::from_secs(2), shared.db.connection()).await
