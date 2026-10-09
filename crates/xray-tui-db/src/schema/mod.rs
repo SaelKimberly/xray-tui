@@ -37,18 +37,6 @@ pub mod ddl;
 /// authority; they must agree, and a test pins it.
 pub const LATEST: i64 = crate::database::SCHEMA_VERSION;
 
-/// What the cursor comparison concluded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaState {
-    /// The database is at the current version — nothing to do.
-    Current,
-    /// The database was created (fresh) or migrated to the current version.
-    Applied,
-    /// The file's cursor names a schema this code does not know. The caller
-    /// decides what to do (the pre-alpha answer is a wipe).
-    Incompatible(i64),
-}
-
 /// Read the migration cursor. Reuses the crate's one PRAGMA decoder so the
 /// cursor and every other `PRAGMA` read cannot drift.
 async fn cursor(conn: &mut impl toasty::Executor) -> Result<i64> {
@@ -84,14 +72,14 @@ async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
 /// comes from `push_schema`, which is the schema of record until the typed
 /// layer is retired (see `ddl.rs`). Everything toasty cannot express comes from
 /// [`ddl`].
-pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<SchemaState> {
+pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<()> {
     match cursor(conn).await? {
         v if v == LATEST => {
             // Current. Still ensure the derived tables/indexes exist — this is
             // the only path a database created before a new raw statement was
             // added to `ddl.rs` takes, and every statement is idempotent.
             ensure_raw_ddl(conn).await?;
-            Ok(SchemaState::Current)
+            Ok(())
         }
         0 => {
             // Cursor 0 with existing foreign tables: `push_schema` emits
@@ -113,7 +101,7 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<S
             toasty::sql::query(format!("PRAGMA user_version = {LATEST}"))
                 .exec(conn)
                 .await?;
-            Ok(SchemaState::Applied)
+            Ok(())
         }
         other => {
             // 0 < other < LATEST would be "apply the steps after `other`" once

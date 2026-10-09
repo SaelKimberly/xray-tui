@@ -324,7 +324,7 @@ impl Database {
         // "delete the file": a supported older version now MIGRATES, and only a
         // file whose cursor names an UNKNOWN schema takes the documented wipe.
         match crate::schema::migrate(&db, &mut conn).await {
-            Ok(_state) => {}
+            Ok(()) => {}
             Err(crate::error::DatabaseError::IncompatibleSchema(version)) => {
                 // A foreign or pre-migration file: unreadable by this code.
                 // The pre-alpha policy is a wipe (AGENTS decision 4), now an
