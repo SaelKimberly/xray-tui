@@ -604,10 +604,18 @@ blocks — an earlier version of it accidentally `% 64`-folded every batch onto 
 same 64 rows and its "conflicts on disjoint rows" reading was that artifact)
 measures the two shapes apart at 16 writers × 24 transactions × 8 rows:
 
-| geo writers (16×) | WAL exhausted | MVCC exhausted | wall |
+| geo writers (16×) | WAL exhausted | MVCC exhausted | wall (2 runs each) |
 | --- | --- | --- | --- |
-| disjoint (production shape: distinct endpoints) | 0 | **0** | MVCC 52–147 ms vs WAL 451 ms — MVCC FASTER |
-| overlapping (all writers on 8 rows) | 0 | **0** (was 0–1 before the `ON CONFLICT` fix) | MVCC 124–211 ms vs WAL 36–43 ms |
+| disjoint (production shape: distinct endpoints) | 0 | **0** | WAL 145–225 ms vs MVCC 166–204 ms — parity |
+| overlapping (all writers on 8 rows) | 0 | **0** (was 0–1 before the `ON CONFLICT` fix) | WAL 55 ms vs MVCC 240–257 ms — MVCC ~4.5× slower |
+| production topology (2 owners, shared rows) | 0 | **0** | WAL 4–6 ms vs MVCC 11–13 ms |
+
+These are POST-batching numbers (`set_countries_bulk`: one statement per 400
+rows). They supersede an earlier run that showed MVCC faster on the disjoint arm
+(WAL 451 ms vs MVCC 52–147 ms) — that run was per-row, where MVCC's cheaper
+statement path won; batching cut WAL's cost far more (451 → 145 ms), so the
+comparison inverted. Mixed rows of the two generations are not comparable, which
+is why only this set is quoted. The exhausted counts were 0 in both generations.
 
 At production geometry (1–2 geo writers, the geo drain being ONE `WriteBehind`
 owner) it is 0 exhausted at the generic 5-attempt budget in every run. So
@@ -630,7 +638,12 @@ rows, so its "disjoint" label was wrong; the fixture now gives each writer a
 distinct id block.)
 
 **Decision: MVCC stays an OPT-IN — the reason is throughput and tooling, not
-correctness, and the verdict is weak.** Correctness is clear on every shape
+correctness, and the verdict is weak.** (The tooling half of that shrank further:
+the Turso project's own `tursodb` CLI reads our MVCC files and `.dump`s them back
+into stock SQLite — so the cost is which tool you reach for, not an inability to
+read or convert. That removes the strongest argument against flipping the
+default, leaving throughput. A flip is now a live, low-risk change if the
+real-feed numbers hold.) Correctness is clear on every shape
 measured: 0 write loss on disjoint rows, on the production 2-writer overlap, and
 even the single-row case loses at most 1 write — which `WriteBehind::flush`
 re-stages rather than drops. MVCC wins on the shape production has (disjoint rows)

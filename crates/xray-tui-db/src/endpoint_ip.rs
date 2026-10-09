@@ -282,20 +282,30 @@ pub(crate) async fn set_countries_bulk(
     conn: &mut impl toasty::Executor,
     rows: &[(EndpointId, IpAddr, String)],
 ) -> Result<()> {
+    use std::collections::hash_map::Entry;
     use std::fmt::Write as _;
     if rows.is_empty() {
         return Ok(());
     }
-    // Dedup by (endpoint, key): the PK is the pair, and two rows for one address
-    // in the same window are a constraint violation, not two writes. LAST wins,
-    // matching the sequential order's last-write-wins.
-    let mut seen: std::collections::HashSet<(i64, Vec<u8>)> =
-        std::collections::HashSet::with_capacity(rows.len());
+    // Dedup by (endpoint, key), LAST occurrence winning: the PK is the pair, and
+    // two rows for one address in one statement are a write collision, not two
+    // writes. Last-wins is the semantics of the per-row loop this replaced (a
+    // later `set_country` overwrote an earlier one) and of
+    // `write_behind::CountrySpec::coalesce`, which already keeps one row per
+    // endpoint — so this branch is not reachable FROM the geo drain today, and it
+    // exists to keep the ordering contract explicit rather than to be exercised.
+    // First-seen order is preserved so the statement's row order is stable.
+    let mut slot: std::collections::HashMap<(i64, Vec<u8>), usize> =
+        std::collections::HashMap::with_capacity(rows.len());
     let mut pairs: Vec<(i64, Vec<u8>, &str)> = Vec::with_capacity(rows.len());
     for (id, ip, iso) in rows {
         let key = key_of(*ip);
-        if seen.insert((id.get(), key.clone())) {
-            pairs.push((id.get(), key, iso.as_str()));
+        match slot.entry((id.get(), key.clone())) {
+            Entry::Occupied(e) => pairs[*e.get()].2 = iso.as_str(),
+            Entry::Vacant(e) => {
+                e.insert(pairs.len());
+                pairs.push((id.get(), key, iso.as_str()));
+            }
         }
     }
     for chunk in pairs.chunks(LITERAL_BULK_ROWS) {
@@ -438,6 +448,36 @@ mod tests {
     /// retry it, at ANY budget. This pins the single-statement form: the write
     /// count for a fresh row is 1 (an upsert), and the second call UPDATES
     /// rather than failing on the existing PK.
+    /// An in-batch duplicate `(endpoint_id, ip_key)` takes the LAST value.
+    ///
+    /// Not reachable from the geo drain (`CountrySpec::coalesce` keeps one row
+    /// per endpoint), so this pins the ORDERING CONTRACT rather than a live path:
+    /// it is the semantics of the per-row loop the bulk writer replaced, and a
+    /// comment (or a later refactor) that flipped it to first-wins would change
+    /// which country a racing window lands on without any test objecting.
+    #[tokio::test]
+    async fn set_countries_bulk_keeps_the_last_value_for_a_duplicate_row() {
+        let db = crate::Database::in_memory().await.expect("db");
+        let mut conn = db.connection().await.expect("conn");
+        let ip: std::net::IpAddr = "203.0.113.9".parse().expect("ip");
+        let id = EndpointId::new(11);
+
+        set_countries_bulk(
+            &mut conn,
+            &[
+                (id, ip, "DE".to_string()),
+                (id, ip, "FR".to_string()), // same pair: this one wins
+            ],
+        )
+        .await
+        .expect("bulk write");
+
+        let stored = load_resolved(&mut conn, &[id]).await.expect("load");
+        let rows = stored.get(&id).expect("one endpoint");
+        assert_eq!(rows.len(), 1, "the duplicate must collapse to one PK row");
+        assert_eq!(rows[0].1.as_deref(), Some("FR"), "LAST value wins");
+    }
+
     #[tokio::test]
     async fn set_countries_bulk_is_an_atomic_upsert() {
         let db = crate::Database::in_memory().await.expect("db");

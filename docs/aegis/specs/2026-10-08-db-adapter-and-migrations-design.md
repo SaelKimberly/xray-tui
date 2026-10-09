@@ -431,9 +431,9 @@ optional.
   the MVCC-only geo failures it once showed were TWO defects now fixed — a
   case-sensitive `conflict` match that skipped the retry entirely, and
   `set_country`'s SELECT-then-INSERT TOCTOU (now one `ON CONFLICT … DO UPDATE`). **WAL stays the
-  default** on the on-disk-format cost (an MVCC file is unreadable by stock
-  SQLite tooling; the conversion is one-way) and the unresolved real-feed
-  throughput.
+  default** on the on-disk-format cost (an MVCC file is unreadable by *stock*
+  SQLite tooling, though the Turso project's own `tursodb` CLI reads it and
+  `.dump` gives a way back) and the unresolved real-feed throughput.
 - **S6 (DONE):** MVCC vs WAL A/B on turso 0.8, synthetic 8,000-endpoint feed, two
   runs per arm. **WAL stays the default**: the sequential geo rows show a
   reproducible MVCC tax (1.1–1.6× slower), and the contended fan-in row swung

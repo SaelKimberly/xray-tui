@@ -89,14 +89,22 @@ turso themselves.
      is now ONE `ON CONFLICT … DO UPDATE` statement, which also removes the N
      reads per geo window. (Under WAL the TOCTOU could not fire — the transaction
      holds the write lock — which is why only the MVCC layout exposed it.)
-   - *Remaining costs of a flip:* (a) an MVCC file is NOT readable by stock SQLite
-     tooling (it answers `file is not a database`), and the conversion is ONE-WAY
-     (the code converts a fresh file INTO MVCC, never back) — external
-     backup/inspection/debug tooling stops working on the app's own data; (b)
-     throughput is mixed (MVCC faster on disjoint writes, 1.1-1.6x slower on the
-     sequential geo mix, ~3x slower on heavy row overlap). Because (a) is a
-     user-visible tooling loss and (b) is unresolved on a real feed, the DEFAULT
-     stays WAL; the opt-in is sound and now correctly checkpointed.
+   - *Remaining costs of a flip:* (a) an MVCC file is not readable by **stock**
+     SQLite tooling (sqlite3 answers `file is not a database`) — but the Turso
+     project's own `tursodb` CLI READS it (verified: 50/50 rows of a file this app
+     wrote, `-log` sidecar included), and `tursodb … .dump` emits portable SQL
+     that reimports cleanly into stock SQLite (verified round trip). So (a) is a
+     TOOLING-CHOICE cost, not the one-way trap this ADR first recorded: the way
+     back is `tursodb <db> .dump | sqlite3 new.db`. It still bites anyone reaching
+     for `sqlite3`/DB-Browser out of habit, which is why it stays listed; (b)
+     throughput is MIXED BY PATH and must not be read as a single verdict:
+     MVCC is the faster arm for the LINK writer in most runs
+     (`mvcc_load_probe`: 84-195 ms vs WAL's 192-775 ms, disjoint rows), while on
+     the GEO writer it is parity on disjoint rows and ~4.5x slower under heavy row
+     overlap (`geo_under_mvcc_probe`, post-`set_countries_bulk`: WAL 55 ms vs
+     MVCC 240-257 ms). Because (a) is a user-visible tooling loss and (b) is
+     unresolved on a real feed, the DEFAULT stays WAL; the opt-in is sound and now
+     correctly checkpointed.
 
 ## Rejected
 
