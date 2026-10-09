@@ -607,7 +607,7 @@ measures the two shapes apart at 16 writers × 24 transactions × 8 rows:
 | geo writers (16×) | WAL exhausted | MVCC exhausted | wall |
 | --- | --- | --- | --- |
 | disjoint (production shape: distinct endpoints) | 0 | **0** | MVCC 52–147 ms vs WAL 451 ms — MVCC FASTER |
-| overlapping (all writers on 8 rows) | 0 | 0–1 | MVCC 352–564 ms vs WAL 138 ms — MVCC ~3× slower |
+| overlapping (all writers on 8 rows) | 0 | **0** (was 0–1 before the `ON CONFLICT` fix) | MVCC 124–211 ms vs WAL 36–43 ms |
 
 At production geometry (1–2 geo writers, the geo drain being ONE `WriteBehind`
 owner) it is 0 exhausted at the generic 5-attempt budget in every run. So
@@ -620,8 +620,11 @@ actually uses. `database::tests::mvcc_load_probe` (ignored; 32 writers × 60
 transactions, 2 runs) wraps the tx-scoped write in **ONE** `retry_on_busy(…, 5)` —
 production's exact budget; nesting the public `apply_link_patches` would have
 measured 25 attempts and proved nothing. Result: **`retry_exhausted = 0` on the
-DISJOINT rows, WAL and MVCC alike** (MVCC 84–87 ms vs WAL 220–775 ms — MVCC
-faster), and **0–1 exhausted** when all 32 writers share ONE row (MVCC ~3× slower).
+DISJOINT rows, WAL and MVCC alike**, with MVCC the faster arm in most runs
+(84–195 ms vs WAL's 192–775 ms) but not all — the spread exceeds the difference,
+so call the wall times parity. On the single-row arm MVCC is consistently slower
+(291–532 ms vs 227–385 ms) and exhausts at most **1 of 1920**, which
+`WriteBehind::flush` re-stages.
 (An earlier version of this probe `% 64`-folded every writer onto the same 64
 rows, so its "disjoint" label was wrong; the fixture now gives each writer a
 distinct id block.)

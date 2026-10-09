@@ -255,37 +255,70 @@ async fn countries_of(
     Ok(out)
 }
 
-/// Record the country of one resolved address — ONE atomic upsert.
+/// Record the countries of a whole geo window — ONE multi-row upsert per 400
+/// rows.
 ///
 /// The write the geo lookup makes once per address; `replace` keeps it
-/// afterwards. The row is created when it is missing: the lookup and the
-/// address write race by design (the geo step runs after the resolution event
-/// was already queued), and a country that arrives first must not be dropped.
+/// afterwards. Rows are created when missing: the lookup and the address write
+/// race by design (the geo step runs after the resolution event was already
+/// queued), and a country that arrives first must not be dropped — hence
+/// `DO UPDATE SET country = excluded.country` rather than `DO NOTHING`.
 ///
-/// `ON CONFLICT … DO UPDATE` is load-bearing, not stylistic. The previous
-/// SELECT-then-UPDATE-or-CREATE was a TOCTOU: two writers could both miss and
-/// both INSERT the same composite PK. Under WAL that cannot happen (the
-/// transaction holds the write lock), but under MVCC it can, and the resulting
-/// `Constraint` is NOT a busy error — [`crate::is_busy_error`] is false for it —
-/// so `retry_on_busy` never retried it, no matter the budget. The single
-/// statement removes the race and the N reads the geo window used to spend
-/// (one SELECT per address).
-pub(crate) async fn set_country(
+/// Two properties are load-bearing, both learned the hard way:
+///
+/// * **`ON CONFLICT … DO UPDATE`, not SELECT-then-write.** The per-row shape was
+///   a TOCTOU: two writers could both miss and both INSERT the same composite
+///   PK. Under WAL that cannot happen (the transaction holds the write lock),
+///   but under MVCC it can, and the resulting `Constraint` is NOT a busy error —
+///   [`crate::is_busy_error`] is false for it — so `retry_on_busy` never retried
+///   it, at ANY budget. One statement removes the race.
+/// * **Multi-row, chunked.** A geo window is hundreds of addresses, and each row
+///   carries a distinct `endpoint_id`/`ip_key`, so per-row statements are that
+///   many distinct SQL texts (each an uncached compile on the `RawSql` route).
+///   `insert_literals_bulk` above set this precedent for the address half
+///   (204,592 statements → ~511) and the country half is the same data at the
+///   same rate.
+pub(crate) async fn set_countries_bulk(
     conn: &mut impl toasty::Executor,
-    endpoint_id: EndpointId,
-    ip: IpAddr,
-    iso: &str,
+    rows: &[(EndpointId, IpAddr, String)],
 ) -> Result<()> {
-    let key = key_of(ip);
-    let sql = format!(
-        "INSERT INTO \"endpoint_ip\" (\"endpoint_id\", \"ip_key\", \"country\") \
-         VALUES ({}, x'{}', {}) \
-         ON CONFLICT(\"endpoint_id\", \"ip_key\") DO UPDATE SET \"country\" = excluded.\"country\"",
-        endpoint_id.get(),
-        hex_lit(&key),
-        crate::database::sql_lit(iso),
-    );
-    toasty::sql::statement(sql).exec(conn).await?;
+    use std::fmt::Write as _;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // Dedup by (endpoint, key): the PK is the pair, and two rows for one address
+    // in the same window are a constraint violation, not two writes. LAST wins,
+    // matching the sequential order's last-write-wins.
+    let mut seen: std::collections::HashSet<(i64, Vec<u8>)> =
+        std::collections::HashSet::with_capacity(rows.len());
+    let mut pairs: Vec<(i64, Vec<u8>, &str)> = Vec::with_capacity(rows.len());
+    for (id, ip, iso) in rows {
+        let key = key_of(*ip);
+        if seen.insert((id.get(), key.clone())) {
+            pairs.push((id.get(), key, iso.as_str()));
+        }
+    }
+    for chunk in pairs.chunks(LITERAL_BULK_ROWS) {
+        let mut sql = String::with_capacity(chunk.len() * 64 + 160);
+        sql.push_str(
+            "INSERT INTO \"endpoint_ip\" (\"endpoint_id\", \"ip_key\", \"country\") VALUES ",
+        );
+        for (i, (id, key, iso)) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            let _ = write!(
+                sql,
+                "({id}, x'{}', {})",
+                hex_lit(key),
+                crate::database::sql_lit(iso)
+            );
+        }
+        sql.push_str(
+            " ON CONFLICT(\"endpoint_id\", \"ip_key\") DO UPDATE SET \"country\" = excluded.\"country\"",
+        );
+        toasty::sql::statement(sql).exec(conn).await?;
+    }
     Ok(())
 }
 
@@ -396,7 +429,7 @@ mod tests {
             .to_string()
     }
 
-    /// `set_country` MUST be a single atomic upsert, not a read-then-write.
+    /// `set_countries_bulk` MUST be an atomic upsert, not a read-then-write.
     ///
     /// The old shape was a TOCTOU: two writers could both SELECT-miss and both
     /// INSERT the same `(endpoint_id, ip_key)` PK. Under WAL the transaction
@@ -406,7 +439,7 @@ mod tests {
     /// count for a fresh row is 1 (an upsert), and the second call UPDATES
     /// rather than failing on the existing PK.
     #[tokio::test]
-    async fn set_country_is_an_atomic_upsert() {
+    async fn set_countries_bulk_is_an_atomic_upsert() {
         let db = crate::Database::in_memory().await.expect("db");
         let mut conn = db.connection().await.expect("conn");
         // No endpoint row is needed: `set_country` writes `endpoint_ip` alone
@@ -414,14 +447,14 @@ mod tests {
         let ip: std::net::IpAddr = "198.51.100.77".parse().expect("ip");
 
         // First write: creates the row.
-        set_country(&mut conn, EndpointId::new(7), ip, "DE")
+        set_countries_bulk(&mut conn, &[(EndpointId::new(7), ip, "DE".to_string())])
             .await
             .expect("first write");
 
         // Second write on the SAME row: the upsert's DO UPDATE branch. A
         // read-then-create would have raced here; without the upsert it is at
         // best an update, at worst a constraint violation.
-        set_country(&mut conn, EndpointId::new(7), ip, "FR")
+        set_countries_bulk(&mut conn, &[(EndpointId::new(7), ip, "FR".to_string())])
             .await
             .expect("second write must update, not conflict");
 

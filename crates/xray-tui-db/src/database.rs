@@ -1447,7 +1447,11 @@ impl Database {
                 async move {
                     let mut conn = db.conn().await?;
                     let mut tx = conn.transaction().await?;
-                    crate::endpoint_ip::set_country(&mut tx, endpoint_id, ip, &iso).await?;
+                    crate::endpoint_ip::set_countries_bulk(
+                        &mut tx,
+                        &[(endpoint_id, ip, iso.clone())],
+                    )
+                    .await?;
                     tx.commit().await?;
                     Ok(())
                 }
@@ -2026,10 +2030,7 @@ pub async fn set_endpoint_ip_countries_once(
     tx: &mut impl Executor,
     rows: &[(EndpointId, std::net::IpAddr, String)],
 ) -> Result<()> {
-    for (endpoint_id, ip, iso) in rows {
-        crate::endpoint_ip::set_country(&mut *tx, *endpoint_id, *ip, iso).await?;
-    }
-    Ok(())
+    crate::endpoint_ip::set_countries_bulk(tx, rows).await
 }
 
 /// Insert-or-update many endpoint↔group links on the caller's executor.
@@ -2305,13 +2306,54 @@ mod tests {
         });
         assert_eq!(mode, Some("wal"));
     }
+    /// The MVCC checkpoint MUST work on the REAL `Database::open` path.
+    ///
+    /// This is the ONLY guard on the fix in `file_driver`: it enables
+    /// `experimental_mvcc_passive_checkpoint` alongside the MVCC opt-in, without
+    /// which the engine rejects the app's only log-bounding statement with
+    /// `PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint` and an
+    /// MVCC database grows its logical log for the life of the process.
+    ///
+    /// It opens a real MVCC handle and runs the statement, so it FAILS if the
+    /// flag is dropped from `file_driver` — which
+    /// `ping::tests::checkpoint_runs_under_both_journal_modes` cannot do (that
+    /// one only asserts a gate predicate whose body is a constant `true`).
+    #[tokio::test]
+    async fn mvcc_checkpoint_succeeds_on_the_open_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mvcc-ckpt.db");
+        let db = Database::open_with_concurrent_writes(&path, true)
+            .await
+            .expect("open mvcc");
+        assert!(db.uses_concurrent_writes());
+        let mut conn = db.connection().await.expect("conn");
+        for n in 0..200 {
+            toasty::sql::statement(format!(
+                "INSERT INTO endpoints (id, created_at, domain, sub_domain, port, ports) \
+                 VALUES ({n}, 0, 'ck.example', 'ck.example', 443, '[]')"
+            ))
+            .exec(&mut conn)
+            .await
+            .expect("insert");
+        }
+        let rows = toasty::sql::query("PRAGMA wal_checkpoint(PASSIVE)")
+            .exec(&mut conn)
+            .await
+            .expect("MVCC must accept the passive checkpoint (file_driver sets the flag)");
+        assert!(!rows.is_empty(), "the checkpoint returns its status row");
+    }
+
     /// The GEO write path under several concurrency topologies — the A/B
     ///
     /// `set_endpoint_ip_countries` is the writer the flow-cost lab's mix arm
-    /// reports failing under MVCC but not WAL (WAL counts exactly one failure
-    /// per sample = the import arm; MVCC counts MORE than one per sample). It
-    /// already wraps `retry_on_busy(..., 5)`, so a failure here is EXHAUSTED
-    /// retries — the one outcome that matters. Counts them by category.
+    /// reported failing under MVCC and not WAL. Its failures are split by
+    /// `is_busy_error`: a spent retry budget is `exhausted`, anything else is
+    /// `hard_err` — the distinction that matters, because a `Constraint` is not
+    /// retryable at ANY budget and would otherwise read as exhaustion.
+    ///
+    /// Measured after the `ON CONFLICT` fix: `exhausted=0 hard_err=0` in EVERY
+    /// arm, WAL and MVCC, including 16 writers on shared rows — i.e. the residue
+    /// the lab showed was the `set_country` TOCTOU, not contention.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "timing probe; prints a table, asserts nothing"]
     #[allow(
@@ -2321,7 +2363,15 @@ mod tests {
         reason = "probe arithmetic over a tiny fixed endpoint pool"
     )]
     async fn geo_under_mvcc_probe() {
-        async fn arm(label: &str, mvcc: bool, writers: usize, rows: usize, shared: bool) {
+        #[allow(clippy::too_many_arguments)]
+        async fn arm(
+            label: &str,
+            mvcc: bool,
+            writers: usize,
+            rows: usize,
+            shared: bool,
+            vary: bool,
+        ) {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("geo.db");
             let db = Arc::new(
@@ -2337,7 +2387,12 @@ mod tests {
                     seed_endpoint(&mut conn, id, id, "geo.example", HostType::Dns, 443, 1).await;
                 }
             }
-            let (ok, exhausted) = (
+            // Split the outcome three ways: `retry_on_busy` returns Err for BOTH
+            // a spent retry budget (a busy error) and a hard error it never
+            // retried — conflating them is how a Constraint gets misread as
+            // exhaustion.
+            let (ok, exhausted, hard_err) = (
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             );
@@ -2347,6 +2402,7 @@ mod tests {
                 let db = Arc::clone(&db);
                 let ok = Arc::clone(&ok);
                 let exhausted = Arc::clone(&exhausted);
+                let hard_err = Arc::clone(&hard_err);
                 set.spawn(async move {
                     for r in 0..24usize {
                         // `shared` = every writer touches the SAME endpoint ids
@@ -2369,7 +2425,11 @@ mod tests {
                                         (id / 256) as u8,
                                         (id % 256) as u8,
                                     ]),
-                                    "DE".to_string(),
+                                    if vary {
+                                        format!("D{w}")
+                                    } else {
+                                        "DE".to_string()
+                                    },
                                 )
                             })
                             .collect();
@@ -2378,8 +2438,15 @@ mod tests {
                                 ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(e) => {
-                                exhausted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if exhausted.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                                if crate::is_busy_error(&e) {
+                                    exhausted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                } else {
+                                    hard_err.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                if exhausted.load(std::sync::atomic::Ordering::Relaxed)
+                                    + hard_err.load(std::sync::atomic::Ordering::Relaxed)
+                                    == 1
+                                {
                                     println!("GEO ERR: {e}");
                                 }
                             }
@@ -2389,24 +2456,27 @@ mod tests {
             }
             while set.join_next().await.is_some() {}
             println!(
-                "GEOPROBE {label:<10} mvcc={mvcc:<5} writers={writers:<3} rows={rows:<3} shared={shared:<5} wall={:>8.2?} ok={:<4} exhausted={}",
+                "GEOPROBE {label:<10} mvcc={mvcc:<5} writers={writers:<3} rows={rows:<3} shared={shared:<5} vary={vary:<5} wall={:>8.2?} ok={:<4} exhausted={} hard_err={}",
                 t0.elapsed(),
                 ok.load(std::sync::atomic::Ordering::Relaxed),
                 exhausted.load(std::sync::atomic::Ordering::Relaxed),
+                hard_err.load(std::sync::atomic::Ordering::Relaxed),
             );
         }
         // Production geometry: the geo drain is ONE owner (the WriteBehind
         // driver), overlapped only by a page seed. So the interesting rows are
         // LOW writer counts, not the lab's 16x.
         for mvcc in [false, true] {
-            arm("prod-1w", mvcc, 1, 8, false).await;
-            arm("prod-2w", mvcc, 2, 8, false).await;
-            // PRODUCTION TOPOLOGY: exactly TWO owners that can touch the same
-            // endpoint_ip row — the page seed (UI task) and the geo drain —
-            // on OVERLAPPING rows.
-            arm("prod-2w-ovl", mvcc, 2, 8, true).await;
-            arm("lab-16w", mvcc, 16, 8, false).await;
-            arm("overlap", mvcc, 16, 8, true).await;
+            arm("prod-1w", mvcc, 1, 8, false, false).await;
+            arm("prod-2w", mvcc, 2, 8, false, false).await;
+            // PRODUCTION TOPOLOGY: TWO owners on the SAME rows. `vary=false` is
+            // the seed/drain agreeing (a no-op UPDATE); `vary=true` is a
+            // re-resolution racing a stale queued value — last-writer-wins must
+            // still hold without a hard error.
+            arm("prod-2w-same", mvcc, 2, 8, true, false).await;
+            arm("prod-2w-vary", mvcc, 2, 8, true, true).await;
+            arm("lab-16w", mvcc, 16, 8, false, false).await;
+            arm("overlap", mvcc, 16, 8, true, false).await;
         }
     }
 
@@ -2424,12 +2494,16 @@ mod tests {
     /// `apply_link_patches` (which adds its own 5-attempt wrap — nesting them
     /// would measure a 25-attempt budget the app never uses).
     ///
-    /// Measured at 32 writers x 60 transactions, 2 runs: **`retry_exhausted = 0`
-    /// on the DISJOINT rows**, WAL and MVCC alike (MVCC 84-87 ms vs WAL
-    /// 220-775 ms — MVCC faster), and 0-1 exhausted when all 32 writers share
-    /// ONE row (MVCC ~3x slower). The production shape is the disjoint one: a
-    /// link's PK is `(protocol_id, endpoint_id)`, and the write-behind
-    /// coalesces a link's groups into ONE patch before writing.
+    /// Measured at 32 writers x 60 transactions, several runs: **`retry_exhausted
+    /// = 0` on the DISJOINT rows**, WAL and MVCC alike, with MVCC the faster arm
+    /// in most runs (84-195 ms vs WAL's 192-775 ms) but not all — the run-to-run
+    /// spread exceeds the difference, so treat the wall times as parity. On the
+    /// single-row arm MVCC is consistently slower (291-532 ms vs 227-385 ms) and
+    /// exhausts at most 1 of 1920, which `WriteBehind::flush` re-stages.
+    ///
+    /// The production shape is the DISJOINT one: a link's PK is
+    /// `(protocol_id, endpoint_id)` and the write-behind coalesces a link's
+    /// groups into ONE patch before writing.
     ///
     /// Ignored: timing-based, so it is a probe, not a gate; run it with
     /// `--ignored --nocapture`.
