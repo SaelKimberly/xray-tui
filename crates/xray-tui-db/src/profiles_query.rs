@@ -23,9 +23,8 @@ use std::net::IpAddr;
 use crate::Database;
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    Endpoint, EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr,
-    ProfileStats, Protocol, ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats,
-    Transport,
+    Endpoint, EndpointId, EndpointRow, ErrorInfo, Latency, ProfileErr, ProfileStats, Protocol,
+    ProtocolId, PurgatoryView, PurgeReason, Security, TrafficStats, Transport,
 };
 use toasty::Deferred;
 use toasty::schema::Load;
@@ -95,19 +94,28 @@ pub enum PlanScope {
 }
 
 impl PlanScope {
-    /// The `rank_bin` values this scope selects (db-rewamp D11). Empty means
-    /// "no predicate".
+    /// The SQL predicate this scope contributes, over the `endpoint_rank` alias
+    /// `k`. `None` = no predicate.
     ///
-    /// Successful = any real success (`0..=5`); New = untested (`12`);
-    /// Failed = real-err/fast-err/dns-err (`13..=15`).
+    /// The R1 partition: membership is `rank_proven` FIRST, then the bin.
+    /// `New` is "not proven AND untested"; `Failed` is "not proven AND a
+    /// failure marker"; `Successful` is proven at any bin. A proven endpoint
+    /// whose representative is an untested sibling (bin 12) is therefore
+    /// Successful, NOT New — which is the whole reason the column exists.
+    ///
+    /// The three arms are pairwise disjoint, so `SuccessfulAndNew` is their
+    /// union and not a double-count. Replaces the retired `bins()` list: a
+    /// proven endpoint can carry bin 12 or 13 (spec
+    /// `2026-10-09-stab-bin-design` §5.3), so membership is no longer a bin
+    /// set for any scope.
     #[must_use]
-    pub const fn bins(self) -> &'static [i64] {
+    pub const fn predicate(self) -> Option<&'static str> {
         match self {
-            Self::All => &[],
-            Self::Successful => &[0, 1, 2, 3, 4, 5],
-            Self::New => &[12],
-            Self::SuccessfulAndNew => &[0, 1, 2, 3, 4, 5, 12],
-            Self::Failed => &[13, 14, 15],
+            Self::All => None,
+            Self::Successful => Some("k.rank_proven = 1"),
+            Self::New => Some("(k.rank_proven = 0 AND k.rank_bin = 12)"),
+            Self::SuccessfulAndNew => Some("(k.rank_proven = 1 OR k.rank_bin = 12)"),
+            Self::Failed => Some("(k.rank_proven = 0 AND k.rank_bin IN (13, 14, 15))"),
         }
     }
 }
@@ -368,6 +376,7 @@ pub fn order_terms(sort: PageSort, ascending: bool) -> Vec<OrderTerm> {
             // the All view would filesort (turso `USE SORTER`).
             term(rank_col("band"), true),
             term(rank_col("rank_bin"), true),
+            term(rank_col("rank_stab"), true),
             term(rank_col("rank_weight"), false),
             term(rank_col("rank_domain"), true),
             term(rank_col("rank_sub_domain"), true),
@@ -459,9 +468,7 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
         let term = search.to_lowercase();
         let escaped = escape_like(&term);
         let port_pat = sql.bind(format!("%{escaped}%"));
-        let mut clauses = vec![format!(
-            "CAST(e.port AS TEXT) LIKE {port_pat} ESCAPE '\\'"
-        )];
+        let mut clauses = vec![format!("CAST(e.port AS TEXT) LIKE {port_pat} ESCAPE '\\'")];
         if let Some((lo, hi)) = ip_range_bounds(&term) {
             let l = sql.bind(Value::Bytes(lo));
             let h = sql.bind(Value::Bytes(hi));
@@ -472,18 +479,19 @@ fn base_from_where(sql: &mut Sql, req: &PageRequest, join_endpoints: bool) {
             clauses.push(format!("(k.rank_domain >= {l} AND k.rank_domain < {h})"));
             let l2 = sql.bind(term.clone());
             let h2 = sql.bind(format!("{term}\u{10ffff}"));
-            clauses.push(format!("(k.rank_sub_domain >= {l2} AND k.rank_sub_domain < {h2})"));
+            clauses.push(format!(
+                "(k.rank_sub_domain >= {l2} AND k.rank_sub_domain < {h2})"
+            ));
         }
         sql.push(&format!(" AND ({})", clauses.join(" OR ")));
     }
-    // The plan scope reads the endpoint's materialized BIN (db-rewamp D11),
-    // so the scoped batch variants are an index range. Bound (never inlined)
-    // like every other predicate, and shared with the count so the footer
-    // cannot drift.
-    let bins = req.scope.bins();
-    if !bins.is_empty() {
-        let placeholders: Vec<String> = bins.iter().map(|b| sql.bind(*b)).collect();
-        sql.push(&format!(" AND k.rank_bin IN ({})", placeholders.join(", ")));
+    // The plan scope reads the endpoint's MATERIALIZED membership (proven-first
+    // bin partition, spec `2026-10-09-stab-bin-design` §5.3). The predicate is
+    // a shared const so the page, the walk and the count cannot drift. It is
+    // an inline filter over the covering index: `rank_proven` is a trailing
+    // covering column, so no scope needs a sorter or a second index.
+    if let Some(pred) = req.scope.predicate() {
+        sql.push(&format!(" AND ({pred})"));
     }
 }
 
@@ -800,6 +808,8 @@ const PAGE_PROJECTION: &[&str] = &[
     "ps.error_kind",
     "ps.error_text",
     "ps.purge_reason",
+    "ps.stab_mask",
+    "ps.stab_len",
     "ps.traffic_today_up",
     "ps.traffic_today_down",
     "ps.traffic_total_up",
@@ -1010,6 +1020,8 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
     // Only the Active view's panel hides purged links; the page decides which
     // links it asked for, so this column is always decoded.
     let purge_reason: Option<PurgeReason> = p.next()?;
+    let stab_mask: i64 = p.next()?;
+    let stab_len: i64 = p.next()?;
     let today_up: i64 = p.next()?;
     let today_down: i64 = p.next()?;
     let total_up: i64 = p.next()?;
@@ -1053,6 +1065,8 @@ fn decode_projected_link(p: &mut Projection<'_>) -> Result<ProfileStats> {
         speed_bps,
         error,
         purge_reason,
+        stab_mask,
+        stab_len,
         traffic: TrafficStats {
             today_up,
             today_down,

@@ -3,14 +3,11 @@
 use std::path::Path;
 
 use turso::Value;
-use xray_tui_proto::proto_spec::{
-EndpointEssentials, HostKind, ProtocolConfig, ProtocolKind,
-};
+use xray_tui_proto::proto_spec::{EndpointEssentials, HostKind, ProtocolConfig, ProtocolKind};
 
 use crate::error::{DatabaseError, Result};
 use crate::models_toasty::{
-    EndpointId, ErrorInfo, Latency, ProfileErr, ProfileStats, ProtocolId,
-    PurgeReason, TrafficStats,
+    EndpointId, ErrorInfo, Latency, ProfileErr, ProfileStats, ProtocolId, PurgeReason, TrafficStats,
 };
 use crate::{Database, endpoint_ip};
 
@@ -219,7 +216,8 @@ fn projection_sql(scope: ExportScope) -> String {
          ps.created_at, ps.updated_at, ps.version, {address_key} AS ip_key, \
          CASE WHEN e.domain = '' AND EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id) THEN 1 \
               WHEN EXISTS (SELECT 1 FROM endpoint_ip dial WHERE dial.endpoint_id = e.id) THEN 0 \
-              ELSE 2 END AS address_rank \
+              ELSE 2 END AS address_rank, \
+         ps.stab_mask, ps.stab_len \
          FROM profile_stats ps \
          JOIN endpoints e ON e.id = ps.endpoint_id \
          JOIN protocols pr ON pr.id = ps.protocol_id \
@@ -282,6 +280,8 @@ fn decode_row(row: &turso::Row, _scope: ExportScope) -> Result<ExportRow> {
         speed_bps: optional_integer(row, 15)?,
         error,
         purge_reason,
+        stab_mask: optional_integer(row, 29)?.unwrap_or(0),
+        stab_len: optional_integer(row, 30)?.unwrap_or(0),
         traffic: TrafficStats {
             today_up: integer(row, 20)?,
             today_down: integer(row, 21)?,
@@ -418,14 +418,12 @@ pub(crate) fn turso_error(error: turso::Error) -> DatabaseError {
 #[allow(clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
-    use crate::models_toasty::{
-        Endpoint, EndpointId, HostType, Protocol, Security, Transport,
-    };
+    use crate::models_toasty::{Endpoint, EndpointId, HostType, Protocol, Security, Transport};
     use tempfile::tempdir;
     use toasty::{Deferred, Json};
     use xray_tui_proto::proto_spec::common::TransportConfig;
     use xray_tui_proto::proto_spec::{
-ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
+        ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
     };
 
     fn endpoint(id: i64, host: &str, host_type: HostType) -> Endpoint {
@@ -490,6 +488,8 @@ ProtocolConfig, ProtocolKind, SecurityConfig, SsConfig, VlessConfig,
             speed_bps: None,
             error,
             purge_reason: None,
+            stab_mask: 0,
+            stab_len: 0,
             traffic: TrafficStats {
                 today_up: 0,
                 today_down: 0,

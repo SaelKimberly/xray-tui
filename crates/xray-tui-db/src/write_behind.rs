@@ -800,14 +800,21 @@ fn merge_group(
     staged: &crate::models_toasty::ProfileStats,
 ) {
     use crate::LinkGroups;
+    // An EXPLICIT arm per group — no catch-all `else`. A catch-all silently
+    // routed a newly added group into whichever arm it fell through to, which
+    // for a fourth bit writes TRAFFIC columns from a STAB snapshot (the
+    // disjointness these groups exist to guarantee).
     if flag == LinkGroups::RESULT {
         base.latency.clone_from(&staged.latency);
         base.speed_bps = staged.speed_bps;
         base.error.clone_from(&staged.error);
     } else if flag == LinkGroups::PURGE {
         base.purge_reason = staged.purge_reason;
-    } else {
+    } else if flag == LinkGroups::TRAFFIC {
         base.traffic = staged.traffic;
+    } else if flag == LinkGroups::STAB {
+        base.stab_mask = staged.stab_mask;
+        base.stab_len = staged.stab_len;
     }
 }
 
@@ -860,7 +867,12 @@ impl CacheSpec for LinkSpec {
             match merged.entry(link_key) {
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
                     let (groups, base) = slot.get_mut();
-                    for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+                    for flag in [
+                        LinkGroups::RESULT,
+                        LinkGroups::PURGE,
+                        LinkGroups::TRAFFIC,
+                        LinkGroups::STAB,
+                    ] {
                         if row.groups.contains(flag) {
                             merge_group(base, flag, &row.link);
                         }
@@ -869,7 +881,12 @@ impl CacheSpec for LinkSpec {
                 }
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     let mut link = row.link.clone();
-                    for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+                    for flag in [
+                        LinkGroups::RESULT,
+                        LinkGroups::PURGE,
+                        LinkGroups::TRAFFIC,
+                        LinkGroups::STAB,
+                    ] {
                         if row.groups.contains(flag) {
                             merge_group(&mut link, flag, &row.link);
                         }
@@ -905,17 +922,22 @@ impl CacheSpec for LinkSpec {
     /// staging key is finer than the patch identity.
     fn restage_entries(row: &Self::Row) -> Vec<(Self::Key, Self::Row)> {
         use crate::LinkGroups;
-        [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC]
-            .into_iter()
-            .filter(|flag| row.groups.contains(*flag))
-            .map(|flag| {
-                let single = LinkRow {
-                    link: row.link.clone(),
-                    groups: flag,
-                };
-                (Self::key_of(&single), single)
-            })
-            .collect()
+        [
+            LinkGroups::RESULT,
+            LinkGroups::PURGE,
+            LinkGroups::TRAFFIC,
+            LinkGroups::STAB,
+        ]
+        .into_iter()
+        .filter(|flag| row.groups.contains(*flag))
+        .map(|flag| {
+            let single = LinkRow {
+                link: row.link.clone(),
+                groups: flag,
+            };
+            (Self::key_of(&single), single)
+        })
+        .collect()
     }
 
     /// The chunked upsert of [`Database::apply_link_patches`], on the driver's
@@ -966,7 +988,12 @@ impl WriteBehind<LinkSpec> {
     /// stage of `ALL` and a later stage of `RESULT` do not shadow each other.
     pub fn stage(&self, link: &crate::models_toasty::ProfileStats, groups: crate::LinkGroups) {
         use crate::LinkGroups;
-        for flag in [LinkGroups::RESULT, LinkGroups::PURGE, LinkGroups::TRAFFIC] {
+        for flag in [
+            LinkGroups::RESULT,
+            LinkGroups::PURGE,
+            LinkGroups::TRAFFIC,
+            LinkGroups::STAB,
+        ] {
             if groups.contains(flag) {
                 self.push(LinkRow {
                     link: link.clone(),
@@ -1556,6 +1583,8 @@ mod tests {
             speed_bps: None,
             error: None,
             purge_reason: None,
+            stab_mask: 0,
+            stab_len: 0,
             traffic: TrafficStats {
                 today_up: 0,
                 today_down: 0,
@@ -1941,8 +1970,8 @@ mod tests {
         }
         assert_eq!(
             driver.staged_len(),
-            9,
-            "ALL normalises to one entry per group, per link"
+            12,
+            "ALL normalises to one entry per group (RESULT/PURGE/TRAFFIC/STAB), per link"
         );
         assert_eq!(
             driver.flush().await.expect("flush"),

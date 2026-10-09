@@ -176,6 +176,8 @@ async fn seed_link(
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
         last_seen_at: ts(last_seen),
+        stab_mask: 0,
+        stab_len: 0,
         traffic: zero_traffic(),
     })
     .exec(conn)
@@ -211,6 +213,8 @@ async fn seed_purged_link(
         endpoint_id: EndpointId::new(endpoint_id),
         last_seen_at: ts(last_seen),
         purge_reason: Some(reason),
+        stab_mask: 0,
+        stab_len: 0,
         traffic: zero_traffic(),
     })
     .exec(conn)
@@ -999,6 +1003,8 @@ async fn seed_link_latency(
         endpoint_id: EndpointId::new(endpoint_id),
         last_seen_at: ts(last_seen),
         latency,
+        stab_mask: 0,
+        stab_len: 0,
         traffic: zero_traffic(),
     })
     .exec(conn)
@@ -1046,6 +1052,8 @@ async fn purge_expired_deletes_expired_and_linkless_keeps_fresh() {
         protocol_id: ProtocolId::new(1002),
         endpoint_id: EndpointId::new(3),
         last_seen_at: ts(1600),
+        stab_mask: 0,
+        stab_len: 0,
         traffic: zero_traffic(),
     })
     .exec(&mut conn)
@@ -1153,6 +1161,8 @@ async fn delete_endpoint_cascades_and_purges_orphan_protocols() {
         protocol_id: ProtocolId::new(1002),
         endpoint_id: EndpointId::new(2),
         last_seen_at: ts(30),
+        stab_mask: 0,
+        stab_len: 0,
         traffic: zero_traffic(),
     })
     .exec(&mut conn)
@@ -1377,6 +1387,8 @@ async fn bulk_upserts_are_idempotent_and_preserve_owned_fields() {
         speed_bps: None,
         error: None,
         purge_reason: None,
+        stab_mask: 0,
+        stab_len: 0,
         traffic: zero_traffic(),
         created_at: ts(0),
         updated_at: ts(0),
@@ -1532,6 +1544,8 @@ async fn subscription_upsert_flow_assembles_group_rows() {
         speed_bps: None,
         error: None,
         purge_reason: None,
+        stab_mask: 0,
+        stab_len: 0,
         traffic: zero_traffic(),
         created_at: ts(0),
         updated_at: ts(0),
@@ -2225,6 +2239,78 @@ async fn apply_link_patches_isolates_column_groups() {
             total_down: 40
         },
         "and the traffic group"
+    );
+
+    // STAB-only patch: the ring moves and NO other group does. This is the
+    // clobber the fourth bit exists to prevent — a fast-only RESULT snapshot
+    // must not rewrite mask/len, and a STAB snapshot must not rewrite traffic.
+    let mut ring = stale.clone();
+    ring.stab_mask = 0b1011;
+    ring.stab_len = 4;
+    db.apply_link_patches(&[LinkPatch {
+        link: ring.clone(),
+        groups: LinkGroups::STAB,
+    }])
+    .await
+    .expect("stab patch");
+    let after = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(301),
+        EndpointId::new(3),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(
+        (after.stab_mask, after.stab_len),
+        (0b1011, 4),
+        "the ring moves"
+    );
+    assert_eq!(
+        after.traffic,
+        TrafficStats {
+            today_up: 10,
+            today_down: 20,
+            total_up: 30,
+            total_down: 40
+        },
+        "a STAB patch must NOT write traffic (the catch-all `else` this test exists for)"
+    );
+    assert_eq!(
+        after.latency,
+        Some(Latency::Fast { delay: 99 }),
+        "nor the result group"
+    );
+    assert_eq!(
+        after.purge_reason,
+        Some(PurgeReason::TransportRejected),
+        "nor the verdict"
+    );
+
+    // The reverse: a RESULT-only patch leaves the ring untouched.
+    let mut result_snapshot = after.clone();
+    result_snapshot.stab_mask = 0;
+    result_snapshot.stab_len = 0;
+    db.apply_link_patches(&[LinkPatch {
+        link: result_snapshot,
+        groups: LinkGroups::RESULT,
+    }])
+    .await
+    .expect("result patch after stab");
+    let after = ProfileStats::filter_by_protocol_id_and_endpoint_id(
+        ProtocolId::new(301),
+        EndpointId::new(3),
+    )
+    .first()
+    .exec(&mut conn)
+    .await
+    .expect("reload")
+    .expect("row");
+    assert_eq!(
+        (after.stab_mask, after.stab_len),
+        (0b1011, 4),
+        "a RESULT patch must not touch the ring its snapshot never sampled"
     );
 }
 

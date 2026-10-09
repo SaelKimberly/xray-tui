@@ -22,9 +22,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 use toasty::{Deferred, Json};
-use xray_tui_proto::proto_spec::{
-    ProtocolConfig, ProtocolKind, SecurityType, TransportType,
-};
+use xray_tui_proto::proto_spec::{ProtocolConfig, ProtocolKind, SecurityType, TransportType};
 
 // ── Typed embed types ───────────────────────────────────────────────────
 //
@@ -316,7 +314,13 @@ impl Endpoint {
         match kind {
             HostType::Dns => xray_tui_proto::domain::split(host).map_or_else(
                 || host.to_lowercase(),
-                |d| if d.sub_domain.is_empty() { d.domain } else { format!("{}.{}", d.sub_domain, d.domain) },
+                |d| {
+                    if d.sub_domain.is_empty() {
+                        d.domain
+                    } else {
+                        format!("{}.{}", d.sub_domain, d.domain)
+                    }
+                },
             ),
             HostType::Ipv4 | HostType::Ipv6 => host.to_string(),
             HostType::Undefined => String::new(),
@@ -326,7 +330,11 @@ impl Endpoint {
     /// The canonical DNS name (`sub_domain.domain`), empty for a non-DNS host.
     #[must_use]
     pub fn dns_name(&self) -> String {
-        if self.sub_domain.is_empty() { self.domain.clone() } else { format!("{}.{}", self.sub_domain, self.domain) }
+        if self.sub_domain.is_empty() {
+            self.domain.clone()
+        } else {
+            format!("{}.{}", self.sub_domain, self.domain)
+        }
     }
 
     /// The endpoint's host as text for DISPLAY and dialing (db-rewamp D10): the
@@ -347,7 +355,9 @@ impl Endpoint {
 
     /// True for a DNS-name host (`domain` non-empty). The DERIVED kind (D10).
     #[must_use]
-    pub const fn is_dns(&self) -> bool { !self.domain.is_empty() }
+    pub const fn is_dns(&self) -> bool {
+        !self.domain.is_empty()
+    }
 }
 
 /// One resolved address of one DNS endpoint (`endpoint_ip`).
@@ -458,6 +468,19 @@ pub struct ProfileStats {
     ///
     /// [`LinkGroups::PURGE`]: crate::LinkGroups::PURGE
     pub purge_reason: Option<PurgeReason>,
+    /// The stability ring: the last [`crate::STAB_WINDOW`] real-probe outcomes,
+    /// bit `i` = the `i`-th OLDEST live sample, `1` = success (spec
+    /// `2026-10-09-stab-bin-design` §5.1). Bits `[stab_len, 64)` are always
+    /// zero, so `count_ones()` is the success count.
+    ///
+    /// Typed, not raw: `decode_projected_link` builds a `ProfileStats` from the
+    /// page projection, and the panel renders the ratio from these two fields —
+    /// a non-model column would have no home in the decoded row.
+    #[column("stab_mask")]
+    pub stab_mask: i64,
+    /// Live samples in the ring, `0..=STAB_WINDOW`.
+    #[column("stab_len")]
+    pub stab_len: i64,
     pub traffic: TrafficStats, // today/total up/down
     pub created_at: i64,       // epoch seconds (stamped by the writer)
     pub updated_at: i64,       // epoch seconds (stamped by the writer)
@@ -602,6 +625,20 @@ pub struct EndpointRank {
     /// the address tiebreak's second term.
     #[column("rank_addr")]
     pub addr: Vec<u8>,
+    /// The representative link's stability bin, `0` (best) `..=7` (worst) —
+    /// its recent real-probe success rate, coarsened (spec
+    /// `2026-10-09-stab-bin-design`). Sits in the ordering key between `bin`
+    /// and `weight`: inside one delay bin the more reliable link leads. `4`
+    /// (neutral) while the link's window is warming up or empty.
+    #[column("rank_stab")]
+    pub stab: i64,
+    /// Whether the endpoint has ANY live, unpurged link whose stability window
+    /// holds at least one real success. Derived from the rings, never a durable
+    /// flag, so it clears on its own once every success ages out. This — not
+    /// `rank_bin` — is what the `Successful` scope selects: a proven endpoint
+    /// can still carry a bin of 12/13 when a sibling is untested or failing.
+    #[column("rank_proven")]
+    pub proven: i64,
     /// Newest `last_seen_at` across the endpoint's links (epoch seconds): the
     /// view windows ask whether any link falls in the band, which is the same
     /// question as whether the newest one does — and reading it here keeps the
@@ -667,7 +704,7 @@ impl EndpointRow {
         link: &ProfileStats,
         weight: crate::weight::ConfigWeight,
         dns_unresolved: bool,
-    ) -> (u8, u64, i64, i64) {
+    ) -> (u8, u8, u64, i64, i64) {
         crate::endpoint_rank::RankLink::new(link, weight).key(dns_unresolved)
     }
 
@@ -739,7 +776,7 @@ impl EndpointRow {
     /// used by the main-table Test column sort. `None` when the endpoint has
     /// no links.
     #[must_use]
-    pub fn best_test_priority_key(&self, dns_unresolved: bool) -> Option<(u8, u64, i64, i64)> {
+    pub fn best_test_priority_key(&self, dns_unresolved: bool) -> Option<(u8, u8, u64, i64, i64)> {
         let weights = self.link_weights();
         let zero = crate::weight::ZERO_WEIGHT;
         self.links
@@ -836,6 +873,8 @@ mod tests {
                 speed_bps: None,
                 error: error.clone(),
                 purge_reason: None,
+                stab_mask: 0,
+                stab_len: 0,
                 traffic: TrafficStats {
                     today_up: 0,
                     today_down: 0,
@@ -1063,7 +1102,7 @@ mod tests {
         // maximum — the negation a "no known stack" link sorts under.
         assert_eq!(
             r.best_test_priority_key(false),
-            Some((2, u64::MAX, -1, 10))
+            Some((2, crate::endpoint_rank::STAB_NEUTRAL, u64::MAX, -1, 10))
         );
         // Empty links -> None
         let empty = row(&[]);

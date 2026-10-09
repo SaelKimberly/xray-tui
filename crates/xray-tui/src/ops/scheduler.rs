@@ -435,9 +435,7 @@ mod tests {
     use std::sync::Arc;
 
     use toasty::Deferred;
-    use xray_tui_db::models::{
-        EndpointId, ProfileStats, ProtocolId, TaskKind, TrafficStats,
-    };
+    use xray_tui_db::models::{EndpointId, ProfileStats, ProtocolId, TaskKind, TrafficStats};
 
     use super::MIN_DNS_DEFER_SECS;
 
@@ -458,6 +456,8 @@ mod tests {
             speed_bps: None,
             error: None,
             purge_reason: None,
+            stab_mask: 0,
+            stab_len: 0,
             traffic: TrafficStats {
                 today_up: 0,
                 today_down: 0,

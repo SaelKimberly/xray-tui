@@ -18,20 +18,31 @@
 //! cargo test -p xray-tui-db --release --test turso_planner -- --ignored --nocapture
 //! ```
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-#![allow(clippy::items_after_statements, clippy::needless_pass_by_value, clippy::significant_drop_tightening, clippy::used_underscore_binding)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+#![allow(
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value,
+    clippy::significant_drop_tightening,
+    clippy::used_underscore_binding
+)]
 use turso::Builder;
 
 /// Reference-feed scale (the 2026-10-06 `data.db` endpoint count).
 const N: usize = 74_723;
 
-/// The proposed covering index — the one name the design fixes.
+/// The covering index the shipped schema uses (`endpoint_rank_key`, v18) —
+/// `rank_stab` between the bin and the weight, `rank_proven` TRAILING.
 const KEY_INDEX: &str = "CREATE INDEX endpoint_rank_key ON endpoint_rank(\
-     band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)";
+     band, rank_bin, rank_stab, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, \
+     endpoint_id, rank_proven)";
 
 /// The ORDER BY term list (the binned law), band-less so the same text serves
 /// the Active/Purgatory seek and the All `(band, key)` scan.
-const KEY: &str = "band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id";
+const KEY: &str = "band, rank_bin, rank_stab, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id";
 
 fn value_row(i: usize) -> String {
     let band = i64::from(!(i % 10).is_multiple_of(10));
@@ -42,7 +53,12 @@ fn value_row(i: usize) -> String {
     let sub = format!("s{}", i % 200);
     let addr = format!("x'04{:08x}'", (i as u32) & 0x00ff_ffff);
     let seen = 1_700_000_000i64 + (i as i64 % 100_000);
-    format!("({i},{band},{bin},{weight},'{domain}','{sub}',{addr},{seen})")
+    // One in four proven, and a stability bin spread so the index's third term
+    // is not constant (a constant column cannot mask a missing term, but a
+    // spread one makes a wrong column ORDER show up in the plan).
+    let stab = (i % 8) as i64;
+    let proven = i64::from(i % 4 == 0);
+    format!("({i},{band},{bin},{weight},'{domain}','{sub}',{addr},{seen},{stab},{proven})")
 }
 
 async fn plan(conn: &turso::Connection, sql: &str) -> Vec<String> {
@@ -76,7 +92,8 @@ async fn turso_planner_gate() {
         "CREATE TABLE endpoint_rank (\
          endpoint_id INTEGER PRIMARY KEY, band INTEGER NOT NULL, rank_bin INTEGER NOT NULL, \
          rank_weight BLOB NOT NULL, rank_domain TEXT NOT NULL, rank_sub_domain TEXT NOT NULL, \
-         rank_addr BLOB NOT NULL, rank_newest_seen INTEGER NOT NULL)",
+         rank_addr BLOB NOT NULL, rank_newest_seen INTEGER NOT NULL, \
+         rank_stab INTEGER NOT NULL, rank_proven INTEGER NOT NULL)",
         (),
     )
     .await
@@ -90,12 +107,9 @@ async fn turso_planner_gate() {
             .map(|&i| value_row(i))
             .collect::<Vec<_>>()
             .join(",");
-        conn.execute(
-            format!("INSERT INTO endpoint_rank VALUES {values}"),
-            (),
-        )
-        .await
-        .expect("seed");
+        conn.execute(format!("INSERT INTO endpoint_rank VALUES {values}"), ())
+            .await
+            .expect("seed");
     }
     conn.execute(
         "CREATE INDEX endpoint_rank_window ON endpoint_rank(band, rank_newest_seen)",
@@ -109,23 +123,33 @@ async fn turso_planner_gate() {
     let cases: [(&str, String); 5] = [
         (
             "Active band=0 seek",
-            format!("SELECT endpoint_id FROM endpoint_rank WHERE band=0 ORDER BY {KEY} LIMIT 200 OFFSET 5000"),
+            format!(
+                "SELECT endpoint_id FROM endpoint_rank WHERE band=0 ORDER BY {KEY} LIMIT 200 OFFSET 5000"
+            ),
         ),
         (
             "Purgatory band=1 seek",
-            format!("SELECT endpoint_id FROM endpoint_rank WHERE band=1 ORDER BY {KEY} LIMIT 200 OFFSET 5000"),
+            format!(
+                "SELECT endpoint_id FROM endpoint_rank WHERE band=1 ORDER BY {KEY} LIMIT 200 OFFSET 5000"
+            ),
         ),
         (
             "All ORDER band,key (wanted)",
-            format!("SELECT endpoint_id FROM endpoint_rank WHERE 1=1 ORDER BY {KEY} LIMIT 200 OFFSET 5000"),
+            format!(
+                "SELECT endpoint_id FROM endpoint_rank WHERE 1=1 ORDER BY {KEY} LIMIT 200 OFFSET 5000"
+            ),
         ),
         (
             "All band IN (0,1) key (trap)",
-            format!("SELECT endpoint_id FROM endpoint_rank WHERE band IN (0,1) ORDER BY {KEY} LIMIT 200 OFFSET 5000"),
+            format!(
+                "SELECT endpoint_id FROM endpoint_rank WHERE band IN (0,1) ORDER BY {KEY} LIMIT 200 OFFSET 5000"
+            ),
         ),
         (
             "scope rank_bin IN (13,14,15)",
-            format!("SELECT endpoint_id FROM endpoint_rank WHERE rank_bin IN (13,14,15) ORDER BY {KEY} LIMIT 200"),
+            format!(
+                "SELECT endpoint_id FROM endpoint_rank WHERE rank_bin IN (13,14,15) ORDER BY {KEY} LIMIT 200"
+            ),
         ),
     ];
 
@@ -141,6 +165,86 @@ async fn turso_planner_gate() {
     )
     .await;
     println!("\n[reband sweep]\n  {p:?}");
+}
+
+/// The planner ASSERTION the design's acceptance 5 rests on (spec
+/// `2026-10-09-stab-bin-design` R5): every scope is an index seek or scan with
+/// NO sorter, `rank_proven` being a TRAILING covering column.
+///
+/// This is the regression the trailing placement exists for: move
+/// `rank_proven` between `band` and the order terms and the two scoped cases
+/// below acquire a `USE TEMP B-TREE FOR ORDER BY`.
+#[tokio::test(flavor = "current_thread")]
+async fn every_scope_plan_is_index_served_without_a_sorter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("planner_assert.db");
+    let db = Builder::new_local(path.to_str().expect("path"))
+        .build()
+        .await
+        .expect("build");
+    let conn = db.connect().expect("connect");
+    conn.execute(
+        "CREATE TABLE endpoint_rank (\
+         endpoint_id INTEGER PRIMARY KEY, band INTEGER NOT NULL, rank_bin INTEGER NOT NULL, \
+         rank_weight BLOB NOT NULL, rank_domain TEXT NOT NULL, rank_sub_domain TEXT NOT NULL, \
+         rank_addr BLOB NOT NULL, rank_newest_seen INTEGER NOT NULL, \
+         rank_stab INTEGER NOT NULL, rank_proven INTEGER NOT NULL)",
+        (),
+    )
+    .await
+    .expect("create");
+    // Small but non-trivial: enough rows that a filesort is chosen if one is
+    // possible, cheap enough to seed on every run.
+    let ids: Vec<usize> = (0..8_000).collect();
+    let values = ids
+        .iter()
+        .map(|&i| value_row(i))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(format!("INSERT INTO endpoint_rank VALUES {values}"), ())
+        .await
+        .expect("seed");
+    conn.execute(KEY_INDEX, ()).await.expect("key index");
+
+    let scope_cases = [
+        ("Active", "band = 0", ""),
+        ("Purgatory", "band = 1", ""),
+        ("Successful", "band = 0", " AND rank_proven = 1"),
+        ("New", "band = 0", " AND rank_proven = 0 AND rank_bin = 12"),
+        (
+            "Failed",
+            "band = 0",
+            " AND rank_proven = 0 AND rank_bin IN (13,14,15)",
+        ),
+        (
+            "SuccessfulAndNew",
+            "band = 0",
+            " AND (rank_proven = 1 OR rank_bin = 12)",
+        ),
+    ];
+    for (label, band, extra) in scope_cases {
+        let sql = format!(
+            "SELECT endpoint_id FROM endpoint_rank WHERE {band}{extra} ORDER BY {KEY} LIMIT 200"
+        );
+        let p = plan(&conn, &sql).await;
+        let joined = p.join(" | ").to_lowercase();
+        assert!(
+            !joined.contains("temp b-tree") && !joined.contains("sorter"),
+            "{label}: the scope must not filesort, plan was {p:?}"
+        );
+    }
+
+    // The unstricted All view: the index order IS the ORDER BY, no sorter.
+    let all = plan(
+        &conn,
+        &format!("SELECT endpoint_id FROM endpoint_rank ORDER BY {KEY} LIMIT 200"),
+    )
+    .await;
+    let joined = all.join(" | ").to_lowercase();
+    assert!(
+        !joined.contains("temp b-tree") && !joined.contains("sorter"),
+        "All must scan in index order, plan was {all:?}"
+    );
 }
 
 /// T14 gate: does turso 0.7.2 actually support `WITHOUT ROWID` behind its
@@ -190,7 +294,10 @@ async fn turso_without_rowid_support() {
         .execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')", ())
         .await
         .expect("insert");
-    let mut rows = conn_on.query("SELECT v FROM t WHERE id = 2", ()).await.expect("select");
+    let mut rows = conn_on
+        .query("SELECT v FROM t WHERE id = 2", ())
+        .await
+        .expect("select");
     let row = rows.next().await.expect("next").expect("row");
     let v: String = row.get(0).expect("v");
     println!("[flag ON ] round-trip id=2 -> {v:?}");

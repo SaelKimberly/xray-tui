@@ -263,6 +263,8 @@ mod tests {
             speed_bps: None,
             error: None,
             purge_reason: None,
+            stab_mask: 0,
+            stab_len: 0,
             traffic: TrafficStats {
                 today_up: 0,
                 today_down: 0,

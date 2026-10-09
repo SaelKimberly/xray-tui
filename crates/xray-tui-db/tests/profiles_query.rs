@@ -7,15 +7,14 @@
 use toasty::{Deferred, Json};
 use xray_tui_db::Database;
 use xray_tui_db::models::{
-    Endpoint, EndpointId, EndpointIp, ErrorInfo, HostType, Latency, ProfileStats,
-    Protocol, ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
+    Endpoint, EndpointId, EndpointIp, ErrorInfo, HostType, Latency, ProfileStats, Protocol,
+    ProtocolId, PurgatoryView, Security, TrafficStats, Transport,
 };
 use xray_tui_db::profiles_query::{PageRequest, PageSort, PlanScope};
 use xray_tui_db::{LinkGroups, LinkPatch};
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
-ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType,
-    VlessConfig,
+    ProtocolConfig, ProtocolKind, SecurityConfig, SecurityType, TransportType, VlessConfig,
 };
 
 /// Epoch seconds — the storage unit of every timestamp column.
@@ -25,12 +24,7 @@ const fn ts(secs: i64) -> i64 {
 
 const ALL_ENDPOINTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
 
-const ALL_SORTS: [PageSort; 4] = [
-    PageSort::Test,
-    PageSort::Port,
-    PageSort::Ip,
-    PageSort::Id,
-];
+const ALL_SORTS: [PageSort; 4] = [PageSort::Test, PageSort::Port, PageSort::Ip, PageSort::Id];
 
 const fn request(sort: PageSort, ascending: bool, offset: usize, limit: usize) -> PageRequest {
     PageRequest {
@@ -127,6 +121,8 @@ async fn seed_link_with(
         protocol_id: ProtocolId::new(protocol_id),
         endpoint_id: EndpointId::new(endpoint_id),
         last_seen_at: ts(last_seen),
+        stab_mask: 0,
+        stab_len: 0,
         traffic: TrafficStats {
             today_up: 0,
             today_down: 0,
@@ -139,8 +135,14 @@ async fn seed_link_with(
     .expect("create link");
 
     if let Some(delay) = delay {
+        // A real measurement IS a success (spec `2026-10-09-stab-bin-design`
+        // §6.2): seed the one-sample ring so `rank_proven` follows, exactly as
+        // the day-one seed does for a real database. Without this the fixture
+        // would carry `latency='real'` with an empty ring — a state the law's
+        // invariant (`rank_bin ∈ 0..=5 ⇒ proven`) forbids.
         toasty::sql::statement(
-            "UPDATE profile_stats SET latency = 'real', latency_delay = ?1 \
+            "UPDATE profile_stats SET latency = 'real', latency_delay = ?1, \
+             stab_mask = 1, stab_len = 1 \
              WHERE endpoint_id = ?2 AND protocol_id = ?3",
         )
         .bind(delay)
@@ -213,6 +215,10 @@ fn link_value(
             text: format!("{kind} probe"),
         }),
         purge_reason: None,
+        // A real delay is a success (see `seed_link_with`): seed the ring so
+        // the fixture obeys the law's proven invariant.
+        stab_mask: i64::from(delay.is_some()),
+        stab_len: i64::from(delay.is_some()),
         traffic: TrafficStats {
             today_up: 0,
             today_down: 0,
@@ -302,7 +308,10 @@ async fn the_direct_page_matches_the_toasty_page() {
     let file_db = Database::open(dir.path().join("direct.db"))
         .await
         .expect("file db");
-    assert!(file_db.uses_direct_reader(), "a file db has a direct reader");
+    assert!(
+        file_db.uses_direct_reader(),
+        "a file db has a direct reader"
+    );
     seed_into(&file_db).await;
     let mem_db = seed_fixture().await;
 
@@ -413,18 +422,21 @@ async fn plan_scopes_select_by_materialized_tier() {
         ids
     };
 
-    // tier 0 = a live resolved link with a real measurement: e1, e2, e4 (its
-    // manual override does not move the tier) and e7 (whose `name` sibling
-    // does not either, because its real link outranks it).
+    // Successful = PROVEN (spec `2026-10-09-stab-bin-design` §5.3), not
+    // "the representative bin is 0..=5": e1, e2, e4, e7 (real measurements),
+    // and e5 — whose representative is its UNTESTED sibling (bin 12) but which
+    // still holds the proven real link 107. That last row is the whole point of
+    // the feature: a proven endpoint is not "New" because a sibling is
+    // untested. e6 is a DNS-unresolved host and is excluded despite its stored
+    // real measurement.
     let successful = db
         .profiles_page(&scoped(PlanScope::Successful))
         .await
         .expect("page");
-    assert_eq!(ids_of(&successful), vec![1, 2, 4, 7]);
-    assert_eq!(successful.total, 4, "the count carries the scope too");
+    assert_eq!(ids_of(&successful), vec![1, 2, 4, 5, 7]);
+    assert_eq!(successful.total, 5, "the count carries the scope too");
 
-    // tier 2 adds the endpoint with no clean measurement but an untested link:
-    // e3 (untested only) and e5 (a fast-error link BESIDE an untested one).
+    // `New` is NOT proven AND untested: only e3 (a single untested link).
     let new = db
         .profiles_page(&scoped(PlanScope::SuccessfulAndNew))
         .await
@@ -432,16 +444,16 @@ async fn plan_scopes_select_by_materialized_tier() {
     assert_eq!(ids_of(&new), vec![1, 2, 3, 4, 5, 7]);
     assert_eq!(new.total, 6);
 
-    // ...and `New` alone is that same set minus the successful ones.
+    // ...and `New` alone is proven ∪ untested minus the proven ones.
     let untested = db
         .profiles_page(&scoped(PlanScope::New))
         .await
         .expect("page");
-    assert_eq!(ids_of(&untested), vec![3, 5]);
-    assert_eq!(untested.total, 2);
+    assert_eq!(ids_of(&untested), vec![3]);
+    assert_eq!(untested.total, 1);
 
-    // tiers 3/4/5: nothing measured clean and nothing untested. e6 is the DNS
-    // host whose stored measurement sits in the name band — the row that shows
+    // Failed: NOT proven and carrying a failure marker. e6 is the DNS host
+    // whose stored measurement sits in the name band — the row that shows
     // `[name]` and cannot otherwise be re-tested deliberately.
     let failed = db
         .profiles_page(&scoped(PlanScope::Failed))
@@ -934,9 +946,9 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
             // The binned law (db-rewamp D11): (bin, neg_weight, domain,
             // sub_domain, addr, endpoint_id). bin/neg_weight come from the
             // representative link; the rest are endpoint-level.
-            let (bin, neg_weight, _seen, _pid) = row
+            let (bin, _stab, neg_weight, _seen, _pid) = row
                 .best_test_priority_key(dns_unresolved(row))
-                .unwrap_or((u8::MAX, u64::MAX, i64::MAX, i64::MAX));
+                .unwrap_or((u8::MAX, u8::MAX, u64::MAX, i64::MAX, i64::MAX));
             let domain = row.endpoint.domain.clone();
             let sub_domain = row.endpoint.sub_domain.clone();
             let addr = if row.endpoint.is_dns() {
@@ -959,9 +971,33 @@ fn oracle_key(row: &xray_tui_db::models::EndpointRow, sort: PageSort) -> OracleK
                 row.endpoint.id.get(),
             )
         }
-        PageSort::Ip => (0, 0, 0, String::new(), String::new(), Vec::new(), row.endpoint.id.get()),
-        PageSort::Id => (0, row.endpoint.id.get(), 0, String::new(), String::new(), Vec::new(), 0),
-        PageSort::Port => (0, i64::from(row.endpoint.port), 0, String::new(), String::new(), Vec::new(), 0),
+        PageSort::Ip => (
+            0,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            row.endpoint.id.get(),
+        ),
+        PageSort::Id => (
+            0,
+            row.endpoint.id.get(),
+            0,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            0,
+        ),
+        PageSort::Port => (
+            0,
+            i64::from(row.endpoint.port),
+            0,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            0,
+        ),
     }
 }
 
@@ -1085,62 +1121,62 @@ async fn seed_projection_into(db: &Database) {
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
-         traffic_total_down, created_at, updated_at, version) VALUES \
+         traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (11, 1, 1789034400, \
           1789038000, 'real', 42, '198.51.100.9', 1234567, \
           NULL, NULL, NULL, 11, 22, 33, 44, 1788220805, \
-          1789038000, 3)",
+          1789038000, 3, 65535, 16)",
         // e1/link B: fast ping, a fast failure, form config.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
-         traffic_total_down, created_at, updated_at, version) VALUES \
+         traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (13, 1, NULL, 1789041600, \
           'fast', 8, NULL, NULL, 1, 'fast', 'fast probe', 0, 0, 0, 0, \
-          1788220806, 1789041600, 1)",
+          1788220806, 1789041600, 1, 0, 0)",
         // e1/link C: the x_http protocol row above, measured — so the raw-column
         // read that computes its weight is on the page path the parity golden
         // checks, not only on a synthetic parser test.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
-         traffic_total_down, created_at, updated_at, version) VALUES \
+         traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (14, 1, NULL, 1789043400, \
           'real', 77, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
-          1788220812, 1789043400, 1)",
+          1788220812, 1789043400, 1, 65535, 16)",
         // e2: name-resolution failure, no measurement.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
-         traffic_total_down, created_at, updated_at, version) VALUES \
+         traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (11, 2, NULL, 1789045200, NULL, \
           NULL, NULL, NULL, 1, 'name', 'name probe', 0, 0, 0, 0, \
-          1788220807, 1789045200, 2)",
+          1788220807, 1789045200, 2, 0, 0)",
         // e2's second link: the only PURGED one, so the purge filter's two
         // policies produce different pages from this fixture.
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
-         traffic_total_up, traffic_total_down, created_at, updated_at, version) VALUES \
+         traffic_total_up, traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (13, 2, NULL, 1789047000, NULL, \
           NULL, NULL, NULL, 1, 'real', 'reality error', 'reality_fallback', 0, 0, 0, 0, \
-          1788220810, 1789047000, 1)",
+          1788220810, 1789047000, 1, 0, 0)",
         // e3: a measured success AND a real failure on one endpoint, plus a
         // link whose protocol row does not exist (LEFT JOIN -> no entry).
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
-         traffic_total_down, created_at, updated_at, version) VALUES \
+         traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (13, 3, NULL, 1789048800, \
           'real', 5, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, \
-          1788220808, 1789048800, 1)",
+          1788220808, 1789048800, 1, 65535, 16)",
         "INSERT INTO profile_stats (protocol_id, endpoint_id, last_used_at, \
          last_seen_at, latency, latency_delay, latency_ip, speed_bps, error, \
          error_kind, error_text, traffic_today_up, traffic_today_down, traffic_total_up, \
-         traffic_total_down, created_at, updated_at, version) VALUES \
+         traffic_total_down, created_at, updated_at, version, stab_mask, stab_len) VALUES \
          (99, 3, NULL, 1789052400, NULL, \
           NULL, NULL, NULL, 1, 'real', 'real probe', 0, 0, 0, 0, \
-          1788220809, 1789052400, 1)",
+          1788220809, 1789052400, 1, 0, 0)",
     ] {
         toasty::sql::statement(stmt)
             .exec(&mut conn)
@@ -1191,7 +1227,10 @@ async fn page_projection_raw_matches_toasty() {
     let file_db = Database::open(dir.path().join("proj.db"))
         .await
         .expect("file db");
-    assert!(file_db.uses_direct_reader(), "a file db has a direct reader");
+    assert!(
+        file_db.uses_direct_reader(),
+        "a file db has a direct reader"
+    );
     seed_projection_into(&file_db).await;
     let mem_db = seed_projection_fixture().await;
 
@@ -1209,10 +1248,7 @@ async fn page_projection_raw_matches_toasty() {
         assert_eq!(raw.len(), cached.len(), "{ctx}: row count");
         for (raw, cached) in raw.iter().zip(&cached) {
             assert_eq!(raw.endpoint.id, cached.endpoint.id, "{ctx}: endpoint id");
-            assert_eq!(
-                raw.resolved_ips, cached.resolved_ips,
-                "{ctx}: resolved_ips"
-            );
+            assert_eq!(raw.resolved_ips, cached.resolved_ips, "{ctx}: resolved_ips");
             assert_eq!(
                 raw.protocols.len(),
                 cached.protocols.len(),
@@ -1284,7 +1320,10 @@ async fn page_projection_matches_the_orm_rows() {
     for (typed, projected) in typed.iter().zip(&projected) {
         let ctx = format!("endpoint {}", typed.endpoint.id.get());
         assert_eq!(typed.endpoint.id, projected.endpoint.id, "{ctx}: id");
-        assert_eq!(typed.endpoint.domain, projected.endpoint.domain, "{ctx}: domain");
+        assert_eq!(
+            typed.endpoint.domain, projected.endpoint.domain,
+            "{ctx}: domain"
+        );
         assert_eq!(
             typed.endpoint.sub_domain, projected.endpoint.sub_domain,
             "{ctx}: sub_domain"
@@ -1594,7 +1633,7 @@ async fn the_test_order_has_an_index_that_includes_the_weight() {
         .collect();
     let weight_index = ddl
         .iter()
-        .find(|sql| sql.starts_with("endpoint_rank_key:"))
+        .find(|sql| sql.starts_with("endpoint_rank_key_v2:"))
         .expect("the covering index exists");
     assert!(
         weight_index.contains("rank_weight DESC"),
@@ -1603,6 +1642,14 @@ async fn the_test_order_has_an_index_that_includes_the_weight() {
     assert!(
         weight_index.contains("rank_bin") && weight_index.contains("rank_domain"),
         "the index must still lead with the terms before the weight: {weight_index}"
+    );
+    assert!(
+        weight_index.contains("rank_stab"),
+        "the stability term must be indexed between bin and weight: {weight_index}"
+    );
+    assert!(
+        weight_index.trim_end_matches(')').ends_with("rank_proven"),
+        "rank_proven must ride LAST as a covering column: {weight_index}"
     );
 }
 
@@ -1695,7 +1742,7 @@ async fn a_stale_weight_version_is_recomputed_at_open() {
         assert_eq!(
             stamped[0],
             toasty::stmt::Value::Record(toasty_core::stmt::ValueRecord::from_vec(vec![
-                toasty::stmt::Value::I64(i64::from(xray_tui_db::weight::WEIGHT_VERSION)),
+                toasty::stmt::Value::I64(xray_tui_db::endpoint_rank::key_inputs_version()),
             ])),
             "the open rewrites the stamp to the running code's version"
         );

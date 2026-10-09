@@ -710,7 +710,8 @@ pub fn fields_to_parsed(
     // every import path) — a form-built host with no registrable domain is
     // rejected here exactly as an imported one is. `allow_private_ips` is off
     // for the form: a single-label/private host cannot key an endpoint.
-    xray_tui_config::import_export::validate_host(&parsed, validation).map_err(|e| e.to_string())?;
+    xray_tui_config::import_export::validate_host(&parsed, validation)
+        .map_err(|e| e.to_string())?;
     Ok(parsed)
 }
 
@@ -1269,8 +1270,7 @@ pub(crate) mod test_support {
     use toasty::Deferred;
     use xray_tui_config::AppConfig;
     use xray_tui_db::models::{
-        Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId,
-        TrafficStats,
+        Endpoint, EndpointId, EndpointRow, HostType, ProfileStats, ProtocolId, TrafficStats,
     };
 
     /// Epoch seconds — the storage unit of every timestamp column.
@@ -1320,6 +1320,8 @@ pub(crate) mod test_support {
                 speed_bps: None,
                 error: None,
                 purge_reason: None,
+                stab_mask: 0,
+                stab_len: 0,
                 traffic: TrafficStats {
                     today_up: 0,
                     today_down: 0,
@@ -1735,6 +1737,8 @@ mod edit_tests {
                 speed_bps: None,
                 error: None,
                 purge_reason: None,
+                stab_mask: 0,
+                stab_len: 0,
                 traffic: TrafficStats {
                     today_up: 0,
                     today_down: 0,
@@ -2047,7 +2051,6 @@ mod view_window_tests {
 }
 
 #[cfg(test)]
-
 #[cfg(test)]
 mod ttl_tests {
     use super::test_support::fake_row;

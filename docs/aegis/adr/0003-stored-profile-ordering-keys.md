@@ -206,3 +206,73 @@ the cell's `[name]` and the tier-5 band read DIFFERENT resolution sources (the
 in-memory `endpoint_info` cache vs the row's persisted `endpoint_ip` addresses).
 The cell now reads `endpoint_rank::dns_unresolved(row)` — the row — so the label
 and the band are one fact.
+
+## Amendment — 2026-10-09: stability joins the keys; membership becomes its own column
+
+Spec: `docs/aegis/specs/2026-10-09-stab-bin-design.md`.
+
+### The keys gain a term
+
+```text
+link key:     (bin, stab_bin, ¬weight, -seen, protocol_id)
+endpoint key: (band, bin, stab_bin, ¬weight, domain, sub_domain, addr, endpoint_id)
+```
+
+`stab_bin` (`0..7`, `4` neutral) is a link's recent REAL-probe success rate from
+a ring of its last 16 real outcomes. It sits **before** the static weight: the
+order is measurement class, then reliability, then stack prior. The 2026-10-01
+amendment's "the weight outranks latency inside a bin" is narrowed to "the weight
+orders links that share both the bin and the stability" — a deliberate reversal,
+since four coarse weight bands would otherwise leave `stab_bin` almost never
+consulted.
+
+### Membership is a separate fact
+
+`rank_bin` stays the representative link's LAST outcome, so it cannot express
+"this endpoint has worked" — a just-failed proven link loses representation to an
+untested sibling (bin 12 < 13), which was exactly the churn that motivated the
+feature. The new `endpoint_rank.rank_proven` (any live unpurged link's ring holds
+a success, on a resolved endpoint) is therefore what the `Successful` scope
+selects:
+
+| scope | predicate |
+| --- | --- |
+| Successful | `rank_proven = 1` |
+| New | `rank_proven = 0 AND rank_bin = 12` |
+| Failed | `rank_proven = 0 AND rank_bin IN (13, 14, 15)` |
+| SuccessfulAndNew | `rank_proven = 1 OR rank_bin = 12` |
+
+`PlanScope::bins()` (a `rank_bin` list) is retired for `PlanScope::predicate()`.
+
+### One index, new name
+
+`endpoint_rank_key_v2(band, rank_bin, rank_stab, rank_weight DESC, rank_domain,
+rank_sub_domain, rank_addr, endpoint_id, rank_proven)` replaces
+`endpoint_rank_key`, which the same DDL list drops. `rank_proven` rides LAST as a
+covering column: placing it between `band` and the ORDER BY terms would filesort
+Active and All; trailing, every scope filters **inline** on an index scan, which
+is the doctrine this ADR already relied on and why no scope needs a second index.
+
+### Storage
+
+`profile_stats.stab_mask`/`stab_len` and `endpoint_rank.rank_stab`/`rank_proven`
+are **typed model fields** — `push_schema` runs only at cursor 0, so declaring
+them costs no schema-cursor bump and no wipe. `ALTER TABLE` entries in
+`schema/ddl.rs` cover databases that already exist. `rank_weight_meta`'s stamp
+becomes `KEY_INPUTS_VERSION` (weight tables + stability thresholds), so a
+threshold edit recomputes every stored key exactly as a weight-cell edit does.
+
+A **day-one seed** gives every link with `latency = 'real'` a one-sample success
+ring: `apply_test_result` keeps `latency` when it later writes an error, so
+without the seed every pre-upgrade success would read `rank_proven = 0` and fall
+out of all four scoped menus.
+
+### Consequences
+
+- `RankLink::key` gains one term; `compute_rank` still one `.min()`, and now
+  also derives `stab` (the representative's) and `proven` (the endpoint's OR).
+- `LinkGroups` gains a fourth bit `STAB`; `merge_group`'s catch-all `else` is
+  replaced by explicit arms, and `link_patch_conflict_sql`/the patch bucketing
+  widen from 8 to 16 column-set combinations.
+- **Remove Bad Servers is not gated by stability** — the user can still delete
+  the pool this feature curates, deliberately.

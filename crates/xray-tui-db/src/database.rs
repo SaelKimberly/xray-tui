@@ -131,14 +131,23 @@ impl LinkGroups {
     pub const PURGE: Self = Self(0b010);
     /// `traffic_*` (the gRPC stats poller).
     pub const TRAFFIC: Self = Self(0b100);
+    /// `stab_mask` + `stab_len` (the stability ring, spec
+    /// `2026-10-09-stab-bin-design`).
+    ///
+    /// Its own bit for the same reason as [`Self::PURGE`]:
+    /// [`link_patch_conflict_sql`] writes a fixed column set from each patch's
+    /// snapshot, so riding RESULT would let a fast-only result — whose snapshot
+    /// never sampled the ring — rewrite the counters. Only the producers that
+    /// actually append a sample set this bit.
+    pub const STAB: Self = Self(0b1000);
     /// Every group.
     ///
     /// Every group can change a STORED ORDERING KEY — the rank columns derive
     /// from a link's `error`/`latency`/`last_seen_at`/`speed_bps`/`traffic`/
-    /// `purge_reason` — so every patch refreshes its endpoint's
-    /// keys. (The scheduler's task state used to be a third group; it is
-    /// runtime-only now and never reaches this table.)
-    pub const ALL: Self = Self(0b111);
+    /// `purge_reason`/`stab_mask`/`stab_len` — so every patch refreshes its
+    /// endpoint's keys. (The scheduler's task state used to be a third group;
+    /// it is runtime-only now and never reaches this table.)
+    pub const ALL: Self = Self(0b1111);
 
     /// Whether `other`'s groups are all present in `self`.
     #[must_use]
@@ -608,7 +617,8 @@ const LINK_COMPARE_KEYS: &str = "protocol_id, endpoint_id";
 const LINK_UPSERT_PREFIX: &str = "INSERT INTO profile_stats (protocol_id, endpoint_id, \
      last_used_at, last_seen_at, latency, latency_delay, latency_ip, speed_bps, \
      error, error_kind, error_text, purge_reason, traffic_today_up, traffic_today_down, \
-     traffic_total_up, traffic_total_down, created_at, updated_at, version) VALUES ";
+     traffic_total_up, traffic_total_down, created_at, updated_at, version, \
+     stab_mask, stab_len) VALUES ";
 
 /// The whole-snapshot SQL tuple for one link.
 ///
@@ -654,13 +664,15 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
     );
     let _ = write!(
         sql,
-        ", {}, {}, {}, {}, {}, {}, 1)",
+        ", {}, {}, {}, {}, {}, {}, 1, {}, {})",
         link.traffic.today_up,
         link.traffic.today_down,
         link.traffic.total_up,
         link.traffic.total_down,
         now,
-        now
+        now,
+        link.stab_mask,
+        link.stab_len
     );
     sql
 }
@@ -672,8 +684,14 @@ fn link_values_sql(link: &ProfileStats, now: i64) -> String {
 /// another writer owns (`last_used_at`) or another group owns keeps its
 /// persisted value — the disjointness [`LinkGroups`] exists for. A patch that
 /// carries no group at all only creates a missing row (`DO NOTHING`).
-fn link_patch_conflict_sql(has_result: bool, has_traffic: bool, has_purge: bool) -> String {
-    let mut sets: Vec<&str> = Vec::with_capacity(12);
+fn link_patch_conflict_sql(groups: LinkGroups) -> String {
+    let (has_result, has_purge, has_traffic, has_stab) = (
+        groups.contains(LinkGroups::RESULT),
+        groups.contains(LinkGroups::PURGE),
+        groups.contains(LinkGroups::TRAFFIC),
+        groups.contains(LinkGroups::STAB),
+    );
+    let mut sets: Vec<&str> = Vec::with_capacity(16);
     if has_result {
         sets.extend_from_slice(&[
             "latency = excluded.latency",
@@ -694,6 +712,12 @@ fn link_patch_conflict_sql(has_result: bool, has_traffic: bool, has_purge: bool)
             "traffic_today_down = excluded.traffic_today_down",
             "traffic_total_up = excluded.traffic_total_up",
             "traffic_total_down = excluded.traffic_total_down",
+        ]);
+    }
+    if has_stab {
+        sets.extend_from_slice(&[
+            "stab_mask = excluded.stab_mask",
+            "stab_len = excluded.stab_len",
         ]);
     }
     if sets.is_empty() {
@@ -1166,6 +1190,8 @@ impl Database {
                     .speed_bps(link.speed_bps)
                     .error(link.error.clone())
                     .purge_reason(link.purge_reason)
+                    .stab_mask(link.stab_mask)
+                    .stab_len(link.stab_len)
                     .traffic(link.traffic)
                     .updated_at(now_epoch())
                     .on_create(|create| create.created_at(now_epoch()))
@@ -1223,31 +1249,31 @@ impl Database {
             return Ok(0);
         }
         // The `ON CONFLICT` action is per-STATEMENT, so the patches are
-        // bucketed by the action they need (both groups / RESULT / TRAFFIC /
-        // none) rather than by their exact bit pattern — `contains` is what
-        // decides the columns written, exactly as the per-row form did.
-        for (has_result, has_purge, has_traffic) in [
-            (true, true, true),
-            (true, true, false),
-            (true, false, true),
-            (true, false, false),
-            (false, true, true),
-            (false, true, false),
-            (false, false, true),
-            (false, false, false),
-        ] {
+        // bucketed by the action they need rather than by their exact bit
+        // pattern — `contains` is what decides the columns written, exactly as
+        // the per-row form did. The bucket is the 4-bit presence vector, so a
+        // new group widens the list automatically instead of silently folding
+        // into an existing bucket (which would write the wrong column set).
+        for bucket in 0u8..16 {
+            let (has_result, has_purge, has_traffic, has_stab) = (
+                bucket & 0b0001 != 0,
+                bucket & 0b0010 != 0,
+                bucket & 0b0100 != 0,
+                bucket & 0b1000 != 0,
+            );
             let shape: Vec<&LinkPatch> = patches
                 .iter()
                 .filter(|p| {
                     p.groups.contains(LinkGroups::RESULT) == has_result
                         && p.groups.contains(LinkGroups::PURGE) == has_purge
                         && p.groups.contains(LinkGroups::TRAFFIC) == has_traffic
+                        && p.groups.contains(LinkGroups::STAB) == has_stab
                 })
                 .collect();
             if shape.is_empty() {
                 continue;
             }
-            let conflict = link_patch_conflict_sql(has_result, has_traffic, has_purge);
+            let conflict = link_patch_conflict_sql(LinkGroups(bucket));
             for chunk in shape.chunks(LINK_STATEMENT_ROWS) {
                 let mut sql = String::with_capacity(chunk.len() * 160 + LINK_UPSERT_PREFIX.len());
                 sql.push_str(LINK_UPSERT_PREFIX);
@@ -1779,6 +1805,11 @@ impl Database {
                     .latency(None)
                     .error(None)
                     .speed_bps(None)
+                    // The stability ring goes with the measurements: "clear all
+                    // stats" that left it behind would keep every wiped link
+                    // proven (spec `2026-10-09-stab-bin-design` §7.5).
+                    .stab_mask(0)
+                    .stab_len(0)
                     .exec(&mut conn)
                     .await?;
                 crate::endpoint_rank::backfill_all(&mut conn).await?;
@@ -2571,6 +2602,8 @@ mod tests {
                             speed_bps: None,
                             error: None,
                             purge_reason: None,
+                            stab_mask: 0,
+                            stab_len: 0,
                             traffic: TrafficStats {
                                 today_up: 0,
                                 today_down: 0,
@@ -2828,6 +2861,8 @@ mod tests {
             protocol_id: ProtocolId::new(protocol_id),
             endpoint_id: EndpointId::new(endpoint_id),
             last_seen_at: ts(last_seen),
+            stab_mask: 0,
+            stab_len: 0,
             traffic: zero_traffic(),
         })
         .exec(conn)
@@ -3017,6 +3052,8 @@ mod tests {
                     delay: 10,
                     ip: None
                 }),
+                stab_mask: 0,
+                stab_len: 0,
                 traffic: zero_traffic(),
             })
             .exec(&mut conn)
@@ -3437,6 +3474,8 @@ mod tests {
             speed_bps: None,
             error: None,
             purge_reason: None,
+            stab_mask: 0,
+            stab_len: 0,
             traffic: zero_traffic(),
             created_at: ts(0),
             updated_at: ts(0),

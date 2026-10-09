@@ -641,9 +641,7 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                     .endpoints
                     .iter()
                     .find(|r| r.endpoint.id.get() == endpoint_id)
-                    .map_or((0, false), |r| {
-                        (r.endpoint.id.get(), r.endpoint.is_dns())
-                    });
+                    .map_or((0, false), |r| (r.endpoint.id.get(), r.endpoint.is_dns()));
                 let ip_info_clone = ip_info.clone();
                 let writer = Arc::clone(&state.link_stage);
 
@@ -663,6 +661,12 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                             // it off the UI task. A stopped test returns `None`
                             // and stages nothing, and the returned groups carry
                             // PURGE only when the verdict moved.
+                            let is_real = test_type == TestType::RealPing;
+                            let sample = is_real
+                                && state.batch_progress.is_none()
+                                && !error.as_deref().is_some_and(|e| {
+                                    e.starts_with(crate::ops::ping::UNTESTABLE_PREFIX)
+                                });
                             if let Some(groups) = apply_test_result(
                                 link,
                                 test_type,
@@ -672,7 +676,30 @@ pub async fn poll_core_events(state: &mut AppState) -> bool {
                                 error.as_deref(),
                                 purge,
                             ) {
-                                writer.stage(link, groups);
+                                // STABILITY, single pings only. A batch stages
+                                // its own samples (its rows are off-page here),
+                                // so sampling in both would count every batch
+                                // probe twice. `batch_progress` is published
+                                // before the batch's first probe and cleared at
+                                // its end: a single ping for one link can only
+                                // MISS a sample here, never double one.
+                                if sample {
+                                    let ok = error.is_none();
+                                    let (mask, len) = xray_tui_db::endpoint_rank::append_sample(
+                                        link.stab_mask.cast_unsigned(),
+                                        u8::try_from(link.stab_len.clamp(
+                                            0,
+                                            i64::from(xray_tui_db::endpoint_rank::STAB_WINDOW),
+                                        ))
+                                        .unwrap_or(0),
+                                        ok,
+                                    );
+                                    link.stab_mask = mask.cast_signed();
+                                    link.stab_len = i64::from(len);
+                                    writer.stage(link, groups.union(LinkGroups::STAB));
+                                } else {
+                                    writer.stage(link, groups);
+                                }
                             }
                         }
                     } else {

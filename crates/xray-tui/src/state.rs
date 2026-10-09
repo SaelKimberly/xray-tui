@@ -14,12 +14,12 @@ use xray_tui_core::speed_test::TestType;
 use xray_tui_db::Database;
 use xray_tui_db::hash::stable_hash;
 use xray_tui_db::models::{
-Endpoint, EndpointGroup, EndpointId, Group, HostType, ProfileStats, Protocol,
-    ProtocolId, PurgatoryView, RoutingRule, Security, TrafficStats, Transport,
+    Endpoint, EndpointGroup, EndpointId, Group, HostType, ProfileStats, Protocol, ProtocolId,
+    PurgatoryView, RoutingRule, Security, TrafficStats, Transport,
 };
 use xray_tui_proto::proto_spec::common::TransportConfig;
 use xray_tui_proto::proto_spec::{
-EndpointEssentials, HostKind, ParsedProto, ProtoSpec, ProtocolConfig,
+    EndpointEssentials, HostKind, ParsedProto, ProtoSpec, ProtocolConfig,
 };
 
 use crate::BackendUpdateStatus;
@@ -347,10 +347,7 @@ pub fn protocol_from_parsed(parsed: &ParsedProto) -> Protocol {
 /// The per-pair `ProfileStats` link for one parsed endpoint, reusing the
 /// already-computed protocol id (no `uid()` rehash per endpoint).
 #[must_use]
-pub fn link_from_parsed_with_id(
-    protocol_id: ProtocolId,
-    endpoint_id: EndpointId,
-) -> ProfileStats {
+pub fn link_from_parsed_with_id(protocol_id: ProtocolId, endpoint_id: EndpointId) -> ProfileStats {
     let now = xray_tui_db::models::now_epoch();
     ProfileStats {
         protocol_id,
@@ -361,6 +358,8 @@ pub fn link_from_parsed_with_id(
         speed_bps: None,
         error: None,
         purge_reason: None,
+        stab_mask: 0,
+        stab_len: 0,
         traffic: TrafficStats {
             today_up: 0,
             today_down: 0,
@@ -707,7 +706,6 @@ impl AppState {
     pub async fn reload_routing_rules(&mut self) {
         profiles::reload_routing_rules(self).await;
     }
-
 
     /// The filtered total across all pages (the page holds one window of it).
     #[must_use]

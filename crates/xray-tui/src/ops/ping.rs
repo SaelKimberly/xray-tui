@@ -1898,6 +1898,18 @@ impl BatchShared {
                 self.retract_fast_marker(link);
             } else {
                 self.counters.unreachable.fetch_add(1, Ordering::Relaxed);
+                // The retirement stands in for the real probe it prevented — a
+                // hard-fast failure is evidence the link is unreachable NOW
+                // (spec §7.2). Gated on `real_phase`: a fast-ONLY pass must not
+                // fill rings with failures no real probe can offset.
+                //
+                // It goes in THIS arm, with the verdict — never on
+                // `hard_fast.contains(key)`: the quic-plugin link above is
+                // reachable and does get real-probed, so a sample there would
+                // demote a working link.
+                if self.real_phase {
+                    self.sample_stability(link, false);
+                }
                 return;
             }
         }
@@ -2328,6 +2340,32 @@ impl BatchShared {
         crate::ops::purge::reason_for(evidence, loaded.fp.as_deref())
     }
 
+    /// Append one stability sample for `link` and stage the STAB group.
+    ///
+    /// The ring is a READ-MODIFY-WRITE over STAGED state (spec
+    /// `2026-10-09-stab-bin-design` §7.3): the write-behind drain REMOVES
+    /// entries from the pending map, so a snapshot-based append would drop the
+    /// sample another producer had already staged for this link. The current
+    /// `(mask, len)` therefore come from the pending map when a sample is
+    /// staged, falling back to the caller's snapshot only when none is.
+    ///
+    /// `get` + `push` is not atomic; the scheduler's one-mutex gate serializes
+    /// this link's real/fast halves, which is the ordering that matters here.
+    fn sample_stability(&self, link: &ProfileStats, ok: bool) {
+        let staged = self
+            .writer
+            .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
+            .map(|row| (row.link.stab_mask, row.link.stab_len));
+        let (mask, len) = staged.unwrap_or((link.stab_mask, link.stab_len));
+        let len = u8::try_from(len.clamp(0, i64::from(xray_tui_db::endpoint_rank::STAB_WINDOW)))
+            .unwrap_or(0);
+        let (mask, len) = xray_tui_db::endpoint_rank::append_sample(mask.cast_unsigned(), len, ok);
+        let mut row = link.clone();
+        row.stab_mask = mask.cast_signed();
+        row.stab_len = i64::from(len);
+        self.writer.stage(&row, LinkGroups::STAB);
+    }
+
     /// Stage one link's RESULT columns from a probe outcome.
     ///
     /// The batch owns its link snapshots, so persistence does not depend on the
@@ -2355,6 +2393,20 @@ impl BatchShared {
             .get(&(link.protocol_id, link.endpoint_id))
         {
             row.latency = Some(Latency::Fast { delay: *delay });
+        }
+        // A REAL probe is the one stability sample that ran (spec §7.1). Fast
+        // pings prove nothing about the config and never sample; the untestable
+        // marker is not a probe at all — the capability gate refused the row —
+        // so it must not accrue an attempt (that would sink every native-
+        // unsupported link's ratio without a single probe).
+        if test_type == TestType::RealPing {
+            let refused = matches!(
+                outcome,
+                ProbeOutcome::Failed { text, .. } if is_untestable_text(text)
+            );
+            if !refused {
+                self.sample_stability(link, matches!(outcome, ProbeOutcome::Ok { .. }));
+            }
         }
         // The mapping returns the groups to write: RESULT always, plus PURGE
         // when the verdict moved.
@@ -3000,12 +3052,18 @@ mod tests {
     async fn a_plan_scope_narrows_the_feed_walk() {
         use xray_tui_db::models::{ErrorInfo, Latency, ProfileErr};
 
-        // e1: a real success (tier 0) plus an untested sibling.
+        // e1: a real success (tier 0) plus an untested sibling. The ring comes
+        // WITH the real latency: `proven` (the Successful scope's membership)
+        // is derived from the ring, and a real measurement is only ever written
+        // by a real success — a `latency = Real` with an empty ring is a state
+        // the law's invariant forbids.
         let mut successful = fake_row(1, "10.0.0.1", 2);
         successful.links[0].latency = Some(Latency::Real {
             delay: 30,
             ip: None,
         });
+        successful.links[0].stab_mask = 1;
+        successful.links[0].stab_len = 1;
         // e2: untested (tier 2).
         let untested = fake_row(2, "10.0.0.2", 1);
         // e3: a fast-error marker, nothing measured (tier 4).
@@ -3478,7 +3536,7 @@ mod tests {
     }
     #[tokio::test]
     async fn dns_resolution_request_is_claimed_once_per_batch() {
-        let mut row = fake_row(1, "example.test", 1);
+        let row = fake_row(1, "example.test", 1);
         // already a DNS host
         let rows = vec![row];
         let mut h = harness(rows.clone()).await;
@@ -4035,6 +4093,128 @@ mod tests {
     }
 
     // ── one summary line per batch ───────────────────────────────────────
+
+    // ── stability samples (spec `2026-10-09-stab-bin-design` §7.1/§7.2) ──
+
+    /// A real probe appends exactly one sample; a fast ping never does.
+    #[tokio::test]
+    async fn only_real_probes_sample_stability() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        let shared = Arc::new(BatchShared::new(build_params(&h, plan, false, false)));
+        let link = rows[0].links[0].clone();
+
+        // A FAST result must not move the ring.
+        shared.stage_result(
+            &link,
+            TestType::TcpPing,
+            &ProbeOutcome::Ok {
+                latency_ms: Some(12),
+                ip_info: None,
+            },
+        );
+        assert!(
+            shared
+                .writer
+                .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
+                .is_none(),
+            "a fast ping proves nothing about the config and must not sample"
+        );
+
+        // A REAL success appends one success.
+        shared.stage_result(
+            &link,
+            TestType::RealPing,
+            &ProbeOutcome::Ok {
+                latency_ms: Some(40),
+                ip_info: None,
+            },
+        );
+        let staged = shared
+            .writer
+            .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
+            .expect("real success samples");
+        assert_eq!((staged.link.stab_mask, staged.link.stab_len), (1, 1));
+
+        // A REAL failure appends one failure to the SAME ring (read-through).
+        shared.stage_result(
+            &link,
+            TestType::RealPing,
+            &ProbeOutcome::Failed {
+                text: "timeout".to_string(),
+                class: ProbeClass::Timeout,
+                hard: false,
+                evidence: None,
+            },
+        );
+        let staged = shared
+            .writer
+            .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
+            .expect("real failure samples");
+        assert_eq!(
+            (staged.link.stab_mask, staged.link.stab_len),
+            (0b01, 2),
+            "the failure appends to the ring the success opened"
+        );
+    }
+
+    /// The untestable marker is NOT a probe: it must not accrue an attempt.
+    #[tokio::test]
+    async fn an_untestable_marker_never_samples_stability() {
+        let rows = vec![fake_row(1, "10.0.0.1", 1)];
+        let h = harness(rows.clone()).await;
+        let plan = plan_from_rows(&rows);
+        let shared = Arc::new(BatchShared::new(build_params(&h, plan, false, false)));
+        let link = rows[0].links[0].clone();
+        shared.stage_result(
+            &link,
+            TestType::RealPing,
+            &ProbeOutcome::soft_failure(untestable_marker_text("flow is not supported")),
+        );
+        assert!(
+            shared
+                .writer
+                .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB))
+                .is_none(),
+            "the capability gate refused the row; no probe ran, so no sample"
+        );
+    }
+
+    /// A hard-fast retirement samples ONLY in a real-capable batch (F1): in a
+    /// fast-only pass it would fill rings with failures no real probe can
+    /// offset, silently demoting proven links.
+    #[tokio::test]
+    async fn the_retirement_sample_is_gated_on_the_real_phase() {
+        for real_phase in [false, true] {
+            let rows = vec![fake_row(1, "10.0.0.1", 1)];
+            let h = harness(rows.clone()).await;
+            let plan = plan_from_rows(&rows);
+            let shared = Arc::new(BatchShared::new(build_params(&h, plan, real_phase, false)));
+            let link = rows[0].links[0].clone();
+            shared
+                .hard_fast
+                .lock()
+                .insert((link.protocol_id, link.endpoint_id));
+            shared.after_fast_settle(&link).await;
+            let staged = shared
+                .writer
+                .get(&(link.protocol_id, link.endpoint_id, LinkGroups::STAB));
+            if real_phase {
+                let staged = staged.expect("a real-capable batch samples the retirement");
+                assert_eq!(
+                    (staged.link.stab_mask, staged.link.stab_len),
+                    (0, 1),
+                    "the retirement appends one FAILURE"
+                );
+            } else {
+                assert!(
+                    staged.is_none(),
+                    "a fast-only pass must not sample a retirement"
+                );
+            }
+        }
+    }
 
     /// The batch's record is ONE line carrying every counter: per-result lines
     /// moved to `debug` (a 5-minute run wrote 32k of them on 2026-09-15, and

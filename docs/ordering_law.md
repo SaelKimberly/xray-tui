@@ -22,8 +22,13 @@ keys — this separation is the whole design:
 
 | | question | key | scope |
 | --- | --- | --- | --- |
-| **link key** | which of *this* endpoint's links represents it? | `(bin, ¬weight, -seen, protocol_id)` | within one endpoint |
-| **endpoint key** | where does the endpoint sit on the page? | `(band, bin, ¬weight, domain, sub_domain, addr, endpoint_id)` | across the feed |
+| **link key** | which of *this* endpoint's links represents it? | `(bin, stab_bin, ¬weight, -seen, protocol_id)` | within one endpoint |
+| **endpoint key** | where does the endpoint sit on the page? | `(band, bin, stab_bin, ¬weight, domain, sub_domain, addr, endpoint_id)` | across the feed |
+
+The endpoint key describes the **representative** link's order terms; whether the
+endpoint is in the `Successful` scope is a **separate stored fact**
+(`rank_proven`, §6) — a proven endpoint can carry `bin` 12 or 13 when an untested
+or failing sibling is its representative, so membership cannot ride the key.
 
 The link key **selects** (the endpoint's representative link); the endpoint key
 **orders** (the page). The link key's recency term (`-seen`) is deliberately
@@ -37,10 +42,14 @@ is what makes orderings drift.
 ### 1.1 The link key
 
 ```
-(bin, u64::MAX - weight, -seen, protocol_id)
+(bin, stab_bin, u64::MAX - weight, -seen, protocol_id)
 ```
 
 * `bin` — the coarse measurement band (§2). Lower is better.
+* `stab_bin` — the recent real-probe success rate, coarsened to `0..7`
+  (§2.1). Lower is better; `4` is neutral (warm-up / never sampled). It sits
+  **before** the weight: inside one delay bin the link that has proved reliable
+  leads the flaky one, whatever stack each runs.
 * `u64::MAX - weight` — the static config weight (§3), **negated** so "higher
   weight = better" rides an ascending tuple. This is the same idiom as `-seen`:
   one plain ascending key, no `Reverse`.
@@ -50,10 +59,10 @@ is what makes orderings drift.
 ### 1.2 The endpoint key
 
 ```
-(band, bin, u64::MAX - weight, domain, sub_domain, addr, endpoint_id)
+(band, bin, stab_bin, u64::MAX - weight, domain, sub_domain, addr, endpoint_id)
 ```
 
-The first three terms are the *representative link's* `(bin, weight)` (the
+The first four terms are the *representative link's* `(bin, stab_bin, weight)` (the
 `.min()` of §1.1, with `-seen`/`protocol_id` dropped). The tail is the
 **address tiebreak**: the endpoint's registrable domain, its sub-domain labels
 and (for an IP host) its packed literal — so two equally-ranked endpoints still
@@ -108,6 +117,31 @@ Two properties the numbering encodes, both load-bearing:
 
 Bins 13/14 fold the persisted failure marker; 16 is the purge sink (§5).
 
+### 2.1 The stability bin
+
+`stab_bin` is a SECOND, independent `0..7` band: the link's recent real-probe
+success rate, from a ring of the last `STAB_WINDOW = 16` real outcomes
+(`profile_stats.stab_mask`/`stab_len`; one real sample per link per batch run,
+`STAB_WARMUP = 4` before the ratio is trusted).
+
+| `stab_bin` | success rate | | `stab_bin` | success rate |
+| --- | --- | --- | --- | --- |
+| 0 | ≥ 95% | | 4 | ≥ 45% (neutral) |
+| 1 | ≥ 85% | | 5 | ≥ 30% |
+| 2 | ≥ 75% | | 6 | ≥ 15% |
+| 3 | ≥ 60% | | 7 | < 15% |
+
+`STAB_NEUTRAL = 4` has three uses and they must not drift: the warm-up/empty
+return, the `rank_stab` column DEFAULT, and the panel's "no data" rendering.
+
+What counts as a sample is narrow and deliberate. A real probe that ran appends
+its outcome; a **hard-fast retirement in a real-capable batch** appends a failure
+(the verdict retired the probe it prevented); a fast **success** never does; a
+fast-only batch never does; a dedup-sibling retire, a stop-retire, a queue-full
+and an `UNTESTABLE_PREFIX` refusal never do (none is a probe of that link).
+`stab_bin` is computed by ONE function (`endpoint_rank::stab_bin`), read by the
+rank refresh and the panel; SQL never re-derives it.
+
 ## 3. The static config weight
 
 The weight answers the one question measurement cannot: **among links nothing
@@ -142,13 +176,25 @@ dimension (VLESS/VMess/Trojan over the same stack score identically), and no
 sub-config fact (ws `path`, kcp `header_type`) is read — the function takes only
 the scalar discriminator columns the DB already stores.
 
-### 3.1 Why the weight outranks latency inside a bin
+### 3.1 The three layers, and why stability outranks the weight
 
-Deliberate and accepted: a 900 ms REALITY link sorts above a 40 ms plain-TCP one
-*when both land in the same bin*. The bins are coarse, so "same bin" means
-"within the same rough delay class" — and inside one class, the stack that is
-likelier to survive a hostile network is the better guess. The cost is accepted
-in exchange for a stable, probe-noise-resistant order.
+The law reads **measurement class, then reliability, then stack prior**:
+
+1. `bin` — how good the last measurement was.
+2. `stab_bin` — how reliably this link's real probes have succeeded recently.
+3. `¬weight` — the compiled prior, for the links stability has no evidence about.
+
+Latency is already folded into `bin`; the weight does **not** outrank `stab_bin`.
+The 900 ms-REALITY-vs-40 ms-TCP example still holds *when the two share both the
+bin and the stability* — inside one class, the stack likelier to survive a
+hostile network is the better guess — but a link that keeps failing loses to one
+that keeps working, whatever its stack.
+
+Deliberate and accepted (`spec 2026-10-09-stab-bin-design` D8): making reliability
+subordinate to the four coarse weight bands would leave it almost never
+consulted, since those bands differ often. The cost is that a 50%-flaky link now
+sorts below a never-sampled one (neutral `4 = STAB_NEUTRAL`), because "unknown"
+beats only a link that loses more often than it wins.
 
 ## 4. From law to page: the derivation pipeline
 
@@ -161,11 +207,11 @@ flowchart LR
     end
     subgraph M["Materialized state"]
       ROW["endpoint_rank row<br/>rank_bin · rank_weight<br/>rank_domain · rank_sub_domain<br/>rank_addr · band"]
-      IDX[("endpoint_rank_key<br/>covering index")]
+      IDX[("endpoint_rank_key_v2<br/>covering index")]
       ROW --- IDX
     end
     subgraph S["SQL — stores and reads, never re-derives"]
-      ORD["ORDER BY band, rank_bin,<br/>rank_weight DESC,<br/>rank_domain, rank_sub_domain,<br/>rank_addr, endpoint_id"]
+      ORD["ORDER BY band, rank_bin, rank_stab,<br/>rank_weight DESC,<br/>rank_domain,<br/>rank_sub_domain, rank_addr,<br/>endpoint_id"]
     end
     CR --> ROW
     IDX --> ORD
@@ -200,15 +246,25 @@ link changes (`endpoint_rank::refresh`, inside the same transaction as the link
 write). One covering index serves every page order:
 
 ```
-endpoint_rank_key(band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)
+endpoint_rank_key_v2(band, rank_bin, rank_stab, rank_weight DESC,
+                     rank_domain, rank_sub_domain, rank_addr, endpoint_id, rank_proven)
 ```
+
+`rank_proven` rides **last** as a covering column: the ORDER BY is
+`band, rank_bin, rank_stab, rank_weight DESC, …`, so a `rank_proven` placed
+between `band` and those terms would filesort Active and All. Trailing, it lets
+every scope (§6) filter **inline** on an index scan — `ordering_law.md`'s
+long-standing doctrine that a scoped predicate needs no index of its own. The
+v18 name `endpoint_rank_key` is dropped by the same DDL list; the new name is
+what makes an existing database pick up the new column list (an in-place edit
+under `CREATE INDEX IF NOT EXISTS` is a silent no-op).
 
 | page | plan | why |
 | --- | --- | --- |
-| Active, Test | `SEARCH … USING INDEX endpoint_rank_key (band=?)` | `band` is constant → seek, no sorter |
+| Active, Test | `SEARCH … USING INDEX endpoint_rank_key_v2 (band=?)` | `band` is constant → seek, no sorter |
 | Purgatory, Test | same, `band = 1` | same shape |
 | All, Test | `SCAN … USING COVERING INDEX` | `band` leads → index order, no sorter |
-| scoped batch (`rank_bin IN …`) | covering scan, bin predicate inline | no extra index needed |
+| scoped batch (proven/bin predicate) | covering scan, predicate inline | no extra index needed |
 
 **Trap, pinned by the turso gate:** a literal `band IN (0,1) ORDER BY key`
 filesorts (`USE SORTER FOR ORDER BY`). The All view therefore orders by the
@@ -240,6 +296,41 @@ Two endpoint-level overrides sit above the measured bands:
   band, so an endpoint's representative link is a live one whenever any live
   link exists. An all-purged endpoint still gets a deterministic position, for
   the Purgatory/All views (ADR 0006).
+
+### 6.1 Scopes: proven first (`rank_proven`)
+
+`rank_proven` is the second endpoint-level fact the rank table stores: **1** iff
+some live, unpurged link's ring holds at least one success, on a resolved
+endpoint. It is derived from the rings, never a durable flag, so it clears on
+its own once every success ages out of the window.
+
+The three batch scopes partition on it first, then the bin:
+
+| scope | predicate |
+| --- | --- |
+| Successful | `rank_proven = 1` |
+| New | `rank_proven = 0 AND rank_bin = 12` |
+| Failed | `rank_proven = 0 AND rank_bin IN (13, 14, 15)` |
+| SuccessfulAndNew | `rank_proven = 1 OR rank_bin = 12` |
+
+Why not `rank_bin IN (0..=5)`: the representative is the endpoint's *minimum*
+link key, so a proven endpoint whose newest real probe failed (bin 13) loses
+representation to any untested sibling (bin 12) — and would be labelled "New,
+never answered for" while the user has already proved it. Membership is
+therefore its own column, and the key's `stab_bin` orders *within* that
+membership.
+
+A **DNS-unresolved** endpoint is never proven: the host cannot be dialled, so it
+is not in the working pool. The old bin list excluded it structurally (its links
+collapse to bin 15); under the proven-first partition the exclusion is stated.
+
+Bins 6..11 (fast success, no real success) match no scope — pre-existing, and
+inherited by this partition.
+
+**Remove Bad Servers is NOT gated by stability.** `is_removable_failure` still
+keys on an error marker, proven or not: a user can delete the pool this feature
+curates, deliberately, and the panel shows the ratio so the deletion is
+informed.
 
 ## 7. Search
 
@@ -273,6 +364,34 @@ one address (text + packed) do not exist; the packed key is the only IP fact.
 The page is flat in offset because it is an index scan — a deep `OFFSET` walks
 the index, not a re-sorted table.
 
+### 8.1 The `stab_bin`/`rank_proven` change (2026-10-09)
+
+**Plans re-verified** at 74,723 rows on turso (`tests/turso_planner.rs`, the
+asserting `every_scope_plan_is_index_served_without_a_sorter` plus the print-only
+`turso_planner_gate`), with the shipped index:
+
+| query | plan |
+| --- | --- |
+| Active `band=0` | `SEARCH … USING COVERING INDEX endpoint_rank_key (band=?)` |
+| Purgatory `band=1` | same, `band=?` |
+| All (no band filter) | `SCAN … USING COVERING INDEX endpoint_rank_key` |
+| scope `rank_bin IN (13,14,15)` | `SCAN … USING COVERING INDEX` |
+| Successful `rank_proven = 1` | index scan, no sorter |
+| New / Failed / SuccessfulAndNew | index scan, no sorter |
+| reband sweep | `SEARCH … USING COVERING INDEX endpoint_rank_window (band=? AND rank_newest_seen<?)` |
+
+No page path has a `USE SORTER`/temp b-tree. The assertion has teeth: moving
+`rank_proven` between `band` and the order terms in the index makes the Active
+case plan `USE SORTER FOR ORDER BY` and fails it — which is why it rides LAST.
+
+**Timings were NOT re-measured.** No real feed was available in this change, so
+the 2026-10-01/2026-10-06 numbers above stand unverified against it; the
+`stab_bin` term and the trailing covering column change neither the row count nor
+the plan shape, and the per-row key comparison gains one `u8`. Re-run the
+`flow_cost` lab against a real feed before trusting a page-fetch number for this
+row. The `band IN (0,1) ORDER BY key` trap above is unchanged and still
+filesorts.
+
 ## 9. What is retired
 
 | gone | replaced by |
@@ -281,7 +400,9 @@ the index, not a re-sorted table.
 | `SortColumn` / the sort cycle / `AppState.sort_column` | the law only (decision 16, D1) |
 | `rank_dns`/`rank_tier`/`rank_latency`/`rank_seen`/`rank_protocol`/`rank_display_seen`/`rank_speed`/`rank_traffic` | `rank_bin`, `rank_weight`, `rank_domain`, `rank_sub_domain`, `rank_addr` |
 | `PageSort::Address` + the `rank_host` column + `endpoint_rank_band_host` | the Test key's `rank_domain`/`rank_sub_domain`/`rank_addr` tail (no production caller) |
-| `endpoint_rank_test`, `endpoint_rank_test_v2`, `endpoint_rank_window` | one `endpoint_rank_key` |
+| `endpoint_rank_test`, `endpoint_rank_test_v2`, `endpoint_rank_window` | one `endpoint_rank_key_v2` |
+| `endpoint_rank_key` (v18: no `rank_stab`, no trailing `rank_proven`) | `endpoint_rank_key_v2` |
+| `PlanScope::bins()` (a `rank_bin` list) | `PlanScope::predicate()` (the proven-first partition, §6.1) |
 
 `PageSort` keeps `Port` and `Ip` for the perf lab; `Ip` is additionally the
 search range index's rationale (`endpoint_ip_by_key`).

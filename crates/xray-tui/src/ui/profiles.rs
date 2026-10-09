@@ -99,6 +99,11 @@ struct PanelRow {
     traffic: String,
     outbound: String,
     outbound_country: String,
+    /// The stability ring as `successes/attempts` ("12/16"), or `—` when the
+    /// link has no samples yet (spec `2026-10-09-stab-bin-design` §8). The
+    /// ratio is the readable form of the ordering's `stab_bin`: it must be
+    /// checkable against where the row sits, which a glyph would not be.
+    stab: String,
 }
 
 /// A single-line endpoint row.
@@ -279,7 +284,7 @@ impl DisplayRowData {
         // are absolute within the panel interior — the untouched cell after
         // config (68) and the one in outbound's 16th cell are deliberate gaps
         // so a clipped/full-width value never blends into the next column.
-        let cols: [(usize, usize); 11] = [
+        let cols: [(usize, usize); 12] = [
             (0, 3),   // marker
             (3, 9),   // id
             (12, 20), // last_seen
@@ -291,6 +296,7 @@ impl DisplayRowData {
             (84, 10), // traffic
             (94, 16), // outbound (1-cell gap before country)
             (110, 5), // country
+            (115, 7), // stability (successes/attempts)
         ];
         for n in 0..visible {
             let pr = &self.panel_rows[win + n];
@@ -326,6 +332,7 @@ impl DisplayRowData {
                 pr.traffic.as_str(),
                 pr.outbound.as_str(),
                 pr.outbound_country.as_str(),
+                pr.stab.as_str(),
             ];
             for ((off, w), text) in cols.iter().zip(cell_texts.iter()) {
                 buf.set_stringn(inner_x + *off as u16, y, text, *w, style);
@@ -559,6 +566,25 @@ fn test_cell_content(
     }
 }
 
+/// The panel's stability cell: `successes/attempts` from the link's ring, or
+/// `—` when it has no samples yet (spec `2026-10-09-stab-bin-design` §8).
+///
+/// Numeric, not a glyph: the ratio is the readable form of the ordering's
+/// `stab_bin` and must be checkable against where the row sits. The neutral
+/// "no data" marker is deliberately not `0/0` — that reads as a measured zero.
+fn stability_ratio(link: &xray_tui_db::models::ProfileStats) -> String {
+    let len = u8::try_from(
+        link.stab_len
+            .clamp(0, i64::from(xray_tui_db::endpoint_rank::STAB_WINDOW)),
+    )
+    .unwrap_or(0);
+    if len == 0 {
+        return "—".to_string();
+    }
+    let successes = xray_tui_db::endpoint_rank::stab_successes(link.stab_mask.cast_unsigned(), len);
+    format!("{successes}/{len}")
+}
+
 /// Row-number cell: a 6-cell right-aligned slot plus a trailing gap cell
 /// (carrying the multi-select `*`) — room for 100000+ profiles without the
 /// number bleeding into the next column.
@@ -724,20 +750,25 @@ fn build_display_rows(
         let country_flag = info
             .and_then(|i| i.country.as_deref())
             .map_or_else(|| "\u{1F3F4}".to_string(), iso_to_flag);
-        let address_port_str =
-            truncate_pad(&format!(" {}:{}", row.endpoint.display_host(&row.resolved_ips), row.endpoint.port), 34);
+        let address_port_str = truncate_pad(
+            &format!(
+                " {}:{}",
+                row.endpoint.display_host(&row.resolved_ips),
+                row.endpoint.port
+            ),
+            34,
+        );
         // Feature flags, one 2-cell slot each: IP (🏁 DNS unresolved, 🏳️
         // IP/CIDR whitelisted) then SNI (🏳️ whitelisted).
-        let ip_feature =
-            if row.endpoint.is_dns() && !resolved {
-                "\u{1F3C1}".to_string()
-            } else if info
-                .is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
-            {
-                "\u{1F3F3}\u{FE0F}".to_string()
-            } else {
-                String::new()
-            };
+        let ip_feature = if row.endpoint.is_dns() && !resolved {
+            "\u{1F3C1}".to_string()
+        } else if info
+            .is_some_and(|i| i.host_features.ip_whitelisted || i.host_features.cidr_whitelisted)
+        {
+            "\u{1F3F3}\u{FE0F}".to_string()
+        } else {
+            String::new()
+        };
         let sni_feature = if info.and_then(|i| i.sni_whitelisted).unwrap_or(false) {
             "\u{1F3F3}\u{FE0F}".to_string()
         } else {
@@ -902,6 +933,7 @@ fn build_display_rows(
                         traffic,
                         outbound,
                         outbound_country,
+                        stab: stability_ratio(link),
                     }
                 })
                 .collect()
@@ -1183,7 +1215,11 @@ fn render_footer(
             let core = state.resolved_core(row);
 
             let host = row.endpoint.display_host(&row.resolved_ips);
-            let addr = if host.is_empty() { "-".to_string() } else { host };
+            let addr = if host.is_empty() {
+                "-".to_string()
+            } else {
+                host
+            };
             let port = row.endpoint.port.to_string();
             Line::from(vec![
                 Span::styled(" Server: ", ThemeStyles::footer_label(palette)),
@@ -1250,7 +1286,13 @@ fn render_confirmation_overlays(
             let profile_name = rows
                 .iter()
                 .find(|r| r.endpoint.id.get() == *delete_id)
-                .map(|r| format!("{}:{}", r.endpoint.display_host(&r.resolved_ips), r.endpoint.port))
+                .map(|r| {
+                    format!(
+                        "{}:{}",
+                        r.endpoint.display_host(&r.resolved_ips),
+                        r.endpoint.port
+                    )
+                })
                 .unwrap_or_default();
             render_confirmation_overlay(
                 frame,
@@ -1358,6 +1400,27 @@ mod page_window_tests {
         state
     }
 
+    /// The whole chain: a link's RING reaches the panel cell. `stability_ratio`
+    /// is correct in isolation (the test above) and the panel draws whatever
+    /// `PanelRow.stab` holds (the render test) — this pins the one line between
+    /// them, reading a real `ProfileStats` through `build_display_rows`.
+    #[tokio::test]
+    async fn a_links_ring_reaches_the_panel_cell() {
+        let mut row = crate::ops::profiles::test_support::fake_row(1, "10.0.0.1", 2);
+        // Link 0: 12 successes out of 16. Link 1: never sampled.
+        row.links[0].stab_mask = (1 << 12) - 1;
+        row.links[0].stab_len = 16;
+        // Only an EXPANDED row builds its panel.
+        row.expanded = true;
+        let mut state = crate::ops::profiles::test_support::test_state(vec![row]).await;
+        state.endpoints[0].expanded = true;
+        let rows = display(&state);
+        let panel = &rows[0].panel_rows;
+        assert_eq!(panel.len(), 2, "both links render a sub-row");
+        assert_eq!(panel[0].stab, "12/16", "the ring, as a ratio");
+        assert_eq!(panel[1].stab, "—", "an unsampled link says so, not 0/0");
+    }
+
     fn display(state: &AppState) -> Vec<DisplayRowData> {
         let rows: Vec<&EndpointRow> = state.endpoints.iter().collect();
         let palette = state.current_palette();
@@ -1431,7 +1494,9 @@ mod page_window_tests {
             after[0].address_port_str.trim(),
             format!(
                 "{}:{}",
-                state.endpoints[0].endpoint.display_host(&state.endpoints[0].resolved_ips),
+                state.endpoints[0]
+                    .endpoint
+                    .display_host(&state.endpoints[0].resolved_ips),
                 state.endpoints[0].endpoint.port
             )
         );
@@ -1442,10 +1507,33 @@ mod page_window_tests {
 mod tests {
     use super::*;
 
+    /// The panel's stability cell (spec §8): a ratio when the link has samples,
+    /// and the neutral marker — never a fake `0/0` — when it has none.
+    #[test]
+    fn the_stability_cell_shows_the_ratio_or_a_dash() {
+        let mut link = crate::ops::profiles::test_support::fake_row(1, "10.0.0.1", 1)
+            .links
+            .remove(0);
+        assert_eq!(stability_ratio(&link), "—", "no samples is not 0/0");
+
+        link.stab_mask = 0b1011;
+        link.stab_len = 4;
+        assert_eq!(stability_ratio(&link), "3/4");
+
+        link.stab_mask = (1 << 16) - 1;
+        link.stab_len = 16;
+        assert_eq!(stability_ratio(&link), "16/16");
+
+        // A corrupt stored len is clamped, not panicked on.
+        link.stab_len = 999;
+        assert_eq!(stability_ratio(&link), "16/16");
+    }
+
     fn sample_panel_row(marker: &str) -> PanelRow {
         PanelRow {
             marker: marker.to_string(),
             proto_id_hex: String::new(),
+            stab: String::new(),
             last_seen: String::new(),
             last_used: String::new(),
             protocol_type: String::new(),
@@ -1456,6 +1544,28 @@ mod tests {
             outbound: String::new(),
             outbound_country: String::new(),
         }
+    }
+
+    /// The panel RENDERS the stability ratio (spec §8): the cell text reaching
+    /// a real buffer, not just the helper's return.
+    #[test]
+    fn the_panel_renders_the_stability_ratio() {
+        let mut row = sample_panel_row("●");
+        row.stab = "12/16".to_string();
+        let data = sample_row(true, vec![row], "1");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        data.render_expansion_panel(&mut buf, 0, 0, 10, 160, Style::default(), 20);
+        let rendered: String = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(
+            rendered.contains("12/16"),
+            "the stability ratio must reach the rendered panel; buffer was {rendered:?}"
+        );
     }
 
     fn sample_row(expanded: bool, panel_rows: Vec<PanelRow>, idx: &str) -> DisplayRowData {

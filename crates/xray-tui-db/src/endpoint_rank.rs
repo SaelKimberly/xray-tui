@@ -60,6 +60,15 @@ pub struct RankLink {
     /// The link carries a purge verdict (spec `2026-09-17-purge-reason`). It can
     /// no longer represent the endpoint while a live link exists.
     pub purged: bool,
+    /// The link's stability bin, `0` (best) `..=7` (worst) — its recent
+    /// real-probe success rate, coarsened (spec `2026-10-09-stab-bin-design`).
+    /// Derived from the ring at construction, never stored on [`RankLink`] as a
+    /// mask: nothing above the law needs the raw bits.
+    pub stab: u8,
+    /// The link's ring holds at least one success — the input to the endpoint
+    /// `proven` OR. Not part of the key: reliability orders, it does not
+    /// represent.
+    pub proven: bool,
     /// The static config weight — the compiled "which stack is likelier to
     /// work" prior (spec `2026-10-01-static-config-weight-design`).
     ///
@@ -101,6 +110,16 @@ impl RankLink {
                 .total_up
                 .saturating_add(link.traffic.total_down),
             purged: link.purge_reason.is_some(),
+            // A negative or oversized stored len is a corrupt row: clamp rather
+            // than shift by >63 (which is UB-ish in debug) or index a bogus bin.
+            stab: stab_bin(
+                link.stab_mask.cast_unsigned(),
+                u8::try_from(link.stab_len.clamp(0, i64::from(STAB_WINDOW))).unwrap_or(0),
+            ),
+            proven: stab_proven(
+                link.stab_mask.cast_unsigned(),
+                u8::try_from(link.stab_len.clamp(0, i64::from(STAB_WINDOW))).unwrap_or(0),
+            ),
             weight,
         }
     }
@@ -122,15 +141,21 @@ impl RankLink {
     /// a live link whenever one exists; an endpoint whose links are all purged
     /// still gets a deterministic position for the Purgatory/All views.
     #[must_use]
-    pub const fn key(&self, dns_unresolved: bool) -> (u8, u64, i64, i64) {
-        // The representative-LINK key (db-rewamp D11): delay BIN, negated
-        // weight, then recency and protocol id. `latency` is gone (the bin
-        // buckets it); recency stays as a LINK tiebreak so the newest link
-        // represents its endpoint — it is deliberately NOT in the endpoint key
-        // (which orders by `domain`/`sub_domain`/`addr`), only in this
-        // same-endpoint selection.
+    pub const fn key(&self, dns_unresolved: bool) -> (u8, u8, u64, i64, i64) {
+        // The representative-LINK key (db-rewamp D11 + stab-bin spec): delay
+        // BIN, then STABILITY bin, then negated weight, then recency and
+        // protocol id. `latency` is gone (the bin buckets it); recency stays as
+        // a LINK tiebreak so the newest link represents its endpoint — it is
+        // deliberately NOT in the endpoint key (which orders by
+        // `domain`/`sub_domain`/`addr`), only in this same-endpoint selection.
+        //
+        // Stability sits BEFORE the weight on purpose: inside one delay bin a
+        // link that has proved reliable outranks a heavier stack that keeps
+        // failing. The weight is the prior for the links stability has no
+        // evidence about (neutral bin), not a trump card.
         (
             self.bin(dns_unresolved),
+            self.stab,
             u64::MAX - weight_u64(self.weight),
             -self.seen_secs,
             self.protocol_id,
@@ -187,6 +212,139 @@ const fn delay_bin(delay: i32) -> u8 {
     } else {
         5
     }
+}
+
+// ── Stability ring (spec `2026-10-09-stab-bin-design`) ──────────────────
+//
+// A link's recent real-probe outcomes, packed as a ring of the last
+// `STAB_WINDOW` samples: bit `i` is the `i`-th OLDEST live sample, `1` = the
+// probe succeeded. Only real-level evidence appends (a real probe that ran, or
+// — in a real-capable batch — the hard-fast failure that retired it); a fast
+// success never does, and a fast-ONLY batch never does.
+//
+// The ring rather than two counters because a counter cannot evict ONE
+// outcome: a tumbling reset throws the whole window away at once and makes
+// `stab_bin` sawtooth. `bits [len, 64)` are always zero, so `count_ones()` is
+// the success count at every length.
+
+/// The stability derivation's own version.
+///
+/// An edit to the `stab_bin` thresholds (or to
+/// `STAB_WINDOW`/`STAB_WARMUP`/`STAB_NEUTRAL`) invalidates every STORED
+/// `rank_stab` exactly as a weight-cell edit invalidates every stored
+/// `rank_weight`. Bump on any such change.
+pub const STAB_VERSION: u32 = 1;
+
+/// The version of every INPUT to the stored rank keys — the compiled weight
+/// tables *and* the stability thresholds. The stamp in `rank_weight_meta` holds
+/// this one number, so a mismatch rebuilds both `rank_weight` and
+/// `rank_stab`/`rank_proven` in a single pass; a second meta table would be a
+/// second staleness path for one fact (spec `2026-10-09-stab-bin-design` §6.4).
+///
+/// The folded form changes whenever either input does, and an existing
+/// database's stored `WEIGHT_VERSION`-only value never equals it, so the first
+/// open after this feature ships recomputes once — which is what the new
+/// `rank_stab`/`rank_proven` columns need anyway.
+// `as` (not `From`) because a `const` cannot call a `From` impl on this
+// toolchain; both casts are lossless by construction (`u32` -> `i64`).
+#[allow(clippy::cast_lossless)]
+const KEY_INPUTS_VERSION: i64 =
+    (crate::weight::WEIGHT_VERSION as i64) * 100 + (STAB_VERSION as i64);
+
+/// The running code's key-input version, for tests that assert what an open
+/// stamps into `rank_weight_meta`.
+#[must_use]
+pub const fn key_inputs_version() -> i64 {
+    KEY_INPUTS_VERSION
+}
+
+/// Samples in the window.
+///
+/// One real sample per link per batch run, so this is ~2 weeks of daily runs:
+/// long enough to survive a bad week, short enough that a dead link does not
+/// squat in `Successful` for a month (hard-dead cleanup is purge's job, not
+/// stability's).
+pub const STAB_WINDOW: u8 = 16;
+
+/// Samples needed before the ratio is trusted. `> 1` so the day-one seed
+/// (one success) stays neutral until there is repeat evidence.
+pub const STAB_WARMUP: u8 = 4;
+
+/// The bin for "no estimate": warm-up, never-sampled.
+///
+/// The one value with a nameable rule — an untested link outranks a link that
+/// loses more often than it wins. Used three ways and they must not drift: the
+/// warm-up return, the `rank_stab` column DEFAULT, and the panel's "no data"
+/// rendering.
+pub const STAB_NEUTRAL: u8 = 4;
+
+/// Append one outcome to the ring, returning the new `(mask, len)`.
+///
+/// Two distinct arms on purpose: below the window the new sample is the NEWEST,
+/// so every existing bit keeps its own index; at the window the oldest shifts
+/// out and the new one enters at the top.
+#[must_use]
+pub const fn append_sample(mask: u64, len: u8, ok: bool) -> (u64, u8) {
+    let bit = if ok { 1u64 } else { 0u64 };
+    if len < STAB_WINDOW {
+        (mask | (bit << len), len + 1)
+    } else {
+        ((mask >> 1) | (bit << (STAB_WINDOW - 1)), len)
+    }
+}
+
+/// Successes in the live window — `mask.count_ones()` is the whole answer
+/// because `bits [len, 64)` are zero by construction (pinned by a test).
+#[must_use]
+pub const fn stab_successes(mask: u64, len: u8) -> u32 {
+    // A mask with garbage above `len` would overcount; mask it off rather than
+    // trusting the append invariant on a row read back from the database.
+    // `u64::BITS` as a literal: a `const fn` cannot call `TryFrom`, and 64
+    // always fits a `u8`.
+    let live = if len >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << len) - 1
+    };
+    (mask & live).count_ones()
+}
+
+/// The stability bin, `0` (best) `..=7` (worst): the success rate, coarsened.
+///
+/// Neutral while the window is warming up or empty. Monotonic in successes at
+/// every length; the ONE implementation, read by `compute_rank` and the panel —
+/// SQL never re-derives it.
+#[must_use]
+pub const fn stab_bin(mask: u64, len: u8) -> u8 {
+    if len < STAB_WARMUP {
+        return STAB_NEUTRAL;
+    }
+    let rate = (stab_successes(mask, len) * 100) / len as u32;
+    if rate >= 95 {
+        0
+    } else if rate >= 85 {
+        1
+    } else if rate >= 75 {
+        2
+    } else if rate >= 60 {
+        3
+    } else if rate >= 45 {
+        4
+    } else if rate >= 30 {
+        5
+    } else if rate >= 15 {
+        6
+    } else {
+        7
+    }
+}
+
+/// Whether the window holds at least one success — the link-level `proven`
+/// fact. Derived from the ring, never a separate durable bit, so a full window
+/// of failures retires a link from `Successful` on its own.
+#[must_use]
+pub const fn stab_proven(mask: u64, len: u8) -> bool {
+    stab_successes(mask, len) > 0
 }
 
 /// The endpoint's own packed address key for the rank `addr` tiebreak (db-rewamp
@@ -329,7 +487,20 @@ pub fn compute_rank(
     dns_unresolved: bool,
     links: &[RankLink],
 ) -> Option<RankRow> {
-    let (bin, neg_weight, _, _) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
+    // The representative link: the minimum key. Its OWN stab is what the stored
+    // column reports — the same link the bin/weight came from, so the stored
+    // stab and the stored key cannot describe different links.
+    let (bin, stab, neg_weight, _, _) = links.iter().map(|l| l.key(dns_unresolved)).min()?;
+    // `proven` is ENDPOINT-level and NOT the representative's: a link that has
+    // worked in its window keeps the endpoint in `Successful` even when a
+    // sibling is the representative (an untested sibling outranks a failed
+    // one). Purged links never contribute — a verdict retired them.
+    //
+    // A DNS-unresolved endpoint is NOT proven, even when a link's ring holds a
+    // success: the host cannot be dialled, so it is not in the working pool.
+    // The old law excluded it structurally (its links collapse to bin 15, never
+    // 0..=5); under the proven-first partition that exclusion has to be stated.
+    let proven = !dns_unresolved && links.iter().any(|l| !l.purged && l.proven);
     // The view windows ask whether any LIVE link falls in the band. A
     // purged-only endpoint therefore reports `NO_SEEN`, which is below every
     // window bound — that is exactly "it belongs to Purgatory" (spec §5), and it
@@ -349,6 +520,8 @@ pub fn compute_rank(
             domain: domain.to_string(),
             sub_domain: sub_domain.to_string(),
             addr,
+            stab: i64::from(stab),
+            proven: i64::from(proven),
             newest_seen,
         },
         weight,
@@ -402,8 +575,8 @@ const RANK_CHUNK: usize = 400;
 /// on every single refresh — and a NULL there makes `profiles_anchor` fail
 /// rather than merely mis-sort, because the anchor binds each term's value back
 /// into a comparison.
-const RANK_COLUMNS: &str = "endpoint_id, rank_bin, rank_weight, rank_domain, \
-     rank_sub_domain, rank_addr, rank_newest_seen";
+const RANK_COLUMNS: &str = "endpoint_id, rank_bin, rank_stab, rank_proven, rank_weight, \
+     rank_domain, rank_sub_domain, rank_addr, rank_newest_seen";
 
 /// Fill the ordering keys and heal stale ones. The table's DDL (and its
 /// indexes) now lives in `crate::schema::ddl`, run by the migration runner
@@ -446,7 +619,7 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     )
     .await
     .unwrap_or(0);
-    let weight_stale = stored_version != i64::from(crate::weight::WEIGHT_VERSION);
+    let weight_stale = stored_version != KEY_INPUTS_VERSION;
 
     if scalar_i64(conn, "SELECT COUNT(*) FROM endpoint_rank").await? > 0 {
         // A database whose keys are absent or stale (written before a refresh
@@ -461,8 +634,8 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
             let written = backfill_all(conn).await?;
             stamp_weight_version(conn).await?;
             tracing::info!(target: "xray_tui_db",
-                stored = stored_version, want = crate::weight::WEIGHT_VERSION, written,
-                "endpoint_rank: weight tables changed, keys recomputed");
+                stored = stored_version, want = KEY_INPUTS_VERSION, written,
+                "endpoint_rank: key inputs changed, keys recomputed");
         }
         return Ok(());
     }
@@ -472,13 +645,12 @@ async fn ensure_in(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     Ok(())
 }
 
-/// Record the compiled tables' version, so the next open can tell whether the
-/// stored weights were produced by the code that is running now.
+/// Record the key-input version, so the next open can tell whether the stored
+/// keys were produced by the code that is running now.
 async fn stamp_weight_version(conn: &mut impl toasty::Executor) -> crate::Result<()> {
     toasty::sql::query(format!(
-        "INSERT INTO rank_weight_meta (id, weight_version) VALUES (0, {}) \
-         ON CONFLICT(id) DO UPDATE SET weight_version = excluded.weight_version",
-        i64::from(crate::weight::WEIGHT_VERSION)
+        "INSERT INTO rank_weight_meta (id, weight_version) VALUES (0, {KEY_INPUTS_VERSION}) \
+         ON CONFLICT(id) DO UPDATE SET weight_version = excluded.weight_version"
     ))
     .exec(conn)
     .await?;
@@ -547,9 +719,11 @@ pub(crate) async fn write(
             .map(|row| {
                 let r = &row.rank;
                 format!(
-                    "({},{},{},{},{},{},{})",
+                    "({},{},{},{},{},{},{},{},{})",
                     r.endpoint_id.get(),
                     r.bin,
+                    r.stab,
+                    r.proven,
                     row.weight.sql_literal(),
                     crate::database::sql_lit(&r.domain),
                     crate::database::sql_lit(&r.sub_domain),
@@ -881,7 +1055,8 @@ pub(crate) async fn refresh(
         "SELECT ps.endpoint_id, ps.protocol_id, ps.error_kind, ps.latency, ps.latency_delay, \
          ps.last_seen_at, ps.speed_bps, ps.traffic_total_up, ps.traffic_total_down, \
          ps.purge_reason, \
-         pr.transport_type, pr.security_type, pr.security_sni, pr.security_fp \
+         pr.transport_type, pr.security_type, pr.security_sni, pr.security_fp, \
+         ps.stab_mask, ps.stab_len \
          FROM profile_stats ps LEFT JOIN protocols pr ON pr.id = ps.protocol_id \
          WHERE ps.endpoint_id IN ({id_list})"
     ))
@@ -915,6 +1090,26 @@ pub(crate) async fn refresh(
             // A NULL column is a live link; any stored spelling is a verdict
             // (the value itself is the page's business, not the rank law's).
             purged: field(9).and_then(as_text).is_some(),
+            stab: stab_bin(
+                field(14).and_then(as_i64).unwrap_or(0).cast_unsigned(),
+                u8::try_from(
+                    field(15)
+                        .and_then(as_i64)
+                        .unwrap_or(0)
+                        .clamp(0, i64::from(STAB_WINDOW)),
+                )
+                .unwrap_or(0),
+            ),
+            proven: stab_proven(
+                field(14).and_then(as_i64).unwrap_or(0).cast_unsigned(),
+                u8::try_from(
+                    field(15)
+                        .and_then(as_i64)
+                        .unwrap_or(0)
+                        .clamp(0, i64::from(STAB_WINDOW)),
+                )
+                .unwrap_or(0),
+            ),
             // A link whose protocol row is absent (the join is LEFT) has no
             // known stack, so it sorts as "worst" — the same value an
             // un-refreshed endpoint carries, never a silent average.
@@ -1032,6 +1227,141 @@ fn parse_error_kind(text: &str) -> Option<ProfileErr> {
 mod tests {
     use super::*;
 
+    // ── stability ring (spec §5.1) ──────────────────────────────────────
+
+    /// The quantizer table, pinned at every boundary. Written as
+    /// (successes, len) → bin so a threshold edit shows up here, not as a
+    /// subtle page reorder.
+    #[test]
+    fn stab_bin_maps_every_boundary_to_its_bin() {
+        let at = |s: u32, len: u8| stab_bin((1u64 << s) - 1, len);
+        // full window (len 16): each rate band's floor
+        assert_eq!(at(16, 16), 0, "100%");
+        assert_eq!(at(15, 16), 1, "93.75%");
+        assert_eq!(at(13, 16), 2, "81.25%");
+        assert_eq!(at(12, 16), 2, "75%");
+        assert_eq!(at(11, 16), 3, "68.75%");
+        assert_eq!(at(10, 16), 3, "62.5%");
+        assert_eq!(at(9, 16), 4, "56.25%");
+        assert_eq!(at(8, 16), 4, "50%");
+        assert_eq!(at(7, 16), 5, "43.75%");
+        assert_eq!(at(5, 16), 5, "31.25%");
+        assert_eq!(at(4, 16), 6, "25%");
+        assert_eq!(at(2, 16), 7, "12.5%");
+        assert_eq!(at(0, 16), 7, "0%");
+        // Just below each threshold
+        assert_eq!(at(14, 16), 1, "87.5% -> bin 1 (>= 85)");
+    }
+
+    #[test]
+    fn warm_up_and_empty_are_neutral_never_best_or_worst() {
+        for len in 0..STAB_WARMUP {
+            for s in 0..=len {
+                assert_eq!(
+                    stab_bin((1u64 << s) - 1, len),
+                    STAB_NEUTRAL,
+                    "{s}/{len} is warm-up"
+                );
+            }
+        }
+        assert_eq!(stab_bin(0, 0), STAB_NEUTRAL);
+        assert_eq!(
+            stab_bin((1u64 << STAB_WARMUP) - 1, STAB_WARMUP),
+            0,
+            "the first trusted sample of an all-success window is best"
+        );
+    }
+
+    #[test]
+    fn stab_bin_is_monotonic_in_successes_at_every_length() {
+        // Lower bin = better, so more successes can only ever give a bin that
+        // is <= the previous one — never worse.
+        for len in STAB_WARMUP..=STAB_WINDOW {
+            let mut prev = 7u8;
+            for s in 0..=len {
+                let b = stab_bin((1u64 << s) - 1, len);
+                assert!(b <= prev, "{s}/{len}: {b} > {prev} (non-monotonic)");
+                prev = b;
+            }
+            assert_eq!(prev, 0, "an all-success window of len {len} is best");
+            assert_eq!(
+                stab_bin(0, len),
+                7,
+                "an all-failure window of len {len} is worst"
+            );
+        }
+    }
+
+    #[test]
+    fn append_fills_above_the_window_then_evicts_the_oldest() {
+        // Filling: every bit keeps its index, the newest is the top bit.
+        let (mask, len) = append_sample(0, 0, true);
+        assert_eq!((mask, len), (0b1, 1), "first success is bit 0");
+        let (mask, len) = append_sample(mask, len, false);
+        assert_eq!((mask, len), (0b01, 2), "a failure lands at bit 1");
+        let (mask, len) = append_sample(mask, len, true);
+        assert_eq!((mask, len), (0b101, 3), "…and the next success at bit 2");
+
+        // Eviction: after a full window, the oldest leaves and the new enters.
+        let mut mask = 0u64;
+        let mut len = 0u8;
+        for _ in 0..STAB_WINDOW {
+            (mask, len) = append_sample(mask, len, true);
+        }
+        assert_eq!(len, STAB_WINDOW);
+        assert_eq!(mask, u64::MAX >> (64 - STAB_WINDOW), "full window of ones");
+        let (mask, len) = append_sample(mask, len, false);
+        assert_eq!(len, STAB_WINDOW, "length stays at the window");
+        assert_eq!(
+            stab_successes(mask, len),
+            u32::from(STAB_WINDOW) - 1,
+            "the oldest success left the window"
+        );
+    }
+
+    #[test]
+    fn bits_above_len_are_always_zero_and_successes_match() {
+        // An arbitrary interleaved op sequence; the invariant checked at each
+        // step, which is what makes `count_ones()` the success count.
+        let ops = [
+            true, true, false, true, false, false, true, true, true, false,
+        ];
+        let mut mask = 0u64;
+        let mut len = 0u8;
+        let mut track = std::collections::VecDeque::new();
+        for _ in 0..3 {
+            for &ok in &ops {
+                (mask, len) = append_sample(mask, len, ok);
+                track.push_back(ok);
+                if track.len() > usize::from(STAB_WINDOW) {
+                    track.pop_front();
+                }
+                let shifted_out: u64 = mask >> len;
+                assert_eq!(shifted_out, 0, "bits [{len}, 64) must be zero");
+                assert_eq!(
+                    u32::try_from(track.iter().filter(|o| **o).count()).unwrap(),
+                    stab_successes(mask, len),
+                    "count_ones() must equal the live success count"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proven_is_any_success_left_in_the_window() {
+        assert!(!stab_proven(0, 0), "never sampled");
+        assert!(!stab_proven(0, STAB_WINDOW), "a full window of failures");
+        assert!(stab_proven(0b1000, 4), "one success anywhere");
+        // One success ages out of a full window after 16 failures.
+        let mut mask = 0u64;
+        let mut len = 0u8;
+        (mask, len) = append_sample(mask, len, true);
+        for _ in 0..STAB_WINDOW {
+            (mask, len) = append_sample(mask, len, false);
+        }
+        assert!(!stab_proven(mask, len), "the last success left the window");
+    }
+
     const fn link(protocol_id: i64, measured: Option<bool>, delay: i32, seen: i64) -> RankLink {
         RankLink {
             protocol_id,
@@ -1042,6 +1372,8 @@ mod tests {
             speed: None,
             traffic: 0,
             purged: false,
+            stab: STAB_NEUTRAL,
+            proven: false,
             weight: ZERO_WEIGHT,
         }
     }
@@ -1133,6 +1465,160 @@ mod tests {
             weight(10),
             "the stored weight must describe the SAME link the tier came from"
         );
+    }
+
+    #[test]
+    fn stability_outranks_weight_inside_a_bin() {
+        // Same bin, same weight: the more stable link leads. This is the whole
+        // point of the term — a reliable plain stack beats a flaky heavier one.
+        let mut stable = link(1, Some(true), 300, 10);
+        stable.stab = 0;
+        let mut flaky = link(2, Some(true), 300, 10);
+        flaky.stab = 6;
+        assert!(
+            stable.key(false) < flaky.key(false),
+            "inside one bin, stability leads"
+        );
+        // …and it outranks the WEIGHT, which used to lead inside a bin.
+        let mut stable_light = link(3, Some(true), 300, 10);
+        stable_light.stab = 1;
+        stable_light.weight = weight(2);
+        let mut flaky_heavy = link(4, Some(true), 300, 10);
+        flaky_heavy.stab = 5;
+        flaky_heavy.weight = weight(10);
+        assert!(
+            stable_light.key(false) < flaky_heavy.key(false),
+            "a stable light stack leads a flaky heavy one — stability > weight"
+        );
+        // The bin still dominates both.
+        let fast_flaky = link(5, Some(true), 40, 10);
+        assert!(
+            fast_flaky.key(false) < stable_light.key(false),
+            "a faster bin leads whatever the stability"
+        );
+    }
+
+    #[test]
+    fn a_proven_sibling_keeps_the_endpoint_proven_at_a_worse_bin() {
+        // The representative is the untested sibling (bin 12 < 13): the failed
+        // proven link does NOT represent the endpoint, yet the endpoint must
+        // stay proven — that is `rank_proven`'s entire job.
+        let mut proven_failed = link(1, None, 0, 100);
+        proven_failed.error_kind = Some(ProfileErr::Real);
+        proven_failed.proven = true;
+        let untested = link(2, None, 0, 100);
+        let row = compute_rank(
+            EndpointId::new(9),
+            "h.example",
+            "",
+            Vec::new(),
+            false,
+            &[proven_failed, untested],
+        )
+        .expect("rank");
+        assert_eq!(
+            row.rank.bin, 12,
+            "the untested sibling is the representative"
+        );
+        assert_eq!(
+            row.rank.proven, 1,
+            "but a live proven sibling keeps it proven"
+        );
+        assert_eq!(
+            row.rank.stab,
+            i64::from(STAB_NEUTRAL),
+            "the stored stab is the REPRESENTATIVE's"
+        );
+    }
+
+    #[test]
+    fn a_purged_link_never_makes_an_endpoint_proven() {
+        let mut purged = link(1, None, 0, 100);
+        purged.proven = true;
+        purged.purged = true;
+        let row = compute_rank(
+            EndpointId::new(9),
+            "h.example",
+            "",
+            Vec::new(),
+            false,
+            &[purged],
+        )
+        .expect("rank");
+        assert_eq!(row.rank.proven, 0, "a verdict retired the link's evidence");
+    }
+
+    #[test]
+    fn the_stored_stab_is_the_representatives_own() {
+        let mut weak = link(1, Some(true), 300, 10);
+        weak.stab = 5;
+        let mut strong = link(2, Some(true), 300, 10);
+        strong.stab = 0;
+        let row = compute_rank(
+            EndpointId::new(7),
+            "h.example",
+            "",
+            Vec::new(),
+            false,
+            &[weak, strong],
+        )
+        .expect("rank");
+        assert_eq!(
+            row.rank.stab, 0,
+            "the stored stab must describe the link the key picked"
+        );
+    }
+
+    /// The link-level ring feeds the law: a full window of successes is bin 0,
+    /// a full window of failures is 7, a partial window is neutral.
+    #[test]
+    fn the_ring_flows_into_the_link_key() {
+        use crate::models_toasty::{Latency, ProfileStats, TrafficStats};
+        let mk = |mask: i64, len: i64| {
+            let l = ProfileStats {
+                protocol_id: crate::models_toasty::ProtocolId::new(1),
+                endpoint_id: crate::models_toasty::EndpointId::new(1),
+                last_used_at: None,
+                last_seen_at: 0,
+                latency: Some(Latency::Real {
+                    delay: 10,
+                    ip: None,
+                }),
+                speed_bps: None,
+                error: None,
+                purge_reason: None,
+                stab_mask: mask,
+                stab_len: len,
+                traffic: TrafficStats {
+                    today_up: 0,
+                    today_down: 0,
+                    total_up: 0,
+                    total_down: 0,
+                },
+                created_at: 0,
+                updated_at: 0,
+                version: 1,
+                protocol: toasty::Deferred::default(),
+                endpoint: toasty::Deferred::default(),
+            };
+            let k = RankLink::new(&l, ZERO_WEIGHT);
+            (k.stab, k.proven, k.key(false))
+        };
+        let (stab, proven, _) = mk((1 << 16) - 1, 16);
+        assert_eq!((stab, proven), (0, true), "a full window of successes");
+        let (stab, proven, _) = mk(0, 16);
+        assert_eq!((stab, proven), (7, false), "a full window of failures");
+        let (stab, proven, _) = mk(1, 1);
+        assert_eq!(
+            (stab, proven),
+            (STAB_NEUTRAL, true),
+            "the seed: one success, no reliability estimate, proven"
+        );
+        let (stab, proven, _) = mk(0, 0);
+        assert_eq!((stab, proven), (STAB_NEUTRAL, false), "never sampled");
+        // A corrupt stored len must not panic or shift past 63.
+        let (stab, _, _) = mk(0, 99);
+        assert_eq!(stab, 7, "clamped len is a full failure window");
     }
 
     #[test]

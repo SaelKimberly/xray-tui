@@ -51,7 +51,23 @@ async fn cursor(conn: &mut impl toasty::Executor) -> Result<i64> {
 /// TOLERATED — this engine has no `ALTER ... IF NOT EXISTS`, and the error is
 /// the only signal that the column is already there. Any OTHER error is real
 /// and propagates.
-async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
+///
+/// Returns `true` when the `stab_mask` ALTER actually ADDED the column, i.e.
+/// this open is the one that introduced the stability ring to an existing
+/// database. The caller uses that to run the day-one seed exactly once (spec
+/// `2026-10-09-stab-bin-design` §6.2).
+async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<bool> {
+    let mut stabbed = false;
+    for alter in ddl::STAB_ADD_COLUMNS {
+        if let Err(e) = toasty::sql::query(*alter).exec(conn).await {
+            let message = e.to_string();
+            if !message.contains("duplicate column") {
+                return Err(e.into());
+            }
+        } else {
+            stabbed = true;
+        }
+    }
     for alter in ddl::ENDPOINT_RANK_ADD_COLUMNS {
         if let Err(e) = toasty::sql::query(*alter).exec(conn).await {
             let message = e.to_string();
@@ -63,7 +79,7 @@ async fn ensure_raw_ddl(conn: &mut impl toasty::Executor) -> Result<()> {
     for statement in ddl::V18_AFTER_ALTERS {
         toasty::sql::query(*statement).exec(conn).await?;
     }
-    Ok(())
+    Ok(stabbed)
 }
 
 /// Bring `db`/`conn` to the current schema version.
@@ -78,7 +94,23 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             // Current. Still ensure the derived tables/indexes exist — this is
             // the only path a database created before a new raw statement was
             // added to `ddl.rs` takes, and every statement is idempotent.
-            ensure_raw_ddl(conn).await?;
+            let stabbed = ensure_raw_ddl(conn).await?;
+            // Day-one stability seed (spec `2026-10-09-stab-bin-design` §6.2).
+            // `latency = 'real'` is evidence a real success happened —
+            // `apply_test_result` writes `Latency::Real` only on success and
+            // KEEPS it when it later writes an error — but an existing
+            // database's rings are empty, so every previously-successful link
+            // would read `rank_proven = 0` and drop out of ALL four scoped
+            // menus. Seeding the ring with that one known success keeps
+            // `proven` true and the window neutral (one sample < `STAB_WARMUP`).
+            //
+            // Gated on the ALTER having ADDED the column, so it runs exactly
+            // once; a later open tolerates the duplicate and skips this.
+            if stabbed {
+                let seeded = seed_stability(conn).await?;
+                tracing::info!(target: "xray_tui_db",
+                    "profile_stats: seeded {seeded} proven links into the stability ring");
+            }
             Ok(())
         }
         0 => {
@@ -112,4 +144,57 @@ pub async fn migrate(db: &toasty::Db, conn: &mut toasty::Connection) -> Result<(
             Err(DatabaseError::IncompatibleSchema(other))
         }
     }
+}
+
+/// The day-one stability seed: give every link that has a real measurement a
+/// one-sample success ring, so `rank_proven` is true for it immediately.
+///
+/// `latency` is the embed's discriminator column (`'real'`/`'fast'`/`''`), the
+/// same one the rank refresh matches on. Only `'real'` seeds: a fast latency is
+/// a TCP handshake, which proves nothing about the config.
+///
+/// Returns the number of rows seeded (counted before the update, since the
+/// engine reports no affected-row count for a raw `UPDATE`).
+///
+/// Also CLEARS the key-input stamp, so `endpoint_rank::ensure` (which runs
+/// later in `open`) sees a mismatch and recomputes every stored key — the
+/// seeded rings must reach `rank_proven`/`rank_stab` or the seed has no effect
+/// on the page.
+async fn seed_stability(conn: &mut impl toasty::Executor) -> Result<i64> {
+    let count = scalar_count(
+        conn,
+        "SELECT COUNT(*) FROM profile_stats WHERE latency = 'real'",
+    )
+    .await?;
+    if count == 0 {
+        return Ok(0);
+    }
+    toasty::sql::query(
+        "UPDATE profile_stats SET stab_mask = 1, stab_len = 1 WHERE latency = 'real'",
+    )
+    .exec(conn)
+    .await?;
+    // `rank_weight_meta` may not exist yet on a very old file; the rank `ensure`
+    // creates it. A failed delete here is therefore not an error.
+    let _ = toasty::sql::query("DELETE FROM rank_weight_meta")
+        .exec(conn)
+        .await;
+    Ok(count)
+}
+
+/// One integer from a single-value query (the schema module's own copy; the
+/// rank module's is private to `endpoint_rank`).
+async fn scalar_count(conn: &mut impl toasty::Executor, sql: &str) -> Result<i64> {
+    let rows = toasty::sql::query(sql).exec(conn).await?;
+    Ok(rows
+        .first()
+        .and_then(|row| match row {
+            toasty_core::stmt::Value::Record(record) => record.fields.first().cloned(),
+            _ => None,
+        })
+        .and_then(|v| match v {
+            toasty_core::stmt::Value::I64(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(0))
 }

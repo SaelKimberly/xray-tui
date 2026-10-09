@@ -71,6 +71,8 @@ erDiagram
         TEXT error_kind "real|fast|name"
         TEXT error_text
         TEXT purge_reason "reality_fallback|certificate_mismatch|…, NULL = live (ADR 0006)"
+        BIGINT stab_mask "stability ring: last STAB_WINDOW=16 real outcomes, bit i = i-th OLDEST, 1 = success"
+        BIGINT stab_len "live samples in the ring, 0..=16 (bits [len,64) are always zero)"
         BIGINT traffic_today_up
         BIGINT traffic_today_down
         BIGINT traffic_total_up
@@ -134,8 +136,10 @@ erDiagram
     }
     endpoint_rank {
         BIGINT endpoint_id PK
-        BIGINT rank_bin "D11 bins: 0..5 real<50..>=1000, 6..11 fast, 12 untested, 13 real-err, 14 fast-err, 15 dns-err, 16 purged — also the batch plan-scope predicate"
-        BLOB rank_weight "static config weight (8 big-endian bytes, NOT NULL); ordered INSIDE the bin — the reliability prior"
+        BIGINT rank_bin "D11 bins: 0..5 real<50..>=1000, 6..11 fast, 12 untested, 13 real-err, 14 fast-err, 15 dns-err, 16 purged — the representative link's LAST outcome"
+        BIGINT rank_stab "0..7 real-probe success rate of the representative link (4 = neutral); ordered inside the bin, BEFORE rank_weight"
+        BIGINT rank_proven "1 when some live unpurged link's ring holds a success — the Successful scope's membership, NOT the representative's bin"
+        BLOB rank_weight "static config weight (8 big-endian bytes, NOT NULL); ordered AFTER rank_stab"
         TEXT rank_domain "registrable domain (eTLD+1), empty for an IP/exotic host (D2)"
         TEXT rank_sub_domain "labels left of the domain"
         BLOB rank_addr "packed IP-literal key, empty for a DNS host (the address tiebreak)"
@@ -235,13 +239,19 @@ routing engine must resolve.
 **`endpoint_rank`** — the materialized per-endpoint ordering keys (ADR 0003;
 full write-up: `docs/ordering_law.md`). Each row is the decision-16 law
 evaluated for one endpoint over its links; the page's default order is an index
-scan of `endpoint_rank_key`, which is why the Profiles tab stays fast at any
+scan of `endpoint_rank_key_v2`, which is why the Profiles tab stays fast at any
 offset. The values are computed **in Rust** by `endpoint_rank::RankLink::key` —
 the single implementation of the law, shared with the panel's link order — and
 never re-derived in SQL. `rank_bin` is the representative link's coarse delay
 band (real `<50..≥1000` = 0–5, fast = 6–11, untested 12, error 13/14, DNS
 unresolved 15, purged 16); `rank_newest_seen` answers the Active/Purgatory
-window. `rank_weight` is the static config weight (spec
+window. `rank_stab` is the representative link's real-probe success rate
+(`0..7`, `4` neutral) from a ring of its last 16 real outcomes, and
+`rank_proven` is the endpoint's `Successful` membership (any live unpurged link
+with a success in its ring) — the two are separate facts because a proven
+endpoint's representative can be an untested sibling (spec
+`2026-10-09-stab-bin-design`, `docs/ordering_law.md` §6.1). `rank_weight` is the
+static config weight (spec
 `2026-10-01-static-config-weight-design`): a compiled prior over the link's
 transport/security discriminators, stored as 8 big-endian bytes so SQL's memcmp
 order IS the comparator's order. It is a RAW `NOT NULL` column (the model has no
@@ -264,8 +274,8 @@ ERROR, not a mis-sort.
 | *(PK autoindex)* | `endpoint_groups(endpoint_id, group_id)` | membership lookups AND an endpoint's groups (`endpoint_id` is the PK prefix, db-rewamp §3.2) |
 | `index_endpoint_groups_by_group_id` | `endpoint_groups(group_id)` | a group's endpoints (the query; `group_id` is the second PK column, so the autoindex cannot serve it) |
 | *(PK autoindex)* | `endpoint_rank(endpoint_id)` | rank-row writes/lookups |
-| `endpoint_rank_key` *(raw)* | `endpoint_rank(band, rank_bin, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id)` | the default page order — a covering index, so the page is an index scan (~8.6 ms at 7,672 endpoints, ADR 0003). **A NEW NAME, never an edit in place**: `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on an existing database, which would drop the page back to the ~240 ms filesort |
-| `rank_weight_meta` *(raw)* | `rank_weight_meta(id, weight_version)` | one row: the version of the compiled weight tables that produced the stored weights. A mismatch at open recomputes every key — the ONLY trigger that can replace the all-zero default `ADD COLUMN` materialized for pre-existing rows |
+| `endpoint_rank_key_v2` *(raw)* | `endpoint_rank(band, rank_bin, rank_stab, rank_weight DESC, rank_domain, rank_sub_domain, rank_addr, endpoint_id, rank_proven)` | the default page order — a covering index, so the page is an index scan. `rank_proven` is TRAILING (placing it between `band` and the order terms filesorts), so every scope filters inline on an index scan with no sorter. **A NEW NAME, never an edit in place**: `CREATE INDEX IF NOT EXISTS` makes a changed column list a silent no-op on an existing database. It supersedes `endpoint_rank_key`, which the same DDL list drops |
+| `rank_weight_meta` *(raw)* | `rank_weight_meta(id, weight_version)` | one row: the version of every INPUT to the stored keys — the compiled weight tables AND the stability thresholds (`KEY_INPUTS_VERSION`). A mismatch at open recomputes every key — the ONLY trigger that can replace the `ADD COLUMN` defaults materialized for pre-existing rows |
 | `endpoint_rank_band_window` *(raw)* | `endpoint_rank(band, rank_newest_seen)` | the directional reband sweep (`band=0 AND rank_newest_seen < ?`) |
 
 The two raw sets exist because toasty's `#[index]` is single-column and cannot
