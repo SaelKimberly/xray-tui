@@ -584,12 +584,36 @@ only the geo rows are a valid A/B.
 | flush trickle (4028 rows @ 12/s) | 32 flushes | 32 flushes | 32 flushes | 32 flushes | identical (write-behind floor unchanged) |
 
 **The `write failures` line this section first reported (408/408 vs 468/470) is
-NOT an MVCC property — it is the lab's own broken import arm.** `write_import_once`
-calls `upsert_protocols_bulk`, which rejects a protocol whose deferred `config`
-was not loaded; the slice comes from `load_page_rows`, which stopped issuing
-`.include()` in `fcf2a5f`. Every import transaction errors deterministically in
-BOTH arms; the import rows are discarded and the failure counter is dominated by
-that one cause. Corrected before it could be read as "MVCC loses writes".
+NOT an MVCC write-loss signal.** The counter (`flow_cost.rs:2381`) sums the
+import, geo AND mix arms. Two contributions, neither an MVCC defect:
+
+1. The **import arm fails in BOTH modes** — `write_import_once` calls
+   `upsert_protocols_bulk`, which rejects a protocol whose deferred `config` was
+   not loaded (the slice comes from `load_page_rows`, which stopped issuing
+   `.include()` in `fcf2a5f`). That is ~1 failure per sample in WAL and MVCC
+   alike, which is exactly why WAL prints `FAILED ON ALL 512 SAMPLES`.
+2. MVCC's EXCESS is the **overlapping geo writes** of the mix arm (below), not a
+   capacity limit on disjoint rows.
+
+**The lab's MVCC failure count is 16-way row OVERLAP, not the production
+shape — and NOT retry exhaustion on disjoint rows.** The mix arm hands every one
+of its 16 writers the SAME geo slice, so all 16 transactions touch the same
+`(endpoint_id, ip_key)` rows; a corrected probe
+(`database::tests::geo_under_mvcc_probe`, which now builds GENUINELY disjoint id
+blocks — an earlier version of it accidentally `% 64`-folded every batch onto the
+same 64 rows and its "conflicts on disjoint rows" reading was that artifact)
+measures the two shapes apart at 16 writers × 24 transactions × 8 rows:
+
+| geo writers (16×) | WAL exhausted | MVCC exhausted | wall |
+| --- | --- | --- | --- |
+| disjoint (production shape: distinct endpoints) | 0 | **0** | MVCC 52–147 ms vs WAL 451 ms — MVCC FASTER |
+| overlapping (all writers on 8 rows) | 0 | 0–1 | MVCC 352–564 ms vs WAL 138 ms — MVCC ~3× slower |
+
+At production geometry (1–2 geo writers, the geo drain being ONE `WriteBehind`
+owner) it is 0 exhausted at the generic 5-attempt budget in every run. So
+**no retry-budget change is shipped** — an unjustified constant is worse than the
+status quo — and a write that IS exhausted is not lost anyway: `WriteBehind::flush`
+calls `restage` on any error, so the window is written on the next drain.
 
 **Separate probe — do MVCC conflicts lose writes?** No, at the budget the app
 actually uses. `database::tests::mvcc_load_probe` (ignored; 32 writers × 60
@@ -603,8 +627,9 @@ rows** (91–110 ms vs WAL's 112–195 ms) and **~2× slower when writers share 
 row** (307–413 ms vs 139–189 ms).
 
 **Decision: MVCC stays an OPT-IN — the reason is throughput, not correctness,
-and it is now a weak verdict.** Correctness is cleared (no write loss at the
-production budget), and MVCC wins on the shape production actually has (a link's
+and it is now a weak verdict.** Correctness is cleared *for the production shape*
+(no write loss at the generic budget on disjoint rows; an exhausted write is
+re-staged, not dropped), and MVCC wins on the shape production actually has (a link's
 PK is `(protocol_id, endpoint_id)`; the write-behind coalesces a link's groups
 into one patch, so same-row contention is rare) while losing on the geo mixed
 stream (1.1–1.6× slower) and on same-row contention. The two labs disagree, so

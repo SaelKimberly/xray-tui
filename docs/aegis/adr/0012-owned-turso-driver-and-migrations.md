@@ -54,10 +54,15 @@ turso themselves.
    `rank_weight_meta`). The `CREATE TABLE`s stay with `push_schema` — that IS the
    schema of record until the typed layer is retired (deferred S7), and copying
    them would be a second spelling of one fact.
-4. **D-D — MVCC stays opt-in.** Measured on 0.8 (S6): the sequential tax is
-   reproducible, the contended fan-in row is noise across two runs, and MVCC
-   surfaces more conflicts as failures. `XRAY_TUI_TURSO_CONCURRENT_WRITES=1`
-   remains the opt-in.
+4. **D-D — MVCC stays opt-in.** Measured on 0.8 (S6): the sequential geo tax is
+   reproducible (1.1-1.6x) and the contended row is noise across runs. The lab's
+   larger MVCC failure count is an artifact of its own 16-way ROW OVERLAP (every
+   writer gets the same geo slice) plus its broken import arm — a corrected probe
+   (`geo_under_mvcc_probe`) shows **0 retry exhaustion on the DISJOINT rows
+   production writes**, and `WriteBehind::flush` re-stages on any error anyway, so
+   an exhausted write is deferred rather than lost. **No retry-budget change is
+   shipped.** `XRAY_TUI_TURSO_CONCURRENT_WRITES=1` remains the opt-in, and a
+   real-feed A/B is the trigger to revisit.
 
 ## Rejected
 

@@ -2296,6 +2296,108 @@ mod tests {
         });
         assert_eq!(mode, Some("wal"));
     }
+    /// SCRATCH PROBE (S6c): the GEO write path under duplicated-fan-in geometry.
+    ///
+    /// `set_endpoint_ip_countries` is the writer the flow-cost lab's mix arm
+    /// reports failing under MVCC but not WAL (WAL counts exactly one failure
+    /// per sample = the import arm; MVCC counts MORE than one per sample). It
+    /// already wraps `retry_on_busy(..., 5)`, so a failure here is EXHAUSTED
+    /// retries — the one outcome that matters. Counts them by category.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "timing probe; prints a table, asserts nothing"]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "probe arithmetic over a tiny fixed endpoint pool"
+    )]
+    async fn geo_under_mvcc_probe() {
+        async fn arm(label: &str, mvcc: bool, writers: usize, rows: usize, shared: bool) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("geo.db");
+            let db = Arc::new(
+                Database::open_with_concurrent_writes(&path, mvcc)
+                    .await
+                    .expect("open"),
+            );
+            {
+                let mut conn = db.connection().await.expect("conn");
+                // A pool big enough for the DISJOINT arm to be genuinely
+                // disjoint: 32 writers x 24 txns x 8 rows = 6144 distinct ids.
+                for id in 1..=4096 {
+                    seed_endpoint(&mut conn, id, id, "geo.example", HostType::Dns, 443, 1).await;
+                }
+            }
+            let (ok, exhausted) = (
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            );
+            let t0 = std::time::Instant::now();
+            let mut set = tokio::task::JoinSet::new();
+            for w in 0..writers {
+                let db = Arc::clone(&db);
+                let ok = Arc::clone(&ok);
+                let exhausted = Arc::clone(&exhausted);
+                set.spawn(async move {
+                    for r in 0..24usize {
+                        // `shared` = every writer touches the SAME endpoint ids
+                        // (the mix arm's 16x duplication); else disjoint.
+                        let batch: Vec<_> = (0..rows)
+                            .map(|i| {
+                                // DISJOINT means each writer owns a distinct id
+                                // BLOCK: never `% 64`, which would make every
+                                // batch span all rows.
+                                let id = if shared {
+                                    (i % 8) as i64 + 1
+                                } else {
+                                    ((w * 24 + r) * rows + i) as i64 + 1
+                                };
+                                (
+                                    EndpointId::new(id),
+                                    std::net::IpAddr::from([
+                                        10,
+                                        0,
+                                        (id / 256) as u8,
+                                        (id % 256) as u8,
+                                    ]),
+                                    "DE".to_string(),
+                                )
+                            })
+                            .collect();
+                        match db.set_endpoint_ip_countries(&batch).await {
+                            Ok(()) => {
+                                ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                exhausted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if exhausted.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                                    println!("GEO ERR: {e}");
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            while set.join_next().await.is_some() {}
+            println!(
+                "GEOPROBE {label:<10} mvcc={mvcc:<5} writers={writers:<3} rows={rows:<3} shared={shared:<5} wall={:>8.2?} ok={:<4} exhausted={}",
+                t0.elapsed(),
+                ok.load(std::sync::atomic::Ordering::Relaxed),
+                exhausted.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+        // Production geometry: the geo drain is ONE owner (the WriteBehind
+        // driver), overlapped only by a page seed. So the interesting rows are
+        // LOW writer counts, not the lab's 16x.
+        for mvcc in [false, true] {
+            arm("prod-1w", mvcc, 1, 8, false).await;
+            arm("prod-2w", mvcc, 2, 8, false).await;
+            arm("prod-4w", mvcc, 4, 8, false).await;
+            arm("lab-16w", mvcc, 16, 8, false).await;
+            arm("overlap", mvcc, 16, 8, true).await;
+        }
+    }
+
     /// Concurrent single-ping-shaped transactions under `retry_on_busy`, MVCC vs
     /// WAL, counting successes and RETRY EXHAUSTION.
     ///
