@@ -1459,11 +1459,11 @@ const FINAL_FLUSH_ATTEMPTS: u32 = 3;
 ///
 /// It used to be `!concurrent_writes`, because under MVCC the engine rejected
 /// the statement outright with `PASSIVE checkpoint requires
-/// experimental_mvcc_passive_checkpoint` — so an MVCC database grew its logical
-/// log unbounded for the whole process life. `file_driver` now sets that flag
-/// with the MVCC opt-in, so the statement succeeds under both journal modes and
-/// the gate has no reason to exist. Kept as a named predicate so the reason is
-/// visible and a future engine change has one place to point at.
+/// experimental_mvcc_passive_checkpoint`. `file_driver` now sets that flag with
+/// the MVCC opt-in, so it succeeds under both journal modes (and MVCC's own
+/// auto-checkpoints switch from blocking `Truncate` to `Passive`). Kept as a
+/// named predicate so the reason is visible and a future engine change has one
+/// place to point at.
 const fn wal_checkpoint_enabled(_concurrent_writes: bool) -> bool {
     true
 }

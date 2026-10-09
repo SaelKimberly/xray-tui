@@ -89,10 +89,16 @@ turso themselves.
      is now ONE `ON CONFLICT … DO UPDATE` statement, which also removes the N
      reads per geo window. (Under WAL the TOCTOU could not fire — the transaction
      holds the write lock — which is why only the MVCC layout exposed it.)
+   - **The engine's own verdict outranks our numbers:** `docs/manual.md:590` —
+     *"the feature is not production ready so do not use it for critical data
+     right now."* Quoted here because a reader weighing a flip should see it
+     before any measurement.
    - *Remaining costs of a flip:* **(a) the file is not stock-SQLite-readable.**
      `sqlite3` answers `file is not a database`; the Turso project's `tursodb` CLI
      does read it (verified: `.tables` lists all 12 tables of a file this app
-     wrote). But **there is NO verified convert-back path**, and a first attempt
+     wrote — read from a shell, i.e. with the app process GONE; from a child of a
+     live process the same file gave an empty dump, which is finding (2) below in
+     action, not a tool defect). But **there is NO verified convert-back path**, and a first attempt
      to document one was a DATA-LOSS TRAP — recorded here so nobody re-derives it:
      `tursodb … .dump | sqlite3 new.db` (i) does not emit `PRAGMA user_version`,
      and the resulting file has tables at cursor 0, which `schema::migrate` reads
@@ -102,13 +108,16 @@ turso themselves.
      0 bytes, while the same file dumped 13 tables from a shell later. So (a)
      stands as this ADR first recorded it: reaching for standard tooling stops
      working, and there is no supported way back short of a SQLite-format dump
-     that this project does not have. **(c) MVCC is SINGLE-PROCESS** — the engine
-     rejects multiprocess access outright (`core/database.rs`: "cannot open MVCC
-     database with experimental multiprocess WAL: MVCC does not support
-     multiprocess access"). A second app instance, or any external tool holding
-     the file open alongside the app, is a HARD failure, not a slow path — and
-     nothing in this session's work touched that, so it is the strongest remaining
-     operational cost, stronger than the tooling one; (b) throughput is MIXED BY PATH and must not be read as a single verdict:
+     that this project does not have. **(c) MVCC is SINGLE-PROCESS, and violates
+     it SILENTLY.** The commit serialization, logical-log append offset and
+     checkpoint exclusion are process-local (`core/database.rs:2055-2058`), so
+     concurrent multiprocess access *"silently loses committed transactions and
+     corrupts live views"*. The guard that would refuse it fires only under
+     `enable_multiprocess_wal` (`:2061`) — **which we never set** — so a second app
+     instance, or an external tool pointed at a LIVE database, is not refused: it
+     corrupts. Mitigation is behavioural (never open the DB from a second
+     process), which is why it is the strongest remaining operational cost; (b)
+     throughput is MIXED BY PATH and must not be read as a single verdict:
      for the LINK writer MVCC is the faster arm in most runs (`mvcc_load_probe`:
      84-195 ms vs WAL's 192-775 ms on disjoint rows), while on the GEO writer it is
      PARITY on disjoint rows (post-`set_countries_bulk`: WAL 145-225 ms vs MVCC
@@ -122,44 +131,65 @@ turso themselves.
 ### MVCC research (2026-10-08, against the engine's own docs + source at v0.8.2)
 
 Checked our implementation against `thirdparty/turso` (`docs/manual.md`,
-`docs/agent-guides/mvcc.md`, `core/mvcc/`). Findings that bear on the default:
+`docs/agent-guides/mvcc.md`, `docs/sql-reference/`, `core/mvcc/`,
+`perf/latency/`). Six findings, in the order they should be weighed:
 
-1. **The engine says MVCC is not production-ready.** `docs/manual.md:590`:
-   "**Note:** the feature is not production ready so do not use it for critical
-   data right now." That is the single strongest argument for keeping WAL the
-   default, and it is the engine's own statement, not our measurement.
-2. **`mvcc_checkpoint_threshold` is never set by us, and its default is
-   effectively OFF.** The engine's auto-checkpoint trigger defaults to
-   `DEFAULT_LOG_CHECKPOINT_THRESHOLD = 4120 * 1000` pages
-   (`core/mvcc/persistent_storage/logical_log.rs:270`) — 4.12 M pages, which no
-   session of ours approaches. Combined with our checkpoint running only at batch
-   end / quit, an MVCC session accumulates the logical log AND its version store
-   for its whole life. **A concrete, unfixed inefficiency in OUR code** (it does
-   not affect the WAL default, which is why it is not a today-bug).
-3. **Row versions live in memory** (`mvcc.md`: "large working sets use a lot of
-   memory"). We import 74 k endpoints / 33 k links; that is exactly a large
-   working set, and the memory cost is invisible to our current probes (which use
-   hundreds of rows). A real-feed MVCC measurement must watch RSS, not just wall
-   time.
-4. **Uncheckpointed MVCC changes are invisible to non-MVCC readers.**
-   `docs/manual.md:116`: "If a database is written to using MVCC and then opened
-   again without MVCC, the changes are not visible unless first checkpointed."
-   This is the mechanism behind the flaky `tursodb .dump` (0 bytes from a child
-   process, 13 tables later from a shell after the log had been replayed): it is
-   not a tursodb version gap, it is the missing checkpoint.
-5. **MVCC is snapshot isolation, not serializable** (`mvcc.md`), so it does not
-   prevent write skew — the class the `set_country` TOCTOU belonged to. Audited
-   the other write paths for it: `upsert_endpoint`/`upsert_protocol`/`upsert_link`
-   use atomic `upsert_by_*`/`ON CONFLICT`, so `set_country` was the only instance.
-6. **`BEGIN CONCURRENT` is the documented best practice for every MVCC write
-   transaction** (`docs/manual.md:224`) — our `TransactionMode::Default` mapping
-   already does this when the opt-in is on. No gap.
+1. **The engine says it is not production-ready.** `docs/manual.md:590` on the
+   `mvcc` journal mode: *"**Note:** the feature is not production ready so do not
+   use it for critical data right now."* That is the vendor's own statement and it
+   outweighs every measurement below — this is the line to quote first.
+2. **Single-process is a SILENT-CORRUPTION hazard, not a refusal.** MVCC's commit
+   serialization, logical-log append offset and checkpoint exclusion are
+   process-local (`core/database.rs:2055-2058`), so concurrent multiprocess access
+   *"silently loses committed transactions and corrupts live views"*. The guard
+   that would refuse it fires ONLY when `enable_multiprocess_wal` is set
+   (`core/database.rs:2061`), **and we never set it** — so a second app instance,
+   or any tool pointed at a live database, is not rejected; it corrupts. This is
+   the strongest remaining operational cost, and the mitigation is behavioural
+   ("never open the DB from a second process"), not "watch for an error". It also
+   explains the observation that a child process saw an empty database while a
+   shell, with the app gone, read all 12 tables.
+3. **The log is bounded by the engine, and the checkpoint flag changes its MODE.**
+   MVCC auto-checkpoints on the commit path once the logical log passes
+   `DEFAULT_LOG_CHECKPOINT_THRESHOLD` (`should_checkpoint()` at
+   `core/mvcc/database/mod.rs:3707`), and the threshold is **bytes** —
+   `4120 * 1000` ≈ 4.12 MB (`persistent_storage/mod.rs:97`). So it fires in normal
+   operation. `experimental_mvcc_passive_checkpoint` selects `Passive` over the
+   default `Truncate` (`database.rs:3708-3715`), and `Truncate` *"blocks both
+   readers and writers"* (`docs/manual.md:114`). **Our flag's real benefit is
+   therefore avoiding a per-threshold BLOCKING stall, not preventing growth** —
+   an earlier, wrong-in-the-other-direction note ("grows its log without bound")
+   is corrected in the code comments.
+4. **Row versions live in memory** (`docs/agent-guides/mvcc.md`): *"large working
+   sets use a lot of memory."* Against a 74 k-endpoint / 33 k-link feed with
+   batched bulk writes, an MVCC session holds versions for everything recently
+   written. Invisible to our probes (hundreds of rows), plausible at real scale,
+   and a distinct argument from throughput — a real-feed A/B should watch RSS, not
+   just wall time. Not measured here.
+5. **Uncheckpointed MVCC changes are invisible to non-MVCC readers**
+   (`docs/manual.md:116`: *"If a database is written to using MVCC and then opened
+   again without MVCC, the changes are not visible unless first checkpointed"*).
+   This is why a dump taken while uncheckpointed state is pending can come back
+   short, and it means any external read of a live MVCC file is
+   checkpoint-dependent. Combined with (2), external inspection belongs to a
+   stopped app.
+6. **Our write shape already matches every documented MVCC best practice — no
+   gaps found.** Conflict detection is ROW-level, not coarse
+   (`docs/sql-reference/statements/transactions.mdx`: *"checks whether any other
+   transaction has modified the same rows"*; *"Both succeed because they modified
+   different rows"*), which is why the correct fix for the `set_country` TOCTOU
+   was making it an atomic `ON CONFLICT … DO UPDATE` — the docs' own
+   recommendation (*"eliminating the need for separate existence checks"*) — and
+   not a retry budget. `BEGIN CONCURRENT` is the documented mode for all MVCC
+   writes (`docs/manual.md:224`) and we already use it; and writes must go through
+   *different connections*, not parallel statements on one (`:164`), which the
+   write-behind's one-connection-per-window already satisfies.
 
-Net: nothing here changes the default decision (it stays WAL), but items 2 and 3
-are real work items for anyone pursuing an MVCC default, and item 1 is the
-argument that should be quoted first.
+Net: nothing here changes the default (WAL stays), but (1) and (2) are stronger
+arguments than any measurement, (3) corrects the mechanism we recorded, and (4)
+is the one that needs a real-feed measurement before anyone flips.
 
-## Rejected
+## Rejected## Rejected
 
 - **S1–S3 (an adapter + `xray-tui-db-macro` derive crate) — DEFERRED** by user
   decision to reduce scope. Design retained in spec §3–§4; the hand decoders stay

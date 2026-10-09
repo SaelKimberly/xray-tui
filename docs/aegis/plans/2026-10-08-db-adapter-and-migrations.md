@@ -656,7 +656,12 @@ materially weaker than the 2026-09-24 rollout's 1.2–4.8× tax, so a future run
 well flip it; it is a live question, not a closed one.
 
 **Follow-up landed with this measurement: the MVCC checkpoint gap is FIXED, and
-two MVCC-only geo defects were fixed.** (a) `driver::error::classify_turso_error`
+two MVCC-only geo defects were fixed.** (Mechanism corrected against the engine
+source: MVCC ALREADY auto-checkpoints on the commit path at a ~4.12 MB logical-log
+threshold, so the log was never unbounded — `experimental_mvcc_passive_checkpoint`
+changes that auto-checkpoint's MODE from blocking `Truncate` to non-blocking
+`Passive`, and it is also what lets our own batch-end `wal_checkpoint(PASSIVE)`
+run under MVCC at all. An earlier "grows unbounded" reading was wrong.) (a) `driver::error::classify_turso_error`
 matched `"conflict"` case-sensitively, so the engine's `Conflict: {0}` spelling
 classified as a hard error and was NEVER retried at any budget; it is now
 case-insensitive, pinned with both spellings. (b) `set_country` was a
@@ -668,8 +673,9 @@ window), pinned by `set_country_is_an_atomic_upsert`. After both, the production
 `PRAGMA wal_checkpoint(PASSIVE)` was rejected under MVCC
 (`PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint`), and
 `ping.rs::wal_checkpoint_enabled` was `!concurrent_writes` — so an MVCC database
-ran with NO checkpoint and grew its logical log unbounded (59 KiB after 500 rows,
-still climbing; 0 with the flag). `file_driver` now enables
+ran with a BLOCKING auto-checkpoint (`Truncate`) and skipped our own batch-end
+`wal_checkpoint(PASSIVE)` entirely; the 59 KiB after 500 rows was simply below the
+engine's ~4.12 MB auto-checkpoint threshold, not evidence of unbounded growth. `file_driver` now enables
 `experimental_mvcc_passive_checkpoint` with the MVCC opt-in and the gate is open
 in both modes. Pinned by
 `database::tests::mvcc_checkpoint_succeeds_on_the_open_path`, which fails with the

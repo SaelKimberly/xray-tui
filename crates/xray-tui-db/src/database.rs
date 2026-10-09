@@ -231,13 +231,17 @@ async fn open_direct_conn(path: &str, concurrent_writes: bool) -> Result<turso::
 fn file_driver(path: &str, concurrent_writes: bool) -> crate::driver::Turso {
     let driver = crate::driver::Turso::file(path);
     if concurrent_writes {
-        // The checkpoint flag MUST accompany the MVCC opt-in. Without it the
-        // engine rejects the app's only log-bounding statement outright —
-        // `PRAGMA wal_checkpoint(PASSIVE)` answers "PASSIVE checkpoint requires
-        // experimental_mvcc_passive_checkpoint" — so an MVCC database grows its
-        // logical log without bound for the life of the process (measured:
-        // 59 KiB after 500 rows and still climbing; 0 with the flag). With the
-        // flag the same statement returns Ok and the log drains to 0.
+        // The checkpoint flag MUST accompany the MVCC opt-in. NOT because the
+        // log would grow without bound — the engine AUTO-checkpoints MVCC on the
+        // commit path once its logical log passes ~4.12 MB
+        // (`should_checkpoint()`, DEFAULT_LOG_CHECKPOINT_THRESHOLD, compared
+        // against a BYTE offset) — but because of the MODE that checkpoint takes:
+        // with the flag unset it is `CheckpointMode::Truncate`, which blocks both
+        // readers and writers for the whole checkpoint; with it set it is
+        // `Passive`, a non-blocking drain. So the flag trades a periodic
+        // whole-database stall for a background one. (It is also what lets our
+        // own batch-end `PRAGMA wal_checkpoint(PASSIVE)` run at all under MVCC —
+        // without it the engine refuses that statement.)
         driver
             .concurrent_writes()
             .experimental_mvcc_passive_checkpoint(true)
@@ -2309,10 +2313,10 @@ mod tests {
     /// The MVCC checkpoint MUST work on the REAL `Database::open` path.
     ///
     /// This is the ONLY guard on the fix in `file_driver`: it enables
-    /// `experimental_mvcc_passive_checkpoint` alongside the MVCC opt-in, without
-    /// which the engine rejects the app's only log-bounding statement with
-    /// `PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint` and an
-    /// MVCC database grows its logical log for the life of the process.
+    /// `experimental_mvcc_passive_checkpoint` alongside the MVCC opt-in. Without
+    /// it the engine refuses `PRAGMA wal_checkpoint(PASSIVE)` with
+    /// `PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint`, and every
+    /// auto-checkpoint takes the blocking `Truncate` mode instead of `Passive`.
     ///
     /// It opens a real MVCC handle and runs the statement, so it FAILS if the
     /// flag is dropped from `file_driver` — which

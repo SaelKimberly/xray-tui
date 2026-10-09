@@ -23,24 +23,22 @@
 //! a bump can break these impls and the fix is ours. `turso` itself is pinned
 //! directly (currently 0.8.2) and bumped when we want it.
 //!
-//! Kept close to the upstream source where that costs nothing, so a reader can
-//! diff a puzzling line against `thirdparty/toasty`; but readability and our own
-//! needs win over diff-closeness when they conflict.
+//! Where a line matches upstream it costs nothing and helps a reader diff a
+//! puzzling spot against `thirdparty/toasty`; where our needs differ, ours win.
 //!
 //! The vendored code owns all NINE required trait methods — `Driver::{url,
 //! capability, connect, generate_migration, reset_db}` and
 //! `Connection::{exec, push_schema, applied_migrations, apply_migration}`.
 //!
-//! Kept close to upstream by design so a `toasty-core` bump is a small diff.
-//! The pedantic lints below are upstream's style, not defects; allowing them
-//! here keeps the diff legible instead of rewriting every builder signature.
+//! The pedantic lints below are style preferences this code does not follow
+//! (builder methods returning `Self`, bool-flag structs); they are not defects.
 #![allow(
     clippy::must_use_candidate,
     clippy::return_self_not_must_use,
     clippy::missing_const_for_fn,
     clippy::struct_excessive_bools,
     clippy::needless_pass_by_ref_mut,
-    reason = "vendored from `toasty-driver-turso`; kept close to upstream for cheap re-sync"
+    reason = "vendored driver style; these pedantic lints are not defects"
 )]
 
 mod error;

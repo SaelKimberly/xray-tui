@@ -54,7 +54,7 @@ Measured/verified, not assumed:
 | 0.8 item | Relevance (WAL default) |
 | --- | --- |
 | group commit / `BEGIN CONCURRENT` | **MVCC only** — this repo A/B-measured MVCC 1.2–4.8× slower on the real-shaped feed and left it off (`specs/2026-09-24-turso-mvcc-rollout-design.md` §12) |
-| `experimental_mvcc_passive_checkpoint` builder flag | **MVCC only** — but it lifts the checkpoint blocker that keeps MVCC from being a real option |
+| `experimental_mvcc_passive_checkpoint` builder flag | **MVCC only** — it changes the engine's own commit-path auto-checkpoint from blocking `Truncate` to non-blocking `Passive`, and is what lets a `wal_checkpoint(PASSIVE)` run under MVCC at all |
 | partial-index predicates, `NULLS FIRST/LAST` indexes | could help the band sort — needs `ANALYZE` first (the live db has no `sqlite_stat1`); speculative |
 | hash joins, window fns, recursive CTE | not our plan (the page is index-driven) |
 | statement cache (ENGINE) | **still unbounded** in 0.8 (`turso_sdk_kit-0.8.x rsapi.rs:1136` `HashMap`) — toasty `main` STILL calls `prepare_cached` (`lib.rs:1254`), so upstream will not fix the leak |
@@ -423,17 +423,21 @@ optional.
 - **(REJECTED) S5:** T12 FK cascade was implemented, reproduced as a
   delete-race wedge (`GEO AFTER DELETE: Err(FOREIGN KEY constraint failed)`),
   and reverted. The manual ordered deletes remain the cascade owner.
-- **S6b (MVCC viability, 2026-10-08):** the MVCC opt-in's two blockers are
-  cleared — `file_driver` now sets `experimental_mvcc_passive_checkpoint` (the
-  engine rejected `wal_checkpoint(PASSIVE)` under MVCC, so its log grew without
-  bound) and the checkpoint gate is open in both modes. Write loss is 0 on
+- **S6b (MVCC viability, 2026-10-08):** the MVCC opt-in's checkpoint blocker is
+  cleared — `file_driver` now sets `experimental_mvcc_passive_checkpoint`, so the
+  engine's own commit-path auto-checkpoint runs `Passive` instead of blocking
+  `Truncate`, and the batch-end `wal_checkpoint(PASSIVE)` is accepted instead of
+  refused. Write loss is 0 on
   disjoint rows (the production shape) and at the production 2-writer overlap;
   the MVCC-only geo failures it once showed were TWO defects now fixed — a
   case-sensitive `conflict` match that skipped the retry entirely, and
   `set_country`'s SELECT-then-INSERT TOCTOU (now one `ON CONFLICT … DO UPDATE`). **WAL stays the
-  default** on the on-disk-format cost (an MVCC file is unreadable by *stock*
-  SQLite tooling, though the Turso project's own `tursodb` CLI reads it and
-  `.dump` gives a way back) and the unresolved real-feed throughput.
+  default** on three live costs: the file is not stock-SQLite-readable and there
+  is NO verified convert-back (a `tursodb .dump | sqlite3` path proved to be a
+  data-loss trap); MVCC is single-process and violates that SILENTLY; and
+  real-feed throughput plus the in-memory version store are unmeasured at our
+  scale. The engine's own `docs/manual.md:590` adds that MVCC is *"not production
+  ready"*.
 - **S6 (DONE):** MVCC vs WAL A/B on turso 0.8, synthetic 8,000-endpoint feed, two
   runs per arm. **WAL stays the default**: the sequential geo rows show a
   reproducible MVCC tax (1.1–1.6× slower), and the contended fan-in row swung
